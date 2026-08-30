@@ -40,7 +40,6 @@ jobs:
     permissions:
       contents: read
       security-events: write
-      actions: read          # required by upload-sarif (workflow-runs API)
     env:
       CODEQL_CLI_VERSION: 2.24.1
       CODEQL_DRIVERS_PACK_VERSION: 1.8.2
@@ -279,19 +278,10 @@ jobs:
           ${{ env.SARIF_MUSTRUN }}
           ${{ env.SARIF_MUSTFIX }}
 
-    - name: Upload mustrun.qls SARIF to GitHub code scanning
-      if: always()
-      uses: github/codeql-action/upload-sarif@v4
-      with:
-        sarif_file: ${{ env.SARIF_MUSTRUN }}
-        category: mustrun
-
-    - name: Upload mustfix.qls SARIF to GitHub code scanning
-      if: always()
-      uses: github/codeql-action/upload-sarif@v4
-      with:
-        sarif_file: ${{ env.SARIF_MUSTFIX }}
-        category: mustfix
+    # GitHub Code Scanning (upload-sarif) is unavailable on this repository:
+    # "Advanced Security is only available for Organizations".
+    # SARIF results are already retained as workflow artifacts (codeql-results)
+    # and bundled into the driver package under checks/.
 
     # =====================================================================
     # Everything below only runs if mustfix.qls above passed clean (exit
