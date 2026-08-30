@@ -5,7 +5,7 @@
 // Minimal self-contained runner — no external test framework dependency
 // assumed for this PoC tree; swap for a real framework (Catch2/GTest)
 // before this becomes a permanent CI suite.
-
+#define NOMINMAX
 #include "../protocol/BridgeXpc/Frame.h"
 #include "../protocol/BridgeXpc/PlistPayload.h"
 #include "../protocol/BiometricKit/MatchResult.h"
