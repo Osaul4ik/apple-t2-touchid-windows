@@ -188,7 +188,7 @@ T2AksBuildHeaderV2(_Out_ PT2_AKS_HEADER_V2 Header)
 NTSTATUS
 T2AksExchange(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
               _In_reads_bytes_opt_(RequestLength) PUCHAR RequestBody, _In_ SIZE_T RequestLength,
-              _Out_writes_bytes_to_(ResponseCapacity, *ResponseLength) PUCHAR ResponseBody,
+              _Out_writes_bytes_to_opt_(ResponseCapacity, *ResponseLength) PUCHAR ResponseBody,
               _In_ SIZE_T ResponseCapacity, _Out_ SIZE_T *ResponseLength)
 {
     NTSTATUS status;

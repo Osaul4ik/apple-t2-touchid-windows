@@ -254,5 +254,5 @@ BOOLEAN T2AksOperationAllowed(_In_ UINT8 Operation);
 NTSTATUS T2AksDigest(_Inout_updates_bytes_(Length) PUCHAR Message, _In_ SIZE_T Length);
 NTSTATUS T2AksExchange(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
                         _In_reads_bytes_opt_(RequestLength) PUCHAR RequestBody, _In_ SIZE_T RequestLength,
-                        _Out_writes_bytes_to_(ResponseCapacity, *ResponseLength) PUCHAR ResponseBody,
+                        _Out_writes_bytes_to_opt_(ResponseCapacity, *ResponseLength) PUCHAR ResponseBody,
                         _In_ SIZE_T ResponseCapacity, _Out_ SIZE_T *ResponseLength);

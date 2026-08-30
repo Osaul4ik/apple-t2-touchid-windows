@@ -573,6 +573,13 @@ T2EvtIoDeviceControlGetStatus(_In_ WDFREQUEST Request, _In_ PT2_DEVICE_CONTEXT C
         return;
     }
 
+    // WdfRequestRetrieveOutputBuffer's contract guarantees outLen is at
+    // least the MinimumRequiredSize (sizeof(*out)) we passed in whenever it
+    // returns success - that guarantee just isn't expressed in the KMDF
+    // header's SAL (_Outptr_result_bytebuffer_(*Length) ties the buffer's
+    // size to *Length alone, not to the input minimum), so /analyze can't
+    // derive it on its own. Restated explicitly rather than suppressed.
+    _Analysis_assume_(outLen >= sizeof(*out));
     RtlZeroMemory(out, sizeof(*out));
     out->PciPresent = TRUE;
     out->VendorId = T2_SEP_VENDOR_ID;
@@ -832,7 +839,14 @@ T2EvtIoDeviceControlAksExchange(_In_ WDFREQUEST Request, _In_ PT2_DEVICE_CONTEXT
 
     if (NT_SUCCESS(status)) {
         // Safe: T2AksExchange already bounds-checked responseLength against
-        // the responseCapacity we gave it (<= outLen - sizeof(*out)).
+        // the responseCapacity we gave it (<= outLen - sizeof(*out)) - see
+        // akstore.c's "if (bodyLen > ResponseCapacity) return
+        // STATUS_BUFFER_TOO_SMALL" - and responseBody is non-NULL exactly
+        // when responseCapacity > 0 (allocated above). Both facts are
+        // restated explicitly for /analyze, which cannot see either one
+        // across the T2AksExchange call boundary on its own.
+        _Analysis_assume_(responseLength <= responseCapacity);
+        _Analysis_assume_(responseBody != NULL || responseLength == 0);
         if (responseLength > 0) {
             RtlCopyMemory((PUCHAR)out + sizeof(*out), responseBody, responseLength);
         }
