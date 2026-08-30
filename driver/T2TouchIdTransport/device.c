@@ -149,6 +149,11 @@ T2EvtDevicePrepareHardware(
         "T2TouchIdTransport: mailbox inbox=0x%x empty=%d outbox=0x%x full=%d\n",
         inbox, (inbox & T2_SEP_INBOX_EMPTY_BIT) != 0,
         outbox, (outbox & T2_SEP_OUTBOX_FULL_BIT) != 0));
+    // KdPrintEx compiles to nothing in free/Release builds, which would
+    // otherwise leave these as "initialized but not referenced" (C4189,
+    // fatal under /WX) in Release even though Debug is fine.
+    UNREFERENCED_PARAMETER(inbox);
+    UNREFERENCED_PARAMETER(outbox);
 
     return STATUS_SUCCESS;
 }
