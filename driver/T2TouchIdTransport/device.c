@@ -105,6 +105,72 @@ T2QueryBar4ViaPciConfig(_In_ WDFDEVICE Device, _Out_ PHYSICAL_ADDRESS *Bar4Base)
     return STATUS_SUCCESS;
 }
 
+// Enable PCI bus mastering (and memory space) on the SEP function.
+// VERIFIED FROM SOURCE: Linux t2_sep_transport.c calls pci_set_master(pdev)
+// before any OOL registration / AKS exchange. Without the bus-master bit
+// SEP cannot DMA into the host OOL buffers and therefore never posts an
+// EP7 reply → the exact "timed out waiting for SEP inbox reply" symptom
+// observed on Gate 4 (capabilities / load-keybag).
+NTSTATUS
+T2EnablePciBusMaster(_In_ WDFDEVICE Device)
+{
+    NTSTATUS status;
+    BUS_INTERFACE_STANDARD busInterface;
+    USHORT command = 0;
+    ULONG bytes;
+
+    RtlZeroMemory(&busInterface, sizeof(busInterface));
+    status = WdfFdoQueryForInterface(Device, &GUID_BUS_INTERFACE_STANDARD,
+        (PINTERFACE)&busInterface, sizeof(busInterface), 1, NULL);
+    if (!NT_SUCCESS(status)) {
+        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "T2TouchIdTransport: WdfFdoQueryForInterface for bus-master enable failed, status=0x%x\n",
+            status));
+        return status;
+    }
+
+    bytes = busInterface.GetBusData(busInterface.Context, PCI_WHICHSPACE_CONFIG,
+        &command, 0x04 /* PCI_COMMAND */, sizeof(command));
+    if (bytes != sizeof(command)) {
+        if (busInterface.InterfaceDereference) {
+            busInterface.InterfaceDereference(busInterface.Context);
+        }
+        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "T2TouchIdTransport: GetBusData(PCI_COMMAND) read only %u bytes\n", bytes));
+        return STATUS_DEVICE_CONFIGURATION_ERROR;
+    }
+
+    // PCI_ENABLE_MEMORY_SPACE = 0x0002, PCI_ENABLE_BUS_MASTER = 0x0004
+    // (standard PCI command register bits; same values Linux pci_set_master uses).
+    if ((command & 0x0006) == 0x0006) {
+        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+            "T2TouchIdTransport: PCI bus-master + memory already enabled (cmd=0x%04x)\n",
+            command));
+        if (busInterface.InterfaceDereference) {
+            busInterface.InterfaceDereference(busInterface.Context);
+        }
+        return STATUS_SUCCESS;
+    }
+
+    command |= 0x0006; // memory space + bus master
+    bytes = busInterface.SetBusData(busInterface.Context, PCI_WHICHSPACE_CONFIG,
+        &command, 0x04, sizeof(command));
+    if (busInterface.InterfaceDereference) {
+        busInterface.InterfaceDereference(busInterface.Context);
+    }
+
+    if (bytes != sizeof(command)) {
+        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "T2TouchIdTransport: SetBusData(PCI_COMMAND) wrote only %u bytes\n", bytes));
+        return STATUS_DEVICE_CONFIGURATION_ERROR;
+    }
+
+    T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        "T2TouchIdTransport: enabled PCI bus-master + memory space (cmd=0x%04x)\n",
+        command));
+    return STATUS_SUCCESS;
+}
+
 NTSTATUS
 T2EvtDeviceAdd(
     _In_ WDFDRIVER Driver,

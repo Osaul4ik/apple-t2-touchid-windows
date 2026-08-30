@@ -63,3 +63,30 @@ Visual Studio, без фізичного MacBook Pro 2019 і без можлив
 10 (цільова аудиторія проєкту — Windows 10; драйвер зібраний з
 KmdfLibraryVersion 1.15 саме для цього).** Цей документ навмисно залишається "чесно неповним" замість того,
 щоб симулювати результат.
+## 2026-08-30 follow-up: Gate 4 timeout fix
+
+**Symptom:** `capabilities` / any AKS (EP7) exchange timed out with
+`final inbox=... empty=1` after successful OOL registration.
+
+**Root cause 1 — missing PCI bus-master:**
+Linux `t2_sep_transport.c` calls `pci_set_master(pdev)` before SET_OOL / AKS.
+Windows driver never set `PCI_COMMAND` bits 1+2. SEP therefore could not
+DMA the registered OOL buffers and never posted an EP7 reply.
+
+**Root cause 2 — wrong AKS timestamps:**
+`T2AksBuildHeaderV2` used FILETIME (since 1601) for both `usec_time` and
+`calendar_seconds`. Linux uses monotonic µs + Unix epoch seconds.
+
+**Changes (this patch):**
+- `device.c`: new `T2EnablePciBusMaster()` via BUS_INTERFACE_STANDARD
+  SetBusData on offset 0x04.
+- `dma.c`: call it at the start of `T2DmaRegisterOolBuffers`.
+- `akstore.c`: `usec_time` ← `KeQueryUnbiasedInterruptTime()/10`,
+  `calendar_seconds` ← FILETIME-to-Unix conversion.
+- `driver.h`: prototype for the new helper.
+
+After rebuild + reinstall + `register-ool` (or fresh load), re-test:
+```
+t2touchid.exe status
+t2touchid.exe capabilities
+```

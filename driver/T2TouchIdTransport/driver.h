@@ -179,6 +179,9 @@ NTSTATUS T2DmaAllocateOolBuffers(_In_ PT2_DEVICE_CONTEXT Ctx);
 NTSTATUS T2DmaRegisterOolBuffers(_In_ PT2_DEVICE_CONTEXT Ctx);
 VOID T2DmaFreeOolBuffers(_In_ PT2_DEVICE_CONTEXT Ctx);
 
+// device.c — PCI config helpers (used by dma registration)
+NTSTATUS T2EnablePciBusMaster(_In_ WDFDEVICE Device);
+
 // akstore.c
 BOOLEAN T2AksOperationAllowed(_In_ UINT8 Operation);
 NTSTATUS T2AksDigest(_Inout_updates_bytes_(Length) PUCHAR Message, _In_ SIZE_T Length);

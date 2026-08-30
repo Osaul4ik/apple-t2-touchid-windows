@@ -116,12 +116,23 @@ T2AksDigest(_Inout_updates_bytes_(Length) PUCHAR Message, _In_ SIZE_T Length)
 static VOID
 T2AksBuildHeaderV2(_Out_ PT2_AKS_HEADER_V2 Header)
 {
-    LARGE_INTEGER now;
+    // Match Linux t2_aks_exchange_locked timestamps exactly:
+    //   usec_time        = monotonic microseconds (ktime_get_ns / 1000)
+    //   calendar_seconds = Unix epoch seconds (ktime_get_real_seconds)
+    // Previous code used FILETIME (100 ns since 1601) for both fields,
+    // which produces values ~3.7e10 larger than what SEP/bridgeOS expects
+    // and can cause silent drops of the EP7 request.
+    LARGE_INTEGER wall;
+    ULONG64 interruptTime;
     RtlZeroMemory(Header, sizeof(*Header));
-    KeQuerySystemTimePrecise(&now);
+    KeQuerySystemTimePrecise(&wall);
+    // Unbiased interrupt time is in 100 ns units and does not jump with
+    // sleep/hibernate — closest kernel equivalent of ktime_get_ns().
+    interruptTime = KeQueryUnbiasedInterruptTime();
     Header->V1.Version = T2_AKS_VERSION_V2;
-    Header->V1.UsecTime = (UINT64)(now.QuadPart / 10); // 100ns -> us
-    Header->CalendarSeconds = (UINT64)(now.QuadPart / 10000000);
+    Header->V1.UsecTime = interruptTime / 10; // 100 ns → µs
+    // FILETIME epoch (1601-01-01) → Unix epoch (1970-01-01) = 11644473600 s
+    Header->CalendarSeconds = (UINT64)(wall.QuadPart / 10000000ULL) - 11644473600ULL;
 }
 
 NTSTATUS

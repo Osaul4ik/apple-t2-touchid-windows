@@ -61,6 +61,15 @@ T2DmaRegisterOolBuffers(_In_ PT2_DEVICE_CONTEXT Ctx)
     PHYSICAL_ADDRESS oolInDma = WdfCommonBufferGetAlignedLogicalAddress(Ctx->OolInBuffer);
     PHYSICAL_ADDRESS oolOutDma = WdfCommonBufferGetAlignedLogicalAddress(Ctx->OolOutBuffer);
 
+    // Linux calls pci_set_master before SET_OOL_*. Without bus-master the
+    // SEP cannot DMA the OOL buffers and AKS (EP7) exchanges time out.
+    status = T2EnablePciBusMaster(Ctx->Device);
+    if (!NT_SUCCESS(status)) {
+        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "T2TouchIdTransport: T2EnablePciBusMaster failed, status=0x%x\n", status));
+        return status;
+    }
+
     status = T2SepControl(Ctx, T2_SEP_CMSG_SET_OOL_IN, 1, oolInDma, T2_SEP_OOL_SIZE);
     if (!NT_SUCCESS(status)) {
         T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
