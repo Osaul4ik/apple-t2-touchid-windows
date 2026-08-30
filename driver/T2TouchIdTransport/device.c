@@ -135,7 +135,7 @@ T2EvtDevicePrepareHardware(
                 ctx->Bar4Length = desc->u.Memory.Length;
                 foundBar = TRUE;
             } else {
-                KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                     "T2TouchIdTransport: unexpected second memory BAR "
                     "(len=0x%x) - BAR4 selection logic needs review\n",
                     desc->u.Memory.Length));
@@ -144,13 +144,13 @@ T2EvtDevicePrepareHardware(
     }
 
     if (!foundBar) {
-        KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
             "T2TouchIdTransport: no memory resource found (expected BAR4)\n"));
         return STATUS_DEVICE_CONFIGURATION_ERROR;
     }
 
     if (ctx->Bar4Length < T2_SEP_BAR_MIN_SIZE) {
-        KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
             "T2TouchIdTransport: BAR smaller than expected (0x%x < 0x%x)\n",
             ctx->Bar4Length, T2_SEP_BAR_MIN_SIZE));
         return STATUS_DEVICE_CONFIGURATION_ERROR;
@@ -169,15 +169,14 @@ T2EvtDevicePrepareHardware(
     // an explicit IOCTL_T2_REGISTER_OOL request (dma.c).
     ULONG inbox = READ_REGISTER_ULONG((PULONG)(ctx->Bar4VirtualAddress + T2_SEP_INBOX_STATUS));
     ULONG outbox = READ_REGISTER_ULONG((PULONG)(ctx->Bar4VirtualAddress + T2_SEP_OUTBOX_STATUS));
-    KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+    T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
         "T2TouchIdTransport: mailbox inbox=0x%x empty=%d outbox=0x%x full=%d\n",
         inbox, (inbox & T2_SEP_INBOX_EMPTY_BIT) != 0,
         outbox, (outbox & T2_SEP_OUTBOX_FULL_BIT) != 0));
-    // KdPrintEx compiles to nothing in free/Release builds, which would
-    // otherwise leave these as "initialized but not referenced" (C4189,
-    // fatal under /WX) in Release even though Debug is fine.
-    UNREFERENCED_PARAMETER(inbox);
-    UNREFERENCED_PARAMETER(outbox);
+    // T2_LOG (see driver.h) wraps the real DbgPrintEx, not the KdPrintEx
+    // macro, so it always references inbox/outbox regardless of build
+    // configuration - no C4189 risk here anymore, and no
+    // UNREFERENCED_PARAMETER needed.
 
     return STATUS_SUCCESS;
 }
@@ -201,7 +200,7 @@ T2EvtDeviceReleaseHardware(
     // that memory at the hardware level; leaking the WDF handles instead of
     // freeing live SEP-owned memory is the correct, deliberate choice.
     if (ctx->OolInRegistered || ctx->OolOutRegistered) {
-        KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
             "T2TouchIdTransport: retaining SEP-registered DMA memory until reboot\n"));
     } else {
         T2DmaFreeOolBuffers(ctx);

@@ -31,6 +31,8 @@ T2MailboxWaitOutbox(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ ULONG TimeoutUs)
         T2StallMicroseconds(T2_SEP_POLL_MIN_US, T2_SEP_POLL_MAX_US);
         waited += T2_SEP_POLL_MIN_US;
     }
+    T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+        "T2TouchIdTransport: timed out waiting for SEP outbox to drain (%u us)\n", TimeoutUs));
     return STATUS_IO_TIMEOUT;
 }
 
@@ -72,6 +74,8 @@ T2MailboxReceive(_In_ PT2_DEVICE_CONTEXT Ctx, _Out_ T2_SEP_MESSAGE *Message, _In
         T2StallMicroseconds(T2_SEP_POLL_MIN_US, T2_SEP_POLL_MAX_US);
         waited += T2_SEP_POLL_MIN_US;
     }
+    T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+        "T2TouchIdTransport: timed out waiting for SEP inbox reply (%u us)\n", TimeoutUs));
     return STATUS_IO_TIMEOUT;
 }
 
@@ -129,15 +133,18 @@ T2SepControl(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Opcode, _In_ UINT8 Tag,
 
         // Never surface asynchronous SEP payloads through this path - only
         // a debug trace, matching the Linux dev_dbg() equivalent.
-        KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
+        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
             "T2TouchIdTransport: queued unrelated mailbox message from endpoint %u\n", endpoint));
         if (++skipped == T2_SEP_MAX_SKIPPED_REPLIES) {
+            T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                "T2TouchIdTransport: gave up waiting for control reply (opcode=%u tag=%u) "
+                "after %u unrelated messages\n", Opcode, Tag, skipped));
             return STATUS_DEVICE_PROTOCOL_ERROR;
         }
     }
 
     if (reply.Word[1] != 0) {
-        KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
             "T2TouchIdTransport: control opcode %u returned SEP result 0x%x\n",
             Opcode, reply.Word[1]));
         return STATUS_UNSUCCESSFUL;
@@ -201,7 +208,7 @@ T2SepAksTransaction(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
             break;
         }
 
-        KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
+        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
             "T2TouchIdTransport: queued unrelated mailbox message from endpoint %u\n",
             replyEndpoint));
         if (++skipped == T2_SEP_MAX_SKIPPED_REPLIES) {

@@ -13,6 +13,22 @@
 #include <initguid.h>
 #include "public.h"
 
+// ---- Logging ----
+// DELIBERATE: DbgPrintEx (the real kernel function), NOT KdPrintEx.
+// KdPrintEx is a macro that expands to nothing when DBG is not defined -
+// and the WDK driver build system defines DBG=0 for the Release
+// configuration automatically. Since this driver is deployed/tested as a
+// test-signed Release build (pnputil install path), every KdPrintEx call
+// in this codebase was previously a silent no-op on the target machine,
+// regardless of DebugView/WinDbg settings - there was nothing to filter,
+// because nothing was ever emitted. DbgPrintEx is a real exported
+// ntoskrnl function present and functional in both Debug and Release
+// builds; it is still subject to the kernel debug-print component filter
+// mask (see docs/milestone-2-hardware-results.md follow-up note on
+// enabling the IHVDRIVER filter in DebugView / the registry), but at
+// least the call itself always executes.
+#define T2_LOG(_x_) DbgPrintEx _x_
+
 // ---- PCI identity (VERIFIED FROM SOURCE) ----
 #define T2_SEP_VENDOR_ID            0x106Bu
 #define T2_SEP_DEVICE_ID            0x1802u

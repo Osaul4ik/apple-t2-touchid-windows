@@ -27,18 +27,24 @@ T2DmaAllocateOolBuffers(_In_ PT2_DEVICE_CONTEXT Ctx)
     WDF_DMA_ENABLER_CONFIG_INIT(&dmaConfig, WdfDmaProfilePacket64, T2_SEP_OOL_SIZE);
     status = WdfDmaEnablerCreate(Ctx->Device, &dmaConfig, WDF_NO_OBJECT_ATTRIBUTES, &Ctx->DmaEnabler);
     if (!NT_SUCCESS(status)) {
+        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "T2TouchIdTransport: WdfDmaEnablerCreate failed, status=0x%x\n", status));
         return status;
     }
 
     status = WdfCommonBufferCreate(Ctx->DmaEnabler, T2_SEP_OOL_SIZE,
         WDF_NO_OBJECT_ATTRIBUTES, &Ctx->OolInBuffer);
     if (!NT_SUCCESS(status)) {
+        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "T2TouchIdTransport: WdfCommonBufferCreate(OolInBuffer) failed, status=0x%x\n", status));
         return status;
     }
 
     status = WdfCommonBufferCreate(Ctx->DmaEnabler, T2_SEP_OOL_SIZE,
         WDF_NO_OBJECT_ATTRIBUTES, &Ctx->OolOutBuffer);
     if (!NT_SUCCESS(status)) {
+        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "T2TouchIdTransport: WdfCommonBufferCreate(OolOutBuffer) failed, status=0x%x\n", status));
         return status;
     }
 
@@ -57,6 +63,8 @@ T2DmaRegisterOolBuffers(_In_ PT2_DEVICE_CONTEXT Ctx)
 
     status = T2SepControl(Ctx, T2_SEP_CMSG_SET_OOL_IN, 1, oolInDma, T2_SEP_OOL_SIZE);
     if (!NT_SUCCESS(status)) {
+        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "T2TouchIdTransport: SET_OOL_IN failed, status=0x%x\n", status));
         return status;
     }
     Ctx->OolInRegistered = TRUE;
@@ -69,14 +77,14 @@ T2DmaRegisterOolBuffers(_In_ PT2_DEVICE_CONTEXT Ctx)
         // common buffer even though OUT registration failed - only a
         // reboot clears SEP's view of it. Leave OolInRegistered = TRUE so
         // T2EvtDeviceReleaseHardware knows to leak, not free.
-        KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
             "T2TouchIdTransport: OOL input registered but output "
-            "registration failed; reboot before retry\n"));
+            "registration failed, status=0x%x; reboot before retry\n", status));
         return status;
     }
     Ctx->OolOutRegistered = TRUE;
 
-    KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+    T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
         "T2TouchIdTransport: registered 16 KiB endpoint-7 OOL input/output buffers\n"));
     return STATUS_SUCCESS;
 }
