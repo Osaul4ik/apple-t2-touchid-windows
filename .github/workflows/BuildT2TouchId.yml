@@ -55,6 +55,59 @@ jobs:
       shell: pwsh
 
     # =====================================================================
+    # Known WDK installer issue on some hosted runners: the x86 InfVerif.dll
+    # that MSBuild's automatic INF-verification step loads (right after
+    # Stampinf, as part of WindowsDriver.common.targets - this step cannot
+    # be disabled via a project property) ends up missing from the
+    # "bin\<ver>\x86\" folder even though the rest of the WDK installed
+    # fine. Symptom: "INF verification exception: Unable to load DLL
+    # 'x86\InfVerif.dll' ... (0x8007007E)". Work around it by locating
+    # whatever copy of InfVerif.dll *did* get installed (x64/arm64 folder)
+    # and placing a copy where the x86 tooling expects it.
+    # =====================================================================
+    - name: Work around missing x86\InfVerif.dll
+      run: |
+        $ErrorActionPreference = "Stop"
+        $roots = @(
+          "C:\Program Files (x86)\Windows Kits\10\bin",
+          "C:\Program Files\Windows Kits\10\bin"
+        )
+
+        $x86Copies = foreach ($root in $roots) {
+          if (Test-Path $root) {
+            Get-ChildItem -Path $root -Filter "InfVerif.dll" -Recurse -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -match '\\x86\\' }
+          }
+        }
+        if ($x86Copies) {
+          Write-Host "OK: x86\InfVerif.dll already present, nothing to do."
+          exit 0
+        }
+
+        $anyCopies = foreach ($root in $roots) {
+          if (Test-Path $root) {
+            Get-ChildItem -Path $root -Filter "InfVerif.dll" -Recurse -ErrorAction SilentlyContinue
+          }
+        }
+        if (-not $anyCopies) {
+          Write-Error "No InfVerif.dll found anywhere under the WDK install - WDK install itself likely failed."
+          exit 1
+        }
+
+        # Use the newest-versioned bin\<ver>\ directory as the target, since
+        # that's the one msbuild will actually probe (WDK versions its bin
+        # folder, e.g. bin\10.0.26100.0\).
+        $source = $anyCopies | Sort-Object FullName -Descending | Select-Object -First 1
+        $verDir = Split-Path (Split-Path $source.FullName -Parent) -Parent
+        $targetDir = Join-Path $verDir "x86"
+
+        Write-Host "==> No x86\InfVerif.dll found; copying from $($source.FullName)"
+        New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+        Copy-Item -Path $source.FullName -Destination (Join-Path $targetDir "InfVerif.dll") -Force
+        Write-Host "OK: staged InfVerif.dll -> $targetDir\InfVerif.dll"
+      shell: pwsh
+
+    # =====================================================================
     # protocol/tools/tests are user-mode and need libplist
     # (protocol/BridgeXpc/PlistPayload.cpp, #include <plist/plist.h>).
     # The vcpkg port only ships an "unofficial-libplist" CMake config -

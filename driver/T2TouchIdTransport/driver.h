@@ -62,7 +62,15 @@
 // which this driver does not implement as a distinct path.
 #define T2_AKS_V1_WIRE_SIZE         (sizeof(UINT32) + T2_AKS_HEADER_V1_SIZE)
 #define T2_AKS_V2_WIRE_SIZE         (sizeof(UINT32) + T2_AKS_HEADER_V2_SIZE)
-#define T2_AKS_MAX_BODY_SIZE        (T2_SEP_OOL_SIZE - T2_AKS_V2_WIRE_SIZE)
+
+// T2_AKS_MAX_BODY_SIZE is defined once, in public.h (it's part of the public
+// IOCTL contract that user-mode callers also need). Do NOT redefine it here:
+// public.h is already included above, and redefining it produces a
+// macro-redefinition warning that is fatal under /WX and was cascading into
+// unrelated parse errors later in this header (bogus C_ASSERT/negative-
+// subscript/__C_ASSERT__-redefinition errors, and a missing PT2_AKS_HEADER_V2
+// type in akstore.c). Assert the two derivations agree instead.
+C_ASSERT(T2_AKS_MAX_BODY_SIZE == (T2_SEP_OOL_SIZE - T2_AKS_V2_WIRE_SIZE));
 
 #pragma pack(push, 1)
 typedef struct _T2_SEP_MESSAGE
