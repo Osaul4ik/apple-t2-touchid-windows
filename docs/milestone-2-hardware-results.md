@@ -34,9 +34,9 @@ Visual Studio, без фізичного MacBook Pro 2019 і без можлив
 
 | Gate | Статус | Нотатки |
 |---|---|---|
-| 1 — T2 PCI access | UNKNOWN | |
-| 2 — SEP mailbox | UNKNOWN | |
-| 3 — DMA / OOL | UNKNOWN | |
+| 1 — T2 PCI access | T2 PCI OK | | BAR4 mapped 
+| 2 — SEP mailbox | SEP mailbox accessible  | |
+| 3 — DMA / OOL |  DMA / OOL not registered  | |
 | 4 — AppleKeyStore | UNKNOWN | |
 | 5 — CDC-NCM / IPv6 | UNKNOWN | не реалізовано в цьому Milestone (див. protocol-architecture.md) |
 | 6 — RemoteXPC discovery | UNKNOWN | не реалізовано в цьому Milestone |
