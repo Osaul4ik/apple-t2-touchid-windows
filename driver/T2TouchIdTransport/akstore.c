@@ -28,7 +28,7 @@
 #include <bcrypt.h>
 
 BOOLEAN
-T2AksOperationAllowed(UINT8 Operation)
+T2AksOperationAllowed(_In_ UINT8 Operation)
 {
     switch (Operation) {
     case T2AksOpLoadKeybag:
@@ -82,7 +82,7 @@ cleanup:
 // own defensive checks so a malformed reply can never smuggle a longer
 // "trusted" length than the buffer actually holds.
 NTSTATUS
-T2AksDigest(PUCHAR Message, SIZE_T Length)
+T2AksDigest(_Inout_updates_bytes_(Length) PUCHAR Message, _In_ SIZE_T Length)
 {
     UINT32 headerSize;
     UINT32 version;
@@ -197,14 +197,10 @@ T2AksBuildHeaderV2(_Out_ PT2_AKS_HEADER_V2 Header)
 }
 
 NTSTATUS
-T2AksExchange(
-    PT2_DEVICE_CONTEXT Ctx,
-    UINT8 Operation,
-    PUCHAR RequestBody,
-    SIZE_T RequestLength,
-    PUCHAR ResponseBody,
-    SIZE_T ResponseCapacity,
-    SIZE_T *ResponseLength)
+T2AksExchange(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
+              _In_reads_bytes_opt_(RequestLength) PUCHAR RequestBody, _In_ SIZE_T RequestLength,
+              _Out_writes_bytes_to_opt_(ResponseCapacity, *ResponseLength) PUCHAR ResponseBody,
+              _In_ SIZE_T ResponseCapacity, _Out_ SIZE_T *ResponseLength)
 {
     NTSTATUS status;
     T2_AKS_HEADER_V2 header;
