@@ -119,6 +119,23 @@ typedef struct _T2_AKS_HEADER_V2
 C_ASSERT(sizeof(T2_AKS_HEADER_V2) == T2_AKS_HEADER_V2_SIZE);
 #pragma pack(pop)
 
+// ---- OOL registration lifecycle state (see docs/windows-pnp-power-lifecycle-design.md) ----
+// NotRegistered: never successfully registered with SEP since this device
+//   stack came up. Registered: SET_OOL_IN and SET_OOL_OUT both confirmed by
+//   SEP and no power transition has happened since. Stale: was Registered,
+//   but the device has since gone through EvtDeviceD0Entry from a non-D0
+//   state (system sleep, Device Manager disable/enable, etc.) - SEP may
+//   have forgotten the registration, so it must not be trusted until
+//   IOCTL_T2_REGISTER_OOL is reissued. The host-side common buffers
+//   themselves are NOT freed/reallocated on this transition - only SEP's
+//   knowledge of them is presumed stale.
+typedef enum _T2_OOL_STATE
+{
+    T2OolStateNotRegistered = 0,
+    T2OolStateRegistered,
+    T2OolStateStale,
+} T2_OOL_STATE;
+
 typedef struct _T2_DEVICE_CONTEXT
 {
     WDFDEVICE           Device;
@@ -133,9 +150,21 @@ typedef struct _T2_DEVICE_CONTEXT
     // WDF common buffers with AddressWidthOverride=32 give the device the
     // correct IOMMU/bus address; after writing OOL_IN we clflush so SEP
     // DMA sees the host stores (write-back cache).
-    BOOLEAN              OolRegisterAttempted;
-    BOOLEAN              OolInRegistered;
-    BOOLEAN              OolOutRegistered;
+    T2_OOL_STATE         OolState;
+
+    // Sticky for the lifetime of the device stack, unlike OolState above:
+    // set the first time SET_OOL_IN or SET_OOL_OUT ever succeeds and NEVER
+    // cleared or reset (not even when OolState cycles Registered->Stale->
+    // Registered again across a power transition). This is what
+    // EvtDeviceReleaseHardware's "retain SEP-registered memory until
+    // reboot" decision must key off, because it has to stay true even if
+    // registration only ever partially succeeded (e.g. SET_OOL_IN
+    // succeeded, SET_OOL_OUT then failed) - SEP may still hold that address
+    // even though OolState never reached Registered. OolState alone is not
+    // enough for this decision because it deliberately does track only the
+    // "safe to use for a fresh AKS exchange" state, not "was SEP ever told
+    // anything at all".
+    BOOLEAN              OolSepMayKnowAddress;
     WDFDMAENABLER        DmaEnabler;
     WDFCOMMONBUFFER      OolInBuffer;
     WDFCOMMONBUFFER      OolOutBuffer;
@@ -149,6 +178,12 @@ typedef struct _T2_DEVICE_CONTEXT
     // Linux exchange_lock and Milestone 2 section 23: one session at a time).
     WDFWAITLOCK          ExchangeLock;
     UINT8                NextTransaction;
+
+    // Incremented once on every EvtDeviceD0Entry (including the very first
+    // one after AddDevice). Lets user-mode detect "the transport went
+    // through a power cycle since I last checked" even if OolState has
+    // already been repaired back to Registered by the time it asks.
+    ULONG                PowerUpGeneration;
 } T2_DEVICE_CONTEXT, *PT2_DEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(T2_DEVICE_CONTEXT, GetDeviceContext);

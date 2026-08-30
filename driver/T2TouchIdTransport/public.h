@@ -69,7 +69,21 @@ typedef struct _T2_TRANSPORT_STATUS
     BOOLEAN Bar4Mapped;
     UINT32  Bar4Size;
     BOOLEAN MailboxAccessible;
-    BOOLEAN OolRegistered;      // both SET_OOL_IN and SET_OOL_OUT succeeded
+    BOOLEAN OolRegistered;      // OolState == Registered (both SET_OOL_IN/OUT succeeded
+                                 // and no power transition has happened since)
+    // --- fields below added for PnP/Power lifecycle support; appended at
+    // the end so existing callers reading only the fields above are
+    // unaffected (ABI-compatible growth) ---
+    BOOLEAN OolStale;           // OolState == Stale: was registered, but the
+                                 // device has since gone through a D0 re-entry
+                                 // (sleep/resume, disable/enable, ...) and SEP's
+                                 // registration can no longer be trusted; caller
+                                 // must reissue IOCTL_T2_REGISTER_OOL before the
+                                 // next IOCTL_T2_AKS_EXCHANGE
+    UINT32  PowerUpGeneration;  // monotonic count of EvtDeviceD0Entry calls;
+                                 // compare against a previously cached value to
+                                 // detect a power cycle even after OolStale has
+                                 // already been cleared by a fresh registration
 } T2_TRANSPORT_STATUS, *PT2_TRANSPORT_STATUS;
 
 #define IOCTL_T2_GET_STATUS \

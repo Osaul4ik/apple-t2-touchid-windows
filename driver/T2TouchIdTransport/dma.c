@@ -14,6 +14,22 @@ T2DmaAllocateOolBuffers(_In_ PT2_DEVICE_CONTEXT Ctx)
     WDF_DMA_ENABLER_CONFIG dmaConfig;
     PHYSICAL_ADDRESS systemPaIn, systemPaOut;
 
+    // Idempotent: after a D0Entry marks OolState Stale (see
+    // T2EvtDeviceD0Entry / docs/windows-pnp-power-lifecycle-design.md),
+    // IOCTL_T2_REGISTER_OOL re-runs this function to re-register with SEP.
+    // The host-side common buffers themselves are untouched by a power
+    // transition - only SEP's knowledge of them goes stale - so if they're
+    // already allocated, skip straight to re-registration instead of
+    // creating a second DMA enabler / common buffer pair on top of the
+    // still-live ones.
+    if (Ctx->OolInVa != NULL && Ctx->OolOutVa != NULL) {
+        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+            "T2TouchIdTransport: OOL buffers already allocated (in=%p out=%p), "
+            "skipping allocation, reusing existing VA/PA\n",
+            Ctx->OolInVa, Ctx->OolOutVa));
+        return STATUS_SUCCESS;
+    }
+
     // Prefer 32-bit packet profile so OOL stays in lower 4GB when possible.
     // AddressWidthOverride is used when the WDK headers expose it.
     WDF_DMA_ENABLER_CONFIG_INIT(&dmaConfig, WdfDmaProfilePacket, T2_SEP_OOL_SIZE);
@@ -101,13 +117,22 @@ T2DmaRegisterOolBuffers(_In_ PT2_DEVICE_CONTEXT Ctx)
     }
 
     // Pass LOGICAL addresses to SEP — never system PA.
+    // Note: this function no longer sets Ctx->OolState itself - the caller
+    // (T2EvtIoDeviceControlRegisterOol) owns that transition and sets it to
+    // T2OolStateRegistered only once this whole function returns success,
+    // per docs/windows-pnp-power-lifecycle-design.md section 4.3. That
+    // keeps the state-machine ownership in one place (under ExchangeLock in
+    // device.c) instead of split between two files.
     status = T2SepControl(Ctx, T2_SEP_CMSG_SET_OOL_IN, 1, Ctx->OolInPa, T2_SEP_OOL_SIZE);
     if (!NT_SUCCESS(status)) {
         T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
             "T2TouchIdTransport: SET_OOL_IN failed, status=0x%x\n", status));
         return status;
     }
-    Ctx->OolInRegistered = TRUE;
+    // Sticky regardless of what happens next - SEP now knows this address
+    // even if SET_OOL_OUT below fails. See the OolSepMayKnowAddress comment
+    // in driver.h.
+    Ctx->OolSepMayKnowAddress = TRUE;
 
     status = T2SepControl(Ctx, T2_SEP_CMSG_SET_OOL_OUT, 2, Ctx->OolOutPa, T2_SEP_OOL_SIZE);
     if (!NT_SUCCESS(status)) {
@@ -116,7 +141,6 @@ T2DmaRegisterOolBuffers(_In_ PT2_DEVICE_CONTEXT Ctx)
             "registration failed, status=0x%x; reboot before retry\n", status));
         return status;
     }
-    Ctx->OolOutRegistered = TRUE;
 
     T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
         "T2TouchIdTransport: registered 16 KiB endpoint-7 OOL "

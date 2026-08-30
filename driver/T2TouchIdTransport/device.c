@@ -394,7 +394,15 @@ T2EvtDeviceReleaseHardware(
     // or clear bus-mastering here. A reboot is required to actually free
     // that memory at the hardware level; leaking the WDF handles instead of
     // freeing live SEP-owned memory is the correct, deliberate choice.
-    if (ctx->OolInRegistered || ctx->OolOutRegistered) {
+    // Keyed off the sticky OolSepMayKnowAddress flag (driver.h), not
+    // OolState: it must stay true for the life of the device stack even if
+    // registration only ever partially succeeded (SET_OOL_IN ok, SET_OOL_OUT
+    // failed) - OolState never reaches Registered in that case, but SEP may
+    // still hold the IN address. It's also true whenever OolState is Stale
+    // (SEP was told the addresses at some point; a later power transition
+    // just means that can't be trusted for a *fresh* exchange, not that SEP
+    // forgot in a way that makes the memory safe to hand back to the OS).
+    if (ctx->OolSepMayKnowAddress) {
         T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
             "T2TouchIdTransport: retaining SEP-registered DMA memory until reboot\n"));
     } else {
@@ -415,13 +423,46 @@ T2EvtDeviceD0Entry(
     _In_ WDF_POWER_DEVICE_STATE PreviousState
     )
 {
-    UNREFERENCED_PARAMETER(Device);
-    UNREFERENCED_PARAMETER(PreviousState);
-    // Milestone 2 section 26: never assume old protocol/session state
-    // remains valid across a power transition. Nothing to invalidate at
-    // the transport layer itself (it is stateless below the AKS exchange
-    // lock), but user-mode protocol state (BridgeXpc/BiometricKit session)
-    // must independently re-initialize after any D0 exit -> D0 entry.
+    PT2_DEVICE_CONTEXT ctx = GetDeviceContext(Device);
+
+    // Milestone 2 section 26 / docs/windows-pnp-power-lifecycle-design.md:
+    // never assume old protocol/session state remains valid across a power
+    // transition. This fires on EVERY entry into D0 - the very first start
+    // after AddDevice as well as every resume from system sleep (S1-S4),
+    // Device Manager disable/enable, and any future runtime idle wake. We
+    // deliberately do NOT distinguish "first start" from "resume" here:
+    // OolState is already NotRegistered on first start (nothing to mark
+    // stale), and is exactly what needs marking Stale on a genuine resume -
+    // the same code is correct for both.
+    //
+    // Deliberately no mailbox/MMIO I/O in this callback. T2SepControl's
+    // worst case is a 5-second synchronous busy-poll (T2_SEP_TIMEOUT_US) -
+    // doing that here would block the PnP/Power manager's resume path.
+    // Re-registration is deferred (lazy) to the next real
+    // IOCTL_T2_REGISTER_OOL request, which already tolerates that latency
+    // because it runs on an ordinary IOCTL thread, not the power callback.
+    // User-mode protocol state (BridgeXpc/BiometricKit session) must
+    // independently re-initialize after any D0 exit -> D0 entry; the
+    // OolStale/PowerUpGeneration fields in IOCTL_T2_GET_STATUS exist so it
+    // can detect that this happened.
+    WdfWaitLockAcquire(ctx->ExchangeLock, NULL);
+
+    if (ctx->OolState == T2OolStateRegistered) {
+        ctx->OolState = T2OolStateStale;
+        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+            "T2TouchIdTransport: OOL registration marked stale after D0 entry "
+            "(previous power state=%d); caller must reissue "
+            "IOCTL_T2_REGISTER_OOL before the next AKS exchange\n",
+            PreviousState));
+    }
+
+    ctx->PowerUpGeneration++;
+    T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        "T2TouchIdTransport: D0 entry #%lu (previous power state=%d, OolState=%d)\n",
+        ctx->PowerUpGeneration, PreviousState, ctx->OolState));
+
+    WdfWaitLockRelease(ctx->ExchangeLock);
+
     return STATUS_SUCCESS;
 }
 
@@ -432,7 +473,20 @@ T2EvtDeviceD0Exit(
     )
 {
     UNREFERENCED_PARAMETER(Device);
-    UNREFERENCED_PARAMETER(TargetState);
+
+    // Deliberately minimal: SEP exposes no OOL-deregistration opcode (see
+    // T2EvtDeviceReleaseHardware's "retain until reboot" comment and
+    // docs/linux-reference-analysis.md Milestone 1 section 3, "Pinning") -
+    // there is no graceful "tell SEP we're powering down" message to send,
+    // and inventing one the protocol doesn't support would be a protocol
+    // error, not an improvement. The actual invalidation work (marking any
+    // prior OOL registration stale) happens on the following D0 entry
+    // instead, where it's cheap and can't race a power-down that's already
+    // in flight. This callback exists to log the transition for
+    // sleep/resume diagnostics.
+    T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        "T2TouchIdTransport: D0 exit -> target power state=%d\n", TargetState));
+
     return STATUS_SUCCESS;
 }
 
@@ -455,7 +509,9 @@ T2EvtIoDeviceControlGetStatus(_In_ WDFREQUEST Request, _In_ PT2_DEVICE_CONTEXT C
     out->DeviceId = T2_SEP_DEVICE_ID;
     out->Bar4Mapped = Ctx->Bar4Mapped;
     out->Bar4Size = Ctx->Bar4Length;
-    out->OolRegistered = Ctx->OolInRegistered && Ctx->OolOutRegistered;
+    out->OolRegistered = (Ctx->OolState == T2OolStateRegistered);
+    out->OolStale = (Ctx->OolState == T2OolStateStale);
+    out->PowerUpGeneration = Ctx->PowerUpGeneration;
 
     if (Ctx->Bar4Mapped) {
         ULONG inbox = READ_REGISTER_ULONG((PULONG)(Ctx->Bar4VirtualAddress + T2_SEP_INBOX_STATUS));
@@ -472,20 +528,38 @@ T2EvtIoDeviceControlRegisterOol(_In_ WDFREQUEST Request, _In_ PT2_DEVICE_CONTEXT
     NTSTATUS status;
 
     WdfWaitLockAcquire(Ctx->ExchangeLock, NULL);
-    if (Ctx->OolRegisterAttempted) {
+
+    if (Ctx->OolState == T2OolStateRegistered) {
+        // Idempotent within the current D0 period: registering twice while
+        // still Registered is a no-op success, never a second live
+        // registration. This is NOT the same as refusing to ever register
+        // again - see docs/windows-pnp-power-lifecycle-design.md section 4.3:
+        // after a power transition (T2EvtDeviceD0Entry) moves the state to
+        // Stale, this same call must be allowed to run again below.
         WdfWaitLockRelease(Ctx->ExchangeLock);
-        // Idempotent: registering twice is a no-op success/failure of the
-        // first attempt, never a second live registration.
-        WdfRequestComplete(Request, Ctx->OolInRegistered && Ctx->OolOutRegistered
-            ? STATUS_SUCCESS : STATUS_DEVICE_NOT_READY);
+        WdfRequestComplete(Request, STATUS_SUCCESS);
         return;
     }
-    Ctx->OolRegisterAttempted = TRUE;
 
+    // OolState is NotRegistered or Stale - (re)register. The host-side
+    // common buffers are not reallocated if they already exist
+    // (T2DmaAllocateOolBuffers is idempotent); only the SEP-side handshake
+    // (T2DmaRegisterOolBuffers -> SET_OOL_IN/SET_OOL_OUT) actually runs
+    // again, which is always safe to repeat.
     status = T2DmaAllocateOolBuffers(Ctx);
     if (NT_SUCCESS(status)) {
         status = T2DmaRegisterOolBuffers(Ctx);
     }
+
+    if (NT_SUCCESS(status)) {
+        Ctx->OolState = T2OolStateRegistered;
+    }
+    // On failure, OolState deliberately stays at its pre-call value
+    // (NotRegistered or Stale) rather than being set to some new "failed"
+    // state: dma.c's own comment documents that a partial SET_OOL_IN/
+    // SET_OOL_OUT failure is a permanent, reboot-required condition on the
+    // SEP side, which the caller already learns from the returned status.
+
     WdfWaitLockRelease(Ctx->ExchangeLock);
 
     WdfRequestComplete(Request, status);
@@ -559,7 +633,14 @@ T2EvtIoDeviceControlAksExchange(_In_ WDFREQUEST Request, _In_ PT2_DEVICE_CONTEXT
     responseCapacity = outLen - sizeof(*out);
     operation = in->Operation;
 
-    if (!Ctx->OolInRegistered || !Ctx->OolOutRegistered) {
+    // Also rejects Stale (post-resume, pre-re-registration) the same way it
+    // already rejected NotRegistered - see
+    // docs/windows-pnp-power-lifecycle-design.md section 4.3. Deliberately
+    // not auto-re-registering here: that would hide an unbounded (up to
+    // T2_SEP_TIMEOUT_US) mailbox handshake behind what the caller expects
+    // to be a fast AKS exchange, and would hide the fact that a power
+    // cycle happened from the caller instead of letting it react.
+    if (Ctx->OolState != T2OolStateRegistered) {
         WdfRequestComplete(Request, STATUS_DEVICE_NOT_READY);
         return;
     }
