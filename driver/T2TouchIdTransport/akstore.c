@@ -129,10 +129,20 @@ T2AksDumpWire(_In_reads_bytes_(Length) PUCHAR Message, _In_ SIZE_T Length, _In_ 
     for (offset = 0; offset < n; offset += 16) {
         UCHAR b[16];
         SIZE_T chunk = (n - offset > 16) ? 16 : (n - offset);
-        SIZE_T i;
-        for (i = 0; i < 16; ++i) {
-            b[i] = (i < chunk) ? Message[offset + i] : 0;
+
+        // chunk <= n - offset <= Length - offset, so Message[offset, offset+chunk)
+        // is always within the caller-declared [Message, Message+Length) range.
+        // Splitting into "copy the real bytes" (bounded by chunk) + "zero the
+        // rest" (bounded by 16-chunk, writes only to the local array b) lets
+        // /analyze verify the read bound directly from chunk's definition,
+        // instead of having to prove it through a per-element ternary whose
+        // index depends on both offset and i.
+        _Analysis_assume_(chunk <= Length - offset);
+        RtlCopyMemory(b, Message + offset, chunk);
+        if (chunk < 16) {
+            RtlZeroMemory(b + chunk, 16 - chunk);
         }
+
         // Fixed-width hex lines; unused trailing bytes of the last row are 00
         // only when chunk < 16 — still fine for diagnosis of the active prefix.
         T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
