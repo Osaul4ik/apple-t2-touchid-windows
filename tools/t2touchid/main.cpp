@@ -57,6 +57,34 @@ static int CmdStatus(Client& client) {
     return 0;
 }
 
+static int CmdRegisterOol(Client& client) {
+    // Gate 3 (docs/milestone-2-hardware-results.md): allocates the two
+    // 16 KiB endpoint-7 common buffers and registers them with SEP via
+    // SET_OOL_IN / SET_OOL_OUT (dma.c). This is a ONE-SHOT, irreversible
+    // action for the lifetime of the boot: once OOL_IN registration
+    // succeeds, SEP retains that physical address until reboot, so the
+    // driver refuses to re-run it (idempotent success/failure replay
+    // instead - see T2EvtIoDeviceControlRegisterOol).
+    AksResult r = client.RegisterOol();
+    if (r == AksResult::Ok) {
+        std::wcout << L"DMA / OOL               registered\n";
+        return 0;
+    }
+    if (r == AksResult::NotReady) {
+        // Driver-side T2DmaAllocateOolBuffers/T2DmaRegisterOolBuffers
+        // failed (e.g. SEP rejected SET_OOL_IN/SET_OOL_OUT, or a prior
+        // attempt already failed this boot). Check DebugView/WinDbg
+        // kernel prints from T2TouchIdTransport for the specific NTSTATUS
+        // - this PoC deliberately does not guess a reason here.
+        std::wcout << L"DMA / OOL               registration failed (not ready) - "
+                      L"see kernel debug output for T2TouchIdTransport\n";
+        return 1;
+    }
+    std::wcout << L"DMA / OOL               registration failed (I/O error) - "
+                  L"is the driver loaded and are you Administrator?\n";
+    return 1;
+}
+
 static int CmdCapabilities(Client& client) {
     uint64_t value = 0;
     AksResult r = client.GetCapabilities(1, &value);
@@ -85,7 +113,7 @@ static int CmdUnlock(Client& client, int32_t handle) {
 
 int wmain(int argc, wchar_t* argv[]) {
     if (argc < 2) {
-        std::wcout << L"usage: t2touchid.exe <status|capabilities|load-keybag|set-system-keybag|unlock|network|identities|verify>\n";
+        std::wcout << L"usage: t2touchid.exe <status|register-ool|capabilities|load-keybag|set-system-keybag|unlock|network|identities|verify>\n";
         return 1;
     }
 
@@ -98,6 +126,7 @@ int wmain(int argc, wchar_t* argv[]) {
 
     std::wstring cmd = argv[1];
     if (cmd == L"status") return CmdStatus(client);
+    if (cmd == L"register-ool") return CmdRegisterOol(client);
     if (cmd == L"capabilities") return CmdCapabilities(client);
     if (cmd == L"unlock") {
         if (argc < 3) { std::wcout << L"usage: unlock <handle>\n"; return 1; }
