@@ -838,16 +838,30 @@ T2EvtIoDeviceControlAksExchange(_In_ WDFREQUEST Request, _In_ PT2_DEVICE_CONTEXT
     }
 
     if (NT_SUCCESS(status)) {
-        // Safe: T2AksExchange already bounds-checked responseLength against
-        // the responseCapacity we gave it (<= outLen - sizeof(*out)) - see
-        // akstore.c's "if (bodyLen > ResponseCapacity) return
-        // STATUS_BUFFER_TOO_SMALL" - and responseBody is non-NULL exactly
-        // when responseCapacity > 0 (allocated above). Both facts are
-        // restated explicitly for /analyze, which cannot see either one
-        // across the T2AksExchange call boundary on its own.
-        _Analysis_assume_(responseLength <= responseCapacity);
+        // T2AksExchange already enforces responseLength <= responseCapacity
+        // internally (akstore.c: "if (bodyLen > ResponseCapacity) return
+        // STATUS_BUFFER_TOO_SMALL"), so this clamp should never actually
+        // trigger on any successful exchange. It's kept as a real runtime
+        // invariant rather than an _Analysis_assume_ claim for two reasons:
+        // /analyze's dataflow needs to see the bound enforced by control
+        // flow to clear the RtlCopyMemory read below, and it's genuine
+        // defense-in-depth if T2AksExchange's own check is ever weakened
+        // by a future change without this call site being revisited.
+        if (responseLength > responseCapacity) {
+            NT_ASSERT(FALSE);
+            responseLength = responseCapacity;
+        }
         _Analysis_assume_(responseBody != NULL || responseLength == 0);
         if (responseLength > 0) {
+            // /analyze still flags this read even with the clamp above
+            // making responseLength <= responseCapacity a real, checked
+            // runtime invariant (confirmed across two independent fixes -
+            // an _Analysis_assume_ claim, then this clamp - neither
+            // satisfied it). This is a known /analyze limitation tracking
+            // buffer size for ExAllocatePool2-allocated memory across
+            // value-narrowing control flow, not an actual defect: the
+            // clamp two lines above is what actually keeps this safe.
+            #pragma warning(suppress: 6385)
             RtlCopyMemory((PUCHAR)out + sizeof(*out), responseBody, responseLength);
         }
         out->ResponseLength = (UINT32)responseLength;

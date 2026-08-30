@@ -134,10 +134,12 @@ T2AksDumpWire(_In_reads_bytes_(Length) PUCHAR Message, _In_ SIZE_T Length, _In_ 
         // is always within the caller-declared [Message, Message+Length) range.
         // Splitting into "copy the real bytes" (bounded by chunk) + "zero the
         // rest" (bounded by 16-chunk, writes only to the local array b) lets
-        // /analyze verify the read bound directly from chunk's definition,
-        // instead of having to prove it through a per-element ternary whose
-        // index depends on both offset and i.
-        _Analysis_assume_(chunk <= Length - offset);
+        // /analyze verify the read bound directly from chunk's own ternary
+        // definition above - no extra assertion needed here. (An earlier
+        // version added an explicit _Analysis_assume_(chunk <= Length -
+        // offset) on this line; that corrupted /analyze's readable-size
+        // model for the unrelated local array b below it instead of fixing
+        // anything, so it was removed rather than worked around.)
         RtlCopyMemory(b, Message + offset, chunk);
         if (chunk < 16) {
             RtlZeroMemory(b + chunk, 16 - chunk);
