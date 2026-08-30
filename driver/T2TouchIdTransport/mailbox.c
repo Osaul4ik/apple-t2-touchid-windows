@@ -39,38 +39,54 @@ T2MailboxWaitOutbox(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ ULONG TimeoutUs)
 NTSTATUS
 T2MailboxSend(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ const T2_SEP_MESSAGE *Message)
 {
-    NTSTATUS status = T2MailboxWaitOutbox(Ctx, T2_SEP_TIMEOUT_US);
+    NTSTATUS status;
+    ULONG preOutbox, preInbox, postOutbox, postInbox;
+    UINT8 ep = (UINT8)(Message->Word[0] & 0xff);
+
+    preOutbox = READ_REGISTER_ULONG((PULONG)(Ctx->Bar4VirtualAddress + T2_SEP_OUTBOX_STATUS));
+    preInbox  = READ_REGISTER_ULONG((PULONG)(Ctx->Bar4VirtualAddress + T2_SEP_INBOX_STATUS));
+
+    status = T2MailboxWaitOutbox(Ctx, T2_SEP_TIMEOUT_US);
     if (!NT_SUCCESS(status)) {
         return status;
     }
 
-    // DIAGNOSTIC (2026-08-30, Gate 4 capabilities timeout follow-up): log
-    // exactly what we are about to post to the outbox. If a future run
-    // shows a timeout again, compare these words against a hand-decoded
-    // expectation (endpoint/operation/transaction in Word[0], length in
-    // Word[1]) before suspecting the hardware - this tells us definitively
-    // whether the bug is upstream of the mailbox write.
+    // Linux t2_sep_send sequence (identical):
+    //   wait !OUTBOX_FULL
+    //   writel word0 @ OUTBOX_DATA+0x0
+    //   writel word1 @ OUTBOX_DATA+0x4
+    //   writel word2 @ OUTBOX_DATA+0x8
+    //   writel 0     @ OUTBOX_DATA+0xc   // doorbell, always last
     T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-        "T2TouchIdTransport: SEP send word0=0x%08x word1=0x%08x word2=0x%08x\n",
+        "T2TouchIdTransport: MMIO SEND ep=%u pre outbox=0x%x (full=%d seq=0x%x) "
+        "inbox=0x%x (empty=%d) words=%08x %08x %08x 00000000\n",
+        ep, preOutbox, (preOutbox & T2_SEP_OUTBOX_FULL_BIT) != 0, preOutbox & 0xffff,
+        preInbox, (preInbox & T2_SEP_INBOX_EMPTY_BIT) != 0,
         Message->Word[0], Message->Word[1], Message->Word[2]));
 
-    // AppleSEPIntelIOP posts the final word last; it is always zero
-    // (VERIFIED FROM SOURCE, t2_sep_transport.c comment reproduced exactly
-    // because it documents required hardware ordering, not prose).
     WRITE_REGISTER_ULONG((PULONG)(Ctx->Bar4VirtualAddress + T2_SEP_OUTBOX_DATA + 0x0), Message->Word[0]);
     WRITE_REGISTER_ULONG((PULONG)(Ctx->Bar4VirtualAddress + T2_SEP_OUTBOX_DATA + 0x4), Message->Word[1]);
     WRITE_REGISTER_ULONG((PULONG)(Ctx->Bar4VirtualAddress + T2_SEP_OUTBOX_DATA + 0x8), Message->Word[2]);
     WRITE_REGISTER_ULONG((PULONG)(Ctx->Bar4VirtualAddress + T2_SEP_OUTBOX_DATA + 0xc), 0);
 
-    // DIAGNOSTIC: confirm the write actually latched (outbox now reports
-    // full, or has already drained if SEP is extremely fast) rather than
-    // silently no-op'ing on a bad BAR mapping.
-    {
-        ULONG postSendOutbox = READ_REGISTER_ULONG((PULONG)(Ctx->Bar4VirtualAddress + T2_SEP_OUTBOX_STATUS));
-        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-            "T2TouchIdTransport: SEP send complete, outbox status=0x%x full=%d\n",
-            postSendOutbox, (postSendOutbox & T2_SEP_OUTBOX_FULL_BIT) != 0));
-    }
+    // Read-back status forces posted MMIO writes to complete (x86).
+    postOutbox = READ_REGISTER_ULONG((PULONG)(Ctx->Bar4VirtualAddress + T2_SEP_OUTBOX_STATUS));
+    postInbox  = READ_REGISTER_ULONG((PULONG)(Ctx->Bar4VirtualAddress + T2_SEP_INBOX_STATUS));
+
+    T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        "T2TouchIdTransport: MMIO SEND done ep=%u post outbox=0x%x (full=%d seq=0x%x) "
+        "inbox=0x%x (empty=%d) seq_delta=%d\n",
+        ep, postOutbox, (postOutbox & T2_SEP_OUTBOX_FULL_BIT) != 0, postOutbox & 0xffff,
+        postInbox, (postInbox & T2_SEP_INBOX_EMPTY_BIT) != 0,
+        (int)((postOutbox & 0xffff) - (preOutbox & 0xffff))));
+
+    // Compatibility with existing log parsers
+    T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        "T2TouchIdTransport: SEP send word0=0x%08x word1=0x%08x word2=0x%08x\n",
+        Message->Word[0], Message->Word[1], Message->Word[2]));
+    T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        "T2TouchIdTransport: SEP send complete, outbox status=0x%x full=%d\n",
+        postOutbox, (postOutbox & T2_SEP_OUTBOX_FULL_BIT) != 0));
 
     return STATUS_SUCCESS;
 }
@@ -82,6 +98,15 @@ T2MailboxReceive(_In_ PT2_DEVICE_CONTEXT Ctx, _Out_ T2_SEP_MESSAGE *Message, _In
 
     while (waited < TimeoutUs) {
         ULONG status = READ_REGISTER_ULONG((PULONG)(Ctx->Bar4VirtualAddress + T2_SEP_INBOX_STATUS));
+        // Heartbeat every 1s so we can see whether inbox/outbox bits move at all
+        // during an EP7 timeout (proves SEP is alive but silent vs frozen).
+        if (waited > 0 && (waited % 1000000) < T2_SEP_POLL_MIN_US) {
+            ULONG ob = READ_REGISTER_ULONG((PULONG)(Ctx->Bar4VirtualAddress + T2_SEP_OUTBOX_STATUS));
+            T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                "T2TouchIdTransport: MMIO WAIT %u ms inbox=0x%x empty=%d outbox=0x%x full=%d seq=0x%x\n",
+                waited / 1000, status, (status & T2_SEP_INBOX_EMPTY_BIT) != 0,
+                ob, (ob & T2_SEP_OUTBOX_FULL_BIT) != 0, ob & 0xffff));
+        }
         if (!(status & T2_SEP_INBOX_EMPTY_BIT)) {
             Message->Word[0] = READ_REGISTER_ULONG((PULONG)(Ctx->Bar4VirtualAddress + T2_SEP_INBOX_DATA + 0x0));
             Message->Word[1] = READ_REGISTER_ULONG((PULONG)(Ctx->Bar4VirtualAddress + T2_SEP_INBOX_DATA + 0x4));
