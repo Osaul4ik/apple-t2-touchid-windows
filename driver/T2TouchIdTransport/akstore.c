@@ -218,10 +218,10 @@ T2AksExchange(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
     outBase = (PUCHAR)Ctx->OolOutVa;
 
     // DIAGNOSTIC: confirm these are still the exact buffers SEP was told
-    // about in T2DmaRegisterOolBuffers (non-cached contiguous).
+    // about in T2DmaRegisterOolBuffers (WDF logical address).
     T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
         "T2TouchIdTransport: AKS exchange using OolIn phys=0x%llx OolOut phys=0x%llx "
-        "(InRegistered=%d OutRegistered=%d non-cached)\n",
+        "(InRegistered=%d OutRegistered=%d WDF-logical)\n",
         Ctx->OolInPa.QuadPart, Ctx->OolOutPa.QuadPart,
         Ctx->OolInRegistered, Ctx->OolOutRegistered));
 
@@ -258,8 +258,68 @@ T2AksExchange(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
         T2AksDumpWire(inBase, requestWireLength, T2_AKS_V2_WIRE_SIZE);
     }
 
-    // CPU -> device: flush WB cache lines so SEP DMA reads the wire we built.
-    T2AksFlushForDevice(inBase, requestWireLength);
+    // Snapshot before flush for readback check.
+    {
+        UCHAR snap[128];
+        SIZE_T snapLen = (requestWireLength < sizeof(snap)) ? requestWireLength : sizeof(snap);
+        RtlCopyMemory(snap, inBase, snapLen);
+
+        // CPU -> device: flush WB cache lines so SEP DMA reads the wire we built.
+        T2AksFlushForDevice(inBase, requestWireLength);
+
+        // Readback: after clflush+mfence the CPU must still see the same bytes.
+        // If this fails, the VA mapping is broken / not the buffer SEP will DMA.
+        {
+            SIZE_T i;
+            BOOLEAN mismatch = FALSE;
+            for (i = 0; i < snapLen; ++i) {
+                if (inBase[i] != snap[i]) {
+                    mismatch = TRUE;
+                    break;
+                }
+            }
+            T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                "T2TouchIdTransport: OolIn readback after flush: %s (checked %Iu bytes)%s\n",
+                mismatch ? "MISMATCH" : "OK",
+                snapLen,
+                mismatch ? " — VA may not match device-visible memory" : ""));
+            if (mismatch) {
+                T2AksDumpWire(inBase, requestWireLength, snapLen);
+            }
+        }
+
+        // Field-by-field (Linux t2_aks_exchange_locked layout):
+        //   [0:4]  header_size = 0x50
+        //   [4:20] digest (16)
+        //   [20:24] version = 2
+        //   [24:32] usec_time
+        //   [32:36] flags
+        //   [36:44] clock_id
+        //   [44:76] platform_data[32]
+        //   [76:84] calendar_seconds   (abs 0x4C..0x53)
+        //   [84:]   body               (abs 0x54+)
+        {
+            UINT32 hs=0, ver=0, flags=0;
+            UINT64 usec=0, clock=0, cal=0;
+            RtlCopyMemory(&hs, inBase + 0, 4);
+            RtlCopyMemory(&ver, inBase + 20, 4);
+            RtlCopyMemory(&usec, inBase + 24, 8);
+            RtlCopyMemory(&flags, inBase + 32, 4);
+            RtlCopyMemory(&clock, inBase + 36, 8);
+            RtlCopyMemory(&cal, inBase + 0x4C, 8);
+            T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                "T2TouchIdTransport: V2 fields hs=0x%x ver=%u usec=%llu flags=0x%x "
+                "clock=%llu cal=%llu body0..3=%02x%02x%02x%02x\n",
+                hs, ver, usec, flags, clock, cal,
+                (requestWireLength > 0x54) ? inBase[0x54] : 0,
+                (requestWireLength > 0x55) ? inBase[0x55] : 0,
+                (requestWireLength > 0x56) ? inBase[0x56] : 0,
+                (requestWireLength > 0x57) ? inBase[0x57] : 0));
+            T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                "T2TouchIdTransport: EP7 doorbell will be word0=ep7|op<<8|txn<<16 "
+                "word1=wireLen<<16 (Linux t2_aks_exchange_locked identical)\n"));
+        }
+    }
 
     // VERIFIED FROM SOURCE: transaction is a free-running byte counter that
     // skips 0 (0 is reserved / never a valid transaction id on this path).
