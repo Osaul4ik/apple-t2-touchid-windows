@@ -8,6 +8,8 @@
 #include "../../protocol/AppleKeyStore/Client.h"
 #include <iostream>
 #include <string>
+#include <fstream>
+#include <limits>
 #include <conio.h>
 
 using namespace t2::applekeystore;
@@ -96,6 +98,77 @@ static int CmdCapabilities(Client& client) {
     return 0;
 }
 
+static bool ReadBinaryFile(const std::wstring& path, std::vector<uint8_t>& bytes) {
+    bytes.clear();
+
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file) return false;
+
+    const std::streampos end = file.tellg();
+    if (end < 0) return false;
+
+    const auto size = static_cast<unsigned long long>(end);
+    // Keep one conservative limit at the CLI boundary. The Linux reference
+    // uses 16000 bytes for the keybag payload, while the driver has a slightly
+    // larger protocol maximum. Rejecting oversized files here avoids building
+    // a request that can never be accepted and avoids accidental huge reads.
+    constexpr unsigned long long kMaxKeybagBytes = 16000;
+    if (size == 0 || size > kMaxKeybagBytes) return false;
+
+    if (size > static_cast<unsigned long long>(std::numeric_limits<size_t>::max())) {
+        return false;
+    }
+
+    bytes.resize(static_cast<size_t>(size));
+    file.seekg(0, std::ios::beg);
+    if (!file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()))) {
+        SecureZeroMemory(bytes.data(), bytes.size());
+        bytes.clear();
+        return false;
+    }
+    return true;
+}
+
+static int CmdLoadKeybag(Client& client, const std::wstring& path) {
+    std::vector<uint8_t> bag;
+    if (!ReadBinaryFile(path, bag)) {
+        std::wcout << L"load-keybag: cannot read keybag file (must be 1..16000 bytes)\n";
+        return 1;
+    }
+
+    int32_t handle = 0;
+    AksResult r = client.LoadKeybag(bag, &handle);
+    SecureZeroMemory(bag.data(), bag.size());
+    bag.clear();
+
+    if (r == AksResult::NotReady) {
+        std::wcout << L"load-keybag failed: DMA / OOL is not registered; run register-ool first\n";
+        return 1;
+    }
+    if (r != AksResult::Ok) {
+        std::wcout << L"load-keybag failed\n";
+        return 1;
+    }
+
+    std::wcout << L"load-keybag: OK, handle=" << handle << L"\n";
+    return 0;
+}
+
+static int CmdSetSystemKeybag(Client& client, int32_t handle, int32_t specialUserBag) {
+    AksResult r = client.MakeSystemKeybag(handle, specialUserBag);
+    if (r == AksResult::NotReady) {
+        std::wcout << L"set-system-keybag failed: DMA / OOL is not registered; run register-ool first\n";
+        return 1;
+    }
+    if (r != AksResult::Ok) {
+        std::wcout << L"set-system-keybag failed\n";
+        return 1;
+    }
+
+    std::wcout << L"set-system-keybag: OK\n";
+    return 0;
+}
+
 static int CmdUnlock(Client& client, int32_t handle) {
     auto secret = ReadPasswordInteractive();
     if (secret.empty()) {
@@ -128,6 +201,20 @@ int wmain(int argc, wchar_t* argv[]) {
     if (cmd == L"status") return CmdStatus(client);
     if (cmd == L"register-ool") return CmdRegisterOol(client);
     if (cmd == L"capabilities") return CmdCapabilities(client);
+    if (cmd == L"load-keybag") {
+        if (argc < 3) {
+            std::wcout << L"usage: load-keybag <keybag-file>\n";
+            return 1;
+        }
+        return CmdLoadKeybag(client, argv[2]);
+    }
+    if (cmd == L"set-system-keybag") {
+        if (argc < 4) {
+            std::wcout << L"usage: set-system-keybag <handle> <special-user-bag>\n";
+            return 1;
+        }
+        return CmdSetSystemKeybag(client, _wtoi(argv[2]), _wtoi(argv[3]));
+    }
     if (cmd == L"unlock") {
         if (argc < 3) { std::wcout << L"usage: unlock <handle>\n"; return 1; }
         return CmdUnlock(client, _wtoi(argv[2]));
