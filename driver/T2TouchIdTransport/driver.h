@@ -129,13 +129,17 @@ typedef struct _T2_DEVICE_CONTEXT
     PUCHAR               Bar4VirtualAddress;   // MmMapIoSpaceEx result
     BOOLEAN              Bar4Mapped;
 
-    // Bus-mastering / DMA — only touched after IOCTL_T2_REGISTER_OOL
+    // Bus-mastering / DMA — only touched after IOCTL_T2_REGISTER_OOL.
+    // Allocated via MmAllocateContiguousMemorySpecifyCache(MmNonCached) so
+    // SEP DMA always sees host writes (write-back WDF common buffers were
+    // the leading cause of silent EP7 timeouts after correct wire layout).
     BOOLEAN              OolRegisterAttempted;
     BOOLEAN              OolInRegistered;
     BOOLEAN              OolOutRegistered;
-    WDFDMAENABLER        DmaEnabler;
-    WDFCOMMONBUFFER      OolInBuffer;
-    WDFCOMMONBUFFER      OolOutBuffer;
+    PVOID                OolInVa;
+    PVOID                OolOutVa;
+    PHYSICAL_ADDRESS     OolInPa;
+    PHYSICAL_ADDRESS     OolOutPa;
 
     // Serializes mailbox + AKS exchange; the mailbox is a single shared
     // hardware resource, so only one in-flight request at a time (matches

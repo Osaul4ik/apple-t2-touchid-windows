@@ -173,8 +173,8 @@ T2AksExchange(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
 {
     NTSTATUS status;
     T2_AKS_HEADER_V2 header;
-    PUCHAR inBase = (PUCHAR)WdfCommonBufferGetAlignedVirtualAddress(Ctx->OolInBuffer);
-    PUCHAR outBase = (PUCHAR)WdfCommonBufferGetAlignedVirtualAddress(Ctx->OolOutBuffer);
+    PUCHAR inBase;
+    PUCHAR outBase;
     SIZE_T requestWireLength;
     UINT16 replyWireLength;
     UINT8 transaction;
@@ -191,16 +191,19 @@ T2AksExchange(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
         return STATUS_INVALID_BUFFER_SIZE; // VERIFIED FROM SOURCE: -EMSGSIZE bound
     }
 
-    // DIAGNOSTIC: confirm these are still the exact buffers SEP was told
-    // about in T2DmaRegisterOolBuffers.
-    {
-        PHYSICAL_ADDRESS oolInDma = WdfCommonBufferGetAlignedLogicalAddress(Ctx->OolInBuffer);
-        PHYSICAL_ADDRESS oolOutDma = WdfCommonBufferGetAlignedLogicalAddress(Ctx->OolOutBuffer);
-        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-            "T2TouchIdTransport: AKS exchange using OolIn phys=0x%llx OolOut phys=0x%llx "
-            "(InRegistered=%d OutRegistered=%d)\n",
-            oolInDma.QuadPart, oolOutDma.QuadPart, Ctx->OolInRegistered, Ctx->OolOutRegistered));
+    if (Ctx->OolInVa == NULL || Ctx->OolOutVa == NULL) {
+        return STATUS_DEVICE_NOT_READY;
     }
+    inBase = (PUCHAR)Ctx->OolInVa;
+    outBase = (PUCHAR)Ctx->OolOutVa;
+
+    // DIAGNOSTIC: confirm these are still the exact buffers SEP was told
+    // about in T2DmaRegisterOolBuffers (non-cached contiguous).
+    T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        "T2TouchIdTransport: AKS exchange using OolIn phys=0x%llx OolOut phys=0x%llx "
+        "(InRegistered=%d OutRegistered=%d non-cached)\n",
+        Ctx->OolInPa.QuadPart, Ctx->OolOutPa.QuadPart,
+        Ctx->OolInRegistered, Ctx->OolOutRegistered));
 
     RtlZeroMemory(inBase, T2_SEP_OOL_SIZE);
     RtlZeroMemory(outBase, T2_SEP_OOL_SIZE);

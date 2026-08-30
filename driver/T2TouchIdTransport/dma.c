@@ -1,56 +1,61 @@
 // dma.c
 //
-// KMDF common-buffer allocation for the two 16 KiB endpoint-7 OOL buffers,
-// and their registration with SEP over endpoint 0 (SET_OOL_IN / SET_OOL_OUT).
-// Sizes/masks VERIFIED FROM SOURCE (driver.h). The 44-bit DMA mask and the
-// exact allocator behavior on this specific chipset are VERIFIED ON WINDOWS
-// pending — Milestone 0/1 explicitly flagged "do not assume Windows
-// IOMMU/DMA configuration is identical to Linux"; this code asks WDF for
-// a 44-bit-capable profile but must be checked against real
-// WdfDmaEnablerCreate results on the target machine (see
-// docs/milestone-2-hardware-results.md).
+// Non-cached contiguous OOL buffers for endpoint-7 AppleKeyStore DMA.
+// VERIFIED FROM SOURCE sizing/masks (driver.h). Allocation deliberately
+// mirrors Linux dma_alloc_coherent: MmNonCached so SEP always sees host
+// stores without a cache flush. WDF common buffers (write-back) caused
+// silent EP7 timeouts even with correct V1/V2 wire layout.
 
 #include "driver.h"
 
 NTSTATUS
 T2DmaAllocateOolBuffers(_In_ PT2_DEVICE_CONTEXT Ctx)
 {
-    NTSTATUS status;
-    WDF_DMA_ENABLER_CONFIG dmaConfig;
+    PHYSICAL_ADDRESS low, high, boundary;
 
-    // WDF_DMA_PROFILE_ScatterGather64 is the closest stock profile; the
-    // OOL buffers are single contiguous common buffers, not scatter-gather
-    // lists, but WdfCommonBufferCreate still requires an enabler. If real
-    // hardware testing shows the 44-bit mask needs an explicit
-    // DEVICE_DESCRIPTION.MaximumLength / DmaAddressWidth override, adjust
-    // here — flagged, not guessed silently.
-    WDF_DMA_ENABLER_CONFIG_INIT(&dmaConfig, WdfDmaProfilePacket64, T2_SEP_OOL_SIZE);
-    status = WdfDmaEnablerCreate(Ctx->Device, &dmaConfig, WDF_NO_OBJECT_ATTRIBUTES, &Ctx->DmaEnabler);
-    if (!NT_SUCCESS(status)) {
+    low.QuadPart = 0;
+    // 44-bit DMA limit (T2_SEP_DMA_BITS) — same constraint as Linux
+    // dma_set_mask_and_coherent(DMA_BIT_MASK(44)).
+    high.QuadPart = (1ULL << T2_SEP_DMA_BITS) - 1;
+    boundary.QuadPart = 0;
+
+    Ctx->OolInVa = MmAllocateContiguousMemorySpecifyCache(
+        T2_SEP_OOL_SIZE, low, high, boundary, MmNonCached);
+    if (Ctx->OolInVa == NULL) {
         T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-            "T2TouchIdTransport: WdfDmaEnablerCreate failed, status=0x%x\n", status));
-        return status;
+            "T2TouchIdTransport: MmAllocateContiguousMemorySpecifyCache(OolIn) failed\n"));
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    Ctx->OolInPa = MmGetPhysicalAddress(Ctx->OolInVa);
+
+    Ctx->OolOutVa = MmAllocateContiguousMemorySpecifyCache(
+        T2_SEP_OOL_SIZE, low, high, boundary, MmNonCached);
+    if (Ctx->OolOutVa == NULL) {
+        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "T2TouchIdTransport: MmAllocateContiguousMemorySpecifyCache(OolOut) failed\n"));
+        MmFreeContiguousMemorySpecifyCache(Ctx->OolInVa, T2_SEP_OOL_SIZE, MmNonCached);
+        Ctx->OolInVa = NULL;
+        Ctx->OolInPa.QuadPart = 0;
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    Ctx->OolOutPa = MmGetPhysicalAddress(Ctx->OolOutVa);
+
+    // Page-aligned check (SEP control message shifts by PAGE_SHIFT).
+    if ((Ctx->OolInPa.QuadPart & (PAGE_SIZE - 1)) != 0 ||
+        (Ctx->OolOutPa.QuadPart & (PAGE_SIZE - 1)) != 0) {
+        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "T2TouchIdTransport: OOL buffers not page-aligned (in=0x%llx out=0x%llx)\n",
+            Ctx->OolInPa.QuadPart, Ctx->OolOutPa.QuadPart));
+        T2DmaFreeOolBuffers(Ctx);
+        return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    status = WdfCommonBufferCreate(Ctx->DmaEnabler, T2_SEP_OOL_SIZE,
-        WDF_NO_OBJECT_ATTRIBUTES, &Ctx->OolInBuffer);
-    if (!NT_SUCCESS(status)) {
-        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-            "T2TouchIdTransport: WdfCommonBufferCreate(OolInBuffer) failed, status=0x%x\n", status));
-        return status;
-    }
+    RtlZeroMemory(Ctx->OolInVa, T2_SEP_OOL_SIZE);
+    RtlZeroMemory(Ctx->OolOutVa, T2_SEP_OOL_SIZE);
 
-    status = WdfCommonBufferCreate(Ctx->DmaEnabler, T2_SEP_OOL_SIZE,
-        WDF_NO_OBJECT_ATTRIBUTES, &Ctx->OolOutBuffer);
-    if (!NT_SUCCESS(status)) {
-        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-            "T2TouchIdTransport: WdfCommonBufferCreate(OolOutBuffer) failed, status=0x%x\n", status));
-        return status;
-    }
-
-    RtlZeroMemory(WdfCommonBufferGetAlignedVirtualAddress(Ctx->OolInBuffer), T2_SEP_OOL_SIZE);
-    RtlZeroMemory(WdfCommonBufferGetAlignedVirtualAddress(Ctx->OolOutBuffer), T2_SEP_OOL_SIZE);
-
+    T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        "T2TouchIdTransport: allocated non-cached OOL buffers inPA=0x%llx outPA=0x%llx\n",
+        Ctx->OolInPa.QuadPart, Ctx->OolOutPa.QuadPart));
     return STATUS_SUCCESS;
 }
 
@@ -58,11 +63,12 @@ NTSTATUS
 T2DmaRegisterOolBuffers(_In_ PT2_DEVICE_CONTEXT Ctx)
 {
     NTSTATUS status;
-    PHYSICAL_ADDRESS oolInDma = WdfCommonBufferGetAlignedLogicalAddress(Ctx->OolInBuffer);
-    PHYSICAL_ADDRESS oolOutDma = WdfCommonBufferGetAlignedLogicalAddress(Ctx->OolOutBuffer);
 
-    // Linux calls pci_set_master before SET_OOL_*. Without bus-master the
-    // SEP cannot DMA the OOL buffers and AKS (EP7) exchanges time out.
+    if (Ctx->OolInVa == NULL || Ctx->OolOutVa == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    // Linux calls pci_set_master before SET_OOL_*.
     status = T2EnablePciBusMaster(Ctx->Device);
     if (!NT_SUCCESS(status)) {
         T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
@@ -70,7 +76,7 @@ T2DmaRegisterOolBuffers(_In_ PT2_DEVICE_CONTEXT Ctx)
         return status;
     }
 
-    status = T2SepControl(Ctx, T2_SEP_CMSG_SET_OOL_IN, 1, oolInDma, T2_SEP_OOL_SIZE);
+    status = T2SepControl(Ctx, T2_SEP_CMSG_SET_OOL_IN, 1, Ctx->OolInPa, T2_SEP_OOL_SIZE);
     if (!NT_SUCCESS(status)) {
         T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
             "T2TouchIdTransport: SET_OOL_IN failed, status=0x%x\n", status));
@@ -78,14 +84,11 @@ T2DmaRegisterOolBuffers(_In_ PT2_DEVICE_CONTEXT Ctx)
     }
     Ctx->OolInRegistered = TRUE;
 
-    status = T2SepControl(Ctx, T2_SEP_CMSG_SET_OOL_OUT, 2, oolOutDma, T2_SEP_OOL_SIZE);
+    status = T2SepControl(Ctx, T2_SEP_CMSG_SET_OOL_OUT, 2, Ctx->OolOutPa, T2_SEP_OOL_SIZE);
     if (!NT_SUCCESS(status)) {
         // VERIFIED FROM SOURCE (Milestone 1, "Pinning"): once OOL_IN
-        // registration succeeds, SEP retains that physical address
-        // regardless of what happens next. Do not free or reuse the
-        // common buffer even though OUT registration failed - only a
-        // reboot clears SEP's view of it. Leave OolInRegistered = TRUE so
-        // T2EvtDeviceReleaseHardware knows to leak, not free.
+        // registration succeeds, SEP retains that physical address.
+        // Do not free; reboot clears SEP's view. Leave OolInRegistered=TRUE.
         T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
             "T2TouchIdTransport: OOL input registered but output "
             "registration failed, status=0x%x; reboot before retry\n", status));
@@ -94,7 +97,9 @@ T2DmaRegisterOolBuffers(_In_ PT2_DEVICE_CONTEXT Ctx)
     Ctx->OolOutRegistered = TRUE;
 
     T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-        "T2TouchIdTransport: registered 16 KiB endpoint-7 OOL input/output buffers\n"));
+        "T2TouchIdTransport: registered 16 KiB endpoint-7 OOL input/output buffers "
+        "(non-cached, inPA=0x%llx outPA=0x%llx)\n",
+        Ctx->OolInPa.QuadPart, Ctx->OolOutPa.QuadPart));
     return STATUS_SUCCESS;
 }
 
@@ -103,16 +108,14 @@ T2DmaFreeOolBuffers(_In_ PT2_DEVICE_CONTEXT Ctx)
 {
     // Only ever called when neither buffer was successfully registered
     // with SEP (see T2EvtDeviceReleaseHardware) - safe to free.
-    if (Ctx->OolOutBuffer) {
-        WdfObjectDelete(Ctx->OolOutBuffer);
-        Ctx->OolOutBuffer = NULL;
+    if (Ctx->OolOutVa) {
+        MmFreeContiguousMemorySpecifyCache(Ctx->OolOutVa, T2_SEP_OOL_SIZE, MmNonCached);
+        Ctx->OolOutVa = NULL;
+        Ctx->OolOutPa.QuadPart = 0;
     }
-    if (Ctx->OolInBuffer) {
-        WdfObjectDelete(Ctx->OolInBuffer);
-        Ctx->OolInBuffer = NULL;
-    }
-    if (Ctx->DmaEnabler) {
-        WdfObjectDelete(Ctx->DmaEnabler);
-        Ctx->DmaEnabler = NULL;
+    if (Ctx->OolInVa) {
+        MmFreeContiguousMemorySpecifyCache(Ctx->OolInVa, T2_SEP_OOL_SIZE, MmNonCached);
+        Ctx->OolInVa = NULL;
+        Ctx->OolInPa.QuadPart = 0;
     }
 }
