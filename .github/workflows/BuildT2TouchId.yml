@@ -22,6 +22,8 @@ env:
   DRIVER_NAME: T2TouchIdTransport
   CONFIGURATION: Release
   PLATFORM: x64
+  SIGN_CERT_PFX: ${{ secrets.CERT }}
+  SIGN_CERT_PASSWORD: ${{ secrets.CERT_PWD }}
 
 jobs:
   build:
@@ -84,7 +86,7 @@ jobs:
 
         if (-not $lib) {
           Write-Error "No plist .lib found under $libDir after vcpkg install."
-          Write-Host "Contents of ${libDir:}"
+          Write-Host "Contents of ${libDir}:"
           Get-ChildItem -Path $libDir | ForEach-Object { Write-Host "  - $($_.Name)" }
           exit 1
         }
@@ -273,11 +275,10 @@ jobs:
     # / Secure Boot test mode required" (see docs/milestone-2-hardware-
     # results.md), so a missing cert just means unsigned/test-signable
     # output, not a broken build. Set the CERT / CERT_PWD repo secrets
-    # (same names/format as the reference project - base64 PFX + password)
-    # to get signed output instead.
+    # (base64 PFX + password) to get signed output instead.
     # =====================================================================
     - name: Sign .sys and .cat with SignTool
-      if: ${{ secrets.CERT != '' && secrets.CERT_PWD != '' }}
+      if: ${{ env.SIGN_CERT_PFX != '' && env.SIGN_CERT_PASSWORD != '' }}
       run: |
         $ErrorActionPreference = "Stop"
         $pfxPath = Join-Path $env:TEMP "signcert.pfx"
@@ -319,12 +320,9 @@ jobs:
           if (Test-Path $pfxPath) { Remove-Item -Path $pfxPath -Force }
         }
       shell: pwsh
-      env:
-        SIGN_CERT_PFX: ${{ secrets.CERT }}
-        SIGN_CERT_PASSWORD: ${{ secrets.CERT_PWD }}
 
     - name: Warn if packaging unsigned
-      if: ${{ !(secrets.CERT != '' && secrets.CERT_PWD != '') }}
+      if: ${{ env.SIGN_CERT_PFX == '' || env.SIGN_CERT_PASSWORD == '' }}
       run: Write-Host "::warning::CERT/CERT_PWD secrets not set - packaging an UNSIGNED .sys/.cat. Target machine needs test-signing enabled or Secure Boot test mode (see docs/milestone-2-hardware-results.md)."
       shell: pwsh
 
