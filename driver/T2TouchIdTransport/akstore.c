@@ -113,6 +113,36 @@ T2AksDigest(_Inout_updates_bytes_(Length) PUCHAR Message, _In_ SIZE_T Length)
                      Message + sizeof(UINT32));
 }
 
+// Dump up to DumpLen bytes of the OOL_IN wire message for diagnosis.
+// Only call for operations that carry no secret material (e.g. capabilities).
+// Emits one T2_LOG line per 16 bytes so DebugView stays readable.
+static VOID
+T2AksDumpWire(_In_reads_bytes_(Length) PUCHAR Message, _In_ SIZE_T Length, _In_ SIZE_T DumpLen)
+{
+    SIZE_T n = (DumpLen < Length) ? DumpLen : Length;
+    SIZE_T offset;
+
+    T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        "T2TouchIdTransport: OolIn first %Iu of %Iu bytes:\n", n, Length));
+
+    for (offset = 0; offset < n; offset += 16) {
+        UCHAR b[16];
+        SIZE_T chunk = (n - offset > 16) ? 16 : (n - offset);
+        SIZE_T i;
+        for (i = 0; i < 16; ++i) {
+            b[i] = (i < chunk) ? Message[offset + i] : 0;
+        }
+        // Fixed-width hex lines; unused trailing bytes of the last row are 00
+        // only when chunk < 16 — still fine for diagnosis of the active prefix.
+        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+            "T2TouchIdTransport:  %04Ix: %02X %02X %02X %02X %02X %02X %02X %02X "
+            "%02X %02X %02X %02X %02X %02X %02X %02X\n",
+            offset,
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+            b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]));
+    }
+}
+
 static VOID
 T2AksBuildHeaderV2(_Out_ PT2_AKS_HEADER_V2 Header)
 {
@@ -160,15 +190,9 @@ T2AksExchange(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
     if (RequestLength > T2_AKS_MAX_BODY_SIZE) {
         return STATUS_INVALID_BUFFER_SIZE; // VERIFIED FROM SOURCE: -EMSGSIZE bound
     }
-    requestWireLength = T2_AKS_V2_WIRE_SIZE + RequestLength;
 
-    // DIAGNOSTIC (2026-08-30, Gate 4 timeout follow-up): confirm these are
-    // still the exact buffers SEP was told about in T2DmaRegisterOolBuffers
-    // - if the device object were ever recreated (surprise PnP re-enum)
-    // between register-ool and this call, OolInRegistered would already be
-    // FALSE and device.c would reject us before we get here, but log the
-    // physical addresses too so a mismatch against the earlier
-    // "registered 16 KiB endpoint-7 OOL..." log line is visible at a glance.
+    // DIAGNOSTIC: confirm these are still the exact buffers SEP was told
+    // about in T2DmaRegisterOolBuffers.
     {
         PHYSICAL_ADDRESS oolInDma = WdfCommonBufferGetAlignedLogicalAddress(Ctx->OolInBuffer);
         PHYSICAL_ADDRESS oolOutDma = WdfCommonBufferGetAlignedLogicalAddress(Ctx->OolOutBuffer);
@@ -178,38 +202,75 @@ T2AksExchange(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
             oolInDma.QuadPart, oolOutDma.QuadPart, Ctx->OolInRegistered, Ctx->OolOutRegistered));
     }
 
-    T2AksBuildHeaderV2(&header);
-
     RtlZeroMemory(inBase, T2_SEP_OOL_SIZE);
     RtlZeroMemory(outBase, T2_SEP_OOL_SIZE);
 
-    // [u32 header_size][T2_AKS_HEADER_V2][body], per t2_aks_exchange_locked.
-    *(UINT32*)inBase = T2_AKS_HEADER_V2_SIZE;
-    RtlCopyMemory(inBase + sizeof(UINT32), &header, sizeof(header));
-    if (RequestBody && RequestLength > 0) {
-        RtlCopyMemory(inBase + T2_AKS_V2_WIRE_SIZE, RequestBody, RequestLength);
+    // SPECIAL CASE for GetCapabilities (0x4d): Linux's proven boot-time probe
+    // (t2_aks_probe_capabilities) uses V1 header + fixed wire size 0x5c, not
+    // the general V2 path. On some bridgeOS builds the V2 form for this
+    // particular op is silently dropped (no EP7 reply). Match the known-
+    // working probe layout exactly when the body is the 16-byte selector
+    // request that user-mode sends.
+    if (Operation == T2AksOpGetCapabilities && RequestLength == 16) {
+        T2_AKS_HEADER_V1 headerV1;
+        LARGE_INTEGER wall;
+        ULONG64 interruptTime;
+
+        RtlZeroMemory(&headerV1, sizeof(headerV1));
+        KeQuerySystemTimePrecise(&wall);
+        interruptTime = KeQueryUnbiasedInterruptTime();
+        headerV1.Version = T2_AKS_VERSION_V1;
+        headerV1.UsecTime = interruptTime / 10;
+
+        requestWireLength = T2_AKS_CAP_REQ_SIZE; // 0x5c = V1 wire + 16-byte body
+        *(UINT32*)inBase = T2_AKS_HEADER_V1_SIZE;
+        RtlCopyMemory(inBase + sizeof(UINT32), &headerV1, sizeof(headerV1));
+        RtlCopyMemory(inBase + T2_AKS_V1_WIRE_SIZE, RequestBody, RequestLength);
+
+        status = T2AksDigest(inBase, requestWireLength);
+        if (!NT_SUCCESS(status)) {
+            RtlSecureZeroMemory(inBase, requestWireLength);
+            return status;
+        }
+
+        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+            "T2TouchIdTransport: AKS (V1-cap) wire header_size=0x%x digest0..3=%02x%02x%02x%02x "
+            "version=%u requestWireLength=%Iu bodyLength=%Iu\n",
+            *(UINT32*)inBase, inBase[4], inBase[5], inBase[6], inBase[7],
+            headerV1.Version, requestWireLength, RequestLength));
+        // Full wire dump — capabilities body has no secrets.
+        T2AksDumpWire(inBase, requestWireLength, 128);
+    } else {
+        // General path: V2 header (t2_aks_exchange_locked).
+        requestWireLength = T2_AKS_V2_WIRE_SIZE + RequestLength;
+        T2AksBuildHeaderV2(&header);
+
+        *(UINT32*)inBase = T2_AKS_HEADER_V2_SIZE;
+        RtlCopyMemory(inBase + sizeof(UINT32), &header, sizeof(header));
+        if (RequestBody && RequestLength > 0) {
+            RtlCopyMemory(inBase + T2_AKS_V2_WIRE_SIZE, RequestBody, RequestLength);
+        }
+
+        status = T2AksDigest(inBase, requestWireLength);
+        if (!NT_SUCCESS(status)) {
+            RtlSecureZeroMemory(inBase, requestWireLength);
+            return status;
+        }
+
+        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+            "T2TouchIdTransport: AKS wire header_size=0x%x digest0..3=%02x%02x%02x%02x version=%u "
+            "requestWireLength=%Iu bodyLength=%Iu\n",
+            *(UINT32*)inBase, inBase[4], inBase[5], inBase[6], inBase[7],
+            header.V1.Version, requestWireLength, RequestLength));
+        // Header-only dump for non-cap ops (body may contain keybag/secret).
+        T2AksDumpWire(inBase, requestWireLength, T2_AKS_V2_WIRE_SIZE);
     }
 
-    status = T2AksDigest(inBase, requestWireLength);
-    if (!NT_SUCCESS(status)) {
-        RtlSecureZeroMemory(inBase, requestWireLength);
-        return status;
-    }
-
-    // DIAGNOSTIC: dump the first bytes of the digest-signed wire message
-    // (header_size, digest, version, and the start of the body) exactly as
-    // it sits in the OOL_IN buffer right before we hand it to SEP. This is
-    // erased by RtlSecureZeroMemory a few lines below, so this is the only
-    // point we can compare it against a hand-decoded expectation later.
-    // Not a privacy concern: this operation (GetCapabilities) carries no
-    // secret material - keybag/unlock operations are logged at this same
-    // point too, but those wire bytes include a caller-supplied secret in
-    // the body, so do not extend this dump past T2_AKS_V2_WIRE_SIZE there.
-    T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-        "T2TouchIdTransport: AKS wire header_size=0x%x digest0..3=%02x%02x%02x%02x version=%u "
-        "requestWireLength=%Iu bodyLength=%Iu\n",
-        *(UINT32*)inBase, inBase[4], inBase[5], inBase[6], inBase[7],
-        header.V1.Version, requestWireLength, RequestLength));
+    // Ensure host writes to the OOL_IN buffer are visible to SEP DMA
+    // (common-buffer memory may be write-back cached on some platforms).
+    // Full fence so the digest and body stores are ordered before the
+    // mailbox doorbell write that follows in T2SepAksTransaction.
+    KeMemoryBarrier();
 
     // VERIFIED FROM SOURCE: transaction is a free-running byte counter that
     // skips 0 (0 is reserved / never a valid transaction id on this path).
@@ -225,22 +286,23 @@ T2AksExchange(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
         return status;
     }
 
-    // VERIFIED FROM SOURCE bounds: reply_length must be at least a bare V2
-    // wire header and never exceed the physical OOL buffer size.
-    if (replyWireLength < T2_AKS_V2_WIRE_SIZE || replyWireLength > T2_SEP_OOL_SIZE) {
+    // Accept either V1 or V2 reply header (Linux probe uses V1 for capabilities;
+    // the general ioctl path uses V2). Minimum size is the smaller of the two.
+    if (replyWireLength < T2_AKS_V1_WIRE_SIZE || replyWireLength > T2_SEP_OOL_SIZE) {
         T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
             "T2TouchIdTransport: AKS reply rejected - replyWireLength=%u out of bounds "
-            "(expect >=%u, <=%u)\n", replyWireLength, (UINT32)T2_AKS_V2_WIRE_SIZE, T2_SEP_OOL_SIZE));
+            "(expect >=%u, <=%u)\n", replyWireLength, (UINT32)T2_AKS_V1_WIRE_SIZE, T2_SEP_OOL_SIZE));
         return STATUS_DEVICE_PROTOCOL_ERROR;
     }
 
     RtlCopyMemory(&replyHeaderSize, outBase, sizeof(UINT32));
     RtlCopyMemory(&replyVersion, outBase + sizeof(UINT32) + 16, sizeof(UINT32));
-    if (replyHeaderSize != T2_AKS_HEADER_V2_SIZE || replyVersion != T2_AKS_VERSION_V2) {
+    if (!((replyHeaderSize == T2_AKS_HEADER_V2_SIZE && replyVersion == T2_AKS_VERSION_V2) ||
+          (replyHeaderSize == T2_AKS_HEADER_V1_SIZE && replyVersion == T2_AKS_VERSION_V1))) {
         T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-            "T2TouchIdTransport: AKS reply rejected - replyHeaderSize=0x%x (want 0x%x) "
-            "replyVersion=%u (want %u)\n",
-            replyHeaderSize, T2_AKS_HEADER_V2_SIZE, replyVersion, T2_AKS_VERSION_V2));
+            "T2TouchIdTransport: AKS reply rejected - replyHeaderSize=0x%x replyVersion=%u "
+            "(expected V1 0x%x or V2 0x%x)\n",
+            replyHeaderSize, replyVersion, T2_AKS_HEADER_V1_SIZE, T2_AKS_HEADER_V2_SIZE));
         return STATUS_DEVICE_PROTOCOL_ERROR;
     }
 
@@ -267,20 +329,18 @@ T2AksExchange(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
         return status;
     }
 
-    // Only now — after header + digest validation — is it safe to trust
-    // the reply's own claimed length to compute the body size. This
-    // replaces the previous bug where body length was derived purely from
-    // the CALLER's ResponseCapacity, independent of what the device
-    // actually reported.
+    // Body starts after the wire header that matches the reply version.
     {
-        SIZE_T bodyLen = replyWireLength - T2_AKS_V2_WIRE_SIZE;
+        SIZE_T wireHeaderSize = (replyVersion == T2_AKS_VERSION_V1)
+            ? T2_AKS_V1_WIRE_SIZE : T2_AKS_V2_WIRE_SIZE;
+        SIZE_T bodyLen = replyWireLength - wireHeaderSize;
         if (bodyLen > ResponseCapacity) {
             // VERIFIED FROM SOURCE: the Linux ioctl handler returns -ENOSPC
             // in this situation rather than silently truncating.
             return STATUS_BUFFER_TOO_SMALL;
         }
         if (bodyLen > 0 && ResponseBody != NULL) {
-            RtlCopyMemory(ResponseBody, outBase + T2_AKS_V2_WIRE_SIZE, bodyLen);
+            RtlCopyMemory(ResponseBody, outBase + wireHeaderSize, bodyLen);
         }
         *ResponseLength = bodyLen;
     }
