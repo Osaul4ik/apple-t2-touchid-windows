@@ -184,8 +184,28 @@ typedef struct _T2_DEVICE_CONTEXT
     // correct IOMMU/bus address; after writing OOL_IN we clflush so SEP
     // DMA sees the host stores (write-back cache).
     BOOLEAN              OolRegisterAttempted;  // diagnostic only - NOT used to gate retry, see State
-    BOOLEAN              OolInRegistered;
-    BOOLEAN              OolOutRegistered;
+    BOOLEAN              OolInRegistered;       // SET_OOL_IN *confirmed* (reply matched, result 0)
+    BOOLEAN              OolOutRegistered;      // SET_OOL_OUT *confirmed* (reply matched, result 0)
+    // Lifecycle hardening: a fact independent of OolInRegistered/
+    // OolOutRegistered/State. Those three only become TRUE once we have a
+    // *confirmed* reply from SEP - but T2MailboxSend can succeed (the
+    // doorbell is rung, the message has physically left for SEP) and the
+    // matching T2SepControl can still return failure afterward (its own
+    // reply wait timed out, an unrelated message pushed it past
+    // T2_SEP_MAX_SKIPPED_REPLIES, etc). In that case OolInRegistered/
+    // OolOutRegistered stay FALSE - but SEP may already have received and
+    // acted on the address, so it is NOT actually safe to free the buffer
+    // and retry with a fresh allocation the way a "never sent" failure is.
+    // OolSepMayKnowAddress is set TRUE the instant either SET_OOL_IN or
+    // SET_OOL_OUT is successfully handed to the mailbox hardware (see
+    // T2SepControl's SentToDevice out-param), and — like OolInRegistered —
+    // is permanent for this device context: no deregistration opcode
+    // exists, so once SEP might know an address, it might know it forever
+    // (until reboot). T2DmaFreeOolBuffers refuses to run while this is
+    // TRUE; PrepareHardware/ReleaseHardware/RegisterOol all treat it the
+    // same way they already treat OolInRegistered/OolOutRegistered - fold
+    // it into every "was OOL ever exposed to SEP" check alongside them.
+    BOOLEAN              OolSepMayKnowAddress;
     WDFDMAENABLER        DmaEnabler;
     WDFCOMMONBUFFER      OolInBuffer;
     WDFCOMMONBUFFER      OolOutBuffer;
@@ -225,8 +245,15 @@ VOID T2SetTransportState(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ T2_TRANSPORT_STATE Ne
 NTSTATUS T2MailboxWaitOutbox(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ ULONG TimeoutUs);
 NTSTATUS T2MailboxSend(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ const T2_SEP_MESSAGE *Message);
 NTSTATUS T2MailboxReceive(_In_ PT2_DEVICE_CONTEXT Ctx, _Out_ T2_SEP_MESSAGE *Message, _In_ ULONG TimeoutUs);
+// SentToDevice (optional): set to TRUE the moment T2MailboxSend for this
+// control message succeeds - i.e. the message was physically handed to the
+// mailbox hardware - regardless of what happens afterward (reply timeout,
+// skipped-message overflow, SEP-reported error). Callers that must never
+// treat a "not confirmed" failure as "never sent" (see OolSepMayKnowAddress
+// in driver.h) check this instead of/in addition to the return status.
 NTSTATUS T2SepControl(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Opcode, _In_ UINT8 Tag,
-                       _In_ PHYSICAL_ADDRESS Dma, _In_ SIZE_T Size);
+                       _In_ PHYSICAL_ADDRESS Dma, _In_ SIZE_T Size,
+                       _Out_opt_ PBOOLEAN SentToDevice);
 
 // EP7 (AppleKeyStore) transaction primitive. VERIFIED FROM SOURCE
 // (t2_sep_transport.c, t2_aks_exchange_locked): this is a DIFFERENT wire

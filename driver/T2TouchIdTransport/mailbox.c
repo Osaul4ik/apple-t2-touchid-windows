@@ -153,12 +153,16 @@ T2MailboxReceive(_In_ PT2_DEVICE_CONTEXT Ctx, _Out_ T2_SEP_MESSAGE *Message, _In
 
 NTSTATUS
 T2SepControl(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Opcode, _In_ UINT8 Tag,
-             _In_ PHYSICAL_ADDRESS Dma, _In_ SIZE_T Size)
+             _In_ PHYSICAL_ADDRESS Dma, _In_ SIZE_T Size, _Out_opt_ PBOOLEAN SentToDevice)
 {
     T2_SEP_MESSAGE request = { 0 };
     T2_SEP_MESSAGE reply;
     ULONG skipped = 0;
     NTSTATUS status;
+
+    if (SentToDevice) {
+        *SentToDevice = FALSE;
+    }
 
     if ((Dma.QuadPart & (T2_SEP_DMA_ALIGNMENT - 1)) != 0) {
         return STATUS_INVALID_PARAMETER;
@@ -183,6 +187,14 @@ T2SepControl(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Opcode, _In_ UINT8 Tag,
     status = T2MailboxSend(Ctx, &request);
     if (!NT_SUCCESS(status)) {
         return status;
+    }
+
+    // The doorbell has now been rung: this message has physically left for
+    // SEP. Everything from here on (reply wait, skip counting, deadline) can
+    // still fail without that meaning SEP never saw it - report "sent" now,
+    // independent of whatever this function ends up returning.
+    if (SentToDevice) {
+        *SentToDevice = TRUE;
     }
 
     // Milestone 2B §9: overall wall-clock bound for this whole transaction,

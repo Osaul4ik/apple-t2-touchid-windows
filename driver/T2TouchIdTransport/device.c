@@ -265,6 +265,15 @@ T2EvtDeviceAdd(
     // T2EvtIoStop for why we acknowledge-and-let-finish rather than force
     // completion here.
     queueConfig.EvtIoStop = T2EvtIoStop;
+    // Lifecycle audit: no EvtIoResume is registered, and none is needed.
+    // EvtIoResume exists for drivers that hold a request across EvtIoStop
+    // and need to know when it is safe to act on it again; this driver
+    // never does that (see T2EvtIoStop) - the request stays exclusively
+    // owned by the thread already running its (possibly slow) handler,
+    // which completes it itself regardless of queue stop/resume state. The
+    // framework resumes dispatching *new* requests to this queue on its
+    // own once un-stopped; there is no in-flight, driver-held request state
+    // that a resume callback would need to react to.
 
     WDFQUEUE queue;
     status = WdfIoQueueCreate(device, &queueConfig, WDF_NO_OBJECT_ATTRIBUTES, &queue);
@@ -406,7 +415,7 @@ T2EvtDevicePrepareHardware(
     // the false-Ready/unsafe-retry situation §6/§7 rule out. Only a
     // context that never reached SEP can safely restart at HardwareReady.
     WdfWaitLockAcquire(ctx->ExchangeLock, NULL);
-    if (!ctx->OolInRegistered && !ctx->OolOutRegistered) {
+    if (!ctx->OolInRegistered && !ctx->OolOutRegistered && !ctx->OolSepMayKnowAddress) {
         T2SetTransportState(ctx, T2TransportHardwareReady);
     } else {
         T2SetTransportState(ctx, T2TransportInvalid);
@@ -444,7 +453,7 @@ T2EvtDeviceReleaseHardware(
     // or clear bus-mastering here. A reboot is required to actually free
     // that memory at the hardware level; leaking the WDF handles instead of
     // freeing live SEP-owned memory is the correct, deliberate choice.
-    BOOLEAN oolWasRegistered = ctx->OolInRegistered || ctx->OolOutRegistered;
+    BOOLEAN oolWasRegistered = ctx->OolInRegistered || ctx->OolOutRegistered || ctx->OolSepMayKnowAddress;
     if (oolWasRegistered) {
         T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
             "T2TouchIdTransport: retaining SEP-registered DMA memory until reboot\n"));
@@ -637,17 +646,22 @@ T2EvtIoDeviceControlRegisterOol(_In_ WDFREQUEST Request, _In_ PT2_DEVICE_CONTEXT
 
     if (NT_SUCCESS(status)) {
         T2SetTransportState(Ctx, T2TransportReady);
-    } else if (Ctx->OolInRegistered) {
-        // dma.c deliberately did NOT roll back here: SET_OOL_IN reached
-        // SEP before SET_OOL_OUT failed, so the buffer memory must be kept
-        // (§5/§7) - conservative terminal state, not retryable.
+    } else if (Ctx->OolInRegistered || Ctx->OolSepMayKnowAddress) {
+        // Terminal, not retryable. Ctx->OolInRegistered means SET_OOL_IN
+        // was *confirmed* before SET_OOL_OUT failed. Ctx->OolSepMayKnowAddress
+        // covers the wider case: SET_OOL_IN (or OUT) was handed to the
+        // mailbox hardware but its own confirmation never came back (reply
+        // timeout / skipped-message overflow) - OolInRegistered can still
+        // be FALSE here even though SEP may already hold the address. Both
+        // are treated identically: never free, never retry with a fresh
+        // allocation (§5/§7).
         T2SetTransportState(Ctx, T2TransportInvalid);
     } else {
-        // Failed before SEP ever saw anything (allocation failure, bus-
-        // master enable failure, or SET_OOL_IN itself failed) - dma.c
-        // already rolled back any partial allocation on the allocate path;
-        // free anything still outstanding from the register path and
-        // it's safe to retry.
+        // Genuinely failed before anything left this host for SEP
+        // (allocation failure, bus-master enable failure, or the mailbox
+        // send itself never went out) - dma.c already rolled back any
+        // partial allocation on the allocate path; free anything still
+        // outstanding from the register path and it's safe to retry.
         T2DmaFreeOolBuffers(Ctx);
         T2SetTransportState(Ctx, T2TransportHardwareReady);
     }

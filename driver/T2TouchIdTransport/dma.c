@@ -117,29 +117,45 @@ T2DmaRegisterOolBuffers(_In_ PT2_DEVICE_CONTEXT Ctx)
     }
 
     // Pass LOGICAL addresses to SEP — never system PA.
-    status = T2SepControl(Ctx, T2_SEP_CMSG_SET_OOL_IN, 1, Ctx->OolInPa, T2_SEP_OOL_SIZE);
+    BOOLEAN sentIn = FALSE;
+    status = T2SepControl(Ctx, T2_SEP_CMSG_SET_OOL_IN, 1, Ctx->OolInPa, T2_SEP_OOL_SIZE, &sentIn);
+    if (sentIn) {
+        // Sticky/permanent for this device context regardless of the
+        // outcome below - see OolSepMayKnowAddress in driver.h. The
+        // doorbell rang; SEP may already have the address even if the
+        // status check right below says this call "failed".
+        Ctx->OolSepMayKnowAddress = TRUE;
+    }
     if (!NT_SUCCESS(status)) {
         T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-            "T2TouchIdTransport: SET_OOL_IN failed, status=0x%x\n", status));
-        // Milestone 2B §5: SET_OOL_IN itself failed - SEP never
-        // acknowledged the address, still fully recoverable/retryable.
+            "T2TouchIdTransport: SET_OOL_IN failed, status=0x%x (sentToDevice=%d)\n",
+            status, sentIn));
+        // Milestone 2B §5: only genuinely safe to treat as fully
+        // recoverable/retryable when sentIn is FALSE (message never left
+        // this host - e.g. bus-master enable failed, or the outbox-full
+        // wait itself timed out before anything was written). If sentIn is
+        // TRUE, OolSepMayKnowAddress above is what now keeps this from
+        // being freed/retried even though OolInRegistered stays FALSE.
         return status;
     }
     Ctx->OolInRegistered = TRUE;
 
-    status = T2SepControl(Ctx, T2_SEP_CMSG_SET_OOL_OUT, 2, Ctx->OolOutPa, T2_SEP_OOL_SIZE);
+    BOOLEAN sentOut = FALSE;
+    status = T2SepControl(Ctx, T2_SEP_CMSG_SET_OOL_OUT, 2, Ctx->OolOutPa, T2_SEP_OOL_SIZE, &sentOut);
+    if (sentOut) {
+        Ctx->OolSepMayKnowAddress = TRUE;
+    }
     if (!NT_SUCCESS(status)) {
         T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
             "T2TouchIdTransport: OOL input registered but output "
-            "registration failed, status=0x%x; SEP now holds the OOL_IN "
-            "logical address (0x%llx) and no deregistration opcode exists "
-            "(Milestone 1 §3) - deliberately NOT freeing OolInBuffer/"
+            "registration failed, status=0x%x (sentToDevice=%d); SEP now holds "
+            "the OOL_IN logical address (0x%llx) and no deregistration opcode "
+            "exists (Milestone 1 §3) - deliberately NOT freeing OolInBuffer/"
             "DmaEnabler, this device context is now terminal until reboot\n",
-            status, Ctx->OolInPa.QuadPart));
-        // Milestone 2B §5/§7: OolInRegistered is left TRUE on purpose - it
-        // is the signal device.c uses to land in the Invalid (not
-        // HardwareReady-retryable) state rather than freeing live
-        // SEP-owned memory.
+            status, sentOut, Ctx->OolInPa.QuadPart));
+        // Milestone 2B §5/§7: OolInRegistered (confirmed) and
+        // OolSepMayKnowAddress (set above, unconditionally sticky) both
+        // independently keep device.c from treating this as retryable.
         return status;
     }
     Ctx->OolOutRegistered = TRUE;
@@ -154,6 +170,19 @@ T2DmaRegisterOolBuffers(_In_ PT2_DEVICE_CONTEXT Ctx)
 VOID
 T2DmaFreeOolBuffers(_In_ PT2_DEVICE_CONTEXT Ctx)
 {
+    // Defense-in-depth: every call site is expected to have already
+    // checked OolSepMayKnowAddress (see driver.h) before calling this, but
+    // refuse here too rather than trust that every future call site gets
+    // it right. Freeing this memory while SEP might still land a DMA write
+    // into the OOL_IN/OOL_OUT logical address would hand that physical
+    // memory to something else while SEP could still be writing to it.
+    if (Ctx->OolSepMayKnowAddress) {
+        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "T2TouchIdTransport: T2DmaFreeOolBuffers called while "
+            "OolSepMayKnowAddress is set - refusing to free (bug at call site)\n"));
+        return;
+    }
+
     if (Ctx->OolOutBuffer) {
         WdfObjectDelete(Ctx->OolOutBuffer);
         Ctx->OolOutBuffer = NULL;

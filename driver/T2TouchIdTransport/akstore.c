@@ -232,9 +232,9 @@ T2AksExchange(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
     // about in T2DmaRegisterOolBuffers (WDF logical address).
     T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
         "T2TouchIdTransport: AKS exchange using OolIn phys=0x%llx OolOut phys=0x%llx "
-        "(InRegistered=%d OutRegistered=%d WDF-logical)\n",
+        "(InRegistered=%d OutRegistered=%d SepMayKnowAddress=%d WDF-logical)\n",
         Ctx->OolInPa.QuadPart, Ctx->OolOutPa.QuadPart,
-        Ctx->OolInRegistered, Ctx->OolOutRegistered));
+        Ctx->OolInRegistered, Ctx->OolOutRegistered, Ctx->OolSepMayKnowAddress));
 
     RtlZeroMemory(inBase, T2_SEP_OOL_SIZE);
     RtlZeroMemory(outBase, T2_SEP_OOL_SIZE);
