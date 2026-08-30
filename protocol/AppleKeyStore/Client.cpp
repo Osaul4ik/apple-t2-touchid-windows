@@ -74,19 +74,20 @@ AksResult Client::RegisterOol() {
 
 AksResult Client::Exchange(uint8_t operation, const std::vector<uint8_t>& request,
                             std::vector<uint8_t>* response) {
-    T2_AKS_EXCHANGE ex{};
-    ex.Operation = operation;
-    ex.RequestBuffer = reinterpret_cast<UINT64>(request.empty() ? nullptr : request.data());
-    ex.RequestLength = static_cast<UINT32>(request.size());
+    std::vector<uint8_t> in(sizeof(T2_AKS_EXCHANGE_IN) + request.size(), 0);
+    auto* inHeader = reinterpret_cast<T2_AKS_EXCHANGE_IN*>(in.data());
+    inHeader->Operation = operation;
+    if (!request.empty()) {
+        std::memcpy(in.data() + sizeof(T2_AKS_EXCHANGE_IN), request.data(), request.size());
+    }
 
-    std::vector<uint8_t> responseBuf(4096); // local cap; response.resize() below to actual length
-    ex.ResponseBuffer = reinterpret_cast<UINT64>(responseBuf.data());
-    ex.ResponseCapacity = static_cast<UINT32>(responseBuf.size());
+    constexpr size_t kResponseBodyCap = 4096; // local cap; response resized to actual length below
+    std::vector<uint8_t> out(sizeof(T2_AKS_EXCHANGE_OUT) + kResponseBodyCap, 0);
 
     DWORD returned = 0;
-    T2_AKS_EXCHANGE outEx{};
-    BOOL ok = DeviceIoControl(handle_, IOCTL_T2_AKS_EXCHANGE, &ex, sizeof(ex),
-        &outEx, sizeof(outEx), &returned, nullptr);
+    BOOL ok = DeviceIoControl(handle_, IOCTL_T2_AKS_EXCHANGE,
+        in.data(), static_cast<DWORD>(in.size()),
+        out.data(), static_cast<DWORD>(out.size()), &returned, nullptr);
     if (!ok) {
         DWORD err = GetLastError();
         if (err == ERROR_ACCESS_DENIED) return AksResult::AccessDenied;
@@ -94,8 +95,14 @@ AksResult Client::Exchange(uint8_t operation, const std::vector<uint8_t>& reques
         return AksResult::IoError;
     }
 
-    responseBuf.resize(outEx.ResponseLength);
-    *response = responseBuf;
+    auto* outHeader = reinterpret_cast<const T2_AKS_EXCHANGE_OUT*>(out.data());
+    size_t responseLength = outHeader->ResponseLength;
+    if (sizeof(T2_AKS_EXCHANGE_OUT) + responseLength > out.size()) {
+        return AksResult::IoError; // defensive: driver must never claim more than our capacity
+    }
+
+    response->assign(out.begin() + sizeof(T2_AKS_EXCHANGE_OUT),
+                      out.begin() + sizeof(T2_AKS_EXCHANGE_OUT) + responseLength);
     return AksResult::Ok;
 }
 

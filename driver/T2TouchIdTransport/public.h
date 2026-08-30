@@ -30,16 +30,35 @@ typedef enum _T2_AKS_OPERATION
 } T2_AKS_OPERATION;
 
 #pragma pack(push, 1)
-typedef struct _T2_AKS_EXCHANGE
+// IOCTL_T2_AKS_EXCHANGE is METHOD_BUFFERED: the request body and response
+// body travel INLINE, immediately after these fixed headers, inside the
+// same buffer the I/O manager already validated and copied to/from
+// user-mode. Earlier revisions carried RequestBuffer/ResponseBuffer as raw
+// user-mode VAs inside the struct and had the driver ProbeForRead/
+// ProbeForWrite + RtlCopyMemory them directly - that is only safe if the
+// I/O request is serviced on the calling thread in the calling process's
+// context, which KMDF does not guarantee (a request can be requeued and
+// completed from a system worker thread, e.g. if the queue is briefly busy
+// or the device is mid PnP/power transition). Doing so would probe/copy
+// against the WRONG process's address space: an arbitrary kernel-mode
+// read/write primitive driven by a user-supplied pointer. Passing the
+// payload inline removes the raw pointers entirely - there is nothing left
+// to mis-dereference.
+typedef struct _T2_AKS_EXCHANGE_IN
 {
     UINT8   Operation;          // one of T2_AKS_OPERATION; anything else -> STATUS_ACCESS_DENIED
     UINT8   Reserved0[7];       // must be zero
-    UINT64  RequestBuffer;      // user VA, in
-    UINT32  RequestLength;      // <= T2_AKS_MAX_BODY_SIZE
-    UINT64  ResponseBuffer;     // user VA, out
-    UINT32  ResponseCapacity;   // <= T2_AKS_MAX_BODY_SIZE
-    UINT32  ResponseLength;     // out: actual bytes written
-} T2_AKS_EXCHANGE, *PT2_AKS_EXCHANGE;
+    // Request body follows immediately; its length is
+    // (InputBufferLength - sizeof(T2_AKS_EXCHANGE_IN)), max T2_AKS_MAX_BODY_SIZE.
+} T2_AKS_EXCHANGE_IN, *PT2_AKS_EXCHANGE_IN;
+
+typedef struct _T2_AKS_EXCHANGE_OUT
+{
+    UINT32  ResponseLength;     // out: actual response body bytes written after this header
+    // Response body follows immediately; caller must size OutputBufferLength
+    // to sizeof(T2_AKS_EXCHANGE_OUT) + however many bytes it wants to receive
+    // (max T2_AKS_MAX_BODY_SIZE).
+} T2_AKS_EXCHANGE_OUT, *PT2_AKS_EXCHANGE_OUT;
 #pragma pack(pop)
 
 typedef struct _T2_TRANSPORT_STATUS

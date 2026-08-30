@@ -115,7 +115,13 @@ T2SepControl(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Opcode, _In_ UINT8 Tag,
             return status;
         }
 
-        UINT8 endpoint = (UINT8)(reply.Word[0] & 0x1f);
+        // Endpoint occupies the full low byte (tag<<8 begins immediately
+        // after it in the wire layout above) — mask 0xff, matching the
+        // equivalent parse in T2SepAksTransaction below. Do not narrow this
+        // to 0x1f: that would fold any garbage/unrelated queued message
+        // whose low byte happens to be e.g. 0x20 or 0xE0 into "endpoint 0"
+        // and misroute it as our own reply.
+        UINT8 endpoint = (UINT8)(reply.Word[0] & 0xff);
         UINT8 replyTag = (UINT8)((reply.Word[0] >> 8) & 0xff);
         if (endpoint == T2_SEP_CONTROL_ENDPOINT && replyTag == Tag) {
             break;

@@ -308,21 +308,43 @@ T2EvtIoDeviceControl(
     }
 }
 
+// Payload travels inline in the METHOD_BUFFERED request/response buffers
+// (see public.h for why: passing raw user VAs inside the struct and
+// probing them here would only be safe if this callback always ran on the
+// calling thread in the calling process's context, which KMDF does not
+// guarantee). WdfRequestRetrieveInputBuffer/RetrieveOutputBuffer hand back
+// pointers into a buffer the I/O manager already copied to/from user-mode
+// for us, in the correct process context, before this callback ever runs -
+// no ProbeForRead/ProbeForWrite or __try/except needed for that part.
 static VOID
 T2EvtIoDeviceControlAksExchange(_In_ WDFREQUEST Request, _In_ PT2_DEVICE_CONTEXT Ctx)
 {
     NTSTATUS status;
-    PT2_AKS_EXCHANGE exchange;
-    size_t len;
+    PT2_AKS_EXCHANGE_IN in;
+    PT2_AKS_EXCHANGE_OUT out;
+    size_t inLen = 0;
+    size_t outLen = 0;
+    SIZE_T requestLength;
+    SIZE_T responseCapacity;
+    SIZE_T responseLength = 0;
+    UINT8 operation;
     PUCHAR requestBody = NULL;
     PUCHAR responseBody = NULL;
-    SIZE_T responseLength = 0;
 
-    status = WdfRequestRetrieveInputBuffer(Request, sizeof(*exchange), (PVOID*)&exchange, &len);
+    status = WdfRequestRetrieveInputBuffer(Request, sizeof(*in), (PVOID*)&in, &inLen);
     if (!NT_SUCCESS(status)) {
         WdfRequestComplete(Request, status);
         return;
     }
+    requestLength = inLen - sizeof(*in);
+
+    status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*out), (PVOID*)&out, &outLen);
+    if (!NT_SUCCESS(status)) {
+        WdfRequestComplete(Request, status);
+        return;
+    }
+    responseCapacity = outLen - sizeof(*out);
+    operation = in->Operation;
 
     if (!Ctx->OolInRegistered || !Ctx->OolOutRegistered) {
         WdfRequestComplete(Request, STATUS_DEVICE_NOT_READY);
@@ -333,37 +355,31 @@ T2EvtIoDeviceControlAksExchange(_In_ WDFREQUEST Request, _In_ PT2_DEVICE_CONTEXT
     // enum implies the caller validated. This is the actual security
     // boundary (Milestone 2, section 25: "No generic arbitrary AKS opcode
     // execution").
-    if (!T2AksOperationAllowed(exchange->Operation)) {
+    if (!T2AksOperationAllowed(operation)) {
         WdfRequestComplete(Request, STATUS_ACCESS_DENIED);
         return;
     }
 
-    if (exchange->RequestLength > T2_AKS_MAX_BODY_SIZE ||
-        exchange->ResponseCapacity > T2_AKS_MAX_BODY_SIZE) {
+    if (requestLength > T2_AKS_MAX_BODY_SIZE || responseCapacity > T2_AKS_MAX_BODY_SIZE) {
         WdfRequestComplete(Request, STATUS_INVALID_BUFFER_SIZE);
         return;
     }
 
-    if (exchange->RequestLength > 0) {
-        requestBody = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED,
-            exchange->RequestLength, 'qeRT');
+    // For METHOD_BUFFERED, `in` and `out` alias the SAME system buffer, so
+    // the request body must be copied out to a scratch allocation before
+    // anything below writes into `out` - otherwise we'd clobber the still
+    // -unread request body in place.
+    if (requestLength > 0) {
+        requestBody = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED, requestLength, 'qeRT');
         if (requestBody == NULL) {
             WdfRequestComplete(Request, STATUS_INSUFFICIENT_RESOURCES);
             return;
         }
-        __try {
-            ProbeForRead((PVOID)(ULONG_PTR)exchange->RequestBuffer, exchange->RequestLength, 1);
-            RtlCopyMemory(requestBody, (PVOID)(ULONG_PTR)exchange->RequestBuffer, exchange->RequestLength);
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            ExFreePoolWithTag(requestBody, 'qeRT');
-            WdfRequestComplete(Request, STATUS_ACCESS_VIOLATION);
-            return;
-        }
+        RtlCopyMemory(requestBody, (PUCHAR)in + sizeof(*in), requestLength);
     }
 
-    if (exchange->ResponseCapacity > 0) {
-        responseBody = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED,
-            exchange->ResponseCapacity, 'peRT');
+    if (responseCapacity > 0) {
+        responseBody = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED, responseCapacity, 'peRT');
         if (responseBody == NULL) {
             if (requestBody) ExFreePoolWithTag(requestBody, 'qeRT');
             WdfRequestComplete(Request, STATUS_INSUFFICIENT_RESOURCES);
@@ -372,37 +388,32 @@ T2EvtIoDeviceControlAksExchange(_In_ WDFREQUEST Request, _In_ PT2_DEVICE_CONTEXT
     }
 
     WdfWaitLockAcquire(Ctx->ExchangeLock, NULL);
-    status = T2AksExchange(Ctx, exchange->Operation, requestBody, exchange->RequestLength,
-        responseBody, exchange->ResponseCapacity, &responseLength);
+    status = T2AksExchange(Ctx, operation, requestBody, requestLength,
+        responseBody, responseCapacity, &responseLength);
     WdfWaitLockRelease(Ctx->ExchangeLock);
 
     if (requestBody) {
-        RtlSecureZeroMemory(requestBody, exchange->RequestLength);
+        RtlSecureZeroMemory(requestBody, requestLength);
         ExFreePoolWithTag(requestBody, 'qeRT');
     }
 
-    if (NT_SUCCESS(status) && responseLength > 0) {
-        __try {
-            ProbeForWrite((PVOID)(ULONG_PTR)exchange->ResponseBuffer, (ULONG)responseLength, 1);
-            RtlCopyMemory((PVOID)(ULONG_PTR)exchange->ResponseBuffer, responseBody, responseLength);
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            status = STATUS_ACCESS_VIOLATION;
+    if (NT_SUCCESS(status)) {
+        // Safe: T2AksExchange already bounds-checked responseLength against
+        // the responseCapacity we gave it (<= outLen - sizeof(*out)).
+        if (responseLength > 0) {
+            RtlCopyMemory((PUCHAR)out + sizeof(*out), responseBody, responseLength);
         }
+        out->ResponseLength = (UINT32)responseLength;
     }
 
     if (responseBody) {
-        RtlSecureZeroMemory(responseBody, exchange->ResponseCapacity);
+        RtlSecureZeroMemory(responseBody, responseCapacity);
         ExFreePoolWithTag(responseBody, 'peRT');
     }
 
     if (NT_SUCCESS(status)) {
-        PT2_AKS_EXCHANGE outExchange;
-        size_t outLen;
-        if (NT_SUCCESS(WdfRequestRetrieveOutputBuffer(Request, sizeof(*outExchange), (PVOID*)&outExchange, &outLen))) {
-            outExchange->ResponseLength = (UINT32)responseLength;
-            WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, sizeof(*outExchange));
-            return;
-        }
+        WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, sizeof(*out) + responseLength);
+        return;
     }
 
     WdfRequestComplete(Request, status);
