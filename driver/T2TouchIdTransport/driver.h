@@ -130,15 +130,18 @@ typedef struct _T2_DEVICE_CONTEXT
     BOOLEAN              Bar4Mapped;
 
     // Bus-mastering / DMA — only touched after IOCTL_T2_REGISTER_OOL.
-    // Allocated via MmAllocateContiguousMemorySpecifyCache(MmNonCached) so
-    // SEP DMA always sees host writes (write-back WDF common buffers were
-    // the leading cause of silent EP7 timeouts after correct wire layout).
+    // WDF common buffers with AddressWidthOverride=32 give the device the
+    // correct IOMMU/bus address; after writing OOL_IN we clflush so SEP
+    // DMA sees the host stores (write-back cache).
     BOOLEAN              OolRegisterAttempted;
     BOOLEAN              OolInRegistered;
     BOOLEAN              OolOutRegistered;
-    PVOID                OolInVa;
+    WDFDMAENABLER        DmaEnabler;
+    WDFCOMMONBUFFER      OolInBuffer;
+    WDFCOMMONBUFFER      OolOutBuffer;
+    PVOID                OolInVa;   // VA from common buffer
     PVOID                OolOutVa;
-    PHYSICAL_ADDRESS     OolInPa;
+    PHYSICAL_ADDRESS     OolInPa;   // logical/bus address for SEP
     PHYSICAL_ADDRESS     OolOutPa;
 
     // Serializes mailbox + AKS exchange; the mailbox is a single shared

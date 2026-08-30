@@ -24,6 +24,7 @@
 // future caller without relying on the IOCTL layer alone.
 
 #include "driver.h"
+#include <intrin.h>
 #include <bcrypt.h>
 
 BOOLEAN
@@ -143,6 +144,25 @@ T2AksDumpWire(_In_reads_bytes_(Length) PUCHAR Message, _In_ SIZE_T Length, _In_ 
     }
 }
 
+
+// Flush CPU write-back caches for [Va, Va+Length) so device DMA sees the
+// data. Common-buffer memory is WB; without this SEP may read stale zeros.
+// Uses clflush (x86/x64); KeMemoryBarrier alone is not sufficient.
+static VOID
+T2AksFlushForDevice(_In_reads_bytes_(Length) PVOID Va, _In_ SIZE_T Length)
+{
+    PUCHAR p = (PUCHAR)Va;
+    PUCHAR end = p + Length;
+    // Align down to cache line; clflush works on any address in the line.
+    p = (PUCHAR)((ULONG_PTR)p & ~(ULONG_PTR)63);
+    while (p < end) {
+        _mm_clflush(p);
+        p += 64;
+    }
+    _mm_mfence();
+    KeMemoryBarrier();
+}
+
 static VOID
 T2AksBuildHeaderV2(_Out_ PT2_AKS_HEADER_V2 Header)
 {
@@ -238,11 +258,8 @@ T2AksExchange(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
         T2AksDumpWire(inBase, requestWireLength, T2_AKS_V2_WIRE_SIZE);
     }
 
-    // Ensure host writes to the OOL_IN buffer are visible to SEP DMA
-    // (common-buffer memory may be write-back cached on some platforms).
-    // Full fence so the digest and body stores are ordered before the
-    // mailbox doorbell write that follows in T2SepAksTransaction.
-    KeMemoryBarrier();
+    // CPU -> device: flush WB cache lines so SEP DMA reads the wire we built.
+    T2AksFlushForDevice(inBase, requestWireLength);
 
     // VERIFIED FROM SOURCE: transaction is a free-running byte counter that
     // skips 0 (0 is reserved / never a valid transaction id on this path).
@@ -257,6 +274,9 @@ T2AksExchange(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
     if (!NT_SUCCESS(status)) {
         return status;
     }
+
+    // Device -> CPU: invalidate cache so we observe SEP's write to OOL_OUT.
+    T2AksFlushForDevice(outBase, T2_SEP_OOL_SIZE);
 
     // Accept either V1 or V2 reply header (Linux probe uses V1 for capabilities;
     // the general ioctl path uses V2). Minimum size is the smaller of the two.
