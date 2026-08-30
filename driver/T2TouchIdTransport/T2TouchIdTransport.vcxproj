@@ -68,8 +68,14 @@
       <!-- akstore.c calls BCryptOpenAlgorithmProvider/BCryptCreateHash/etc
            (kernel-mode CNG, SHA-256 digest for the AKS wire header). Those
            ship in ksecdd.sys; drivers link against Ksecdd.lib for them,
-           not Bcrypt.lib (that's the user-mode CNG import lib). -->
-      <AdditionalDependencies>Ksecdd.lib;%(AdditionalDependencies)</AdditionalDependencies>
+           not Bcrypt.lib (that's the user-mode CNG import lib).
+
+           device.c references SDDL_DEVOBJ_SYS_ALL_ADM_ALL, which is
+           declared extern in wdmsec.h but only actually defined in
+           wdmsec.lib (a separate WDK security-descriptor helper import
+           lib, not pulled in automatically) - link it or the string
+           symbol is unresolved at link time. -->
+      <AdditionalDependencies>Ksecdd.lib;wdmsec.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <DriverSign>
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
