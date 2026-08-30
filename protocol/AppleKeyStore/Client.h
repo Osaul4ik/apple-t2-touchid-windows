@@ -39,6 +39,10 @@ public:
     AksResult MakeSystemKeybag(int32_t handle, int32_t specialUserBag);
     AksResult Unlock(int32_t handle, std::vector<uint8_t>& secretUtf8 /* zeroed on return */);
     AksResult GetCapabilities(uint64_t selector, uint64_t* outValue);
+    // Differential test vs capabilities: same V2 transport, op 0x19.
+    // body = [result:u32=0][handle:u64][selector:u32] (20 bytes).
+    AksResult GetDeviceState(int64_t handle, uint32_t selector,
+                            std::vector<uint8_t>* responseBody);
 
     ~Client() { Close(); }
 

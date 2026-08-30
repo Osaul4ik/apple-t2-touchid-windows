@@ -221,4 +221,24 @@ AksResult Client::GetCapabilities(uint64_t selector, uint64_t* outValue) {
     return AksResult::Ok;
 }
 
+
+AksResult Client::GetDeviceState(int64_t handle, uint32_t selector,
+                                 std::vector<uint8_t>* responseBody) {
+    // VERIFIED FROM SOURCE (t2-aks-tool.c get_device_state): 20-byte request
+    // [result:u32le=0][handle:u64le][selector:u32le]. Same V2 transport as
+    // every other allow-listed op — useful differential vs 0x4d.
+    std::vector<uint8_t> req(20, 0);
+    uint32_t resultField = 0;
+    uint64_t handleU = static_cast<uint64_t>(handle);
+    std::memcpy(req.data() + 0, &resultField, 4);
+    std::memcpy(req.data() + 4, &handleU, 8);
+    std::memcpy(req.data() + 12, &selector, 4);
+
+    std::vector<uint8_t> response;
+    AksResult r = Exchange(static_cast<uint8_t>(T2AksOpGetDeviceState), req, &response);
+    if (r != AksResult::Ok) return r;
+    if (responseBody) *responseBody = std::move(response);
+    return AksResult::Ok;
+}
+
 } // namespace t2::applekeystore

@@ -252,7 +252,7 @@ T2AksExchange(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
         *(UINT32*)inBase, inBase[4], inBase[5], inBase[6], inBase[7],
         header.V1.Version, requestWireLength, RequestLength));
     // Full dump for capabilities (no secrets); header-only otherwise.
-    if (Operation == T2AksOpGetCapabilities) {
+    if (Operation == T2AksOpGetCapabilities || Operation == T2AksOpGetDeviceState) {
         T2AksDumpWire(inBase, requestWireLength, 128);
     } else {
         T2AksDumpWire(inBase, requestWireLength, T2_AKS_V2_WIRE_SIZE);

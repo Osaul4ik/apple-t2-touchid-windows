@@ -184,9 +184,33 @@ static int CmdUnlock(Client& client, int32_t handle) {
     return 0;
 }
 
+
+static int CmdDeviceState(Client& client, int64_t handle, uint32_t selector) {
+    std::vector<uint8_t> response;
+    AksResult r = client.GetDeviceState(handle, selector, &response);
+    if (r == AksResult::NotReady) {
+        std::wcout << L"device-state failed: DMA / OOL is not registered; run register-ool first\n";
+        return 1;
+    }
+    if (r != AksResult::Ok) {
+        std::wcout << L"device-state failed (same timeout as capabilities implies EP7 dead)\n";
+        return 1;
+    }
+    std::wcout << L"device-state: OK, response_length=" << response.size();
+    if (response.size() >= 8) {
+        uint32_t status = 0, blobLen = 0;
+        std::memcpy(&status, response.data(), 4);
+        std::memcpy(&blobLen, response.data() + 4, 4);
+        std::wcout << L" status=0x" << std::hex << status
+                   << L" blob_length=" << std::dec << blobLen;
+    }
+    std::wcout << L"\n";
+    return 0;
+}
+
 int wmain(int argc, wchar_t* argv[]) {
     if (argc < 2) {
-        std::wcout << L"usage: t2touchid.exe <status|register-ool|capabilities|load-keybag|set-system-keybag|unlock|network|identities|verify>\n";
+        std::wcout << L"usage: t2touchid.exe <status|register-ool|capabilities|device-state|load-keybag|set-system-keybag|unlock|network|identities|verify>\n";
         return 1;
     }
 
@@ -201,6 +225,12 @@ int wmain(int argc, wchar_t* argv[]) {
     if (cmd == L"status") return CmdStatus(client);
     if (cmd == L"register-ool") return CmdRegisterOol(client);
     if (cmd == L"capabilities") return CmdCapabilities(client);
+    if (cmd == L"device-state") {
+        // Default handle=0 selector=0 — pure EP7 liveness probe.
+        int64_t handle = (argc >= 3) ? _wtoi64(argv[2]) : 0;
+        uint32_t selector = (argc >= 4) ? static_cast<uint32_t>(_wtoi(argv[3])) : 0;
+        return CmdDeviceState(client, handle, selector);
+    }
     if (cmd == L"load-keybag") {
         if (argc < 3) {
             std::wcout << L"usage: load-keybag <keybag-file>\n";
