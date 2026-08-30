@@ -87,9 +87,21 @@
     <ClInclude Include="public.h" />
   </ItemGroup>
   <ItemGroup>
-    <!-- Not auto-catalogued (no EnableInf2cat) - BuildT2TouchId.yml stamps
-         and runs Inf2Cat/signtool itself, same as the reference project. -->
-    <Inf Include="T2TouchIdTransport.inf" />
+    <!-- No <Inf> item here on purpose. Including the .inf as a project item
+         makes MSBuild's WindowsDriver.common.targets run Stampinf, then
+         InfVerif, automatically during this build - and that automatic
+         InfVerif invocation cannot be disabled via any project property
+         (Microsoft's own docs: "It is not possible to change that automatic
+         invocation"). It also requires the WDK's x86 InfVerif.dll to be
+         present regardless of the driver's own target platform (x64 here),
+         which is a known source of CI breakage when that specific x86
+         tool is missing from an otherwise-working WDK install.
+         BuildT2TouchId.yml already stamps (StampInf), catalogs (Inf2Cat),
+         and signs the .inf itself as separate workflow steps, over the
+         copy in the packaged output folder - same pattern as this org's
+         other driver project (AmtPtpDeviceUsbKm), which also keeps the
+         .inf out of the vcxproj for the same reason. Do not re-add this
+         item without re-adding a real x86 InfVerif.dll story for CI. -->
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

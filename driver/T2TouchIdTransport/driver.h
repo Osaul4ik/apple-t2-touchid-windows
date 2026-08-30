@@ -45,8 +45,14 @@
 #define T2_SEP_MAX_SKIPPED_REPLIES  32        // -> STATUS_DEVICE_PROTOCOL_ERROR beyond this
 
 // ---- AppleKeyStore header sizes (VERIFIED FROM SOURCE) ----
-#define T2_AKS_HEADER_V1            1
-#define T2_AKS_HEADER_V2            2
+// NOTE: these are intentionally named T2_AKS_VERSION_Vn, not T2_AKS_HEADER_Vn:
+// T2_AKS_HEADER_V1/V2 are the *struct* typedef names below. Reusing the same
+// name for a #define and a typedef is a preprocessor collision — the macro
+// expands first and silently corrupts the struct declaration (and every
+// PT2_AKS_HEADER_Vn use downstream), producing a cascade of unrelated-looking
+// C2059/C2118/C2148/C2369 errors. Do not rename these back.
+#define T2_AKS_VERSION_V1           1
+#define T2_AKS_VERSION_V2           2
 #define T2_AKS_HEADER_V1_SIZE       0x48u
 #define T2_AKS_HEADER_V2_SIZE       0x50u
 #define T2_AKS_CAP_REQ_SIZE         0x5Cu

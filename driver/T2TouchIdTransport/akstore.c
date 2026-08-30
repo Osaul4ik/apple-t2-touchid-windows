@@ -95,9 +95,9 @@ T2AksDigest(_Inout_updates_bytes_(Length) PUCHAR Message, _In_ SIZE_T Length)
     header = Message + sizeof(UINT32);
     RtlCopyMemory(&version, header + 16, sizeof(UINT32));
 
-    if ((version == T2_AKS_HEADER_V1 && headerSize != T2_AKS_HEADER_V1_SIZE) ||
-        (version == T2_AKS_HEADER_V2 && headerSize != T2_AKS_HEADER_V2_SIZE) ||
-        (version != T2_AKS_HEADER_V1 && version != T2_AKS_HEADER_V2) ||
+    if ((version == T2_AKS_VERSION_V1 && headerSize != T2_AKS_HEADER_V1_SIZE) ||
+        (version == T2_AKS_VERSION_V2 && headerSize != T2_AKS_HEADER_V2_SIZE) ||
+        (version != T2_AKS_VERSION_V1 && version != T2_AKS_VERSION_V2) ||
         (Length < sizeof(UINT32) + headerSize)) {
         return STATUS_INVALID_DEVICE_STATE;
     }
@@ -119,7 +119,7 @@ T2AksBuildHeaderV2(_Out_ PT2_AKS_HEADER_V2 Header)
     LARGE_INTEGER now;
     RtlZeroMemory(Header, sizeof(*Header));
     KeQuerySystemTimePrecise(&now);
-    Header->V1.Version = T2_AKS_HEADER_V2;
+    Header->V1.Version = T2_AKS_VERSION_V2;
     Header->V1.UsecTime = (UINT64)(now.QuadPart / 10); // 100ns -> us
     Header->CalendarSeconds = (UINT64)(now.QuadPart / 10000000);
 }
@@ -191,7 +191,7 @@ T2AksExchange(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
 
     RtlCopyMemory(&replyHeaderSize, outBase, sizeof(UINT32));
     RtlCopyMemory(&replyVersion, outBase + sizeof(UINT32) + 16, sizeof(UINT32));
-    if (replyHeaderSize != T2_AKS_HEADER_V2_SIZE || replyVersion != T2_AKS_HEADER_V2) {
+    if (replyHeaderSize != T2_AKS_HEADER_V2_SIZE || replyVersion != T2_AKS_VERSION_V2) {
         return STATUS_DEVICE_PROTOCOL_ERROR;
     }
 
