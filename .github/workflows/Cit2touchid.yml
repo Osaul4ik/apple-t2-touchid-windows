@@ -1,0 +1,631 @@
+name: CI T2TouchId (CodeQL + PREfast + StaticAnalysis + Build)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-t2touchid-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  SOLUTION: T2TouchId.sln
+  DRIVER_DIR: driver/T2TouchIdTransport
+  DRIVER_PROJECT: driver/T2TouchIdTransport/T2TouchIdTransport.vcxproj
+  DRIVER_NAME: T2TouchIdTransport
+  CONFIGURATION: Release
+  PLATFORM: x64
+  SIGN_CERT_PFX: ${{ secrets.CERT }}
+  SIGN_CERT_PASSWORD: ${{ secrets.CERT_PWD }}
+
+# ===========================================================================
+# Той самий принцип, що й у CI (CodeQL + StaticAnalysis + Build) для
+# AmtPtpDeviceUsbKm: один job, один раннер. CodeQL трасує саме той msbuild-
+# виклик, що будує T2TouchIdTransport.vcxproj (PREfast-прапори всередині
+# цього виклику), потім mustrun/mustfix аналіз бази - і лише якщо mustfix
+# чистий, job іде далі: білдиться решта солюшна (protocol/tools/tests,
+# яким потрібен vcpkg/libplist), ганяються тести, і той самий .sys що вже
+# лежить на диску - стемпається/підписується й пакується разом із SARIF-
+# звітами. Ніякого окремого білда "на підпис" - той самий бінарник.
+# ===========================================================================
+jobs:
+  ci:
+    name: CodeQL + PREfast + StaticAnalysis + Build + Package
+    runs-on: windows-2022
+    timeout-minutes: 75
+    permissions:
+      contents: read
+      security-events: write
+    env:
+      CODEQL_CLI_VERSION: 2.24.1
+      CODEQL_DRIVERS_PACK_VERSION: 1.8.2
+      CODEQL_CPP_QUERIES_PACK_VERSION: 0.0.4
+      CA_TREAT_WARNINGS_AS_ERRORS: true
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Add MSBuild to PATH
+      uses: microsoft/setup-msbuild@v2
+
+    # =====================================================================
+    # Official WDK installer - same fwlink/flow as the reference driver's
+    # CI. Avoids the choco windowsdriverkit11 package's missing x86
+    # InfVerif.dll gap that MSBuild's automatic INF-verification step
+    # needs.
+    # =====================================================================
+    - name: Install WDK
+      run: |
+        $ErrorActionPreference = "Stop"
+        $wdkUrl = "https://go.microsoft.com/fwlink/?linkid=2085767"
+        $wdkInstaller = "$env:TEMP\wdksetup.exe"
+        Invoke-WebRequest -Uri $wdkUrl -OutFile $wdkInstaller
+        $proc = Start-Process -FilePath $wdkInstaller -ArgumentList "/quiet /norestart" -Wait -PassThru
+        $exitCode = $proc.ExitCode
+        if ($exitCode -ne 0 -and $exitCode -ne 3010) {
+          Write-Error "WDK installer exited with code $exitCode"
+          exit 1
+        }
+        Write-Host "OK: WDK installer exited with code $exitCode"
+      shell: pwsh
+
+    - name: Verify WDK installation
+      run: |
+        $ErrorActionPreference = "Stop"
+        $roots = @(
+          "C:\Program Files (x86)\Windows Kits\10\bin",
+          "C:\Program Files\Windows Kits\10\bin"
+        )
+        $stampinf = foreach ($root in $roots) {
+          if (Test-Path $root) {
+            Get-ChildItem -Path $root -Filter "StampInf.exe" -Recurse -ErrorAction SilentlyContinue
+          }
+        }
+        if (-not $stampinf) {
+          Write-Error "WDK build tooling (StampInf.exe) not found anywhere under Windows Kits 10\bin after install."
+          exit 1
+        }
+        Write-Host "OK: found WDK build tooling, e.g. $($stampinf[0].FullName)"
+      shell: pwsh
+
+    # =====================================================================
+    # protocol/tools/tests are user-mode and need libplist
+    # (protocol/BridgeXpc/PlistPayload.cpp). Only classic-mode consumers
+    # (this repo builds via plain MSBuild, not CMake) need the actual .lib
+    # filename vcpkg produced, so it's discovered rather than guessed -
+    # same "locate, don't assume" pattern used for StampInf/Inf2Cat/
+    # signtool below. This step is only needed for the full-solution build
+    # after the driver-only CodeQL/PREfast pass; the driver project itself
+    # does not depend on vcpkg.
+    # =====================================================================
+    - name: Bootstrap vcpkg
+      run: |
+        $ErrorActionPreference = "Stop"
+        git clone --depth 1 https://github.com/microsoft/vcpkg.git vcpkg
+        .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+      shell: pwsh
+
+    - name: Install libplist (vcpkg)
+      run: |
+        $ErrorActionPreference = "Stop"
+        .\vcpkg\vcpkg.exe install libplist:x64-windows
+      shell: pwsh
+
+    - name: Locate libplist library file
+      run: |
+        $ErrorActionPreference = "Stop"
+        $libDir = "vcpkg\installed\x64-windows\lib"
+        $lib = Get-ChildItem -Path $libDir -Filter "*.lib" |
+          Where-Object { $_.Name -match "plist" -and $_.Name -notmatch "\+\+" } |
+          Select-Object -First 1
+
+        if (-not $lib) {
+          Write-Error "No plist .lib found under $libDir after vcpkg install."
+          exit 1
+        }
+
+        Write-Host "OK: found $($lib.Name)"
+        Add-Content -Path $env:GITHUB_ENV -Value "PLIST_LIB_NAME=$($lib.Name)"
+        Add-Content -Path $env:GITHUB_ENV -Value "VCPKG_INSTALLED_DIR=$PWD\vcpkg\installed\x64-windows"
+      shell: pwsh
+
+    - name: Download CodeQL CLI
+      run: |
+        $ErrorActionPreference = "Stop"
+        $url = "https://github.com/github/codeql-cli-binaries/releases/download/v$env:CODEQL_CLI_VERSION/codeql-win64.zip"
+        Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\codeql.zip"
+        Expand-Archive -Path "$env:TEMP\codeql.zip" -DestinationPath "$env:TEMP\codeql-home" -Force
+        $codeqlExe = Get-ChildItem -Path "$env:TEMP\codeql-home" -Filter "codeql.exe" -Recurse | Select-Object -First 1
+        if (-not $codeqlExe) {
+          Write-Error "codeql.exe not found after extraction."
+          exit 1
+        }
+        Add-Content -Path $env:GITHUB_ENV -Value "CODEQL_DIR=$($codeqlExe.DirectoryName)"
+      shell: pwsh
+
+    - name: Verify CodeQL install
+      run: |
+        & "$env:CODEQL_DIR\codeql.exe" --version
+      shell: pwsh
+
+    - name: Download windows-drivers query pack
+      run: |
+        $ErrorActionPreference = "Stop"
+        & "$env:CODEQL_DIR\codeql.exe" pack download "microsoft/windows-drivers@$env:CODEQL_DRIVERS_PACK_VERSION"
+      shell: pwsh
+
+    - name: Download cpp-queries dependency pack
+      run: |
+        $ErrorActionPreference = "Stop"
+        & "$env:CODEQL_DIR\codeql.exe" pack download "microsoft/cpp-queries@$env:CODEQL_CPP_QUERIES_PACK_VERSION"
+      shell: pwsh
+
+    # =====================================================================
+    # Same version/date scheme as the reference project, computed once so
+    # it stays identical between the INF stamp later and any artifact
+    # naming.
+    # =====================================================================
+    - name: Compute driver version and date
+      id: setver
+      run: |
+        $ErrorActionPreference = "Stop"
+        $now = Get-Date
+
+        $driverDate    = $now.ToString("MM/dd/yyyy")
+        $driverVersion = "1.$($now.Year).$($now.ToString('MMdd')).$($now.ToString('HHmm'))"
+
+        Write-Host "==> Driver date (DriverVer date): $driverDate"
+        Write-Host "==> Driver version (DriverVer ver): $driverVersion"
+
+        Add-Content -Path $env:GITHUB_ENV -Value "DRIVER_DATE=$driverDate"
+        Add-Content -Path $env:GITHUB_ENV -Value "DRIVER_VERSION=$driverVersion"
+        Add-Content -Path $env:GITHUB_OUTPUT -Value "version=$driverVersion"
+      shell: pwsh
+
+    # =====================================================================
+    # Single compile that CodeQL traces: only T2TouchIdTransport.vcxproj
+    # (the actual PCI\VEN_106B&DEV_1802 KMDF driver), same as the
+    # reference project's driver-only CodeQL pass. mustrun/mustfix.qls
+    # (windows-driver-suites) are driver-specific query suites, so scoping
+    # the traced build to the driver project - not the whole solution -
+    # keeps the WHCP-relevant signal from being diluted by unrelated
+    # user-mode protocol/tool/test code. KMDF_VERSION_MAJOR/MINOR (1.15)
+    # are already pinned inside the vcxproj; only the WDK target platform
+    # version needs to be pinned here, to whatever this runner's WDK
+    # installer actually shipped.
+    # =====================================================================
+    - name: Build CodeQL database (with PREfast /analyze baked in)
+      run: |
+        $ErrorActionPreference = "Stop"
+        $dbPath  = "$env:TEMP\codeql-db"
+        $logDir  = Join-Path $env:GITHUB_WORKSPACE "static-analysis-logs"
+        New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+        $buildLog = Join-Path $logDir "build.log"
+
+        $buildCmd = "msbuild /p:Configuration=$env:CONFIGURATION /p:Platform=$env:PLATFORM " +
+                    "/p:WindowsTargetPlatformVersion=10.0.26100.0 " +
+                    "/p:RunCodeAnalysis=true /p:EnableCppCoreCheck=true " +
+                    "/p:CodeAnalysisTreatWarningsAsErrors=$env:CA_TREAT_WARNINGS_AS_ERRORS " +
+                    "/nologo /verbosity:normal /clp:Summary " +
+                    "/flp:logfile=$buildLog;verbosity=normal " +
+                    "$env:DRIVER_PROJECT /t:rebuild"
+
+        & "$env:CODEQL_DIR\codeql.exe" database create $dbPath `
+          --language=cpp `
+          --source-root=. `
+          --command=$buildCmd
+
+        Add-Content -Path $env:GITHUB_ENV -Value "CODEQL_DB=$dbPath"
+        Add-Content -Path $env:GITHUB_ENV -Value "BUILD_LOG_DIR=$logDir"
+      shell: pwsh
+
+    - name: Upload build logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: static-analysis-logs
+        retention-days: 14
+        if-no-files-found: warn
+        path: static-analysis-logs/
+
+    - name: Analyze with mustrun.qls (informational)
+      run: |
+        $ErrorActionPreference = "Stop"
+        & "$env:CODEQL_DIR\codeql.exe" database analyze "$env:CODEQL_DB" `
+          "microsoft/windows-drivers:windows-driver-suites/mustrun.qls" `
+          --format=sarifv2.1.0 `
+          --output="$env:TEMP\codeql-mustrun.sarif"
+        Add-Content -Path $env:GITHUB_ENV -Value "SARIF_MUSTRUN=$env:TEMP\codeql-mustrun.sarif"
+      shell: pwsh
+
+    - name: Analyze with mustfix.qls (blocking)
+      run: |
+        $ErrorActionPreference = "Stop"
+        $sarifPath = "$env:TEMP\codeql-mustfix.sarif"
+
+        & "$env:CODEQL_DIR\codeql.exe" database analyze "$env:CODEQL_DB" `
+          "microsoft/windows-drivers:windows-driver-suites/mustfix.qls" `
+          --format=sarifv2.1.0 `
+          --output=$sarifPath
+
+        Add-Content -Path $env:GITHUB_ENV -Value "SARIF_MUSTFIX=$sarifPath"
+
+        $sarif = Get-Content -Path $sarifPath -Raw | ConvertFrom-Json
+        $resultCount = 0
+        foreach ($run in $sarif.runs) {
+          if ($run.results) { $resultCount += $run.results.Count }
+        }
+        Write-Host "==> mustfix.qls results: $resultCount"
+
+        if ($resultCount -gt 0) {
+          Write-Host "::error::$resultCount Must-Fix defect(s) found - this driver would FAIL the WHCP Static Tools Logo Test."
+          exit 1
+        }
+        Write-Host "OK: 0 Must-Fix defects."
+      shell: pwsh
+
+    - name: Upload SARIF results as build artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: codeql-results
+        retention-days: 14
+        path: |
+          ${{ env.SARIF_MUSTRUN }}
+          ${{ env.SARIF_MUSTFIX }}
+
+    - name: Upload mustrun.qls SARIF to GitHub code scanning
+      if: always()
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: ${{ env.SARIF_MUSTRUN }}
+        category: mustrun
+
+    - name: Upload mustfix.qls SARIF to GitHub code scanning
+      if: always()
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: ${{ env.SARIF_MUSTFIX }}
+        category: mustfix
+
+    # =====================================================================
+    # Everything below only runs if mustfix.qls above passed clean (exit
+    # 0) - none of these steps use if: always(), so a Must-Fix defect
+    # stops the job right above and none of this - full-solution build,
+    # tests, signing, final artifact - ever runs.
+    # =====================================================================
+
+    # =====================================================================
+    # Full solution build: the driver project is already up to date from
+    # the CodeQL pass above (same OutDir/IntDir), so MSBuild's incremental
+    # check just confirms it and moves on to protocol/tools/tests, which
+    # need the vcpkg plist include/lib dirs discovered earlier. No PREfast
+    # flags here - static analysis already ran on the driver above, and
+    # PREfast is not meaningful for the plain user-mode protocol/tool/test
+    # projects.
+    # =====================================================================
+    - name: Build full solution (protocol + tool + tests)
+      run: |
+        msbuild $env:SOLUTION `
+          /p:Configuration=$env:CONFIGURATION `
+          /p:Platform=$env:PLATFORM `
+          /p:WindowsTargetPlatformVersion=10.0.26100.0 `
+          /p:VcpkgInstalledDir=$env:VCPKG_INSTALLED_DIR `
+          /p:PlistLibName=$env:PLIST_LIB_NAME `
+          /nologo /verbosity:minimal /clp:Summary
+      shell: pwsh
+
+    # =====================================================================
+    # Milestone 2A's own rule ("don't write PASS unless verified") applies
+    # here too - a red test run fails the job, it doesn't just get logged.
+    # =====================================================================
+    - name: Run T2TouchIdTests.exe
+      run: |
+        $ErrorActionPreference = "Stop"
+        $exe = "build\T2TouchIdTests\$env:PLATFORM\$env:CONFIGURATION\T2TouchIdTests.exe"
+        if (-not (Test-Path $exe)) {
+          Write-Error "Test binary not found: $exe"
+          exit 1
+        }
+
+        $vcpkgBinDir = Join-Path $env:VCPKG_INSTALLED_DIR "bin"
+        if (-not (Test-Path $vcpkgBinDir)) {
+          Write-Error "vcpkg bin dir not found: $vcpkgBinDir"
+          exit 1
+        }
+        $env:PATH = "$vcpkgBinDir;$env:PATH"
+
+        & $exe
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "T2TouchIdTests.exe reported failures (exit code $LASTEXITCODE)."
+          exit 1
+        }
+        Write-Host "OK: all tests passed."
+      shell: pwsh
+
+    # =====================================================================
+    # Driver packaging: same StampInf / Inf2Cat / signtool sequence as the
+    # reference project's CI, applied to the .sys already produced above.
+    # =====================================================================
+    - name: Prepare driver package folder
+      run: |
+        $ErrorActionPreference = "Stop"
+
+        $buildOutDir = "$env:DRIVER_DIR\build\$env:DRIVER_NAME\$env:PLATFORM\$env:CONFIGURATION"
+        $sysPath     = "$buildOutDir\$env:DRIVER_NAME.sys"
+        $infSrcPath  = "$env:DRIVER_DIR\$env:DRIVER_NAME.inf"
+        $packageDir  = "artifacts\driver"
+
+        if (-not (Test-Path $sysPath)) {
+          Write-Error "Built .sys not found: $sysPath"
+          exit 1
+        }
+        if (-not (Test-Path $infSrcPath)) {
+          Write-Error ".inf file not found: $infSrcPath"
+          exit 1
+        }
+
+        New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
+        Copy-Item -Path $sysPath -Destination $packageDir -Force
+        Copy-Item -Path $infSrcPath -Destination $packageDir -Force
+
+        $pdbPath = "$buildOutDir\$env:DRIVER_NAME.pdb"
+        if (Test-Path $pdbPath) {
+          Copy-Item -Path $pdbPath -Destination $packageDir -Force
+        }
+
+        Write-Host "OK: staged driver files:"
+        Get-ChildItem $packageDir | ForEach-Object { Write-Host "  - $($_.Name)" }
+
+        Add-Content -Path $env:GITHUB_ENV -Value "PACKAGE_DIR=$packageDir"
+        Add-Content -Path $env:GITHUB_ENV -Value "SYS_PATH=$packageDir\$env:DRIVER_NAME.sys"
+        Add-Content -Path $env:GITHUB_ENV -Value "INF_PATH=$packageDir\$env:DRIVER_NAME.inf"
+        Add-Content -Path $env:GITHUB_ENV -Value "CAT_PATH=$packageDir\$env:DRIVER_NAME.cat"
+      shell: pwsh
+
+    - name: Locate StampInf.exe
+      run: |
+        $ErrorActionPreference = "Stop"
+        $roots = @(
+          "C:\Program Files (x86)\Windows Kits\10\bin",
+          "C:\Program Files\Windows Kits\10\bin"
+        )
+        $candidates = foreach ($root in $roots) {
+          if (Test-Path $root) {
+            Get-ChildItem -Path $root -Filter "StampInf.exe" -Recurse -ErrorAction SilentlyContinue
+          }
+        }
+        if (-not $candidates) {
+          Write-Error "StampInf.exe was not found on this runner."
+          exit 1
+        }
+        $tool = $candidates | Where-Object { $_.FullName -match '\\x64\\' } | Sort-Object FullName -Descending | Select-Object -First 1
+        if (-not $tool) { $tool = $candidates | Sort-Object FullName -Descending | Select-Object -First 1 }
+        Write-Host "OK: found StampInf.exe -> $($tool.FullName)"
+        Add-Content -Path $env:GITHUB_ENV -Value "STAMPINF_PATH=$($tool.FullName)"
+      shell: pwsh
+
+    - name: Stamp INF (architecture / date / version / KMDF)
+      run: |
+        $ErrorActionPreference = "Stop"
+        $infPath = (Resolve-Path $env:INF_PATH).Path
+
+        # -k 1.15 must match KMDF_VERSION_MAJOR/MINOR in
+        # T2TouchIdTransport.vcxproj. Pinned to 1.15 (Windows 10
+        # 1507/TH1+), not the WDK's newest supported version, because
+        # KMDF >= 1.13 has no co-installer fallback: the exact stamped
+        # version must already be present natively on the target OS or
+        # the driver refuses to load.
+        & "$env:STAMPINF_PATH" -f "$infPath" -a amd64 -d "$env:DRIVER_DATE" -v "$env:DRIVER_VERSION" -k 1.15
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "StampInf exited with error code $LASTEXITCODE."
+          exit 1
+        }
+
+        Write-Host "==> Stamped INF contents:"
+        Get-Content -Path $infPath | Select-String -Pattern 'DriverVer|PCI\\VEN|KmdfLibraryVersion'
+        Write-Host "OK: INF stamped."
+      shell: pwsh
+
+    - name: Locate Inf2Cat.exe
+      run: |
+        $ErrorActionPreference = "Stop"
+        $roots = @(
+          "C:\Program Files (x86)\Windows Kits\10\bin",
+          "C:\Program Files\Windows Kits\10\bin"
+        )
+        $candidates = foreach ($root in $roots) {
+          if (Test-Path $root) {
+            Get-ChildItem -Path $root -Filter "Inf2Cat.exe" -Recurse -ErrorAction SilentlyContinue
+          }
+        }
+        if (-not $candidates) {
+          Write-Error "Inf2Cat.exe was not found on this runner."
+          exit 1
+        }
+        $tool = $candidates | Where-Object { $_.FullName -match '\\x64\\' } | Sort-Object FullName -Descending | Select-Object -First 1
+        if (-not $tool) { $tool = $candidates | Sort-Object FullName -Descending | Select-Object -First 1 }
+        Write-Host "OK: found Inf2Cat.exe -> $($tool.FullName)"
+        Add-Content -Path $env:GITHUB_ENV -Value "INF2CAT_PATH=$($tool.FullName)"
+      shell: pwsh
+
+    - name: Generate CAT file (Inf2Cat)
+      run: |
+        $ErrorActionPreference = "Stop"
+        $fullPackageDir = (Resolve-Path $env:PACKAGE_DIR).Path
+        & "$env:INF2CAT_PATH" /driver:"$fullPackageDir" /os:10_X64 /verbose
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "Inf2Cat exited with error code $LASTEXITCODE."
+          exit 1
+        }
+        if (-not (Test-Path $env:CAT_PATH)) {
+          Write-Error "Inf2Cat did not report an error, but no .cat file was produced at $env:CAT_PATH."
+          exit 1
+        }
+        Write-Host "OK: .cat generated -> $env:CAT_PATH"
+      shell: pwsh
+
+    # =====================================================================
+    # Signing stays OPTIONAL, matching what T2TouchIdTransport.inf itself
+    # says: "PoC-only, not WHQL signed - test-signing / Secure Boot test
+    # mode required" (docs/milestone-2-hardware-results.md). A missing
+    # CERT/CERT_PWD secret pair means unsigned/test-signable output, not a
+    # broken build - unlike the reference AmtPtpDeviceUsbKm workflow,
+    # which hard-fails without secrets because that driver ships signed.
+    # =====================================================================
+    - name: Locate signtool.exe
+      if: ${{ env.SIGN_CERT_PFX != '' && env.SIGN_CERT_PASSWORD != '' }}
+      run: |
+        $ErrorActionPreference = "Stop"
+        $roots = @(
+          "C:\Program Files (x86)\Windows Kits\10\bin",
+          "C:\Program Files\Windows Kits\10\bin"
+        )
+        $candidates = foreach ($root in $roots) {
+          if (Test-Path $root) {
+            Get-ChildItem -Path $root -Filter "signtool.exe" -Recurse -ErrorAction SilentlyContinue
+          }
+        }
+        if (-not $candidates) {
+          Write-Error "signtool.exe was not found on this runner."
+          exit 1
+        }
+        $tool = $candidates | Where-Object { $_.FullName -match '\\x64\\' } | Sort-Object FullName -Descending | Select-Object -First 1
+        if (-not $tool) { $tool = $candidates | Sort-Object FullName -Descending | Select-Object -First 1 }
+        Write-Host "OK: found signtool.exe -> $($tool.FullName)"
+        Add-Content -Path $env:GITHUB_ENV -Value "SIGNTOOL_PATH=$($tool.FullName)"
+      shell: pwsh
+
+    - name: Sign .sys and .cat with SignTool
+      if: ${{ env.SIGN_CERT_PFX != '' && env.SIGN_CERT_PASSWORD != '' }}
+      run: |
+        $ErrorActionPreference = "Stop"
+        $pfxPath = Join-Path $env:TEMP "signcert.pfx"
+        $cerPath = Join-Path $env:PACKAGE_DIR "$env:DRIVER_NAME.cer"
+
+        try {
+          $bytes = [Convert]::FromBase64String($env:SIGN_CERT_PFX)
+          [IO.File]::WriteAllBytes($pfxPath, $bytes)
+
+          & "$env:SIGNTOOL_PATH" sign /v /fd SHA256 /f "$pfxPath" /p "$env:SIGN_CERT_PASSWORD" `
+            /tr http://timestamp.digicert.com /td SHA256 "$env:SYS_PATH"
+          if ($LASTEXITCODE -ne 0) { Write-Error "Signing .sys failed (exit code $LASTEXITCODE)."; exit 1 }
+
+          & "$env:SIGNTOOL_PATH" sign /v /fd SHA256 /f "$pfxPath" /p "$env:SIGN_CERT_PASSWORD" `
+            /tr http://timestamp.digicert.com /td SHA256 "$env:CAT_PATH"
+          if ($LASTEXITCODE -ne 0) { Write-Error "Signing .cat failed (exit code $LASTEXITCODE)."; exit 1 }
+
+          $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(
+            $pfxPath, $env:SIGN_CERT_PASSWORD,
+            [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable
+          )
+          Export-Certificate -Cert $cert -FilePath $cerPath | Out-Null
+          Write-Host "OK: .sys and .cat signed; .cer exported."
+        }
+        finally {
+          if (Test-Path $pfxPath) { Remove-Item -Path $pfxPath -Force }
+        }
+      shell: pwsh
+
+    - name: Warn if packaging unsigned
+      if: ${{ env.SIGN_CERT_PFX == '' || env.SIGN_CERT_PASSWORD == '' }}
+      run: Write-Host "::warning::CERT/CERT_PWD secrets not set - packaging an UNSIGNED .sys/.cat. Target machine needs test-signing enabled or Secure Boot test mode (see docs/milestone-2-hardware-results.md)."
+      shell: pwsh
+
+    - name: Stage t2touchid.exe alongside the driver
+      run: |
+        $ErrorActionPreference = "Stop"
+        Copy-Item -Path "build\t2touchid\$env:PLATFORM\$env:CONFIGURATION\t2touchid.exe" -Destination $env:PACKAGE_DIR -Force
+
+        $vcpkgBinDir = Join-Path $env:VCPKG_INSTALLED_DIR "bin"
+        if (-not (Test-Path $vcpkgBinDir)) {
+          Write-Error "vcpkg bin dir not found: $vcpkgBinDir"
+          exit 1
+        }
+        Copy-Item -Path (Join-Path $vcpkgBinDir "*.dll") -Destination $env:PACKAGE_DIR -Force
+
+        Write-Host "OK: staged t2touchid.exe and its runtime DLLs"
+      shell: pwsh
+
+    # =====================================================================
+    # "Дані перевірок" go INTO the shipped package, not just into separate
+    # workflow-artifact uploads: mustrun/mustfix SARIF, the PREfast build
+    # log, and a short plain-text summary sit in a checks/ subfolder next
+    # to the driver, so anyone who downloads the driver package also gets
+    # the verification evidence for that exact build.
+    # =====================================================================
+    - name: Bundle static-analysis results with the package
+      run: |
+        $ErrorActionPreference = "Stop"
+        $checksDir = Join-Path $env:PACKAGE_DIR "checks"
+        New-Item -ItemType Directory -Path $checksDir -Force | Out-Null
+
+        Copy-Item -Path $env:SARIF_MUSTRUN -Destination (Join-Path $checksDir "codeql-mustrun.sarif") -Force
+        Copy-Item -Path $env:SARIF_MUSTFIX -Destination (Join-Path $checksDir "codeql-mustfix.sarif") -Force
+        if (Test-Path (Join-Path $env:BUILD_LOG_DIR "build.log")) {
+          Copy-Item -Path (Join-Path $env:BUILD_LOG_DIR "build.log") -Destination (Join-Path $checksDir "prefast-build.log") -Force
+        }
+
+        function Get-SarifResultCount($path) {
+          $sarif = Get-Content -Path $path -Raw | ConvertFrom-Json
+          $count = 0
+          foreach ($run in $sarif.runs) { if ($run.results) { $count += $run.results.Count } }
+          return $count
+        }
+
+        $mustrunCount = Get-SarifResultCount $env:SARIF_MUSTRUN
+        $mustfixCount = Get-SarifResultCount $env:SARIF_MUSTFIX
+
+        @"
+        T2TouchIdTransport static-analysis summary
+        ===========================================
+        Driver:          $env:DRIVER_NAME.sys
+        Driver version:  $env:DRIVER_VERSION
+        Built:           $env:DRIVER_DATE (UTC build date; local runner clock)
+        Target:          PCI\VEN_106B&DEV_1802, KMDF 1.15
+
+        CodeQL query pack:  microsoft/windows-drivers@$env:CODEQL_DRIVERS_PACK_VERSION
+        PREfast:            enabled (RunCodeAnalysis + EnableCppCoreCheck, warnings-as-errors)
+
+        mustrun.qls (informational): $mustrunCount finding(s) - see codeql-mustrun.sarif
+        mustfix.qls (WHCP-blocking): $mustfixCount finding(s) - see codeql-mustfix.sarif
+
+        Tests:  T2TouchIdTests.exe passed (see workflow log for details)
+        Signed: $(if ($env:SIGN_CERT_PFX -and $env:SIGN_CERT_PASSWORD) { "yes" } else { "no - test-signing / Secure Boot test mode required on target machine" })
+        "@ | Set-Content -Path (Join-Path $checksDir "SUMMARY.txt") -Encoding utf8
+
+        Write-Host "OK: bundled checks/ into $env:PACKAGE_DIR :"
+        Get-ChildItem -Recurse $checksDir | ForEach-Object { Write-Host "  - $($_.FullName)" }
+      shell: pwsh
+
+    # =====================================================================
+    # Same "staging folder with a named root inside the zip" pattern as
+    # the reference project's package upload.
+    # =====================================================================
+    - name: Prepare final package folder
+      run: |
+        $ErrorActionPreference = "Stop"
+
+        $tempRoot   = "temp-upload"
+        $stagingDir = Join-Path $tempRoot "T2TouchId"
+
+        Write-Host "==> Preparing staging folder $stagingDir"
+        New-Item -ItemType Directory -Path $stagingDir -Force | Out-Null
+        Copy-Item -Path (Join-Path $env:PACKAGE_DIR "*") -Destination $stagingDir -Recurse -Force
+
+        Write-Host "OK: staged files:"
+        Get-ChildItem -Recurse $stagingDir | ForEach-Object { Write-Host "  - $($_.FullName)" }
+
+        Add-Content -Path $env:GITHUB_ENV -Value "STAGING_DIR=$tempRoot"
+      shell: pwsh
+
+    - name: Upload driver + checks package
+      uses: actions/upload-artifact@v4
+      with:
+        name: T2TouchId-Signed-${{ env.DRIVER_VERSION }}
+        path: ${{ env.STAGING_DIR }}
+        if-no-files-found: error
