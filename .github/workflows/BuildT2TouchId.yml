@@ -280,7 +280,14 @@ jobs:
         $ErrorActionPreference = "Stop"
         $infPath = (Resolve-Path $env:INF_PATH).Path
 
-        & "$env:STAMPINF_PATH" -f "$infPath" -a amd64 -d "$env:DRIVER_DATE" -v "$env:DRIVER_VERSION" -k 1.33
+        # -k 1.15 must match KMDF_VERSION_MAJOR/MINOR in
+        # T2TouchIdTransport.vcxproj. Pinned to 1.15 (Windows 10
+        # 1507/TH1+), not the WDK's newest supported version (1.33,
+        # Windows 11 only) - the target audience is Windows 10, and
+        # KMDF >= 1.13 has no co-installer fallback: the exact stamped
+        # version must already be present natively in the OS or the
+        # driver refuses to load.
+        & "$env:STAMPINF_PATH" -f "$infPath" -a amd64 -d "$env:DRIVER_DATE" -v "$env:DRIVER_VERSION" -k 1.15
         if ($LASTEXITCODE -ne 0) {
           Write-Error "StampInf exited with error code $LASTEXITCODE."
           exit 1
