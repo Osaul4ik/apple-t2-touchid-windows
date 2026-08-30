@@ -39,19 +39,53 @@ jobs:
     - name: Add MSBuild to PATH
       uses: microsoft/setup-msbuild@v2
 
-    - name: Install WDK
+    # =====================================================================
+    # NOTE: this used to run wdksetup.exe (from the fwlink below) silently
+    # and trust its exit code. On at least one run that installer exited
+    # 0/3010 ("success") while placing NO driver build tooling at all
+    # (StampInf/Inf2Cat/InfVerif were missing entirely, not just misplaced -
+    # see the follow-up verification step). wdksetup.exe in silent mode
+    # depends on an already-installed, version-matched Visual Studio + SDK
+    # and silently no-ops instead of erroring when that match isn't right,
+    # so a clean exit code does not mean the WDK actually landed.
+    #
+    # Install via Chocolatey's windowsdriverkit11 package instead - it's
+    # pre-available on GitHub's windows-2022 runner image (which already
+    # ships a matching VS2022 + C++ workload), and its result is checked by
+    # file presence in the next step rather than by trusting exit codes.
+    # =====================================================================
+    - name: Install WDK (via Chocolatey)
+      run: choco install windowsdriverkit11 -y --no-progress
+      shell: pwsh
+
+    - name: Verify WDK installation
       run: |
         $ErrorActionPreference = "Stop"
-        $wdkUrl = "https://go.microsoft.com/fwlink/?linkid=2085767"
-        $wdkInstaller = "$env:TEMP\wdksetup.exe"
-        Invoke-WebRequest -Uri $wdkUrl -OutFile $wdkInstaller
-        $proc = Start-Process -FilePath $wdkInstaller -ArgumentList "/quiet /norestart" -Wait -PassThru
-        $exitCode = $proc.ExitCode
-        if ($exitCode -ne 0 -and $exitCode -ne 3010) {
-          Write-Error "WDK installer exited with code $exitCode"
+        $roots = @(
+          "C:\Program Files (x86)\Windows Kits\10\bin",
+          "C:\Program Files\Windows Kits\10\bin"
+        )
+
+        $stampinf = foreach ($root in $roots) {
+          if (Test-Path $root) {
+            Get-ChildItem -Path $root -Filter "StampInf.exe" -Recurse -ErrorAction SilentlyContinue
+          }
+        }
+
+        if (-not $stampinf) {
+          Write-Error "WDK build tooling (StampInf.exe) not found anywhere under Windows Kits 10\bin after install - the WDK install did not actually complete, even though the installer step reported success."
+          Write-Host "Contents of Windows Kits 10 (if it exists):"
+          foreach ($base in @("C:\Program Files (x86)\Windows Kits\10", "C:\Program Files\Windows Kits\10")) {
+            if (Test-Path $base) {
+              Write-Host "-- $base --"
+              Get-ChildItem -Path $base -Recurse -Depth 2 -ErrorAction SilentlyContinue |
+                ForEach-Object { Write-Host "  $($_.FullName)" }
+            }
+          }
           exit 1
         }
-        Write-Host "OK: WDK installer exited with code $exitCode"
+
+        Write-Host "OK: found WDK build tooling, e.g. $($stampinf[0].FullName)"
       shell: pwsh
 
     # =====================================================================
@@ -90,7 +124,7 @@ jobs:
           }
         }
         if (-not $anyCopies) {
-          Write-Error "No InfVerif.dll found anywhere under the WDK install - WDK install itself likely failed."
+          Write-Error "No InfVerif.dll found anywhere under Windows Kits 10\bin, even though StampInf.exe was confirmed present. This WDK install is missing the INF-verification component specifically - check the Chocolatey package/version being installed."
           exit 1
         }
 
