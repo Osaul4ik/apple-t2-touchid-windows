@@ -14,19 +14,33 @@ T2DmaAllocateOolBuffers(_In_ PT2_DEVICE_CONTEXT Ctx)
     PHYSICAL_ADDRESS low, high, boundary;
 
     low.QuadPart = 0;
-    // 44-bit DMA limit (T2_SEP_DMA_BITS) — same constraint as Linux
-    // dma_set_mask_and_coherent(DMA_BIT_MASK(44)).
-    high.QuadPart = (1ULL << T2_SEP_DMA_BITS) - 1;
     boundary.QuadPart = 0;
+
+    // Prefer physical addresses below 4GB. Earlier WDF buffers that at least
+    // completed EP0 lived in 0x7a7xxxxx; the first non-cached attempt landed
+    // at 0x4713fc000 and still timed out on EP7 — may indicate the SEP DMA
+    // engine on this revision only reliably reaches the lower 4GB.
+    high.QuadPart = 0xFFFFFFFFULL;
 
     Ctx->OolInVa = MmAllocateContiguousMemorySpecifyCache(
         T2_SEP_OOL_SIZE, low, high, boundary, MmNonCached);
+    if (Ctx->OolInVa == NULL) {
+        // Fallback to full 44-bit range (Linux DMA_BIT_MASK(44)).
+        high.QuadPart = (1ULL << T2_SEP_DMA_BITS) - 1;
+        Ctx->OolInVa = MmAllocateContiguousMemorySpecifyCache(
+            T2_SEP_OOL_SIZE, low, high, boundary, MmNonCached);
+    }
     if (Ctx->OolInVa == NULL) {
         T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
             "T2TouchIdTransport: MmAllocateContiguousMemorySpecifyCache(OolIn) failed\n"));
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     Ctx->OolInPa = MmGetPhysicalAddress(Ctx->OolInVa);
+
+    // Keep Out in the same address window as In.
+    high.QuadPart = (Ctx->OolInPa.QuadPart <= 0xFFFFFFFFULL)
+        ? 0xFFFFFFFFULL
+        : ((1ULL << T2_SEP_DMA_BITS) - 1);
 
     Ctx->OolOutVa = MmAllocateContiguousMemorySpecifyCache(
         T2_SEP_OOL_SIZE, low, high, boundary, MmNonCached);

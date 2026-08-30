@@ -208,64 +208,33 @@ T2AksExchange(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
     RtlZeroMemory(inBase, T2_SEP_OOL_SIZE);
     RtlZeroMemory(outBase, T2_SEP_OOL_SIZE);
 
-    // SPECIAL CASE for GetCapabilities (0x4d): Linux's proven boot-time probe
-    // (t2_aks_probe_capabilities) uses V1 header + fixed wire size 0x5c, not
-    // the general V2 path. On some bridgeOS builds the V2 form for this
-    // particular op is silently dropped (no EP7 reply). Match the known-
-    // working probe layout exactly when the body is the 16-byte selector
-    // request that user-mode sends.
-    if (Operation == T2AksOpGetCapabilities && RequestLength == 16) {
-        T2_AKS_HEADER_V1 headerV1;
-        LARGE_INTEGER wall;
-        ULONG64 interruptTime;
+    // Always V2 — matches Linux t2_aks_exchange_locked / t2-aks-tool ioctl
+    // path (proven for capabilities on real hardware). Combined with
+    // non-cached + prefer-<4GB OOL buffers.
+    requestWireLength = T2_AKS_V2_WIRE_SIZE + RequestLength;
+    T2AksBuildHeaderV2(&header);
 
-        RtlZeroMemory(&headerV1, sizeof(headerV1));
-        KeQuerySystemTimePrecise(&wall);
-        interruptTime = KeQueryUnbiasedInterruptTime();
-        headerV1.Version = T2_AKS_VERSION_V1;
-        headerV1.UsecTime = interruptTime / 10;
+    *(UINT32*)inBase = T2_AKS_HEADER_V2_SIZE;
+    RtlCopyMemory(inBase + sizeof(UINT32), &header, sizeof(header));
+    if (RequestBody && RequestLength > 0) {
+        RtlCopyMemory(inBase + T2_AKS_V2_WIRE_SIZE, RequestBody, RequestLength);
+    }
 
-        requestWireLength = T2_AKS_CAP_REQ_SIZE; // 0x5c = V1 wire + 16-byte body
-        *(UINT32*)inBase = T2_AKS_HEADER_V1_SIZE;
-        RtlCopyMemory(inBase + sizeof(UINT32), &headerV1, sizeof(headerV1));
-        RtlCopyMemory(inBase + T2_AKS_V1_WIRE_SIZE, RequestBody, RequestLength);
+    status = T2AksDigest(inBase, requestWireLength);
+    if (!NT_SUCCESS(status)) {
+        RtlSecureZeroMemory(inBase, requestWireLength);
+        return status;
+    }
 
-        status = T2AksDigest(inBase, requestWireLength);
-        if (!NT_SUCCESS(status)) {
-            RtlSecureZeroMemory(inBase, requestWireLength);
-            return status;
-        }
-
-        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-            "T2TouchIdTransport: AKS (V1-cap) wire header_size=0x%x digest0..3=%02x%02x%02x%02x "
-            "version=%u requestWireLength=%Iu bodyLength=%Iu\n",
-            *(UINT32*)inBase, inBase[4], inBase[5], inBase[6], inBase[7],
-            headerV1.Version, requestWireLength, RequestLength));
-        // Full wire dump — capabilities body has no secrets.
+    T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        "T2TouchIdTransport: AKS wire header_size=0x%x digest0..3=%02x%02x%02x%02x version=%u "
+        "requestWireLength=%Iu bodyLength=%Iu\n",
+        *(UINT32*)inBase, inBase[4], inBase[5], inBase[6], inBase[7],
+        header.V1.Version, requestWireLength, RequestLength));
+    // Full dump for capabilities (no secrets); header-only otherwise.
+    if (Operation == T2AksOpGetCapabilities) {
         T2AksDumpWire(inBase, requestWireLength, 128);
     } else {
-        // General path: V2 header (t2_aks_exchange_locked).
-        requestWireLength = T2_AKS_V2_WIRE_SIZE + RequestLength;
-        T2AksBuildHeaderV2(&header);
-
-        *(UINT32*)inBase = T2_AKS_HEADER_V2_SIZE;
-        RtlCopyMemory(inBase + sizeof(UINT32), &header, sizeof(header));
-        if (RequestBody && RequestLength > 0) {
-            RtlCopyMemory(inBase + T2_AKS_V2_WIRE_SIZE, RequestBody, RequestLength);
-        }
-
-        status = T2AksDigest(inBase, requestWireLength);
-        if (!NT_SUCCESS(status)) {
-            RtlSecureZeroMemory(inBase, requestWireLength);
-            return status;
-        }
-
-        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-            "T2TouchIdTransport: AKS wire header_size=0x%x digest0..3=%02x%02x%02x%02x version=%u "
-            "requestWireLength=%Iu bodyLength=%Iu\n",
-            *(UINT32*)inBase, inBase[4], inBase[5], inBase[6], inBase[7],
-            header.V1.Version, requestWireLength, RequestLength));
-        // Header-only dump for non-cap ops (body may contain keybag/secret).
         T2AksDumpWire(inBase, requestWireLength, T2_AKS_V2_WIRE_SIZE);
     }
 
