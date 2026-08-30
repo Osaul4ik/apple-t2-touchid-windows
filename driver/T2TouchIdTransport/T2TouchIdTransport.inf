@@ -1,0 +1,58 @@
+; T2TouchIdTransport.inf
+; PoC-only. Not WHQL signed. Test-signing / Secure Boot test mode required
+; on the target machine (see docs/milestone-2-hardware-results.md).
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %ManufacturerName%
+DriverVer   = ; filled by build
+CatalogFile = T2TouchIdTransport.cat
+PnpLockdown = 1
+
+[Manufacturer]
+%ManufacturerName% = Standard,NT$ARCH$
+
+[Standard.NT$ARCH$]
+; VERIFIED FROM SOURCE: Apple T2 SEP function, vendor 0x106B device 0x1802.
+; Function/subsystem IDs intentionally left unrestricted (no &SUBSYS_ filter)
+; until confirmed on the specific target board (docs/windows-transport-research.md).
+%T2TouchIdTransport.DeviceDesc% = T2TouchIdTransport_Device, PCI\VEN_106B&DEV_1802
+
+[T2TouchIdTransport_Device.NT]
+CopyFiles = Drivers_Dir
+
+[T2TouchIdTransport_Device.NT.HW]
+AddReg = T2TouchIdTransport_Device.NT.AddReg
+
+[T2TouchIdTransport_Device.NT.AddReg]
+HKR,,"UpperFilters",0x00010000,"WdfKernelShim"
+
+[T2TouchIdTransport_Device.NT.Services]
+AddService = T2TouchIdTransport,0x000001fa,T2TouchIdTransport_Service_Inst
+
+[T2TouchIdTransport_Service_Inst]
+DisplayName   = %T2TouchIdTransport.SvcDesc%
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %13%\T2TouchIdTransport.sys
+
+[Drivers_Dir]
+T2TouchIdTransport.sys
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+T2TouchIdTransport.sys = 1,,
+
+[DestinationDirs]
+Drivers_Dir = 13 ; %SystemRoot%\System32\drivers\UMDF (KMDF: 12, driver store handled by inf2cat/build)
+
+[Strings]
+ManufacturerName = "T2TouchId Project (unsigned PoC)"
+DiskName = "T2TouchIdTransport Installation Disk"
+T2TouchIdTransport.DeviceDesc = "Apple T2 SEP Mailbox (Touch ID transport PoC)"
+T2TouchIdTransport.SvcDesc = "T2 Touch ID Transport"

@@ -1,0 +1,343 @@
+name: BuildT2TouchId
+
+# NOTE: branch name below is a guess (main) - adjust to match this repo.
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: build-t2touchid-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  SOLUTION: T2TouchId.sln
+  DRIVER_DIR: driver/T2TouchIdTransport
+  DRIVER_NAME: T2TouchIdTransport
+  CONFIGURATION: Release
+  PLATFORM: x64
+
+jobs:
+  build:
+    name: Build driver + protocol + tool, run tests, package
+    runs-on: windows-2022
+    timeout-minutes: 60
+    outputs:
+      version: ${{ steps.setver.outputs.version }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Add MSBuild to PATH
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Install WDK
+      run: |
+        $ErrorActionPreference = "Stop"
+        $wdkUrl = "https://go.microsoft.com/fwlink/?linkid=2085767"
+        $wdkInstaller = "$env:TEMP\wdksetup.exe"
+        Invoke-WebRequest -Uri $wdkUrl -OutFile $wdkInstaller
+        $proc = Start-Process -FilePath $wdkInstaller -ArgumentList "/quiet /norestart" -Wait -PassThru
+        $exitCode = $proc.ExitCode
+        if ($exitCode -ne 0 -and $exitCode -ne 3010) {
+          Write-Error "WDK installer exited with code $exitCode"
+          exit 1
+        }
+        Write-Host "OK: WDK installer exited with code $exitCode"
+      shell: pwsh
+
+    # =====================================================================
+    # protocol/tools/tests are user-mode and need libplist
+    # (protocol/BridgeXpc/PlistPayload.cpp, #include <plist/plist.h>).
+    # The vcpkg port only ships an "unofficial-libplist" CMake config -
+    # there's no documented classic-mode (plain MSBuild) lib filename to
+    # hardcode, so find out what this install actually produced instead
+    # of guessing. Same "locate the tool/file, don't assume a path"
+    # pattern as the StampInf/Inf2Cat/signtool steps below.
+    # =====================================================================
+    - name: Bootstrap vcpkg
+      run: |
+        $ErrorActionPreference = "Stop"
+        git clone --depth 1 https://github.com/microsoft/vcpkg.git vcpkg
+        .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+      shell: pwsh
+
+    - name: Install libplist (vcpkg)
+      run: |
+        $ErrorActionPreference = "Stop"
+        .\vcpkg\vcpkg.exe install libplist:x64-windows
+      shell: pwsh
+
+    - name: Locate libplist library file
+      run: |
+        $ErrorActionPreference = "Stop"
+        $libDir = "vcpkg\installed\x64-windows\lib"
+        $lib = Get-ChildItem -Path $libDir -Filter "*.lib" |
+          Where-Object { $_.Name -match "plist" -and $_.Name -notmatch "\+\+" } |
+          Select-Object -First 1
+
+        if (-not $lib) {
+          Write-Error "No plist .lib found under $libDir after vcpkg install."
+          Write-Host "Contents of ${libDir:}"
+          Get-ChildItem -Path $libDir | ForEach-Object { Write-Host "  - $($_.Name)" }
+          exit 1
+        }
+
+        Write-Host "OK: found $($lib.Name)"
+        Add-Content -Path $env:GITHUB_ENV -Value "PLIST_LIB_NAME=$($lib.Name)"
+        Add-Content -Path $env:GITHUB_ENV -Value "VCPKG_INSTALLED_DIR=$PWD\vcpkg\installed\x64-windows"
+      shell: pwsh
+
+    # =====================================================================
+    # Same version/date scheme as the reference project's driver workflows,
+    # so artifact naming stays consistent if this is ever merged with them.
+    # =====================================================================
+    - name: Compute driver version and date
+      id: setver
+      run: |
+        $ErrorActionPreference = "Stop"
+        $now = Get-Date
+
+        $driverDate    = $now.ToString("MM/dd/yyyy")
+        $driverVersion = "1.$($now.Year).$($now.ToString('MMdd')).$($now.ToString('HHmm'))"
+
+        Write-Host "==> Driver date (DriverVer date): $driverDate"
+        Write-Host "==> Driver version (DriverVer ver): $driverVersion"
+
+        Add-Content -Path $env:GITHUB_ENV -Value "DRIVER_DATE=$driverDate"
+        Add-Content -Path $env:GITHUB_ENV -Value "DRIVER_VERSION=$driverVersion"
+        Add-Content -Path $env:GITHUB_OUTPUT -Value "version=$driverVersion"
+      shell: pwsh
+
+    # =====================================================================
+    # One build for the whole solution: driver (KMDF PCI - needs
+    # WindowsTargetPlatformVersion pinned to what the WDK installer above
+    # actually shipped) + protocol static lib + tool + tests (need the
+    # vcpkg plist include/lib dirs discovered above). The vcpkg properties
+    # are no-ops on the driver project, which doesn't reference them.
+    # =====================================================================
+    - name: Build solution
+      run: |
+        msbuild $env:SOLUTION `
+          /p:Configuration=$env:CONFIGURATION `
+          /p:Platform=$env:PLATFORM `
+          /p:WindowsTargetPlatformVersion=10.0.26100.0 `
+          /p:VcpkgInstalledDir=$env:VCPKG_INSTALLED_DIR `
+          /p:PlistLibName=$env:PLIST_LIB_NAME `
+          /nologo /verbosity:minimal /clp:Summary
+      shell: pwsh
+
+    # =====================================================================
+    # Milestone 2A's own rule ("don't write PASS unless verified") applies
+    # here too: a red test run fails the job, it doesn't just get logged.
+    # =====================================================================
+    - name: Run T2TouchIdTests.exe
+      run: |
+        $ErrorActionPreference = "Stop"
+        $exe = "build\T2TouchIdTests\$env:PLATFORM\$env:CONFIGURATION\T2TouchIdTests.exe"
+        if (-not (Test-Path $exe)) {
+          Write-Error "Test binary not found: $exe"
+          exit 1
+        }
+        & $exe
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "T2TouchIdTests.exe reported failures (exit code $LASTEXITCODE)."
+          exit 1
+        }
+        Write-Host "OK: all tests passed."
+      shell: pwsh
+
+    # =====================================================================
+    # Driver packaging: same StampInf / Inf2Cat / signtool sequence as the
+    # reference project's BuildKM+Sym.yml.
+    # =====================================================================
+    - name: Prepare driver package folder
+      run: |
+        $ErrorActionPreference = "Stop"
+
+        $buildOutDir = "$env:DRIVER_DIR\build\$env:DRIVER_NAME\$env:PLATFORM\$env:CONFIGURATION"
+        $sysPath     = "$buildOutDir\$env:DRIVER_NAME.sys"
+        $infSrcPath  = "$env:DRIVER_DIR\$env:DRIVER_NAME.inf"
+        $packageDir  = "artifacts\driver"
+
+        if (-not (Test-Path $sysPath)) {
+          Write-Error "Built .sys not found: $sysPath"
+          exit 1
+        }
+        if (-not (Test-Path $infSrcPath)) {
+          Write-Error ".inf file not found: $infSrcPath"
+          exit 1
+        }
+
+        New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
+        Copy-Item -Path $sysPath -Destination $packageDir -Force
+        Copy-Item -Path $infSrcPath -Destination $packageDir -Force
+
+        $pdbPath = "$buildOutDir\$env:DRIVER_NAME.pdb"
+        if (Test-Path $pdbPath) {
+          Copy-Item -Path $pdbPath -Destination $packageDir -Force
+        }
+
+        Write-Host "OK: staged driver files:"
+        Get-ChildItem $packageDir | ForEach-Object { Write-Host "  - $($_.Name)" }
+
+        Add-Content -Path $env:GITHUB_ENV -Value "PACKAGE_DIR=$packageDir"
+        Add-Content -Path $env:GITHUB_ENV -Value "SYS_PATH=$packageDir\$env:DRIVER_NAME.sys"
+        Add-Content -Path $env:GITHUB_ENV -Value "INF_PATH=$packageDir\$env:DRIVER_NAME.inf"
+        Add-Content -Path $env:GITHUB_ENV -Value "CAT_PATH=$packageDir\$env:DRIVER_NAME.cat"
+      shell: pwsh
+
+    - name: Locate StampInf.exe
+      run: |
+        $ErrorActionPreference = "Stop"
+        $roots = @(
+          "C:\Program Files (x86)\Windows Kits\10\bin",
+          "C:\Program Files\Windows Kits\10\bin"
+        )
+        $candidates = foreach ($root in $roots) {
+          if (Test-Path $root) {
+            Get-ChildItem -Path $root -Filter "StampInf.exe" -Recurse -ErrorAction SilentlyContinue
+          }
+        }
+        if (-not $candidates) {
+          Write-Error "StampInf.exe was not found on this runner."
+          exit 1
+        }
+        $tool = $candidates | Where-Object { $_.FullName -match '\\x64\\' } | Sort-Object FullName -Descending | Select-Object -First 1
+        if (-not $tool) { $tool = $candidates | Sort-Object FullName -Descending | Select-Object -First 1 }
+        Add-Content -Path $env:GITHUB_ENV -Value "STAMPINF_PATH=$($tool.FullName)"
+      shell: pwsh
+
+    - name: Stamp INF (architecture / date / version / KMDF)
+      run: |
+        $ErrorActionPreference = "Stop"
+        $infPath = (Resolve-Path $env:INF_PATH).Path
+
+        & "$env:STAMPINF_PATH" -f "$infPath" -a amd64 -d "$env:DRIVER_DATE" -v "$env:DRIVER_VERSION" -k 1.33
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "StampInf exited with error code $LASTEXITCODE."
+          exit 1
+        }
+
+        Write-Host "==> Stamped INF contents:"
+        Get-Content -Path $infPath | Select-String -Pattern 'DriverVer|PCI\\VEN|KmdfLibraryVersion'
+        Write-Host "OK: INF stamped."
+      shell: pwsh
+
+    - name: Locate Inf2Cat.exe
+      run: |
+        $ErrorActionPreference = "Stop"
+        $roots = @(
+          "C:\Program Files (x86)\Windows Kits\10\bin",
+          "C:\Program Files\Windows Kits\10\bin"
+        )
+        $candidates = foreach ($root in $roots) {
+          if (Test-Path $root) {
+            Get-ChildItem -Path $root -Filter "Inf2Cat.exe" -Recurse -ErrorAction SilentlyContinue
+          }
+        }
+        if (-not $candidates) {
+          Write-Error "Inf2Cat.exe was not found on this runner."
+          exit 1
+        }
+        $tool = $candidates | Where-Object { $_.FullName -match '\\x64\\' } | Sort-Object FullName -Descending | Select-Object -First 1
+        if (-not $tool) { $tool = $candidates | Sort-Object FullName -Descending | Select-Object -First 1 }
+        Add-Content -Path $env:GITHUB_ENV -Value "INF2CAT_PATH=$($tool.FullName)"
+      shell: pwsh
+
+    - name: Generate CAT file (Inf2Cat)
+      run: |
+        $ErrorActionPreference = "Stop"
+        $fullPackageDir = (Resolve-Path $env:PACKAGE_DIR).Path
+        & "$env:INF2CAT_PATH" /driver:"$fullPackageDir" /os:10_X64 /verbose
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "Inf2Cat exited with error code $LASTEXITCODE."
+          exit 1
+        }
+        if (-not (Test-Path $env:CAT_PATH)) {
+          Write-Error "Inf2Cat did not report an error, but no .cat file was produced at $env:CAT_PATH."
+          exit 1
+        }
+        Write-Host "OK: .cat generated -> $env:CAT_PATH"
+      shell: pwsh
+
+    # =====================================================================
+    # Signing is OPTIONAL here, unlike the reference project's hard-fail:
+    # T2TouchIdTransport.inf says "PoC-only, not WHQL signed - test-signing
+    # / Secure Boot test mode required" (see docs/milestone-2-hardware-
+    # results.md), so a missing cert just means unsigned/test-signable
+    # output, not a broken build. Set the CERT / CERT_PWD repo secrets
+    # (same names/format as the reference project - base64 PFX + password)
+    # to get signed output instead.
+    # =====================================================================
+    - name: Sign .sys and .cat with SignTool
+      if: ${{ secrets.CERT != '' && secrets.CERT_PWD != '' }}
+      run: |
+        $ErrorActionPreference = "Stop"
+        $pfxPath = Join-Path $env:TEMP "signcert.pfx"
+        $cerPath = Join-Path $env:PACKAGE_DIR "$env:DRIVER_NAME.cer"
+
+        try {
+          $bytes = [Convert]::FromBase64String($env:SIGN_CERT_PFX)
+          [IO.File]::WriteAllBytes($pfxPath, $bytes)
+
+          $roots = @(
+            "C:\Program Files (x86)\Windows Kits\10\bin",
+            "C:\Program Files\Windows Kits\10\bin"
+          )
+          $candidates = foreach ($root in $roots) {
+            if (Test-Path $root) {
+              Get-ChildItem -Path $root -Filter "signtool.exe" -Recurse -ErrorAction SilentlyContinue
+            }
+          }
+          $tool = $candidates | Where-Object { $_.FullName -match '\\x64\\' } | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $tool) { $tool = $candidates | Sort-Object FullName -Descending | Select-Object -First 1 }
+          if (-not $tool) { Write-Error "signtool.exe was not found on this runner."; exit 1 }
+
+          & "$($tool.FullName)" sign /v /fd SHA256 /f "$pfxPath" /p "$env:SIGN_CERT_PASSWORD" `
+            /tr http://timestamp.digicert.com /td SHA256 "$env:SYS_PATH"
+          if ($LASTEXITCODE -ne 0) { Write-Error "Signing .sys failed (exit code $LASTEXITCODE)."; exit 1 }
+
+          & "$($tool.FullName)" sign /v /fd SHA256 /f "$pfxPath" /p "$env:SIGN_CERT_PASSWORD" `
+            /tr http://timestamp.digicert.com /td SHA256 "$env:CAT_PATH"
+          if ($LASTEXITCODE -ne 0) { Write-Error "Signing .cat failed (exit code $LASTEXITCODE)."; exit 1 }
+
+          $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(
+            $pfxPath, $env:SIGN_CERT_PASSWORD,
+            [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable
+          )
+          Export-Certificate -Cert $cert -FilePath $cerPath | Out-Null
+          Write-Host "OK: .sys and .cat signed; .cer exported."
+        }
+        finally {
+          if (Test-Path $pfxPath) { Remove-Item -Path $pfxPath -Force }
+        }
+      shell: pwsh
+      env:
+        SIGN_CERT_PFX: ${{ secrets.CERT }}
+        SIGN_CERT_PASSWORD: ${{ secrets.CERT_PWD }}
+
+    - name: Warn if packaging unsigned
+      if: ${{ !(secrets.CERT != '' && secrets.CERT_PWD != '') }}
+      run: Write-Host "::warning::CERT/CERT_PWD secrets not set - packaging an UNSIGNED .sys/.cat. Target machine needs test-signing enabled or Secure Boot test mode (see docs/milestone-2-hardware-results.md)."
+      shell: pwsh
+
+    - name: Stage t2touchid.exe alongside the driver
+      run: |
+        $ErrorActionPreference = "Stop"
+        Copy-Item -Path "build\t2touchid\$env:PLATFORM\$env:CONFIGURATION\t2touchid.exe" -Destination $env:PACKAGE_DIR -Force
+        Write-Host "OK: staged t2touchid.exe"
+      shell: pwsh
+
+    - name: Upload driver + tool package
+      uses: actions/upload-artifact@v4
+      with:
+        name: T2TouchId-${{ env.DRIVER_VERSION }}
+        path: ${{ env.PACKAGE_DIR }}
+        if-no-files-found: error

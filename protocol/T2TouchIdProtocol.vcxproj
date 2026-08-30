@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{5A008826-B113-4E2E-BD73-49EC4779E1C5}</ProjectGuid>
+    <RootNamespace>T2TouchIdProtocol</RootNamespace>
+    <WindowsTargetPlatformVersion>$(LatestTargetPlatformVersion)</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Label="Configuration" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <UseDebugLibraries>true</UseDebugLibraries>
+  </PropertyGroup>
+  <PropertyGroup Label="Configuration" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup>
+    <TargetName>T2TouchIdProtocol</TargetName>
+    <OutDir>$(SolutionDir)build\$(TargetName)\$(Platform)\$(Configuration)\</OutDir>
+    <IntDir>$(SolutionDir)build\$(TargetName)\$(Platform)\$(Configuration)\obj\</IntDir>
+    <!-- libplist (protocol/BridgeXpc/PlistPayload.cpp) only ships an
+         unofficial-libplist CMake config, no documented classic-mode lib
+         name - BuildT2TouchId.yml discovers the real .lib filename after
+         `vcpkg install` and passes both properties on the command line.
+         These are just local-dev fallbacks (vcpkg cloned/bootstrapped next
+         to the .sln); override them if that's not your layout. -->
+    <VcpkgInstalledDir Condition="'$(VcpkgInstalledDir)'==''">$(SolutionDir)vcpkg\installed\x64-windows</VcpkgInstalledDir>
+    <PlistLibName Condition="'$(PlistLibName)'==''">plist-2.0.lib</PlistLibName>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <TreatWarningAsError>true</TreatWarningAsError>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(VcpkgInstalledDir)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="AppleKeyStore\Client.cpp" />
+    <ClCompile Include="BiometricKit\Commands.cpp" />
+    <ClCompile Include="BiometricKit\MatchResult.cpp" />
+    <ClCompile Include="BiometricKit\VerificationEngine.cpp" />
+    <ClCompile Include="BridgeXpc\Connection.cpp" />
+    <ClCompile Include="BridgeXpc\Frame.cpp" />
+    <ClCompile Include="BridgeXpc\PlistPayload.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="AppleKeyStore\Client.h" />
+    <ClInclude Include="BiometricKit\Commands.h" />
+    <ClInclude Include="BiometricKit\MatchResult.h" />
+    <ClInclude Include="BiometricKit\VerificationEngine.h" />
+    <ClInclude Include="BridgeXpc\Connection.h" />
+    <ClInclude Include="BridgeXpc\Frame.h" />
+    <ClInclude Include="BridgeXpc\PlistPayload.h" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>
