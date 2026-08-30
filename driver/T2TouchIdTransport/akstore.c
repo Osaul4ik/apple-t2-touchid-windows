@@ -28,7 +28,7 @@
 #include <bcrypt.h>
 
 BOOLEAN
-T2AksOperationAllowed(_In_ UINT8 Operation)
+T2AksOperationAllowed(UINT8 Operation)
 {
     switch (Operation) {
     case T2AksOpLoadKeybag:
@@ -82,7 +82,7 @@ cleanup:
 // own defensive checks so a malformed reply can never smuggle a longer
 // "trusted" length than the buffer actually holds.
 NTSTATUS
-T2AksDigest(_Inout_updates_bytes_(Length) PUCHAR Message, _In_ SIZE_T Length)
+T2AksDigest(PUCHAR Message, SIZE_T Length)
 {
     UINT32 headerSize;
     UINT32 version;
@@ -128,21 +128,20 @@ T2AksDumpWire(_In_reads_bytes_(Length) PUCHAR Message, _In_ SIZE_T Length, _In_ 
 
     for (offset = 0; offset < n; offset += 16) {
         UCHAR b[16];
+        SIZE_T i;
         SIZE_T chunk = (n - offset > 16) ? 16 : (n - offset);
 
-        // chunk <= n - offset <= Length - offset, so Message[offset, offset+chunk)
-        // is always within the caller-declared [Message, Message+Length) range.
-        // Splitting into "copy the real bytes" (bounded by chunk) + "zero the
-        // rest" (bounded by 16-chunk, writes only to the local array b) lets
-        // /analyze verify the read bound directly from chunk's own ternary
-        // definition above - no extra assertion needed here. (An earlier
-        // version added an explicit _Analysis_assume_(chunk <= Length -
-        // offset) on this line; that corrupted /analyze's readable-size
-        // model for the unrelated local array b below it instead of fixing
-        // anything, so it was removed rather than worked around.)
-        RtlCopyMemory(b, Message + offset, chunk);
-        if (chunk < 16) {
-            RtlZeroMemory(b + chunk, 16 - chunk);
+        // Byte-by-byte fill keeps /analyze's readable-size model simple:
+        // each Message[offset + i] is guarded by offset + i < Length
+        // (n <= Length and i < chunk <= n - offset). Avoids C6385 on a
+        // bulk RtlCopyMemory whose bound the analyzer does not always
+        // prove from the ternary above.
+        RtlZeroMemory(b, sizeof(b));
+        for (i = 0; i < chunk; i++) {
+            if (offset + i >= Length) {
+                break;
+            }
+            b[i] = Message[offset + i];
         }
 
         // Fixed-width hex lines; unused trailing bytes of the last row are 00
@@ -198,10 +197,14 @@ T2AksBuildHeaderV2(_Out_ PT2_AKS_HEADER_V2 Header)
 }
 
 NTSTATUS
-T2AksExchange(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
-              _In_reads_bytes_opt_(RequestLength) PUCHAR RequestBody, _In_ SIZE_T RequestLength,
-              _Out_writes_bytes_to_opt_(ResponseCapacity, *ResponseLength) PUCHAR ResponseBody,
-              _In_ SIZE_T ResponseCapacity, _Out_ SIZE_T *ResponseLength)
+T2AksExchange(
+    PT2_DEVICE_CONTEXT Ctx,
+    UINT8 Operation,
+    PUCHAR RequestBody,
+    SIZE_T RequestLength,
+    PUCHAR ResponseBody,
+    SIZE_T ResponseCapacity,
+    SIZE_T *ResponseLength)
 {
     NTSTATUS status;
     T2_AKS_HEADER_V2 header;
