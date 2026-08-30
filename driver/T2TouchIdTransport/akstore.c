@@ -338,13 +338,30 @@ T2AksExchange(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
     // Device -> CPU: invalidate cache so we observe SEP's write to OOL_OUT.
     T2AksFlushForDevice(outBase, T2_SEP_OOL_SIZE);
 
-    // Accept either V1 or V2 reply header (Linux probe uses V1 for capabilities;
-    // the general ioctl path uses V2). Minimum size is the smaller of the two.
+    // replyWireLength==0: SEP posted a mailbox ack with no OOL payload
+    // (seen for get_device_state with handle=0 — endpoint alive, no body).
+    if (replyWireLength == 0) {
+        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+            "T2TouchIdTransport: AKS reply has zero wire length "
+            "(operation=0x%02x transaction=0x%02x) — mailbox ack only, no OOL body\n",
+            Operation, transaction));
+        *ResponseLength = 0;
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
+    // Accept either V1 or V2 reply header.
     if (replyWireLength < T2_AKS_V1_WIRE_SIZE || replyWireLength > T2_SEP_OOL_SIZE) {
         T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
             "T2TouchIdTransport: AKS reply rejected - replyWireLength=%u out of bounds "
             "(expect >=%u, <=%u)\n", replyWireLength, (UINT32)T2_AKS_V1_WIRE_SIZE, T2_SEP_OOL_SIZE));
         return STATUS_DEVICE_PROTOCOL_ERROR;
+    }
+
+    // Dump OOL_OUT for diagnostic ops so we can verify digest/body.
+    if (Operation == T2AksOpGetCapabilities || Operation == T2AksOpGetDeviceState) {
+        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+            "T2TouchIdTransport: OolOut reply wireLength=%u:\n", replyWireLength));
+        T2AksDumpWire(outBase, replyWireLength, 128);
     }
 
     RtlCopyMemory(&replyHeaderSize, outBase, sizeof(UINT32));
