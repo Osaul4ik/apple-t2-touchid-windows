@@ -43,6 +43,18 @@ T2EvtDeviceAdd(
     WdfDeviceInitSetDeviceType(DeviceInit, FILE_DEVICE_UNKNOWN);
     WdfDeviceInitSetExclusive(DeviceInit, FALSE);
 
+    // Root-only equivalent: restrict the device interface with a SDDL that
+    // grants Administrators/SYSTEM only. Mirrors Linux /dev/t2-aks mode 0600.
+    // MUST be assigned before WdfDeviceCreate: WdfDeviceCreate consumes and
+    // nulls out DeviceInit on success, so calling
+    // WdfDeviceInitAssignSDDLString afterward passes a NULL DeviceInit and
+    // trips WDF_VIOLATION (0x10D, Arg1=4, "NULL parameter").
+    status = WdfDeviceInitAssignSDDLString(DeviceInit,
+        &SDDL_DEVOBJ_SYS_ALL_ADM_ALL); // SYSTEM + Administrators full control, everyone else denied
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, T2_DEVICE_CONTEXT);
     status = WdfDeviceCreate(&DeviceInit, &attributes, &device);
     if (!NT_SUCCESS(status)) {
@@ -67,15 +79,8 @@ T2EvtDeviceAdd(
         return status;
     }
 
-    // Root-only equivalent: restrict the device interface with a SDDL that
-    // grants Administrators/SYSTEM only. Mirrors Linux /dev/t2-aks mode 0600.
-    WDF_OBJECT_ATTRIBUTES fileAttributes;
     WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&queueConfig, WdfIoQueueDispatchSequential);
     queueConfig.EvtIoDeviceControl = T2EvtIoDeviceControl;
-
-    WDF_OBJECT_ATTRIBUTES_INIT(&fileAttributes);
-    status = WdfDeviceInitAssignSDDLString(DeviceInit,
-        &SDDL_DEVOBJ_SYS_ALL_ADM_ALL); // SYSTEM + Administrators full control, everyone else denied
 
     WDFQUEUE queue;
     status = WdfIoQueueCreate(device, &queueConfig, WDF_NO_OBJECT_ATTRIBUTES, &queue);
