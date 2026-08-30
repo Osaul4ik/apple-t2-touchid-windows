@@ -15,6 +15,16 @@
 
 #include "driver.h"
 
+// Built locally instead of relying on the SDK's SDDL_DEVOBJ_SYS_ALL_ADM_ALL
+// (declared in wdmsec.h, defined only in wdmsec.lib): that external symbol
+// was resolving to an invalid/garbage UNICODE_STRING at runtime on this
+// build - WdfDeviceInitAssignSDDLString failed with
+// STATUS_INVALID_SECURITY_DESCR ("SECURITY_DESCRIPTOR structure is not
+// valid"), which fails AddDevice and shows up as Device Manager Code 31.
+// Same SDDL text (SYSTEM + Administrators full control, everyone else
+// denied), no wdmsec.lib dependency, nothing to resolve wrong.
+DECLARE_CONST_UNICODE_STRING(g_T2SddlDevObjSysAllAdmAll, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
+
 static VOID T2EvtIoDeviceControlAksExchange(_In_ WDFREQUEST Request, _In_ PT2_DEVICE_CONTEXT Ctx);
 
 NTSTATUS
@@ -50,7 +60,7 @@ T2EvtDeviceAdd(
     // WdfDeviceInitAssignSDDLString afterward passes a NULL DeviceInit and
     // trips WDF_VIOLATION (0x10D, Arg1=4, "NULL parameter").
     status = WdfDeviceInitAssignSDDLString(DeviceInit,
-        &SDDL_DEVOBJ_SYS_ALL_ADM_ALL); // SYSTEM + Administrators full control, everyone else denied
+        &g_T2SddlDevObjSysAllAdmAll); // SYSTEM + Administrators full control, everyone else denied
     if (!NT_SUCCESS(status)) {
         return status;
     }

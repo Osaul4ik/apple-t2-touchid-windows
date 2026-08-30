@@ -82,12 +82,17 @@
            ship in ksecdd.sys; drivers link against Ksecdd.lib for them,
            not Bcrypt.lib (that's the user-mode CNG import lib).
 
-           device.c references SDDL_DEVOBJ_SYS_ALL_ADM_ALL, which is
-           declared extern in wdmsec.h but only actually defined in
-           wdmsec.lib (a separate WDK security-descriptor helper import
-           lib, not pulled in automatically) - link it or the string
-           symbol is unresolved at link time. -->
-      <AdditionalDependencies>Ksecdd.lib;wdmsec.lib;%(AdditionalDependencies)</AdditionalDependencies>
+           wdmsec.lib is intentionally NOT linked: device.c used to
+           reference SDDL_DEVOBJ_SYS_ALL_ADM_ALL (declared in wdmsec.h,
+           defined only in wdmsec.lib), but that external symbol resolved
+           to an invalid UNICODE_STRING at runtime and made
+           WdfDeviceInitAssignSDDLString fail with
+           STATUS_INVALID_SECURITY_DESCR (Device Manager Code 31).
+           device.c now builds the identical SDDL text locally via
+           DECLARE_CONST_UNICODE_STRING, so there is nothing left that
+           needs wdmsec.lib - don't re-add it without also reverting that
+           change. -->
+      <AdditionalDependencies>Ksecdd.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <DriverSign>
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
