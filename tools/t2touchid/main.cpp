@@ -4,7 +4,7 @@
 // of fabricated success. Every command either reports a real driver/IOCTL
 // result or reports the specific failure — there is no "assume it worked"
 // path anywhere in this file.
-
+#define NOMINMAX
 #include "../../protocol/AppleKeyStore/Client.h"
 #include <iostream>
 #include <string>
