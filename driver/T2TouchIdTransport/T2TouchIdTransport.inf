@@ -23,11 +23,17 @@ PnpLockdown = 1
 [T2TouchIdTransport_Device.NT]
 CopyFiles = Drivers_Dir
 
-[T2TouchIdTransport_Device.NT.HW]
-AddReg = T2TouchIdTransport_Device.NT.AddReg
-
-[T2TouchIdTransport_Device.NT.AddReg]
-HKR,,"UpperFilters",0x00010000,"WdfKernelShim"
+; NOTE: no [T2TouchIdTransport_Device.NT.HW] / UpperFilters entry here.
+; An earlier draft of this INF added
+;   HKR,,"UpperFilters",0x00010000,"WdfKernelShim"
+; but "WdfKernelShim" is not a real Windows component - it doesn't
+; correspond to any documented service, coinstaller, or reflector (the
+; closest real thing, WudfRd, is the UMDF reflector and is irrelevant to
+; a KMDF driver like this one). PnP would look for a filter service by
+; that name to load above this function driver and simply not find one,
+; which is pure downside: it changes this PCI device's filter stack for
+; no benefit. Do not re-add an UpperFilters/LowerFilters entry unless a
+; specific, real filter driver actually needs to sit in this stack.
 
 [T2TouchIdTransport_Device.NT.Services]
 AddService = T2TouchIdTransport,0x000001fa,T2TouchIdTransport_Service_Inst
@@ -49,7 +55,14 @@ T2TouchIdTransport.sys
 T2TouchIdTransport.sys = 1,,
 
 [DestinationDirs]
-Drivers_Dir = 13 ; %SystemRoot%\System32\drivers\UMDF (KMDF: 12, driver store handled by inf2cat/build)
+; DIRID 13 = "run from Driver Store", not a UMDF-specific path - this is
+; the Microsoft-documented, Driver-Package-Isolation-compliant pattern
+; for a KERNEL driver's service binary too (see "Run From Driver Store" /
+; "Service binary" in the WDK docs), and it's already correctly paired
+; with ServiceBinary = %13%\... above. Don't change this to 12 - that
+; would only revert to the older, non-driver-store install style, not
+; fix anything.
+Drivers_Dir = 13
 
 [Strings]
 ManufacturerName = "T2TouchId Project (unsigned PoC)"
