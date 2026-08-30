@@ -151,6 +151,22 @@ T2AksExchange(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
     }
     requestWireLength = T2_AKS_V2_WIRE_SIZE + RequestLength;
 
+    // DIAGNOSTIC (2026-08-30, Gate 4 timeout follow-up): confirm these are
+    // still the exact buffers SEP was told about in T2DmaRegisterOolBuffers
+    // - if the device object were ever recreated (surprise PnP re-enum)
+    // between register-ool and this call, OolInRegistered would already be
+    // FALSE and device.c would reject us before we get here, but log the
+    // physical addresses too so a mismatch against the earlier
+    // "registered 16 KiB endpoint-7 OOL..." log line is visible at a glance.
+    {
+        PHYSICAL_ADDRESS oolInDma = WdfCommonBufferGetAlignedLogicalAddress(Ctx->OolInBuffer);
+        PHYSICAL_ADDRESS oolOutDma = WdfCommonBufferGetAlignedLogicalAddress(Ctx->OolOutBuffer);
+        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+            "T2TouchIdTransport: AKS exchange using OolIn phys=0x%llx OolOut phys=0x%llx "
+            "(InRegistered=%d OutRegistered=%d)\n",
+            oolInDma.QuadPart, oolOutDma.QuadPart, Ctx->OolInRegistered, Ctx->OolOutRegistered));
+    }
+
     T2AksBuildHeaderV2(&header);
 
     RtlZeroMemory(inBase, T2_SEP_OOL_SIZE);
@@ -169,6 +185,21 @@ T2AksExchange(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
         return status;
     }
 
+    // DIAGNOSTIC: dump the first bytes of the digest-signed wire message
+    // (header_size, digest, version, and the start of the body) exactly as
+    // it sits in the OOL_IN buffer right before we hand it to SEP. This is
+    // erased by RtlSecureZeroMemory a few lines below, so this is the only
+    // point we can compare it against a hand-decoded expectation later.
+    // Not a privacy concern: this operation (GetCapabilities) carries no
+    // secret material - keybag/unlock operations are logged at this same
+    // point too, but those wire bytes include a caller-supplied secret in
+    // the body, so do not extend this dump past T2_AKS_V2_WIRE_SIZE there.
+    T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        "T2TouchIdTransport: AKS wire header_size=0x%x digest0..3=%02x%02x%02x%02x version=%u "
+        "requestWireLength=%Iu bodyLength=%Iu\n",
+        *(UINT32*)inBase, inBase[4], inBase[5], inBase[6], inBase[7],
+        header.V1.Version, requestWireLength, RequestLength));
+
     // VERIFIED FROM SOURCE: transaction is a free-running byte counter that
     // skips 0 (0 is reserved / never a valid transaction id on this path).
     Ctx->NextTransaction++;
@@ -186,12 +217,19 @@ T2AksExchange(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
     // VERIFIED FROM SOURCE bounds: reply_length must be at least a bare V2
     // wire header and never exceed the physical OOL buffer size.
     if (replyWireLength < T2_AKS_V2_WIRE_SIZE || replyWireLength > T2_SEP_OOL_SIZE) {
+        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "T2TouchIdTransport: AKS reply rejected - replyWireLength=%u out of bounds "
+            "(expect >=%u, <=%u)\n", replyWireLength, (UINT32)T2_AKS_V2_WIRE_SIZE, T2_SEP_OOL_SIZE));
         return STATUS_DEVICE_PROTOCOL_ERROR;
     }
 
     RtlCopyMemory(&replyHeaderSize, outBase, sizeof(UINT32));
     RtlCopyMemory(&replyVersion, outBase + sizeof(UINT32) + 16, sizeof(UINT32));
     if (replyHeaderSize != T2_AKS_HEADER_V2_SIZE || replyVersion != T2_AKS_VERSION_V2) {
+        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "T2TouchIdTransport: AKS reply rejected - replyHeaderSize=0x%x (want 0x%x) "
+            "replyVersion=%u (want %u)\n",
+            replyHeaderSize, T2_AKS_HEADER_V2_SIZE, replyVersion, T2_AKS_VERSION_V2));
         return STATUS_DEVICE_PROTOCOL_ERROR;
     }
 
@@ -208,6 +246,9 @@ T2AksExchange(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
         if (NT_SUCCESS(status) &&
             RtlCompareMemory(expected, outBase + sizeof(UINT32), sizeof(expected)) != sizeof(expected)) {
             status = STATUS_INVALID_DEVICE_STATE; // digest mismatch: never trust body
+            T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                "T2TouchIdTransport: AKS reply rejected - digest mismatch (operation=0x%02x "
+                "transaction=0x%02x replyWireLength=%u)\n", Operation, transaction, replyWireLength));
         }
         RtlSecureZeroMemory(expected, sizeof(expected));
     }
