@@ -191,6 +191,21 @@ jobs:
           Write-Error "Test binary not found: $exe"
           exit 1
         }
+
+        # T2TouchIdTests.exe links plist-2.0.lib, which is just the import
+        # lib for vcpkg's dynamically-built plist-2.0.dll (the x64-windows
+        # triplet is dynamic by default) - the actual DLL, and its own
+        # dependencies (libxml2/zlib/liblzma/iconv), live in
+        # vcpkg\installed\x64-windows\bin, not ...\lib. Without that dir on
+        # PATH the exe can't even start (STATUS_DLL_NOT_FOUND / exit code
+        # -1073741515), which looks like a test failure but isn't one.
+        $vcpkgBinDir = Join-Path $env:VCPKG_INSTALLED_DIR "bin"
+        if (-not (Test-Path $vcpkgBinDir)) {
+          Write-Error "vcpkg bin dir not found: $vcpkgBinDir"
+          exit 1
+        }
+        $env:PATH = "$vcpkgBinDir;$env:PATH"
+
         & $exe
         if ($LASTEXITCODE -ne 0) {
           Write-Error "T2TouchIdTests.exe reported failures (exit code $LASTEXITCODE)."
@@ -374,7 +389,19 @@ jobs:
       run: |
         $ErrorActionPreference = "Stop"
         Copy-Item -Path "build\t2touchid\$env:PLATFORM\$env:CONFIGURATION\t2touchid.exe" -Destination $env:PACKAGE_DIR -Force
-        Write-Host "OK: staged t2touchid.exe"
+
+        # Same dynamic-plist dependency as T2TouchIdTests.exe (see that
+        # step) - t2touchid.exe needs plist-2.0.dll and its own
+        # dependencies alongside it, or it fails to launch on a machine
+        # that doesn't happen to have vcpkg's bin dir on PATH.
+        $vcpkgBinDir = Join-Path $env:VCPKG_INSTALLED_DIR "bin"
+        if (-not (Test-Path $vcpkgBinDir)) {
+          Write-Error "vcpkg bin dir not found: $vcpkgBinDir"
+          exit 1
+        }
+        Copy-Item -Path (Join-Path $vcpkgBinDir "*.dll") -Destination $env:PACKAGE_DIR -Force
+
+        Write-Host "OK: staged t2touchid.exe and its runtime DLLs"
       shell: pwsh
 
     - name: Upload driver + tool package
