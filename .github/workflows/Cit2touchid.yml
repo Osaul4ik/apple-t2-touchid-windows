@@ -40,6 +40,7 @@ jobs:
     permissions:
       contents: read
       security-events: write
+      actions: read          # required by upload-sarif (workflow-runs API)
     env:
       CODEQL_CLI_VERSION: 2.24.1
       CODEQL_DRIVERS_PACK_VERSION: 1.8.2
@@ -280,14 +281,14 @@ jobs:
 
     - name: Upload mustrun.qls SARIF to GitHub code scanning
       if: always()
-      uses: github/codeql-action/upload-sarif@v3
+      uses: github/codeql-action/upload-sarif@v4
       with:
         sarif_file: ${{ env.SARIF_MUSTRUN }}
         category: mustrun
 
     - name: Upload mustfix.qls SARIF to GitHub code scanning
       if: always()
-      uses: github/codeql-action/upload-sarif@v3
+      uses: github/codeql-action/upload-sarif@v4
       with:
         sarif_file: ${{ env.SARIF_MUSTFIX }}
         category: mustfix
