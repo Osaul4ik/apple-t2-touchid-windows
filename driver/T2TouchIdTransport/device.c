@@ -1,19 +1,19 @@
 // device.c
 //
-// PCI enumeration/BAR-mapping assumption (flagged, not silently guessed):
-// the Linux reference maps BAR4 by PCI config offset. KMDF's translated
-// resource list does not label entries by BAR index directly; this driver
-// walks CmResourceTypeMemory descriptors and, absent a second memory BAR on
-// the T2 SEP function, treats the first (and expected-only) memory resource
-// as BAR4. This MUST be confirmed on real hardware via IOCTL_T2_GET_STATUS
-// (Bar4Size should read 0x10000 or larger) before trusting mailbox I/O.
-// If the target machine's SEP function exposes more than one memory BAR,
-// this selection logic needs a real PCI config-space BAR4 read (via the
-// bus interface, IRP_MN_READ_CONFIG) to disambiguate — not implemented in
-// this PoC because the Linux reference gives no evidence multiple memory
-// BARs exist on this function (VERIFIED FROM SOURCE: only BAR4 referenced).
+// PCI enumeration/BAR-mapping: BAR4 is now selected by reading its real
+// base address directly out of PCI config space (offset 0x20) via
+// BUS_INTERFACE_STANDARD.GetBusData, then matching that address against
+// the assigned resource list - see T2QueryBar4ViaPciConfig below. This
+// replaces an earlier "assume the first memory resource is BAR4"
+// heuristic that was proven wrong on real hardware: the T2 SEP PCI
+// function exposes THREE memory BARs (confirmed via
+// docs/milestone-2-hardware-results.md), and the first one enumerated by
+// KMDF's translated resource list is not reliably BAR4. The old heuristic
+// is kept only as a last-resort fallback if GetBusData is ever
+// unavailable, and is clearly logged as unreliable when used.
 
 #include "driver.h"
+#include <wdmguid.h>   // GUID_BUS_INTERFACE_STANDARD
 
 // Built locally instead of relying on the SDK's SDDL_DEVOBJ_SYS_ALL_ADM_ALL
 // (declared in wdmsec.h, defined only in wdmsec.lib): that external symbol
@@ -26,6 +26,84 @@
 DECLARE_CONST_UNICODE_STRING(g_T2SddlDevObjSysAllAdmAll, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
 
 static VOID T2EvtIoDeviceControlAksExchange(_In_ WDFREQUEST Request, _In_ PT2_DEVICE_CONTEXT Ctx);
+
+// Reads the SEP function's real BAR4 base address directly out of PCI
+// config space (offset 0x20 - BAR0 is at 0x10, each BAR is 4 bytes, so
+// BAR4 is the 5th slot: 0x10 + 4*4 = 0x20). This is the disambiguation
+// the file-header comment always said was needed: on real hardware this
+// PCI function exposes THREE memory BARs (confirmed via
+// docs/milestone-2-hardware-results.md hardware run - two "unexpected
+// second memory BAR" warnings, sizes 0x80000 and 0x10000), so "first
+// memory resource in the translated list" is not a safe stand-in for
+// "BAR4". Returns the raw (bus-relative) base address; the caller must
+// match it against ResourcesRaw, not ResourcesTranslated, because raw
+// descriptors carry the same bus-relative addresses that live in the PCI
+// BAR registers themselves.
+static NTSTATUS
+T2QueryBar4ViaPciConfig(_In_ WDFDEVICE Device, _Out_ PHYSICAL_ADDRESS *Bar4Base)
+{
+    NTSTATUS status;
+    BUS_INTERFACE_STANDARD busInterface;
+    ULONG bytesRead;
+    UCHAR barBytes[8] = { 0 };
+    ULONG bar4Raw, barType;
+
+    RtlZeroMemory(&busInterface, sizeof(busInterface));
+    status = WdfFdoQueryForInterface(Device, &GUID_BUS_INTERFACE_STANDARD,
+        (PINTERFACE)&busInterface, sizeof(busInterface), 1, NULL);
+    if (!NT_SUCCESS(status)) {
+        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "T2TouchIdTransport: WdfFdoQueryForInterface(BUS_INTERFACE_STANDARD) failed, status=0x%x\n",
+            status));
+        return status;
+    }
+
+    // Read BAR4 (offset 0x20) and BAR5 (offset 0x24) in one shot - BAR5
+    // is only meaningful if BAR4 turns out to be a 64-bit BAR, but reading
+    // both up front avoids a second round trip through GetBusData.
+    bytesRead = busInterface.GetBusData(busInterface.Context, PCI_WHICHSPACE_CONFIG,
+        barBytes, 0x20, sizeof(barBytes));
+
+    if (busInterface.InterfaceDereference) {
+        busInterface.InterfaceDereference(busInterface.Context);
+    }
+
+    if (bytesRead < 4) {
+        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "T2TouchIdTransport: GetBusData read only %u of 4+ bytes at PCI config offset 0x20\n",
+            bytesRead));
+        return STATUS_DEVICE_CONFIGURATION_ERROR;
+    }
+
+    bar4Raw = *(PULONG)&barBytes[0];
+    if ((bar4Raw & 0x1) != 0) {
+        // Bit 0 set = I/O space BAR, not memory - wrong offset or wrong
+        // function entirely for a device this driver expects to be
+        // memory-mapped.
+        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "T2TouchIdTransport: PCI config offset 0x20 is an I/O BAR (raw=0x%x), expected memory\n",
+            bar4Raw));
+        return STATUS_DEVICE_CONFIGURATION_ERROR;
+    }
+
+    barType = (bar4Raw >> 1) & 0x3; // 0 = 32-bit, 2 = 64-bit (bit pattern per PCI spec)
+    if (barType == 0x2) {
+        if (bytesRead < 8) {
+            T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                "T2TouchIdTransport: BAR4 is a 64-bit BAR but BAR5 (high dword) was not read\n"));
+            return STATUS_DEVICE_CONFIGURATION_ERROR;
+        }
+        ULONG bar5Raw = *(PULONG)&barBytes[4];
+        Bar4Base->QuadPart = ((LONGLONG)bar5Raw << 32) | (LONGLONG)(bar4Raw & 0xFFFFFFF0u);
+    } else {
+        Bar4Base->QuadPart = (LONGLONG)(bar4Raw & 0xFFFFFFF0u);
+    }
+
+    T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        "T2TouchIdTransport: PCI config space reports BAR4 base 0x%I64x (%s)\n",
+        Bar4Base->QuadPart, (barType == 0x2) ? "64-bit" : "32-bit"));
+    return STATUS_SUCCESS;
+}
 
 NTSTATUS
 T2EvtDeviceAdd(
@@ -117,28 +195,79 @@ T2EvtDevicePrepareHardware(
     _In_ WDFCMRESLIST ResourcesTranslated
     )
 {
-    UNREFERENCED_PARAMETER(ResourcesRaw);
-
     PT2_DEVICE_CONTEXT ctx = GetDeviceContext(Device);
     ULONG count = WdfCmResourceListGetCount(ResourcesTranslated);
+    ULONG rawCount = WdfCmResourceListGetCount(ResourcesRaw);
     BOOLEAN foundBar = FALSE;
+    PHYSICAL_ADDRESS bar4Base = { 0 };
+    NTSTATUS pciStatus;
 
-    for (ULONG i = 0; i < count; i++) {
-        PCM_PARTIAL_RESOURCE_DESCRIPTOR desc =
-            WdfCmResourceListGetDescriptor(ResourcesTranslated, i);
+    // Confirmed on real hardware (docs/milestone-2-hardware-results.md):
+    // this SEP PCI function exposes THREE memory BARs, not the single one
+    // this driver originally assumed. Blindly taking "the first memory
+    // resource" mapped the wrong region - mailbox reads returned constant
+    // 0x0 status words that never legitimately reflect real inbox/outbox
+    // state, and SET_OOL_IN spun through T2_SEP_MAX_SKIPPED_REPLIES bogus
+    // "replies" before failing with STATUS_DEVICE_PROTOCOL_ERROR. Read
+    // BAR4's real base address out of PCI config space and match it
+    // against the assigned resource list instead of guessing.
+    pciStatus = T2QueryBar4ViaPciConfig(Device, &bar4Base);
 
-        if (desc->Type == CmResourceTypeMemory) {
-            // See file-header comment: first memory BAR is treated as BAR4
-            // pending real-hardware confirmation via IOCTL_T2_GET_STATUS.
-            if (!foundBar) {
+    if (NT_SUCCESS(pciStatus)) {
+        // ResourcesRaw and ResourcesTranslated are parallel lists - index i
+        // in one always corresponds to the same underlying resource as
+        // index i in the other (WDF guarantee). Raw descriptors carry the
+        // bus-relative address that matches what's actually programmed
+        // into the PCI BAR register; translated descriptors carry the
+        // CPU-usable address MmMapIoSpaceEx needs. We match on raw, then
+        // map using translated.
+        ULONG scanCount = (rawCount < count) ? rawCount : count;
+        for (ULONG i = 0; i < scanCount; i++) {
+            PCM_PARTIAL_RESOURCE_DESCRIPTOR rawDesc = WdfCmResourceListGetDescriptor(ResourcesRaw, i);
+            if (rawDesc->Type == CmResourceTypeMemory &&
+                rawDesc->u.Memory.Start.QuadPart == bar4Base.QuadPart) {
+                PCM_PARTIAL_RESOURCE_DESCRIPTOR desc = WdfCmResourceListGetDescriptor(ResourcesTranslated, i);
                 ctx->Bar4PhysicalAddress = desc->u.Memory.Start;
                 ctx->Bar4Length = desc->u.Memory.Length;
                 foundBar = TRUE;
-            } else {
-                T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                    "T2TouchIdTransport: unexpected second memory BAR "
-                    "(len=0x%x) - BAR4 selection logic needs review\n",
-                    desc->u.Memory.Length));
+                T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                    "T2TouchIdTransport: BAR4 confirmed via PCI config space at resource index %u "
+                    "(len=0x%x)\n", i, desc->u.Memory.Length));
+                break;
+            }
+        }
+        if (!foundBar) {
+            T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                "T2TouchIdTransport: PCI config space reports BAR4 base 0x%I64x but no matching "
+                "memory resource was found in the assigned resource list\n", bar4Base.QuadPart));
+        }
+    } else {
+        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+            "T2TouchIdTransport: could not confirm BAR4 via PCI config space (status=0x%x); "
+            "falling back to first-memory-resource heuristic - THIS IS UNRELIABLE, do not "
+            "trust a successful mailbox read that follows this warning\n", pciStatus));
+    }
+
+    if (!foundBar) {
+        // Last-resort fallback only - kept so the driver doesn't outright
+        // refuse to load if GetBusData is ever unavailable on some target,
+        // but this is exactly the heuristic that mapped the wrong BAR on
+        // real hardware. Any warning below means BAR4 selection is still
+        // unconfirmed.
+        for (ULONG i = 0; i < count; i++) {
+            PCM_PARTIAL_RESOURCE_DESCRIPTOR desc = WdfCmResourceListGetDescriptor(ResourcesTranslated, i);
+
+            if (desc->Type == CmResourceTypeMemory) {
+                if (!foundBar) {
+                    ctx->Bar4PhysicalAddress = desc->u.Memory.Start;
+                    ctx->Bar4Length = desc->u.Memory.Length;
+                    foundBar = TRUE;
+                } else {
+                    T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                        "T2TouchIdTransport: unexpected second memory BAR "
+                        "(len=0x%x) - BAR4 selection logic needs review\n",
+                        desc->u.Memory.Length));
+                }
             }
         }
     }
