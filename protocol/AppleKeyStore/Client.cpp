@@ -34,6 +34,11 @@ static std::optional<std::wstring> FindDevicePath() {
 }
 
 AksResult Client::Open() {
+    // Milestone 2B §10: a repeated Open() call on an already-open Client
+    // must not leak the previous handle - close it first so this is a
+    // reconnect, not a leak.
+    Close();
+
     auto path = FindDevicePath();
     if (!path) return AksResult::DeviceNotFound;
 
@@ -188,12 +193,20 @@ AksResult Client::Unlock(int32_t handle, std::vector<uint8_t>& secretUtf8) {
     req.resize(req.size() + (paddedSecretLen - secretUtf8.size()), 0); // zero pad
 
     // Zero the caller's buffer and our local copy before returning,
-    // regardless of success/failure (Milestone 2 §10, §24).
+    // regardless of success/failure (Milestone 2 §10, §24; Milestone 2B
+    // §10 "zeroize the full actually-used sensitive buffer capacity, not
+    // just size"). std::vector may have allocated more storage than
+    // size() reports (e.g. the caller reserved/grew it before handing it
+    // to us) - zeroing only up to size() would leave the secret bytes
+    // sitting in that extra, still-allocated-but-"unused" capacity where
+    // this function would never touch them again. uint8_t is trivial, so
+    // writing zero bytes out to capacity() is well-defined even though
+    // those bytes are past size().
     std::vector<uint8_t> response;
     AksResult r = Exchange(static_cast<uint8_t>(T2AksOpChangeLockState), req, &response);
 
-    SecureZeroMemory(req.data(), req.size());
-    SecureZeroMemory(secretUtf8.data(), secretUtf8.size());
+    SecureZeroMemory(req.data(), req.capacity());
+    SecureZeroMemory(secretUtf8.data(), secretUtf8.capacity());
     secretUtf8.clear();
 
     return r;

@@ -24,9 +24,42 @@ enum class AksResult {
 
 class Client {
 public:
+    Client() = default;
+    ~Client() { Close(); }
+
+    // Milestone 2B §10: this class owns a raw HANDLE. The implicitly
+    // generated copy constructor/assignment would copy that HANDLE value
+    // into a second Client, and when either instance is destroyed (or
+    // Close()d) it would CloseHandle() a handle the other instance still
+    // believes is live - a double-close, and a potential handle-reuse bug
+    // if a third, unrelated handle gets that same value in between. Delete
+    // copying outright; there is no use case in this codebase for two
+    // Client objects sharing one device handle.
+    Client(const Client&) = delete;
+    Client& operator=(const Client&) = delete;
+
+    // Moving is safe (and useful, e.g. returning a Client by value) as long
+    // as the moved-from instance is left holding nothing to close.
+    Client(Client&& other) noexcept : handle_(other.handle_) {
+        other.handle_ = INVALID_HANDLE_VALUE;
+    }
+    Client& operator=(Client&& other) noexcept {
+        if (this != &other) {
+            Close();
+            handle_ = other.handle_;
+            other.handle_ = INVALID_HANDLE_VALUE;
+        }
+        return *this;
+    }
+
     // Opens \\.\GLOBALROOT\Device\... via the registered device interface
     // (GUID_DEVINTERFACE_T2TOUCHID_TRANSPORT). Requires admin (SDDL on the
     // device interface restricts to SYSTEM/Administrators).
+    //
+    // Safe to call again on an already-open Client (Milestone 2B §10
+    // "check repeated Connect()"): any existing handle is closed first, so
+    // a caller that calls Open() twice in a row gets a fresh handle instead
+    // of leaking the first one.
     AksResult Open();
     void Close();
 
@@ -43,8 +76,6 @@ public:
     // body = [result:u32=0][handle:u64][selector:u32] (20 bytes).
     AksResult GetDeviceState(int64_t handle, uint32_t selector,
                             std::vector<uint8_t>* responseBody);
-
-    ~Client() { Close(); }
 
 private:
     HANDLE handle_ = INVALID_HANDLE_VALUE;

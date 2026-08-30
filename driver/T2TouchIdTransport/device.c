@@ -27,6 +27,19 @@ DECLARE_CONST_UNICODE_STRING(g_T2SddlDevObjSysAllAdmAll, L"D:P(A;;GA;;;SY)(A;;GA
 
 static VOID T2EvtIoDeviceControlAksExchange(_In_ WDFREQUEST Request, _In_ PT2_DEVICE_CONTEXT Ctx);
 
+// Milestone 2B §2: single choke point for transport state transitions so
+// every change is logged and the state machine documented in driver.h
+// stays the one source of truth. Caller must already hold ExchangeLock.
+VOID
+T2SetTransportState(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ T2_TRANSPORT_STATE NewState)
+{
+    if (Ctx->State != NewState) {
+        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+            "T2TouchIdTransport: transport state %d -> %d\n", Ctx->State, NewState));
+    }
+    Ctx->State = NewState;
+}
+
 // Reads the SEP function's real BAR4 base address directly out of PCI
 // config space (offset 0x20 - BAR0 is at 0x10, each BAR is 4 bytes, so
 // BAR4 is the 5th slot: 0x10 + 4*4 = 0x20). This is the disambiguation
@@ -244,6 +257,14 @@ T2EvtDeviceAdd(
 
     WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&queueConfig, WdfIoQueueDispatchSequential);
     queueConfig.EvtIoDeviceControl = T2EvtIoDeviceControl;
+    // Milestone 2B §4: this is a power-managed default queue (the WDF
+    // default), so the framework can call EvtIoStop for a request that is
+    // still executing when a power-down/PnP-stop/remove is starting. Our
+    // IOCTL handlers are synchronous and complete the request themselves
+    // (possibly after a long AKS mailbox exchange under ExchangeLock) - see
+    // T2EvtIoStop for why we acknowledge-and-let-finish rather than force
+    // completion here.
+    queueConfig.EvtIoStop = T2EvtIoStop;
 
     WDFQUEUE queue;
     status = WdfIoQueueCreate(device, &queueConfig, WDF_NO_OBJECT_ATTRIBUTES, &queue);
@@ -373,6 +394,25 @@ T2EvtDevicePrepareHardware(
     // configuration - no C4189 risk here anymore, and no
     // UNREFERENCED_PARAMETER needed.
 
+    // Milestone 2B §2/§7: if OOL was ever successfully registered with SEP
+    // on this device context (OolInRegistered/OolOutRegistered), it stays
+    // Invalid even across a fresh PrepareHardware - T2EvtDeviceReleaseHardware
+    // deliberately never frees or deregisters that memory (no dereg opcode
+    // exists, and this same WDFDEVICE/context can be reused across a
+    // Stop/Start resource-rebalance without ever being destroyed), so SEP
+    // may still hold and use that physical address. Re-arming to
+    // HardwareReady here would let a later IOCTL_T2_REGISTER_OOL allocate a
+    // brand-new buffer while the old one is still live SEP-side - exactly
+    // the false-Ready/unsafe-retry situation §6/§7 rule out. Only a
+    // context that never reached SEP can safely restart at HardwareReady.
+    WdfWaitLockAcquire(ctx->ExchangeLock, NULL);
+    if (!ctx->OolInRegistered && !ctx->OolOutRegistered) {
+        T2SetTransportState(ctx, T2TransportHardwareReady);
+    } else {
+        T2SetTransportState(ctx, T2TransportInvalid);
+    }
+    WdfWaitLockRelease(ctx->ExchangeLock);
+
     return STATUS_SUCCESS;
 }
 
@@ -385,6 +425,16 @@ T2EvtDeviceReleaseHardware(
     UNREFERENCED_PARAMETER(ResourcesTranslated);
     PT2_DEVICE_CONTEXT ctx = GetDeviceContext(Device);
 
+    // Milestone 2B §7: block any new AKS exchange/registration attempt
+    // before touching anything else below, and serialize against whatever
+    // may currently be in flight - ExchangeLock is the same lock
+    // T2EvtIoDeviceControlAksExchange/RegisterOol hold while touching SEP,
+    // so acquiring it here guarantees no such operation is mid-flight once
+    // we proceed to unmap/release.
+    WdfWaitLockAcquire(ctx->ExchangeLock, NULL);
+    T2SetTransportState(ctx, T2TransportStopping);
+    WdfWaitLockRelease(ctx->ExchangeLock);
+
     // VERIFIED FROM SOURCE (Milestone 1, section 3 "Pinning"): the Linux
     // module deliberately never deregisters SEP-registered OOL buffers and
     // never unmaps/frees them once SET_OOL_IN/SET_OOL_OUT succeed, because
@@ -394,15 +444,8 @@ T2EvtDeviceReleaseHardware(
     // or clear bus-mastering here. A reboot is required to actually free
     // that memory at the hardware level; leaking the WDF handles instead of
     // freeing live SEP-owned memory is the correct, deliberate choice.
-    // Keyed off the sticky OolSepMayKnowAddress flag (driver.h), not
-    // OolState: it must stay true for the life of the device stack even if
-    // registration only ever partially succeeded (SET_OOL_IN ok, SET_OOL_OUT
-    // failed) - OolState never reaches Registered in that case, but SEP may
-    // still hold the IN address. It's also true whenever OolState is Stale
-    // (SEP was told the addresses at some point; a later power transition
-    // just means that can't be trusted for a *fresh* exchange, not that SEP
-    // forgot in a way that makes the memory safe to hand back to the OS).
-    if (ctx->OolSepMayKnowAddress) {
+    BOOLEAN oolWasRegistered = ctx->OolInRegistered || ctx->OolOutRegistered;
+    if (oolWasRegistered) {
         T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
             "T2TouchIdTransport: retaining SEP-registered DMA memory until reboot\n"));
     } else {
@@ -414,6 +457,16 @@ T2EvtDeviceReleaseHardware(
         ctx->Bar4Mapped = FALSE;
     }
 
+    // Milestone 2B §2/§7: land in a state that documents WHY, rather than
+    // just clearing a boolean. If SEP-owned OOL memory is being retained,
+    // this transport instance must never look Ready again (Invalid,
+    // permanent for this context - see the matching check in
+    // T2EvtDevicePrepareHardware). Otherwise nothing SEP-visible ever
+    // happened and it is safe to fall back to a clean slate.
+    WdfWaitLockAcquire(ctx->ExchangeLock, NULL);
+    T2SetTransportState(ctx, oolWasRegistered ? T2TransportInvalid : T2TransportNotInitialized);
+    WdfWaitLockRelease(ctx->ExchangeLock);
+
     return STATUS_SUCCESS;
 }
 
@@ -424,45 +477,55 @@ T2EvtDeviceD0Entry(
     )
 {
     PT2_DEVICE_CONTEXT ctx = GetDeviceContext(Device);
+    UNREFERENCED_PARAMETER(PreviousState);
 
-    // Milestone 2 section 26 / docs/windows-pnp-power-lifecycle-design.md:
-    // never assume old protocol/session state remains valid across a power
-    // transition. This fires on EVERY entry into D0 - the very first start
-    // after AddDevice as well as every resume from system sleep (S1-S4),
-    // Device Manager disable/enable, and any future runtime idle wake. We
-    // deliberately do NOT distinguish "first start" from "resume" here:
-    // OolState is already NotRegistered on first start (nothing to mark
-    // stale), and is exactly what needs marking Stale on a genuine resume -
-    // the same code is correct for both.
-    //
-    // Deliberately no mailbox/MMIO I/O in this callback. T2SepControl's
-    // worst case is a 5-second synchronous busy-poll (T2_SEP_TIMEOUT_US) -
-    // doing that here would block the PnP/Power manager's resume path.
-    // Re-registration is deferred (lazy) to the next real
-    // IOCTL_T2_REGISTER_OOL request, which already tolerates that latency
-    // because it runs on an ordinary IOCTL thread, not the power callback.
+    // Milestone 2 section 26 / Milestone 2B §3: never assume old
+    // protocol/session state remains valid across a power transition.
     // User-mode protocol state (BridgeXpc/BiometricKit session) must
-    // independently re-initialize after any D0 exit -> D0 entry; the
-    // OolStale/PowerUpGeneration fields in IOCTL_T2_GET_STATUS exist so it
-    // can detect that this happened.
+    // independently re-initialize after any D0 exit -> D0 entry regardless
+    // of what we do here.
     WdfWaitLockAcquire(ctx->ExchangeLock, NULL);
 
-    if (ctx->OolState == T2OolStateRegistered) {
-        ctx->OolState = T2OolStateStale;
-        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-            "T2TouchIdTransport: OOL registration marked stale after D0 entry "
-            "(previous power state=%d); caller must reissue "
-            "IOCTL_T2_REGISTER_OOL before the next AKS exchange\n",
-            PreviousState));
+    if (!ctx->Bar4Mapped) {
+        // PrepareHardware has not run yet (or failed) for this power-up -
+        // nothing transport-specific to revalidate; leave State as-is
+        // (NotInitialized) and let PrepareHardware set it when it runs.
+        WdfWaitLockRelease(ctx->ExchangeLock);
+        return STATUS_SUCCESS;
     }
 
-    ctx->PowerUpGeneration++;
+    if (ctx->State == T2TransportInvalid) {
+        // SEP-owned OOL memory is being retained (§7) - this transport
+        // instance stays Invalid across power transitions too, for the
+        // same reason it stays Invalid across a fresh PrepareHardware.
+        WdfWaitLockRelease(ctx->ExchangeLock);
+        return STATUS_SUCCESS;
+    }
+
+    // Do a real liveness check of the mailbox registers rather than
+    // trusting that D0 entry alone means the SEP side resumed cleanly - a
+    // read that succeeds is the same liveness signal T2EvtIoDeviceControlGetStatus
+    // uses.
+    ULONG inbox = READ_REGISTER_ULONG((PULONG)(ctx->Bar4VirtualAddress + T2_SEP_INBOX_STATUS));
     T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-        "T2TouchIdTransport: D0 entry #%lu (previous power state=%d, OolState=%d)\n",
-        ctx->PowerUpGeneration, PreviousState, ctx->OolState));
+        "T2TouchIdTransport: D0Entry mailbox liveness check inbox=0x%x empty=%d\n",
+        inbox, (inbox & T2_SEP_INBOX_EMPTY_BIT) != 0));
+
+    if (ctx->OolInRegistered && ctx->OolOutRegistered) {
+        // OOL was registered before this power transition and was not
+        // retained-as-Invalid above, so this is the ordinary
+        // sleep/wake-with-live-registration case: resume Ready. We do NOT
+        // re-run SET_OOL_IN/SET_OOL_OUT - there is no evidence from the
+        // Linux reference that SEP requires (or even supports) re-arming
+        // an already-registered OOL buffer after a power transition, and
+        // guessing at an undocumented re-register step is explicitly out
+        // of scope (§1 "no guessing undocumented protocol details").
+        T2SetTransportState(ctx, T2TransportReady);
+    } else {
+        T2SetTransportState(ctx, T2TransportHardwareReady);
+    }
 
     WdfWaitLockRelease(ctx->ExchangeLock);
-
     return STATUS_SUCCESS;
 }
 
@@ -472,20 +535,27 @@ T2EvtDeviceD0Exit(
     _In_ WDF_POWER_DEVICE_STATE TargetState
     )
 {
-    UNREFERENCED_PARAMETER(Device);
+    PT2_DEVICE_CONTEXT ctx = GetDeviceContext(Device);
+    UNREFERENCED_PARAMETER(TargetState);
 
-    // Deliberately minimal: SEP exposes no OOL-deregistration opcode (see
-    // T2EvtDeviceReleaseHardware's "retain until reboot" comment and
-    // docs/linux-reference-analysis.md Milestone 1 section 3, "Pinning") -
-    // there is no graceful "tell SEP we're powering down" message to send,
-    // and inventing one the protocol doesn't support would be a protocol
-    // error, not an improvement. The actual invalidation work (marking any
-    // prior OOL registration stale) happens on the following D0 entry
-    // instead, where it's cheap and can't race a power-down that's already
-    // in flight. This callback exists to log the transition for
-    // sleep/resume diagnostics.
-    T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-        "T2TouchIdTransport: D0 exit -> target power state=%d\n", TargetState));
+    // Milestone 2B §3/§9: block new AKS exchanges/registration before the
+    // power transition proceeds. Acquiring ExchangeLock here is also what
+    // makes this safe against a transaction currently in flight: since
+    // T2EvtIoDeviceControlAksExchange/RegisterOol hold this same lock for
+    // the entire duration of their SEP call, this Acquire blocks until any
+    // such call already in progress has finished (bounded by
+    // T2_SEP_TRANSACTION_DEADLINE_US) - D0Exit cannot return, and the power
+    // transition cannot proceed, out from under a live exchange.
+    WdfWaitLockAcquire(ctx->ExchangeLock, NULL);
+    if (ctx->State == T2TransportReady || ctx->State == T2TransportRegisteringOol) {
+        // Not Ready again until D0Entry positively revalidates - see
+        // T2EvtDeviceD0Entry. RegisteringOol should not normally still be
+        // set here (the handler holds this same lock for the whole
+        // registration), but fold it in defensively rather than leaving a
+        // stale in-progress-looking state across the transition.
+        T2SetTransportState(ctx, T2TransportHardwareReady);
+    }
+    WdfWaitLockRelease(ctx->ExchangeLock);
 
     return STATUS_SUCCESS;
 }
@@ -509,9 +579,7 @@ T2EvtIoDeviceControlGetStatus(_In_ WDFREQUEST Request, _In_ PT2_DEVICE_CONTEXT C
     out->DeviceId = T2_SEP_DEVICE_ID;
     out->Bar4Mapped = Ctx->Bar4Mapped;
     out->Bar4Size = Ctx->Bar4Length;
-    out->OolRegistered = (Ctx->OolState == T2OolStateRegistered);
-    out->OolStale = (Ctx->OolState == T2OolStateStale);
-    out->PowerUpGeneration = Ctx->PowerUpGeneration;
+    out->OolRegistered = Ctx->OolInRegistered && Ctx->OolOutRegistered;
 
     if (Ctx->Bar4Mapped) {
         ULONG inbox = READ_REGISTER_ULONG((PULONG)(Ctx->Bar4VirtualAddress + T2_SEP_INBOX_STATUS));
@@ -529,36 +597,53 @@ T2EvtIoDeviceControlRegisterOol(_In_ WDFREQUEST Request, _In_ PT2_DEVICE_CONTEXT
 
     WdfWaitLockAcquire(Ctx->ExchangeLock, NULL);
 
-    if (Ctx->OolState == T2OolStateRegistered) {
-        // Idempotent within the current D0 period: registering twice while
-        // still Registered is a no-op success, never a second live
-        // registration. This is NOT the same as refusing to ever register
-        // again - see docs/windows-pnp-power-lifecycle-design.md section 4.3:
-        // after a power transition (T2EvtDeviceD0Entry) moves the state to
-        // Stale, this same call must be allowed to run again below.
+    if (Ctx->State == T2TransportReady) {
+        // Idempotent: already fully registered - a second call is a no-op
+        // success, never a second live registration.
         WdfWaitLockRelease(Ctx->ExchangeLock);
         WdfRequestComplete(Request, STATUS_SUCCESS);
         return;
     }
 
-    // OolState is NotRegistered or Stale - (re)register. The host-side
-    // common buffers are not reallocated if they already exist
-    // (T2DmaAllocateOolBuffers is idempotent); only the SEP-side handshake
-    // (T2DmaRegisterOolBuffers -> SET_OOL_IN/SET_OOL_OUT) actually runs
-    // again, which is always safe to repeat.
+    if (Ctx->State != T2TransportHardwareReady) {
+        // Milestone 2B §6: only HardwareReady may start (or retry) a
+        // registration attempt. NotInitialized/Stopping mean hardware
+        // isn't ready yet or is going away; RegisteringOol means another
+        // attempt is (unexpectedly, since this lock is held throughout one)
+        // already in progress; Invalid means a previous attempt already
+        // reached SEP with OOL_IN and must never be retried with a fresh
+        // allocation (§5/§7) - a real, deliberate terminal state for that
+        // specific case, not a permanent "attempted" flag misused as
+        // failure-forever.
+        WdfWaitLockRelease(Ctx->ExchangeLock);
+        WdfRequestComplete(Request, STATUS_DEVICE_NOT_READY);
+        return;
+    }
+
+    Ctx->OolRegisterAttempted = TRUE; // diagnostic only, see driver.h
+    T2SetTransportState(Ctx, T2TransportRegisteringOol);
+
     status = T2DmaAllocateOolBuffers(Ctx);
     if (NT_SUCCESS(status)) {
         status = T2DmaRegisterOolBuffers(Ctx);
     }
 
     if (NT_SUCCESS(status)) {
-        Ctx->OolState = T2OolStateRegistered;
+        T2SetTransportState(Ctx, T2TransportReady);
+    } else if (Ctx->OolInRegistered) {
+        // dma.c deliberately did NOT roll back here: SET_OOL_IN reached
+        // SEP before SET_OOL_OUT failed, so the buffer memory must be kept
+        // (§5/§7) - conservative terminal state, not retryable.
+        T2SetTransportState(Ctx, T2TransportInvalid);
+    } else {
+        // Failed before SEP ever saw anything (allocation failure, bus-
+        // master enable failure, or SET_OOL_IN itself failed) - dma.c
+        // already rolled back any partial allocation on the allocate path;
+        // free anything still outstanding from the register path and
+        // it's safe to retry.
+        T2DmaFreeOolBuffers(Ctx);
+        T2SetTransportState(Ctx, T2TransportHardwareReady);
     }
-    // On failure, OolState deliberately stays at its pre-call value
-    // (NotRegistered or Stale) rather than being set to some new "failed"
-    // state: dma.c's own comment documents that a partial SET_OOL_IN/
-    // SET_OOL_OUT failure is a permanent, reboot-required condition on the
-    // SEP side, which the caller already learns from the returned status.
 
     WdfWaitLockRelease(Ctx->ExchangeLock);
 
@@ -593,6 +678,50 @@ T2EvtIoDeviceControl(
         WdfRequestComplete(Request, STATUS_INVALID_DEVICE_REQUEST);
         break;
     }
+}
+
+// Milestone 2B §4: EvtIoStop for the power-managed default queue.
+//
+// A long-running IOCTL_T2_AKS_EXCHANGE or IOCTL_T2_REGISTER_OOL request may
+// still be executing (blocked inside T2AksExchange/T2DmaRegisterOolBuffers
+// under ExchangeLock, on whatever dispatch thread WDF ran the callback on)
+// when the framework needs to stop the queue for a power-down, PnP stop, or
+// remove. We deliberately do NOT try to force-complete or cancel that
+// request from here:
+//   - the mailbox transaction it is waiting on may still be legitimately
+//     in flight with real hardware/SEP, and forcing early completion would
+//     race with the owning handler's own WdfRequestComplete call, i.e.
+//     double-completion (explicitly out of scope per the Definition of
+//     Done and §12);
+//   - whether the transaction can even be safely aborted mid-flight is
+//     unknown for this protocol, so the conservative choice is to let it
+//     run to its own conclusion.
+// T2_SEP_TRANSACTION_DEADLINE_US already bounds how long that "let it
+// finish" can take, so this can never hang forever. We call
+// WdfRequestStopAcknowledge(Request, FALSE) to tell the framework "I see
+// this request, I am not completing/requeuing it right now, I will
+// complete it myself later" - the correct response either for
+// WdfRequestStopActionSuspend (resumable stop) or
+// WdfRequestStopActionPurge (surprise-remove): in both cases the owning
+// handler, not this callback, completes the request.
+VOID
+T2EvtIoStop(
+    _In_ WDFQUEUE Queue,
+    _In_ WDFREQUEST Request,
+    _In_ ULONG ActionFlags
+    )
+{
+    UNREFERENCED_PARAMETER(Queue);
+
+    // ActionFlags (WdfRequestStopActionSuspend vs ...Purge) only changes
+    // whether the framework can later resume dispatching to this queue -
+    // it does not change what we do here, so it's logged for diagnostics
+    // only and otherwise ignored.
+    T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+        "T2TouchIdTransport: EvtIoStop for in-flight request 0x%p (ActionFlags=0x%x); "
+        "letting the owning handler complete it\n", Request, ActionFlags));
+
+    WdfRequestStopAcknowledge(Request, FALSE);
 }
 
 // Payload travels inline in the METHOD_BUFFERED request/response buffers
@@ -633,14 +762,13 @@ T2EvtIoDeviceControlAksExchange(_In_ WDFREQUEST Request, _In_ PT2_DEVICE_CONTEXT
     responseCapacity = outLen - sizeof(*out);
     operation = in->Operation;
 
-    // Also rejects Stale (post-resume, pre-re-registration) the same way it
-    // already rejected NotRegistered - see
-    // docs/windows-pnp-power-lifecycle-design.md section 4.3. Deliberately
-    // not auto-re-registering here: that would hide an unbounded (up to
-    // T2_SEP_TIMEOUT_US) mailbox handshake behind what the caller expects
-    // to be a fast AKS exchange, and would hide the fact that a power
-    // cycle happened from the caller instead of letting it react.
-    if (Ctx->OolState != T2OolStateRegistered) {
+    // Milestone 2B §2: cheap pre-check outside the lock, purely to avoid
+    // allocating scratch buffers for a request we already know will be
+    // rejected. The authoritative check is the one taken under
+    // ExchangeLock immediately before T2AksExchange below - this one can
+    // race with a concurrent D0Exit/ReleaseHardware and that's fine, it
+    // only ever causes an extra allocate+free, never an unsafe exchange.
+    if (Ctx->State != T2TransportReady) {
         WdfRequestComplete(Request, STATUS_DEVICE_NOT_READY);
         return;
     }
@@ -682,8 +810,19 @@ T2EvtIoDeviceControlAksExchange(_In_ WDFREQUEST Request, _In_ PT2_DEVICE_CONTEXT
     }
 
     WdfWaitLockAcquire(Ctx->ExchangeLock, NULL);
-    status = T2AksExchange(Ctx, operation, requestBody, requestLength,
-        responseBody, responseCapacity, &responseLength);
+    // Authoritative check (Milestone 2B §2/§3): D0Exit/ReleaseHardware
+    // acquire this same lock to move State out of Ready, so if we observe
+    // Ready here, no such transition can be racing us - and this check
+    // plus the exchange itself run as one atomic unit under the lock, so
+    // nothing can move the state out from under an in-progress exchange
+    // either (that guarantee is exactly what makes D0Exit's Acquire above
+    // block until an in-flight exchange finishes).
+    if (Ctx->State != T2TransportReady) {
+        status = STATUS_DEVICE_NOT_READY;
+    } else {
+        status = T2AksExchange(Ctx, operation, requestBody, requestLength,
+            responseBody, responseCapacity, &responseLength);
+    }
     WdfWaitLockRelease(Ctx->ExchangeLock);
 
     if (requestBody) {

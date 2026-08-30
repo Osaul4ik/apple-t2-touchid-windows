@@ -70,6 +70,28 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     if (!conn->SendBiometricCommand(startCmd, 64, &reply, config_.ioTimeout)) {
         return VerifyOutcome::TransportError;
     }
+
+    // Milestone 2B §11: from here on the StartMatch IPC itself succeeded,
+    // so a match session may now be live on the device regardless of what
+    // happens next - a malformed/unparseable reply, an explicit device
+    // rejection, a later transport error, a timeout, or normal completion.
+    // CancelMatch must be attempted on every one of those exit paths, not
+    // just the "we got all the way through the event loop" one. A
+    // scope-exit guard (the same pattern as BusyGuard above) makes this
+    // hold regardless of which `return` below actually fires, without
+    // duplicating the cancel call at every one of them; it replaces the
+    // single unconditional cancel that previously ran only after the event
+    // loop and so was skipped by the two early returns below.
+    struct CancelGuard {
+        bridgexpc::Connection* conn;
+        const std::vector<uint8_t>* cancelCmd;
+        std::chrono::milliseconds ioTimeout;
+        ~CancelGuard() {
+            std::vector<uint8_t> discard;
+            conn->SendBiometricCommand(*cancelCmd, 64, &discard, ioTimeout); // best-effort
+        }
+    } cancelGuard{conn, &cancelCmd, config_.ioTimeout};
+
     if (reply.size() < 4) {
         return VerifyOutcome::Malformed;
     }
@@ -125,10 +147,10 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
         // NoMatch, but does not require aborting the whole session.
     }
 
-    // Cancel unconditionally after the loop, matching Linux reference
-    // behavior (Milestone 1 §2).
-    conn->SendBiometricCommand(cancelCmd, 64, &reply, config_.ioTimeout);
-
+    // Cancel runs unconditionally via cancelGuard's destructor as this
+    // function returns, matching Linux reference behavior (Milestone 1 §2)
+    // - see the CancelGuard comment above for why it now covers every exit
+    // path, not just this one.
     return outcome;
 }
 

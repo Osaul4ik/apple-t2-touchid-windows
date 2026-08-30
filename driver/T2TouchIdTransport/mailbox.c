@@ -6,6 +6,14 @@
 
 #include "driver.h"
 
+// Milestone 2B §9: monotonic microsecond clock for bounding total
+// transaction time, independent of wall-clock/system-time changes.
+// KeQueryInterruptTime returns 100ns units and needs no frequency lookup.
+static ULONGLONG T2NowUs(VOID)
+{
+    return KeQueryInterruptTime() / 10;
+}
+
 static VOID T2StallMicroseconds(_In_ ULONG MinUs, _In_ ULONG MaxUs)
 {
     // KeStallExecutionProcessor busy-waits; acceptable here because the
@@ -177,8 +185,25 @@ T2SepControl(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Opcode, _In_ UINT8 Tag,
         return status;
     }
 
+    // Milestone 2B §9: overall wall-clock bound for this whole transaction,
+    // independent of how many unrelated messages get skipped along the
+    // way - see T2_SEP_TRANSACTION_DEADLINE_US in driver.h.
+    ULONGLONG deadlineUs = T2NowUs() + T2_SEP_TRANSACTION_DEADLINE_US;
+
     for (;;) {
-        status = T2MailboxReceive(Ctx, &reply, T2_SEP_TIMEOUT_US);
+        ULONGLONG nowUs = T2NowUs();
+        if (nowUs >= deadlineUs) {
+            T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                "T2TouchIdTransport: control transaction (opcode=%u tag=%u) exceeded "
+                "overall deadline of %llu us after %u skipped messages\n",
+                Opcode, Tag, T2_SEP_TRANSACTION_DEADLINE_US, skipped));
+            return STATUS_IO_TIMEOUT;
+        }
+        ULONGLONG remainingUs = deadlineUs - nowUs;
+        ULONG pollTimeoutUs = (remainingUs < (ULONGLONG)T2_SEP_TIMEOUT_US)
+            ? (ULONG)remainingUs : (ULONG)T2_SEP_TIMEOUT_US;
+
+        status = T2MailboxReceive(Ctx, &reply, pollTimeoutUs);
         if (!NT_SUCCESS(status)) {
             return status;
         }
@@ -256,8 +281,23 @@ T2SepAksTransaction(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
         return status;
     }
 
+    // Milestone 2B §9: same overall deadline bound as T2SepControl above.
+    ULONGLONG deadlineUs = T2NowUs() + T2_SEP_TRANSACTION_DEADLINE_US;
+
     for (;;) {
-        status = T2MailboxReceive(Ctx, &reply, T2_SEP_TIMEOUT_US);
+        ULONGLONG nowUs = T2NowUs();
+        if (nowUs >= deadlineUs) {
+            T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                "T2TouchIdTransport: AKS transaction (operation=0x%02x transaction=0x%02x) "
+                "exceeded overall deadline of %llu us after %u skipped messages\n",
+                Operation, Transaction, T2_SEP_TRANSACTION_DEADLINE_US, skipped));
+            return STATUS_IO_TIMEOUT;
+        }
+        ULONGLONG remainingUs = deadlineUs - nowUs;
+        ULONG pollTimeoutUs = (remainingUs < (ULONGLONG)T2_SEP_TIMEOUT_US)
+            ? (ULONG)remainingUs : (ULONG)T2_SEP_TIMEOUT_US;
+
+        status = T2MailboxReceive(Ctx, &reply, pollTimeoutUs);
         if (!NT_SUCCESS(status)) {
             return status;
         }

@@ -60,6 +60,16 @@
 #define T2_SEP_POLL_MAX_US          200
 #define T2_SEP_MAX_SKIPPED_REPLIES  32        // -> STATUS_DEVICE_PROTOCOL_ERROR beyond this
 
+// Milestone 2B §9: bound the TOTAL time a single control/AKS transaction
+// (T2SepControl / T2SepAksTransaction) may spend inside its receive loop,
+// independent of how many unrelated/skipped mailbox messages show up along
+// the way. Without this, T2_SEP_MAX_SKIPPED_REPLIES (32) skipped messages
+// each re-arming a full T2_SEP_TIMEOUT_US (5s) wait could stretch a single
+// logical transaction out to ~160s. This is NOT a protocol change - it only
+// caps how long we keep polling for OUR reply; the wire messages and their
+// semantics are untouched.
+#define T2_SEP_TRANSACTION_DEADLINE_US (15ULL * 1000 * 1000)
+
 // ---- AppleKeyStore header sizes (VERIFIED FROM SOURCE) ----
 // NOTE: these are intentionally named T2_AKS_VERSION_Vn, not T2_AKS_HEADER_Vn:
 // T2_AKS_HEADER_V1/V2 are the *struct* typedef names below. Reusing the same
@@ -119,22 +129,45 @@ typedef struct _T2_AKS_HEADER_V2
 C_ASSERT(sizeof(T2_AKS_HEADER_V2) == T2_AKS_HEADER_V2_SIZE);
 #pragma pack(pop)
 
-// ---- OOL registration lifecycle state (see docs/windows-pnp-power-lifecycle-design.md) ----
-// NotRegistered: never successfully registered with SEP since this device
-//   stack came up. Registered: SET_OOL_IN and SET_OOL_OUT both confirmed by
-//   SEP and no power transition has happened since. Stale: was Registered,
-//   but the device has since gone through EvtDeviceD0Entry from a non-D0
-//   state (system sleep, Device Manager disable/enable, etc.) - SEP may
-//   have forgotten the registration, so it must not be trusted until
-//   IOCTL_T2_REGISTER_OOL is reissued. The host-side common buffers
-//   themselves are NOT freed/reallocated on this transition - only SEP's
-//   knowledge of them is presumed stale.
-typedef enum _T2_OOL_STATE
+// Milestone 2B §2: explicit transport lifecycle state, replacing a set of
+// independent boolean flags. All transitions happen while holding
+// ExchangeLock (the same lock that already serializes mailbox/AKS
+// exchange) - see device.c T2SetTransportState and its callers.
+//
+//   NotInitialized -> HardwareReady            PrepareHardware succeeds
+//   HardwareReady  -> RegisteringOol           IOCTL_T2_REGISTER_OOL starts
+//   RegisteringOol -> Ready                    OOL_IN + OOL_OUT both registered
+//   RegisteringOol -> HardwareReady            registration failed, fully
+//                                               rolled back before SEP saw
+//                                               anything - safe to retry
+//   RegisteringOol -> Invalid                  OOL_IN reached SEP but OOL_OUT
+//                                               failed - SEP may already be
+//                                               holding the OOL_IN address,
+//                                               so retrying with a fresh
+//                                               allocation is not safe (§5/§7)
+//   Ready          -> HardwareReady            D0Exit (leaving D0) - not
+//                                               Ready again until D0Entry
+//                                               revalidates
+//   (any)          -> Invalid                  ReleaseHardware ran while OOL
+//                                               was registered - SEP-owned
+//                                               memory is retained until
+//                                               reboot (§7), so this
+//                                               transport instance must never
+//                                               look Ready again
+//
+// AKS exchange (T2EvtIoDeviceControlAksExchange) is only permitted in
+// Ready. IOCTL_T2_REGISTER_OOL is only permitted in HardwareReady (or is a
+// no-op success in Ready); every other state rejects both with
+// STATUS_DEVICE_NOT_READY.
+typedef enum _T2_TRANSPORT_STATE
 {
-    T2OolStateNotRegistered = 0,
-    T2OolStateRegistered,
-    T2OolStateStale,
-} T2_OOL_STATE;
+    T2TransportNotInitialized = 0,
+    T2TransportHardwareReady,
+    T2TransportRegisteringOol,
+    T2TransportReady,
+    T2TransportStopping,
+    T2TransportInvalid
+} T2_TRANSPORT_STATE;
 
 typedef struct _T2_DEVICE_CONTEXT
 {
@@ -150,21 +183,9 @@ typedef struct _T2_DEVICE_CONTEXT
     // WDF common buffers with AddressWidthOverride=32 give the device the
     // correct IOMMU/bus address; after writing OOL_IN we clflush so SEP
     // DMA sees the host stores (write-back cache).
-    T2_OOL_STATE         OolState;
-
-    // Sticky for the lifetime of the device stack, unlike OolState above:
-    // set the first time SET_OOL_IN or SET_OOL_OUT ever succeeds and NEVER
-    // cleared or reset (not even when OolState cycles Registered->Stale->
-    // Registered again across a power transition). This is what
-    // EvtDeviceReleaseHardware's "retain SEP-registered memory until
-    // reboot" decision must key off, because it has to stay true even if
-    // registration only ever partially succeeded (e.g. SET_OOL_IN
-    // succeeded, SET_OOL_OUT then failed) - SEP may still hold that address
-    // even though OolState never reached Registered. OolState alone is not
-    // enough for this decision because it deliberately does track only the
-    // "safe to use for a fresh AKS exchange" state, not "was SEP ever told
-    // anything at all".
-    BOOLEAN              OolSepMayKnowAddress;
+    BOOLEAN              OolRegisterAttempted;  // diagnostic only - NOT used to gate retry, see State
+    BOOLEAN              OolInRegistered;
+    BOOLEAN              OolOutRegistered;
     WDFDMAENABLER        DmaEnabler;
     WDFCOMMONBUFFER      OolInBuffer;
     WDFCOMMONBUFFER      OolOutBuffer;
@@ -173,17 +194,16 @@ typedef struct _T2_DEVICE_CONTEXT
     PHYSICAL_ADDRESS     OolInPa;   // logical/bus address for SEP
     PHYSICAL_ADDRESS     OolOutPa;
 
-    // Serializes mailbox + AKS exchange; the mailbox is a single shared
-    // hardware resource, so only one in-flight request at a time (matches
-    // Linux exchange_lock and Milestone 2 section 23: one session at a time).
+    // Serializes mailbox + AKS exchange AND transport state transitions;
+    // the mailbox is a single shared hardware resource, so only one
+    // in-flight request at a time (matches Linux exchange_lock and
+    // Milestone 2 section 23: one session at a time). Reusing this same
+    // lock for state transitions (Milestone 2B §2) means an in-flight
+    // exchange always completes (or times out) before D0Exit/ReleaseHardware
+    // can move the state out from under it - no separate lock needed.
     WDFWAITLOCK          ExchangeLock;
     UINT8                NextTransaction;
-
-    // Incremented once on every EvtDeviceD0Entry (including the very first
-    // one after AddDevice). Lets user-mode detect "the transport went
-    // through a power cycle since I last checked" even if OolState has
-    // already been repaired back to Registered by the time it asks.
-    ULONG                PowerUpGeneration;
+    T2_TRANSPORT_STATE   State;   // guarded by ExchangeLock
 } T2_DEVICE_CONTEXT, *PT2_DEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(T2_DEVICE_CONTEXT, GetDeviceContext);
@@ -195,6 +215,11 @@ EVT_WDF_DEVICE_RELEASE_HARDWARE T2EvtDeviceReleaseHardware;
 EVT_WDF_DEVICE_D0_ENTRY T2EvtDeviceD0Entry;
 EVT_WDF_DEVICE_D0_EXIT T2EvtDeviceD0Exit;
 EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL T2EvtIoDeviceControl;
+EVT_WDF_IO_QUEUE_IO_STOP T2EvtIoStop;
+
+// device.c — transport lifecycle state (Milestone 2B §2). Caller must hold
+// Ctx->ExchangeLock.
+VOID T2SetTransportState(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ T2_TRANSPORT_STATE NewState);
 
 // mailbox.c
 NTSTATUS T2MailboxWaitOutbox(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ ULONG TimeoutUs);
