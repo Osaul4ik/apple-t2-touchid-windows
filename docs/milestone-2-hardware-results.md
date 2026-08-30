@@ -37,7 +37,7 @@ Visual Studio, без фізичного MacBook Pro 2019 і без можлив
 | 1 — T2 PCI access | T2 PCI OK | | BAR4 mapped 
 | 2 — SEP mailbox | SEP mailbox accessible  | |
 | 3 — DMA / OOL | **DMA / OOL registered** | Закрито 30.08.2026 на реальному залізі. BAR4 base `0xc1620000` (64-bit), resource index 4, `len=0x10000`, підтверджено через PCI config space offset 0x20 (`GetBusData`), а не через вгадування першого memory-ресурсу — попередня версія коду мапила НЕ той BAR (SEP-функція має 3 memory BAR на цій машині), що й спричиняло "queued unrelated mailbox message from endpoint 0" ×32 → `STATUS_DEVICE_PROTOCOL_ERROR` при спробі `SET_OOL_IN`. Після виправлення BAR4-selection логіки в `device.c` (`T2QueryBar4ViaPciConfig`): `mailbox inbox=0x20001 empty=1 outbox=0x20001 full=0`, потім `registered 16 KiB endpoint-7 OOL input/output buffers`. |
-| 4 — AppleKeyStore | UNKNOWN | Тепер технічно доступний для перевірки — `T2EvtIoDeviceControlAksExchange` більше не блокує запит з `STATUS_DEVICE_NOT_READY`, бо `OolInRegistered && OolOutRegistered` тепер `TRUE`. Наступний крок: `t2touchid.exe capabilities`. |
+| 4 — AppleKeyStore | OK | t2touchid.exe capabilities - > capability[1] = 0x2. Lifecycle (SleepWake) OK
 | 5 — CDC-NCM / IPv6 | UNKNOWN | не реалізовано в цьому Milestone (див. protocol-architecture.md) |
 | 6 — RemoteXPC discovery | UNKNOWN | не реалізовано в цьому Milestone |
 | 7 — BridgeXPC | UNKNOWN | Connection.cpp має TODO-заглушки, потребує PlistPayload.cpp |
