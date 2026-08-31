@@ -2,10 +2,7 @@
 // PortScan.cpp — VERIFIED FROM SOURCE: jmurth1234/t2-touchid-linux
 // src/discover-biometric-port.py probe_port()
 //
-// Linux does NOT send an HTTP/2 client preface. It connects, then
-// sock_recv(21) and checks:
-//   len >= 9 && greeting[3] == 4 (SETTINGS) && greeting[5:9] == 00 00 00 00
-// (stream id 0). Sending a preface first was wrong and yielded zero hits.
+// Connect, then recv only (peer SETTINGS first). No client preface.
 #include "PortScan.h"
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -14,6 +11,7 @@
 #include <thread>
 #include <mutex>
 #include <algorithm>
+#include <cstring>
 
 #pragma comment(lib, "Ws2_32.lib")
 
@@ -30,17 +28,39 @@ bool EnsureWinsock() {
     return ok;
 }
 
-struct ProbeResult { bool connected = false; bool http2 = false; };
+struct ProbeResult {
+    bool connected = false;
+    bool http2 = false;
+    // First bytes received after connect (for diagnostics when SETTINGS missing).
+    unsigned char head[21]{};
+    int headLen = 0;
+};
 
-ProbeResult ProbePort(const NcmEndpoint& ep, uint16_t port, unsigned timeoutMs) {
+// Deadline-based wait until readable or timeout_ms elapsed.
+bool WaitReadable(SOCKET s, unsigned timeoutMs) {
+    fd_set rset;
+    FD_ZERO(&rset);
+    FD_SET(s, &rset);
+    timeval tv{};
+    tv.tv_sec = static_cast<long>(timeoutMs / 1000);
+    tv.tv_usec = static_cast<long>((timeoutMs % 1000) * 1000);
+    return select(0, &rset, nullptr, nullptr, &tv) > 0;
+}
+
+ProbeResult ProbePort(const NcmEndpoint& ep, uint16_t port,
+                      unsigned connectTimeoutMs, unsigned recvTimeoutMs) {
     ProbeResult r;
     SOCKET s = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
     if (s == INVALID_SOCKET) return r;
 
-    // Prefer the T2 NCM interface for link-local (Windows routing).
     DWORD ifIndex = ep.ifIndex;
     setsockopt(s, IPPROTO_IPV6, IPV6_UNICAST_IF,
                reinterpret_cast<const char*>(&ifIndex), sizeof(ifIndex));
+
+    // Disable Nagle — small control frames.
+    BOOL nodelay = TRUE;
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY,
+               reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
 
     u_long nonblock = 1;
     ioctlsocket(s, FIONBIO, &nonblock);
@@ -64,8 +84,8 @@ ProbeResult ProbePort(const NcmEndpoint& ep, uint16_t port, unsigned timeoutMs) 
         FD_SET(s, &wset);
         FD_SET(s, &eset);
         timeval tv{};
-        tv.tv_sec = static_cast<long>(timeoutMs / 1000);
-        tv.tv_usec = static_cast<long>((timeoutMs % 1000) * 1000);
+        tv.tv_sec = static_cast<long>(connectTimeoutMs / 1000);
+        tv.tv_usec = static_cast<long>((connectTimeoutMs % 1000) * 1000);
         int sel = select(0, nullptr, &wset, &eset, &tv);
         if (sel <= 0 || FD_ISSET(s, &eset)) {
             closesocket(s);
@@ -81,22 +101,37 @@ ProbeResult ProbePort(const NcmEndpoint& ep, uint16_t port, unsigned timeoutMs) 
     }
     r.connected = true;
 
-    // VERIFIED FROM SOURCE: peer speaks first. Do NOT send client preface.
-    // sock_recv up to 21 bytes; require SETTINGS type and stream id 0.
-    fd_set rset;
-    FD_ZERO(&rset);
-    FD_SET(s, &rset);
-    timeval rtv{};
-    rtv.tv_sec = static_cast<long>(timeoutMs / 1000);
-    rtv.tv_usec = static_cast<long>((timeoutMs % 1000) * 1000);
-    if (select(0, &rset, nullptr, nullptr, &rtv) > 0) {
-        unsigned char buf[21] = {};
-        int n = recv(s, reinterpret_cast<char*>(buf), sizeof(buf), 0);
-        // greeting[3] == 4 (SETTINGS), greeting[5:9] == \0\0\0\0 (stream 0)
-        if (n >= 9 && buf[3] == 0x04 &&
-            buf[5] == 0 && buf[6] == 0 && buf[7] == 0 && buf[8] == 0) {
-            r.http2 = true;
+    // VERIFIED FROM SOURCE: peer speaks first. Accumulate up to 21 bytes
+    // within recvTimeoutMs (Linux sock_recv(21) with the same timeout).
+    // Partial reads are common on Windows NCM; loop until 9+ or deadline.
+    ULONGLONG deadline =
+        GetTickCount64() + static_cast<ULONGLONG>(recvTimeoutMs);
+    int got = 0;
+    while (got < 21) {
+        ULONGLONG now = GetTickCount64();
+        if (now >= deadline) break;
+        unsigned left = static_cast<unsigned>(deadline - now);
+        if (!WaitReadable(s, left)) break;
+        int n = recv(s, reinterpret_cast<char*>(r.head + got), 21 - got, 0);
+        if (n == 0) break; // peer closed
+        if (n < 0) {
+            int e = WSAGetLastError();
+            if (e == WSAEWOULDBLOCK) continue;
+            break;
         }
+        got += n;
+        // Fast-path: enough for the Linux check
+        if (got >= 9) {
+            // Can stop early if SETTINGS already clear; still keep what we have.
+            break;
+        }
+    }
+    r.headLen = got;
+
+    // Linux: len >= 9 && type==4 && stream id == 0
+    if (got >= 9 && r.head[3] == 0x04 &&
+        r.head[5] == 0 && r.head[6] == 0 && r.head[7] == 0 && r.head[8] == 0) {
+        r.http2 = true;
     }
 
     closesocket(s);
@@ -112,7 +147,8 @@ std::vector<PortCandidate> ScanHttp2Preface(const NcmEndpoint& endpoint,
     if (endpoint.ifIndex == 0) return hits;
     if (options.portEnd < options.portBegin) return hits;
 
-    const unsigned total = static_cast<unsigned>(options.portEnd - options.portBegin) + 1;
+    const unsigned total =
+        static_cast<unsigned>(options.portEnd - options.portBegin) + 1;
     std::atomic<unsigned> next{0};
     std::atomic<unsigned> tried{0};
     std::atomic<unsigned> tcpHits{0};
@@ -124,18 +160,31 @@ std::vector<PortCandidate> ScanHttp2Preface(const NcmEndpoint& endpoint,
     if (workers > total) workers = total;
     if (workers > 64) workers = 64;
 
+    // Recv window: at least connect timeout; prefer a bit longer on Windows
+    // NCM (partial deliveries). Still matches Linux spirit of ~150ms default
+    // when connectTimeoutMs is 150; options can raise it.
+    unsigned recvMs = options.connectTimeoutMs;
+    if (recvMs < 300) recvMs = 300;
+
     auto worker = [&]() {
         for (;;) {
             unsigned i = next.fetch_add(1);
             if (i >= total) break;
             uint16_t port = static_cast<uint16_t>(options.portBegin + i);
-            ProbeResult pr = ProbePort(endpoint, port, options.connectTimeoutMs);
+            ProbeResult pr =
+                ProbePort(endpoint, port, options.connectTimeoutMs, recvMs);
             if (pr.connected) {
                 tcpHits.fetch_add(1);
                 if (pr.http2) http2Hits.fetch_add(1);
                 if (pr.http2 || options.includeTcpOnly) {
+                    PortCandidate c;
+                    c.port = port;
+                    c.tcpOpen = true;
+                    c.http2PrefaceOk = pr.http2;
+                    c.recvLen = pr.headLen;
+                    std::memcpy(c.recvHead, pr.head, sizeof(c.recvHead));
                     std::lock_guard<std::mutex> lock(hitsMu);
-                    hits.push_back(PortCandidate{port, true, pr.http2});
+                    hits.push_back(c);
                 }
             }
             unsigned t = tried.fetch_add(1) + 1;
@@ -151,7 +200,9 @@ std::vector<PortCandidate> ScanHttp2Preface(const NcmEndpoint& endpoint,
     for (auto& th : threads) th.join();
 
     std::sort(hits.begin(), hits.end(),
-              [](const PortCandidate& a, const PortCandidate& b) { return a.port < b.port; });
+              [](const PortCandidate& a, const PortCandidate& b) {
+                  return a.port < b.port;
+              });
     return hits;
 }
 

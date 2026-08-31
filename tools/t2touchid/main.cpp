@@ -304,6 +304,18 @@ static int CmdNetwork(int argc, wchar_t* argv[]) {
         std::wcout << L"  port " << h.port;
         if (h.http2PrefaceOk) std::wcout << L"  [HTTP/2 SETTINGS]";
         else std::wcout << L"  [TCP only]";
+        std::wcout << L"  recv=" << h.recvLen << L"B";
+        if (h.recvLen > 0) {
+            std::wcout << L"  hex=";
+            int show = h.recvLen < 12 ? h.recvLen : 12;
+            for (int i = 0; i < show; ++i) {
+                wchar_t tmp[4];
+                swprintf(tmp, 4, L"%02x", h.recvHead[i]);
+                std::wcout << tmp;
+            }
+        } else {
+            std::wcout << L"  (no data — peer silent)";
+        }
         std::wcout << L"\n";
     }
     if (nHttp2 == 0) {
