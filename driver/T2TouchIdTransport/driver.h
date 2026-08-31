@@ -44,6 +44,14 @@
 #define T2_SEP_INBOX_EMPTY_BIT      (1u << 17)
 #define T2_SEP_OUTBOX_FULL_BIT      (1u << 16)
 
+// A read of all-ones off a PCI MMIO BAR is the standard "nothing answered"
+// signal (link down / device surprise-removed / not yet powered) rather
+// than a real register value - no legitimate T2_SEP_INBOX_STATUS value is
+// 0xFFFFFFFF. Used by the D0Entry mailbox liveness check (device.c) to
+// fail closed instead of trusting a bus read that never actually reached
+// the SEP.
+#define T2_SEP_MAILBOX_DEAD_READ    0xFFFFFFFFu
+
 // ---- Endpoint / control-message layout (VERIFIED FROM SOURCE) ----
 #define T2_SEP_CONTROL_ENDPOINT     0
 #define T2_SEP_AKS_ENDPOINT         7
@@ -149,20 +157,41 @@ C_ASSERT(sizeof(T2_AKS_HEADER_V2) == T2_AKS_HEADER_V2_SIZE);
 //   Ready          -> HardwareReady            D0Exit (leaving D0) - not
 //                                               Ready again until D0Entry
 //                                               revalidates
-//   (Ready or HardwareReady) -> HardwareReady  D0Entry (any power-up,
-//                                               including resume from
-//                                               sleep). Deliberately never
-//                                               D0Entry -> Ready directly:
-//                                               that would mean trusting a
-//                                               pre-sleep OOL registration
-//                                               SEP may have forgotten,
-//                                               which fails silently (full
-//                                               mailbox-timeout stalls on
-//                                               the next exchange) instead
-//                                               of the immediate
-//                                               STATUS_DEVICE_NOT_READY +
-//                                               cheap re-arm this state
-//                                               forces instead.
+//   (Ready or HardwareReady) -> Ready          D0Entry, ordinary resume:
+//                                               mailbox liveness check
+//                                               succeeds (a real MMIO read,
+//                                               not a bus-dead 0xFFFFFFFF -
+//                                               see T2_SEP_MAILBOX_DEAD_READ)
+//                                               AND OolInRegistered &&
+//                                               OolOutRegistered are both
+//                                               still TRUE from before the
+//                                               sleep. Hardware testing
+//                                               confirmed the same SEP OOL
+//                                               registration keeps working
+//                                               across an ordinary
+//                                               D0->D3->D0 cycle, so this
+//                                               path does NOT re-run
+//                                               IOCTL_T2_REGISTER_OOL
+//                                               (no SET_OOL_IN/SET_OOL_OUT)
+//                                               - it only resumes the
+//                                               TransportState to match the
+//                                               OOL flags that never
+//                                               changed, closing the
+//                                               HardwareReady+OOL-registered
+//                                               contradiction this used to
+//                                               produce.
+//   (Ready or HardwareReady) -> HardwareReady  D0Entry, otherwise: liveness
+//                                               check failed (mailbox not
+//                                               answering) OR OOL is not
+//                                               *both* In+Out registered.
+//                                               Fail closed - the next AKS
+//                                               exchange gets an immediate
+//                                               STATUS_DEVICE_NOT_READY
+//                                               instead of a silent stale
+//                                               mailbox timeout, and
+//                                               IOCTL_T2_REGISTER_OOL must
+//                                               be explicitly re-run to
+//                                               reach Ready again.
 //   (any)          -> Invalid                  ReleaseHardware ran while OOL
 //                                               was registered - SEP-owned
 //                                               memory is retained until

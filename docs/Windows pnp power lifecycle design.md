@@ -508,3 +508,43 @@ EvtDevicePrepareHardware → EvtDeviceD0Entry(PreviousState=D3)
 
 Файли `dma.c` (сеттер) і `device.c` (читач у ReleaseHardware) — обидва
 показані нижче серед змінених файлів.
+
+---
+
+## 9. Пізніше уточнення (Milestone 2B §2) — і виправлення "D0 resume OOL
+    state inconsistency"
+
+Подальший рефакторинг (Milestone 2B §2, див. коментар над
+`T2_TRANSPORT_STATE` у `driver.h`) замінив пару `OolState`/
+`PowerUpGeneration` із §3–§8 вище на єдиний явний enum
+`T2_TRANSPORT_STATE` (`NotInitialized / HardwareReady / RegisteringOol /
+Ready / Stopping / Invalid`), а `OolInRegistered`/`OolOutRegistered`
+лишились окремими булевими прапорцями (не злились у `T2OolStateRegistered`,
+як планувалось у §3.2) — секції §3–§8 цього документа описують проміжну,
+вже замінену модель і мають історичну, а не поточну цінність для `device.c`.
+
+Той рефакторинг переніс §4.1 буквально: `EvtDeviceD0Entry` завжди опускав
+стан до `HardwareReady` після будь-якого resume, ніколи напряму в `Ready`
+(коментар "Deliberately never D0Entry -> Ready directly"). Це відтворило
+рівно ту суперечність, яку §1 цього документа діагностував як баг:
+`OolInRegistered`/`OolOutRegistered` лишались `TRUE` (їх ніхто не скидає -
+на відміну від запланованого `OolState = Stale`), тоді як
+`TransportState == HardwareReady` — тобто `status` міг репортувати
+"OOL registered", а `IOCTL_T2_AKS_EXCHANGE`/`capabilities` одразу
+відхилялись з `STATUS_DEVICE_NOT_READY`, бо той шлях перевіряє
+`State == Ready`, а не прапорці окремо.
+
+**Виправлення** (підтверджено апаратним тестом: та сама SEP OOL-реєстрація
+продовжує працювати після звичайного sleep/resume, без повторного
+`SET_OOL_IN`/`SET_OOL_OUT`): `EvtDeviceD0Entry` тепер робить дешеву mailbox
+liveness-перевірку (MMIO read of `T2_SEP_INBOX_STATUS`; читання
+`T2_SEP_MAILBOX_DEAD_READ` = `0xFFFFFFFF` трактується як провал живості) і,
+лише коли ця перевірка проходить **і** `OolInRegistered && OolOutRegistered`
+обидва вже `TRUE` з часів до сну, переходить напряму в `Ready` — без
+повторного виклику `IOCTL_T2_REGISTER_OOL`. У будь-якому іншому випадку
+(мертвий mailbox, або неповна/відсутня OOL-реєстрація) поведінка лишається
+fail-closed, як і раніше: перехід у `HardwareReady`, наступний AKS-обмін
+негайно отримує `STATUS_DEVICE_NOT_READY`, потрібен явний
+`IOCTL_T2_REGISTER_OOL`. `EvtDeviceD0Exit` (демоція `Ready`/`RegisteringOol`
+→ `HardwareReady` перед сном), `PrepareHardware`/`ReleaseHardware`,
+`Invalid`-гілка та сам AKS/OOL-протокол не змінювались.

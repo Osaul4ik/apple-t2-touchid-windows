@@ -533,41 +533,57 @@ T2EvtDeviceD0Entry(
     // Do a real liveness check of the mailbox registers rather than
     // trusting that D0 entry alone means the SEP side resumed cleanly - a
     // read that succeeds is the same liveness signal T2EvtIoDeviceControlGetStatus
-    // uses.
+    // uses. A read that comes back all-ones (T2_SEP_MAILBOX_DEAD_READ) means
+    // nothing actually answered on the bus (link still down / device not
+    // really back yet), which is treated as a liveness *failure* below, not
+    // just an unusual register value.
     ULONG inbox = READ_REGISTER_ULONG((PULONG)(ctx->Bar4VirtualAddress + T2_SEP_INBOX_STATUS));
+    BOOLEAN livenessOk = (inbox != T2_SEP_MAILBOX_DEAD_READ);
     T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-        "T2TouchIdTransport: D0Entry mailbox liveness check inbox=0x%x empty=%d\n",
-        inbox, (inbox & T2_SEP_INBOX_EMPTY_BIT) != 0));
+        "T2TouchIdTransport: D0Entry mailbox liveness check inbox=0x%x empty=%d ... %s\n",
+        inbox, (inbox & T2_SEP_INBOX_EMPTY_BIT) != 0,
+        livenessOk ? "success" : "failed"));
 
-    // Lifecycle fix (see docs/Windows pnp power lifecycle design.md §1-2):
-    // do NOT resume straight to Ready even if OolInRegistered/OolOutRegistered
-    // were TRUE before this power transition. "No evidence SEP requires
-    // re-arming" is not evidence it doesn't - trusting the old registration
-    // either way is a guess, and the guess-Ready direction fails silently
-    // (every AKS exchange after a bad guess blocks for the full
-    // T2_SEP_TRANSACTION_DEADLINE_US mailbox timeout before the caller
-    // finds out anything is wrong, which is also the shape of a real-world
-    // battery/wake drain: repeated blocked/retried exchanges instead of an
-    // immediate, cheap failure).
+    // State-model fix (D0 resume OOL state inconsistency): an ordinary
+    // D0 -> D3 -> D0 cycle must never leave TransportState and
+    // Ool*Registered contradicting each other (HardwareReady while OOL is
+    // still fully registered, which is exactly what let a status query
+    // report "OOL registered" right next to an AKS exchange rejected with
+    // STATUS_DEVICE_NOT_READY). Hardware testing confirmed the same SEP OOL
+    // registration keeps working across an ordinary sleep/resume - so if
+    // the mailbox came back alive AND both OOL buffers were confirmed
+    // registered before this power transition, resume directly to Ready.
+    // Do NOT re-run IOCTL_T2_REGISTER_OOL here (no SET_OOL_IN/SET_OOL_OUT) -
+    // the existing registration is trusted, not re-sent.
     //
-    // Always land in HardwareReady after a power-up. This does not run any
-    // mailbox I/O here - D0Entry stays cheap (§2.3) - it only means the
+    // Any other case fails closed into HardwareReady, same as before: a
+    // dead mailbox, or an incomplete/absent OOL registration, means the
     // *next* IOCTL_T2_AKS_EXCHANGE gets an immediate STATUS_DEVICE_NOT_READY
     // (see the Ctx->State != T2TransportReady check in
     // T2EvtIoDeviceControlAksExchange) instead of a silent stale-Ready
-    // timeout, and the next IOCTL_T2_REGISTER_OOL harmlessly re-arms SEP:
-    // T2DmaAllocateOolBuffers is already idempotent (checked in the
-    // Milestone 2B §8 checklist) and T2DmaRegisterOolBuffers re-sends
-    // SET_OOL_IN/OUT unconditionally whenever State == HardwareReady, so
-    // this is a real, verified-by-reply re-registration, not a guess in the
-    // other direction either.
-    T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-        "T2TouchIdTransport: D0Entry forcing re-arm (PreviousState=%d, "
-        "OolInRegistered=%d, OolOutRegistered=%d, PriorState=%d) -> "
-        "HardwareReady; next AKS exchange fails closed until "
-        "IOCTL_T2_REGISTER_OOL re-confirms with SEP\n",
-        PreviousState, ctx->OolInRegistered, ctx->OolOutRegistered, ctx->State));
-    T2SetTransportState(ctx, T2TransportHardwareReady);
+    // mailbox timeout, and IOCTL_T2_REGISTER_OOL must be explicitly re-run
+    // to reach Ready again (T2DmaAllocateOolBuffers is idempotent and
+    // T2DmaRegisterOolBuffers re-sends SET_OOL_IN/OUT unconditionally
+    // whenever State == HardwareReady, so that path is unaffected).
+    BOOLEAN oolFullyRegistered = ctx->OolInRegistered && ctx->OolOutRegistered;
+
+    if (livenessOk && oolFullyRegistered) {
+        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+            "T2TouchIdTransport: D0Entry resume (PreviousState=%d, "
+            "OolInRegistered=1, OolOutRegistered=1, PriorState=%d) -> Ready; "
+            "not re-running IOCTL_T2_REGISTER_OOL\n",
+            PreviousState, ctx->State));
+        T2SetTransportState(ctx, T2TransportReady);
+    } else {
+        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+            "T2TouchIdTransport: D0Entry (PreviousState=%d, livenessOk=%d, "
+            "OolInRegistered=%d, OolOutRegistered=%d, PriorState=%d) -> "
+            "HardwareReady; next AKS exchange fails closed until "
+            "IOCTL_T2_REGISTER_OOL re-confirms with SEP\n",
+            PreviousState, livenessOk, ctx->OolInRegistered,
+            ctx->OolOutRegistered, ctx->State));
+        T2SetTransportState(ctx, T2TransportHardwareReady);
+    }
 
     T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
         "T2TouchIdTransport: D0Entry EXIT - State=%d\n", ctx->State));
