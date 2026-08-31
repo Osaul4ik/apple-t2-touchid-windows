@@ -4,9 +4,11 @@ Experimental Windows 11 driver/protocol stack that exposes the built-in
 Touch ID sensor on Intel MacBooks with an Apple T2 chip as a Windows Hello
 biometric device.
 
-**Status: proof-of-concept, not hardware-validated.** The code builds and
-passes hardware-free unit tests, but no run has yet happened on real T2
-hardware — see [Status](#status) below.
+**Status: proof-of-concept.** The SEP PCI transport, DMA/OOL registration,
+and AppleKeyStore exchange are confirmed working on real T2 hardware
+(30.08.2026). BridgeXPC/BiometricKit (the actual fingerprint-match path)
+and the Windows Hello WBDI driver are not yet implemented — see
+[Status](#status) below.
 
 ## What this is
 
@@ -45,16 +47,16 @@ docs/                        Design docs, protocol analysis, milestone reports
 
 ## Status
 
-All Milestone 1 (Linux reference source audit) protocol gates are
-confirmed from source — the SEP mailbox, AppleKeyStore, BridgeXPC, and
-BiometricKit protocols are documented, not guessed. Milestone 2 (Windows
-implementation) exists as working source but every hardware-facing gate is
-still `UNKNOWN` pending a real run:
+Milestone 1 (Linux reference source audit) protocol facts are confirmed
+from source — the SEP mailbox, AppleKeyStore, BridgeXPC, and BiometricKit
+protocols are documented, not guessed. Milestone 2 (Windows implementation)
+has real hardware results as of 30.08.2026:
 
 | Gate | Status |
 |---|---|
-| SEP PCI transport / mailbox | Implemented, not run on hardware |
-| AppleKeyStore exchange | Implemented, not run on hardware |
+| SEP PCI transport / mailbox | **Confirmed on hardware** — BAR4 `0xc1620000`, mailbox live |
+| DMA / OOL registration | **Confirmed on hardware** — 16 KiB endpoint-7 in/out buffers registered |
+| AppleKeyStore exchange | **Confirmed on hardware** — `capabilities` returns `capability[1] = 0x2`; sleep/wake lifecycle in testing |
 | CDC-NCM / IPv6 discovery | Not implemented |
 | RemoteXPC discovery | Not implemented |
 | BridgeXPC | `Connection.cpp` has TODOs; needs `PlistPayload.cpp` completion |
