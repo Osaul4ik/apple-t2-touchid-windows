@@ -486,7 +486,17 @@ T2EvtDeviceD0Entry(
     )
 {
     PT2_DEVICE_CONTEXT ctx = GetDeviceContext(Device);
-    UNREFERENCED_PARAMETER(PreviousState);
+
+    // Sleep/wake audit trail (Milestone 2B §2.2 follow-up): log entry to
+    // every D0Entry with the D-state we're coming from, unconditionally,
+    // before any early-return below - this is what lets a DebugView/ETW
+    // capture actually answer "did the device power up at all, and from
+    // what state" when correlating against a suspected sleep/wake drain,
+    // instead of only seeing the liveness-check line lower down (which is
+    // skipped by both early returns).
+    T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        "T2TouchIdTransport: D0Entry ENTER PreviousState=%d (WdfPowerDevice: "
+        "D0=1 D1=2 D2=3 D3=4 D3Final=5)\n", PreviousState));
 
     // Milestone 2 section 26 / Milestone 2B §3: never assume old
     // protocol/session state remains valid across a power transition.
@@ -499,6 +509,10 @@ T2EvtDeviceD0Entry(
         // PrepareHardware has not run yet (or failed) for this power-up -
         // nothing transport-specific to revalidate; leave State as-is
         // (NotInitialized) and let PrepareHardware set it when it runs.
+        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+            "T2TouchIdTransport: D0Entry EXIT - Bar4 not mapped yet, "
+            "deferring to PrepareHardware, State unchanged (%d)\n",
+            ctx->State));
         WdfWaitLockRelease(ctx->ExchangeLock);
         return STATUS_SUCCESS;
     }
@@ -507,6 +521,10 @@ T2EvtDeviceD0Entry(
         // SEP-owned OOL memory is being retained (§7) - this transport
         // instance stays Invalid across power transitions too, for the
         // same reason it stays Invalid across a fresh PrepareHardware.
+        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+            "T2TouchIdTransport: D0Entry EXIT - State=Invalid (SEP-owned OOL "
+            "memory retained until reboot), staying Invalid across this "
+            "power transition\n"));
         WdfWaitLockRelease(ctx->ExchangeLock);
         return STATUS_SUCCESS;
     }
@@ -520,19 +538,38 @@ T2EvtDeviceD0Entry(
         "T2TouchIdTransport: D0Entry mailbox liveness check inbox=0x%x empty=%d\n",
         inbox, (inbox & T2_SEP_INBOX_EMPTY_BIT) != 0));
 
-    if (ctx->OolInRegistered && ctx->OolOutRegistered) {
-        // OOL was registered before this power transition and was not
-        // retained-as-Invalid above, so this is the ordinary
-        // sleep/wake-with-live-registration case: resume Ready. We do NOT
-        // re-run SET_OOL_IN/SET_OOL_OUT - there is no evidence from the
-        // Linux reference that SEP requires (or even supports) re-arming
-        // an already-registered OOL buffer after a power transition, and
-        // guessing at an undocumented re-register step is explicitly out
-        // of scope (§1 "no guessing undocumented protocol details").
-        T2SetTransportState(ctx, T2TransportReady);
-    } else {
-        T2SetTransportState(ctx, T2TransportHardwareReady);
-    }
+    // Lifecycle fix (see docs/Windows pnp power lifecycle design.md §1-2):
+    // do NOT resume straight to Ready even if OolInRegistered/OolOutRegistered
+    // were TRUE before this power transition. "No evidence SEP requires
+    // re-arming" is not evidence it doesn't - trusting the old registration
+    // either way is a guess, and the guess-Ready direction fails silently
+    // (every AKS exchange after a bad guess blocks for the full
+    // T2_SEP_TRANSACTION_DEADLINE_US mailbox timeout before the caller
+    // finds out anything is wrong, which is also the shape of a real-world
+    // battery/wake drain: repeated blocked/retried exchanges instead of an
+    // immediate, cheap failure).
+    //
+    // Always land in HardwareReady after a power-up. This does not run any
+    // mailbox I/O here - D0Entry stays cheap (§2.3) - it only means the
+    // *next* IOCTL_T2_AKS_EXCHANGE gets an immediate STATUS_DEVICE_NOT_READY
+    // (see the Ctx->State != T2TransportReady check in
+    // T2EvtIoDeviceControlAksExchange) instead of a silent stale-Ready
+    // timeout, and the next IOCTL_T2_REGISTER_OOL harmlessly re-arms SEP:
+    // T2DmaAllocateOolBuffers is already idempotent (checked in the
+    // Milestone 2B §8 checklist) and T2DmaRegisterOolBuffers re-sends
+    // SET_OOL_IN/OUT unconditionally whenever State == HardwareReady, so
+    // this is a real, verified-by-reply re-registration, not a guess in the
+    // other direction either.
+    T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        "T2TouchIdTransport: D0Entry forcing re-arm (PreviousState=%d, "
+        "OolInRegistered=%d, OolOutRegistered=%d, PriorState=%d) -> "
+        "HardwareReady; next AKS exchange fails closed until "
+        "IOCTL_T2_REGISTER_OOL re-confirms with SEP\n",
+        PreviousState, ctx->OolInRegistered, ctx->OolOutRegistered, ctx->State));
+    T2SetTransportState(ctx, T2TransportHardwareReady);
+
+    T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        "T2TouchIdTransport: D0Entry EXIT - State=%d\n", ctx->State));
 
     WdfWaitLockRelease(ctx->ExchangeLock);
     return STATUS_SUCCESS;
@@ -545,7 +582,16 @@ T2EvtDeviceD0Exit(
     )
 {
     PT2_DEVICE_CONTEXT ctx = GetDeviceContext(Device);
-    UNREFERENCED_PARAMETER(TargetState);
+
+    // Sleep/wake audit trail: log entry with the D-state we're heading
+    // into (D3 covers S1-S4 system sleep/hibernate; see the D0Entry log
+    // line above for the WdfPowerDevice numeric legend) before we even try
+    // to acquire the lock, so a hang/long-wait acquiring ExchangeLock
+    // (bounded by an in-flight exchange, see the comment below) is still
+    // visible in the log as "D0Exit was entered but hasn't exited yet".
+    T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        "T2TouchIdTransport: D0Exit ENTER TargetState=%d, current State=%d\n",
+        TargetState, ctx->State));
 
     // Milestone 2B §3/§9: block new AKS exchanges/registration before the
     // power transition proceeds. Acquiring ExchangeLock here is also what
@@ -562,9 +608,16 @@ T2EvtDeviceD0Exit(
         // set here (the handler holds this same lock for the whole
         // registration), but fold it in defensively rather than leaving a
         // stale in-progress-looking state across the transition.
+        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+            "T2TouchIdTransport: D0Exit demoting State %d -> HardwareReady "
+            "before power-down\n", ctx->State));
         T2SetTransportState(ctx, T2TransportHardwareReady);
     }
     WdfWaitLockRelease(ctx->ExchangeLock);
+
+    T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        "T2TouchIdTransport: D0Exit EXIT TargetState=%d, State=%d\n",
+        TargetState, ctx->State));
 
     return STATUS_SUCCESS;
 }

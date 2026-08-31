@@ -148,6 +148,20 @@ C_ASSERT(sizeof(T2_AKS_HEADER_V2) == T2_AKS_HEADER_V2_SIZE);
 //   Ready          -> HardwareReady            D0Exit (leaving D0) - not
 //                                               Ready again until D0Entry
 //                                               revalidates
+//   (Ready or HardwareReady) -> HardwareReady  D0Entry (any power-up,
+//                                               including resume from
+//                                               sleep). Deliberately never
+//                                               D0Entry -> Ready directly:
+//                                               that would mean trusting a
+//                                               pre-sleep OOL registration
+//                                               SEP may have forgotten,
+//                                               which fails silently (full
+//                                               mailbox-timeout stalls on
+//                                               the next exchange) instead
+//                                               of the immediate
+//                                               STATUS_DEVICE_NOT_READY +
+//                                               cheap re-arm this state
+//                                               forces instead.
 //   (any)          -> Invalid                  ReleaseHardware ran while OOL
 //                                               was registered - SEP-owned
 //                                               memory is retained until

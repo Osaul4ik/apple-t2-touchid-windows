@@ -388,15 +388,26 @@ User-mode викликає `IOCTL_T2_REGISTER_OOL` → `OolState: NotRegistered�
 ### 7.2 Сон системи (S1–S4) і пробудження
 ```
 ... (система засинає) ...
-EvtDeviceD0Exit(TargetState=D3)             [лише лог, §4.2]
+EvtDeviceD0Exit(TargetState=D3)             [лише лог, §4.2; State: Ready→HardwareReady]
    ... пристрій фізично в D3 ...
 ... (система прокидається) ...
-EvtDeviceD0Entry(PreviousState=D3)          [OolState: Registered→Stale, §4.1]
+EvtDeviceD0Entry(PreviousState=D3)          [State: (Ready або HardwareReady)→HardwareReady]
 ```
-Наступний `IOCTL_T2_AKS_EXCHANGE` від BridgeXPC → `STATUS_DEVICE_NOT_READY`
-(замість мовчазного зависання/помилкового результату, як зараз). BridgeXPC
-викликає `IOCTL_T2_REGISTER_OOL` (§4.3) → `OolState: Stale→Registered`,
-далі AKS-обмін працює штатно.
+Наступний `IOCTL_T2_AKS_EXCHANGE` від BridgeXPC → негайний
+`STATUS_DEVICE_NOT_READY` (замість мовчазного 5-секундного mailbox-timeout
+при кожному обміні — саме та поведінка, що на практиці виглядає як "з'їдає
+енергію уві сні": повторні заблоковані/повторювані обміни замість швидкої
+відмови). BridgeXPC викликає `IOCTL_T2_REGISTER_OOL` (§4.3) →
+`HardwareReady→Ready` (реальний повторний `SET_OOL_IN`/`SET_OOL_OUT`,
+підтверджений відповіддю SEP, а не здогадка), далі AKS-обмін працює штатно.
+
+**Виправлено (було регресією відносно цього документа):** початкова
+реалізація Milestone 2B у `T2EvtDeviceD0Entry` при `OolInRegistered &&
+OolOutRegistered` переходила напряму в `Ready`, довіряючи
+пре-сон-реєстрації без перевірки — саме той сценарій, для запобігання
+якому писався §2.2 цього документа. Замінено на безумовний перехід у
+`HardwareReady` при кожному D0Entry (див. коментар над
+`T2SetTransportState(ctx, T2TransportHardwareReady)` у `device.c`).
 
 **Очікуваний "known limitation" для цього сценарію** (успадкований від
 `docs/t2-touchid-windows-feasibility.md`): навіть після цього виправлення
