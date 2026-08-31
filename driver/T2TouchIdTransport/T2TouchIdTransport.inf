@@ -65,7 +65,7 @@ T2TouchIdTransport.sys = 1,,
 Drivers_Dir = 13
 
 [Strings]
-ManufacturerName = "T2TouchId Project (unsigned PoC)"
+ManufacturerName = "Osaul4ik"
 DiskName = "T2TouchIdTransport Installation Disk"
-T2TouchIdTransport.DeviceDesc = "Apple T2 SEP Mailbox (Touch ID transport PoC)"
+T2TouchIdTransport.DeviceDesc = "Apple T2 SEP Mailbox"
 T2TouchIdTransport.SvcDesc = "T2 Touch ID Transport"

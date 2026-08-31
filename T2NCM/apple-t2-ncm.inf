@@ -70,6 +70,6 @@ HKR, Ndi\Interfaces, LowerRange, 0, "ethernet"
 HKR,,                EnumPropPages32, 0, "netcfgx.dll,NetPropPageProvider"
 
 [Strings]
-ManufacturerName      = "Apple T2 Touch ID (community)"
+ManufacturerName      = "Osaul4ik"
 DiskName              = "Apple T2 USB NCM Driver Package"
 AppleT2Ncm.DeviceDesc = "Apple T2 USB NCM Network Adapter"
