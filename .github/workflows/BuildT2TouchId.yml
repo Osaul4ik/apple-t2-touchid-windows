@@ -411,6 +411,147 @@ jobs:
         Write-Host "OK: staged t2touchid.exe and its runtime DLLs"
       shell: pwsh
 
+
+    # =====================================================================
+    # Apple T2 NCM package (inbox UsbNcm.sys binding via project INF)
+    # Directory: T2NCM/   INF: apple-t2-ncm.inf
+    # No .sys is shipped; Inf2Cat + optional SignTool on the CAT only.
+    # =====================================================================
+    - name: Prepare Apple T2 NCM package folder
+      run: |
+        $ErrorActionPreference = "Stop"
+        $ncmSrcInf = "T2NCM\apple-t2-ncm.inf"
+        $ncmPkgDir = "artifacts\ncm"
+        if (-not (Test-Path $ncmSrcInf)) {
+          Write-Error "NCM INF not found: $ncmSrcInf"
+          exit 1
+        }
+        New-Item -ItemType Directory -Path $ncmPkgDir -Force | Out-Null
+        Copy-Item -Path $ncmSrcInf -Destination (Join-Path $ncmPkgDir "apple-t2-ncm.inf") -Force
+        Write-Host "OK: staged NCM INF"
+        Get-ChildItem $ncmPkgDir | ForEach-Object { Write-Host "  - $($_.Name)" }
+        Add-Content -Path $env:GITHUB_ENV -Value "NCM_PACKAGE_DIR=$ncmPkgDir"
+        Add-Content -Path $env:GITHUB_ENV -Value "NCM_INF_PATH=$ncmPkgDir\apple-t2-ncm.inf"
+        Add-Content -Path $env:GITHUB_ENV -Value "NCM_CAT_PATH=$ncmPkgDir\apple-t2-ncm.cat"
+      shell: pwsh
+
+    - name: Validate NCM INF (InfVerif)
+      run: |
+        $ErrorActionPreference = "Stop"
+        $roots = @(
+          "C:\Program Files (x86)\Windows Kits\10\Tools",
+          "C:\Program Files (x86)\Windows Kits\10\bin",
+          "C:\Program Files\Windows Kits\10\bin"
+        )
+        $candidates = foreach ($root in $roots) {
+          if (Test-Path $root) {
+            Get-ChildItem -Path $root -Filter "InfVerif.exe" -Recurse -ErrorAction SilentlyContinue
+          }
+        }
+        if (-not $candidates) {
+          Write-Error "InfVerif.exe not found. Cannot validate apple-t2-ncm.inf."
+          exit 1
+        }
+        $tool = $candidates | Where-Object { $_.FullName -match '\\x64\\' } | Sort-Object FullName -Descending | Select-Object -First 1
+        if (-not $tool) { $tool = $candidates | Sort-Object FullName -Descending | Select-Object -First 1 }
+        Write-Host "Using InfVerif: $($tool.FullName)"
+        & "$($tool.FullName)" /v "$env:NCM_INF_PATH"
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "InfVerif failed for apple-t2-ncm.inf (exit $LASTEXITCODE)."
+          exit 1
+        }
+        Write-Host "OK: InfVerif passed for apple-t2-ncm.inf"
+      shell: pwsh
+
+    - name: Generate NCM CAT (Inf2Cat)
+      run: |
+        $ErrorActionPreference = "Stop"
+        $fullPkg = (Resolve-Path $env:NCM_PACKAGE_DIR).Path
+        & "$env:INF2CAT_PATH" /driver:"$fullPkg" /os:10_X64 /verbose
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "Inf2Cat for NCM package failed (exit $LASTEXITCODE)."
+          exit 1
+        }
+        if (-not (Test-Path $env:NCM_CAT_PATH)) {
+          Write-Error "Inf2Cat did not produce $env:NCM_CAT_PATH"
+          exit 1
+        }
+        Write-Host "OK: NCM .cat generated -> $env:NCM_CAT_PATH"
+      shell: pwsh
+
+    - name: Sign NCM CAT with SignTool
+      if: ${{ env.SIGN_CERT_PFX != '' && env.SIGN_CERT_PASSWORD != '' }}
+      run: |
+        $ErrorActionPreference = "Stop"
+        $pfxPath = Join-Path $env:TEMP "ncm-signcert.pfx"
+        try {
+          $bytes = [Convert]::FromBase64String($env:SIGN_CERT_PFX)
+          [IO.File]::WriteAllBytes($pfxPath, $bytes)
+
+          $roots = @(
+            "C:\Program Files (x86)\Windows Kits\10\bin",
+            "C:\Program Files\Windows Kits\10\bin"
+          )
+          $candidates = foreach ($root in $roots) {
+            if (Test-Path $root) {
+              Get-ChildItem -Path $root -Filter "signtool.exe" -Recurse -ErrorAction SilentlyContinue
+            }
+          }
+          $tool = $candidates | Where-Object { $_.FullName -match '\\x64\\' } | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $tool) { $tool = $candidates | Sort-Object FullName -Descending | Select-Object -First 1 }
+          if (-not $tool) { Write-Error "signtool.exe not found."; exit 1 }
+
+          & "$($tool.FullName)" sign /v /fd SHA256 /f "$pfxPath" /p "$env:SIGN_CERT_PASSWORD" `
+            /tr http://timestamp.digicert.com /td SHA256 "$env:NCM_CAT_PATH"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Signing NCM .cat failed (exit $LASTEXITCODE)."
+            exit 1
+          }
+          Write-Host "OK: NCM .cat signed."
+        }
+        finally {
+          if (Test-Path $pfxPath) { Remove-Item -Path $pfxPath -Force }
+        }
+      shell: pwsh
+
+    - name: Verify NCM CAT signature
+      if: ${{ env.SIGN_CERT_PFX != '' && env.SIGN_CERT_PASSWORD != '' }}
+      run: |
+        $ErrorActionPreference = "Stop"
+        $roots = @(
+          "C:\Program Files (x86)\Windows Kits\10\bin",
+          "C:\Program Files\Windows Kits\10\bin"
+        )
+        $candidates = foreach ($root in $roots) {
+          if (Test-Path $root) {
+            Get-ChildItem -Path $root -Filter "signtool.exe" -Recurse -ErrorAction SilentlyContinue
+          }
+        }
+        $tool = $candidates | Where-Object { $_.FullName -match '\\x64\\' } | Sort-Object FullName -Descending | Select-Object -First 1
+        if (-not $tool) { $tool = $candidates | Sort-Object FullName -Descending | Select-Object -First 1 }
+        if (-not $tool) { Write-Error "signtool.exe not found."; exit 1 }
+
+        # /pa accepts any valid Authenticode signature (test cert included).
+        & "$($tool.FullName)" verify /pa /v "$env:NCM_CAT_PATH"
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "NCM .cat signature verification FAILED (exit $LASTEXITCODE)."
+          exit 1
+        }
+        Write-Host "OK: NCM .cat signature verified."
+      shell: pwsh
+
+    - name: Warn if NCM package unsigned
+      if: ${{ env.SIGN_CERT_PFX == '' || env.SIGN_CERT_PASSWORD == '' }}
+      run: Write-Host "::warning::CERT/CERT_PWD secrets not set - NCM package is UNSIGNED. Target machine needs test-signing mode."
+      shell: pwsh
+
+    - name: Upload Apple T2 NCM package
+      uses: actions/upload-artifact@v4
+      with:
+        name: AppleT2NCM-${{ env.DRIVER_VERSION }}
+        path: ${{ env.NCM_PACKAGE_DIR }}
+        if-no-files-found: error
+
     - name: Upload driver + tool package
       uses: actions/upload-artifact@v4
       with:

@@ -1,0 +1,94 @@
+; apple-t2-ncm.inf
+;
+; Apple T2 USB CDC-NCM function (VID_05AC&PID_8233)
+; Project-owned package that binds the Windows inbox UsbNcm.sys to the
+; T2 NCM control interface. No private copy of UsbNcm.sys is shipped.
+;
+; Topology (required):
+;
+;   USB\VID_05AC&PID_8233                  parent composite
+;           │
+;           ▼
+;      usbccgp.sys                         (generic parent — never replaced)
+;           │
+;           ├── MI_00  CDC NCM Control (class 02 / subclass 0D)
+;           │            │
+;           │            └── this INF  →  UsbNcm.sys  →  one NDIS adapter
+;           │
+;           └── MI_01  CDC NCM Data   (class 0A)
+;                        (associated via CDC Union Functional Descriptor;
+;                         claimed by the same UsbNcm instance)
+;
+; Parent device remains under Apple's existing null package
+; (oem15.inf / AppleNull64):
+;   %NCM_DEVICE% = NullDeviceInstall, USB\VID_05AC&PID_8233
+; This INF deliberately does NOT match the parent.
+;
+; Design decisions:
+; - Match only MI_00 (control). Matching both MI_00 and MI_01 independently
+;   would risk two separate UsbNcm instances; the Union descriptor already
+;   ties data interface 1 to control interface 0.
+; - Use Include/Needs against the inbox usbncm.inf so the Service=UsbNcm
+;   and Ndi registry values come from Microsoft's package.
+; - No filter driver, no custom bus driver, no redistribution of
+;   UsbNcm.sys.
+;
+; Hardware validation on real T2 is required to confirm that UsbNcm.sys
+; accepts this descriptor set when installed via a third-party INF.
+; If it rejects the device (missing MS_COMP_WINNCM compatible ID or
+; other internal checks), report "INBOX NCM DRIVER BINDING: NOT SUPPORTED"
+; with SetupAPI evidence rather than inventing workarounds.
+;
+; SPDX-License-Identifier: GPL-2.0-only
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = Net
+ClassGUID   = {4d36e972-e325-11ce-bfc1-08002be10318}
+Provider    = %ManufacturerName%
+DriverVer   = 09/01/2026,1.0.0.0
+CatalogFile = apple-t2-ncm.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+; No files are copied; UsbNcm.sys lives in the Windows inbox Driver Store.
+; DestinationDirs is still required for InfVerif.
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+; Intentionally empty — inbox driver only.
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTamd64
+
+[Standard.NTamd64]
+; Exact hardware ID observed on the target T2.
+; Do not broaden to USB\Class_02&SubClass_0d without documented need —
+; that would claim unrelated NCM devices.
+%AppleT2Ncm.DeviceDesc% = AppleT2Ncm_Install, USB\VID_05AC&PID_8233&MI_00
+
+; ---------------------------------------------------------------------------
+; Pull DDInstall / Services / HW content from the Microsoft inbox
+; usbncm.inf. Section names follow the public form of that INF
+; (UsbNcm_Device.NT / .Services / .HW) present on Windows 10 1709+
+; and Windows 11.
+; ---------------------------------------------------------------------------
+
+[AppleT2Ncm_Install]
+Include = usbncm.inf
+Needs   = UsbNcm_Device.NT
+
+[AppleT2Ncm_Install.Services]
+Include = usbncm.inf
+Needs   = UsbNcm_Device.NT.Services
+
+[AppleT2Ncm_Install.HW]
+Include = usbncm.inf
+Needs   = UsbNcm_Device.NT.HW
+
+[Strings]
+ManufacturerName      = "Apple T2 Touch ID (community)"
+DiskName              = "Apple T2 USB NCM Driver Package"
+AppleT2Ncm.DeviceDesc = "Apple T2 USB NCM Network Adapter"
