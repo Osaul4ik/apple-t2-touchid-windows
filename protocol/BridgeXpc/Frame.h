@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Frame.h — BridgeXpc/T2BridgeXpc
 //
 // Wire format VERIFIED FROM SOURCE (Milestone 1, section 7):

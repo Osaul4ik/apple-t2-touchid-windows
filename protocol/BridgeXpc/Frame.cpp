@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Frame.cpp
 #include "Frame.h"
 #include <cstring>

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // MatchResult.h
 //
 // This file implements the single most security-critical decision in the

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // main.cpp — t2touchid.exe
 //
 // Milestone 2 §10, §27: commands are read-evidence tools, never a source

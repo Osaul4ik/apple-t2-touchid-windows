@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Connection.cpp
 #include "Connection.h"
 #include <ws2tcpip.h>

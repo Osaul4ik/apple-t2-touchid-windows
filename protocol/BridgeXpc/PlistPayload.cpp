@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // PlistPayload.cpp
 //
 // libplist-backed implementation of the narrow bplist shapes this project

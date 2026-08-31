@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // PlistPayload.h
 //
 // MESSAGE frame bodies are binary property lists (VERIFIED FROM SOURCE:

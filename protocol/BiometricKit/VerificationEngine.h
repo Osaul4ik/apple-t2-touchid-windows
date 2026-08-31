@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // VerificationEngine.h
 #pragma once
 #include "Commands.h"

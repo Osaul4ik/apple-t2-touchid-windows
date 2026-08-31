@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // ProtocolTests.cpp
 //
 // Hardware-independent tests (Milestone 2 §28 "Invalid" test matrix +

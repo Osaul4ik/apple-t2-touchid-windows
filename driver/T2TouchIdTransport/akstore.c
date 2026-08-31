@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // akstore.c
 //
 // Endpoint-7 (AppleKeyStore) exchange. Wire format VERIFIED FROM SOURCE

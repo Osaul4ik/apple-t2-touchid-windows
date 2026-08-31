@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // MatchResult.cpp
 //
 // PROVENANCE NOTE (updated after direct read of bridge-xpc-probe.py's

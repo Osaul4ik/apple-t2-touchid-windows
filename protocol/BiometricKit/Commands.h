@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Commands.h — T2BiometricKit
 //
 // All structures/IDs VERIFIED FROM SOURCE (Milestone 1, section 7).

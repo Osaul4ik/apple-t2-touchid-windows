@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // device.c
 //
 // PCI enumeration/BAR-mapping: BAR4 is now selected by reading its real

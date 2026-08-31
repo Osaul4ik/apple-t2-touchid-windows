@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // public.h
 // Public IOCTL interface exposed by T2TouchIdTransport.sys.
 // Mirrors the ioctl surface of the Linux reference (t2_sep_transport_uapi.h),

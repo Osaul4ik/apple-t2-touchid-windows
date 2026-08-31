@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Client.h — user-mode AppleKeyStore client
 //
 // Thin wrapper over IOCTL_T2_AKS_EXCHANGE. Password handling rules

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Client.cpp
 #include "Client.h"
 #include "../../driver/T2TouchIdTransport/public.h"

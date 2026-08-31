@@ -18,11 +18,3 @@ common buffer, оскільки жоден існуючий Windows-проєкт
 | Один active exchange за раз (`WDFWAITLOCK`) | Milestone 2 §23 concurrency вимога |
 | Retain (leak), не free, DMA-буфери після успішної SEP-реєстрації | Прямий перенос "pinning" властивості з Milestone 1, а не сліпе копіювання "cannot unload" висновку |
 
-## Відкрите питання для реальної машини
-
-BAR-selection логіка (`device.c`) припускає, що на T2 SEP PCI-функції є
-рівно один memory-type resource descriptor і трактує його як BAR4. Це
-потрібно підтвердити через `t2touchid.exe status` на цільовій машині —
-якщо `Bar4Size` не показує щонайменше `0x10000`, селекція неправильна і
-потребує явного читання PCI config space (BAR4 offset `0x20`) через bus
-interface, а не припущення про порядок ресурсів.

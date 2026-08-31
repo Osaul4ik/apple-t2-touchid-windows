@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // mailbox.c
 //
 // Direct semantic port (not literal code copy) of t2_sep_transport.c's

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // driver.h
 // T2TouchIdTransport.sys — KMDF PCI driver for the Apple T2 SEP mailbox.
 //

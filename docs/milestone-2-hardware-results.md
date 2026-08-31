@@ -1,6 +1,6 @@
 # milestone-2-hardware-results.md
 
-## Статус: НЕ ВИКОНАНО — немає доступу до фізичного заліза в цьому середовищі
+## Статус: НЕ ВИКОНАНО
 
 Це формальна вимога розділу 31 ТЗ ("Milestone 2 is NOT complete based on
 compilation") і критичного правила №8 ("No mocked hardware"). Я (модель,
@@ -11,24 +11,6 @@ Visual Studio, без фізичного MacBook Pro 2019 і без можлив
 - Жодного рядка нижче не буде заповнено вигаданими значеннями.
 - Усі Gate-статуси розділу 32 — `UNKNOWN`, доки ти особисто не запустиш
   `t2touchid.exe` на цільовій машині.
-
-## Що потрібно від тебе, щоб закрити цей документ
-
-1. Встановити WDK + Visual Studio (Driver Development workload).
-2. Увімкнути test signing (`bcdedit /set testsigning on`) або підписати
-   драйвер тестовим сертифікатом — Secure Boot майже напевно доведеться
-   тимчасово вимкнути для першого PoC.
-3. Скомпілювати `driver/T2TouchIdTransport`, встановити через
-   `pnputil /add-driver T2TouchIdTransport.inf /install` (або Device
-   Manager → Update driver → Have Disk).
-4. Скомпілювати `tools/t2touchid` (потребує `protocol/*` і `libplist` —
-   див. `docs/windows-protocol-architecture.md` щодо відсутньої
-   `PlistPayload.cpp` реалізації, яку треба дописати першою).
-5. Запустити послідовно:
-   ```
-   t2touchid.exe status
-   ```
-   і заповнити нижче реальний вивід.
 
 ## Gate results (заповнити після реального запуску)
 
@@ -84,9 +66,3 @@ DMA the registered OOL buffers and never posted an EP7 reply.
 - `akstore.c`: `usec_time` ← `KeQueryUnbiasedInterruptTime()/10`,
   `calendar_seconds` ← FILETIME-to-Unix conversion.
 - `driver.h`: prototype for the new helper.
-
-After rebuild + reinstall + `register-ool` (or fresh load), re-test:
-```
-t2touchid.exe status
-t2touchid.exe capabilities
-```

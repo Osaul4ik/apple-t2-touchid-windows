@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Commands.cpp
 #include "Commands.h"
 #include <cstring>

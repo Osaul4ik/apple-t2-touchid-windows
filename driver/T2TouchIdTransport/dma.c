@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // dma.c
 //
 // OOL buffers via WDF common buffer. Logical address

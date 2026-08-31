@@ -94,16 +94,3 @@ have NOT been run; they require an actual WDK toolchain.
   cancel call entirely, since it only ran unconditionally after the event
   loop.
 
-## Not done / explicitly out of scope here
-
-- No WDK toolchain available in this environment, so none of §13's checks
-  (`/W4 /WX` build, PREfast/CodeQL, Driver Verifier, the lifecycle test
-  matrix) have actually been run. Basic brace/paren balance and a manual
-  read-through were done instead; a real build is still required before
-  this is trustworthy.
-- `akstore.c` was reviewed against the new state machine and needs no
-  changes — it only touches `Ctx->OolInVa`/`OolOutVa` and is only ever
-  called by `device.c` after `State == Ready` has already been verified
-  under the lock.
-- No changes to the AKS/OOL wire protocol, mailbox message format, or
-  KMDF→WDM architecture, per §12.

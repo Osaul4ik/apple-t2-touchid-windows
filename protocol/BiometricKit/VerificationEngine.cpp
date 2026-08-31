@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // VerificationEngine.cpp
 #include "VerificationEngine.h"
 #include "../BridgeXpc/PlistPayload.h"
