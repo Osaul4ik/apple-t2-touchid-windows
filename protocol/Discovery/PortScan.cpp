@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-// PortScan.cpp — concurrent TCP + HTTP/2 preface probe (Gate 6 phase 1).
+// PortScan.cpp
 #include "PortScan.h"
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -24,14 +24,24 @@ bool EnsureWinsock() {
     return ok;
 }
 
-// Non-blocking connect with timeout; on success optionally reads peer bytes
-// and checks for HTTP/2 SETTINGS (type == 4) or accepts our preface echo path.
-bool ProbePort(const NcmEndpoint& ep, uint16_t port, unsigned timeoutMs, bool* http2Ok) {
-    *http2Ok = false;
-    SOCKET s = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
-    if (s == INVALID_SOCKET) return false;
+// Returns: connected (TCP), http2 (SETTINGS seen).
+struct ProbeResult { bool connected = false; bool http2 = false; };
 
-    // Non-blocking
+ProbeResult ProbePort(const NcmEndpoint& ep, uint16_t port, unsigned timeoutMs) {
+    ProbeResult r;
+    SOCKET s = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) return r;
+
+    // Bind to the T2 NCM interface so link-local traffic leaves the right NIC.
+    sockaddr_in6 bindAddr{};
+    bindAddr.sin6_family = AF_INET6;
+    bindAddr.sin6_addr = in6addr_any;
+    bindAddr.sin6_scope_id = ep.ifIndex;
+    // Binding with scope_id only is not always enough; IPV6_UNICAST_IF helps.
+    DWORD ifIndex = ep.ifIndex;
+    setsockopt(s, IPPROTO_IPV6, IPV6_UNICAST_IF,
+               reinterpret_cast<const char*>(&ifIndex), sizeof(ifIndex));
+
     u_long nonblock = 1;
     ioctlsocket(s, FIONBIO, &nonblock);
 
@@ -46,7 +56,7 @@ bool ProbePort(const NcmEndpoint& ep, uint16_t port, unsigned timeoutMs, bool* h
         int err = WSAGetLastError();
         if (err != WSAEWOULDBLOCK && err != WSAEINPROGRESS) {
             closesocket(s);
-            return false;
+            return r;
         }
         fd_set wset, eset;
         FD_ZERO(&wset);
@@ -59,47 +69,49 @@ bool ProbePort(const NcmEndpoint& ep, uint16_t port, unsigned timeoutMs, bool* h
         int sel = select(0, nullptr, &wset, &eset, &tv);
         if (sel <= 0 || FD_ISSET(s, &eset)) {
             closesocket(s);
-            return false;
+            return r;
         }
         int soerr = 0;
         int solen = sizeof(soerr);
         getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&soerr), &solen);
         if (soerr != 0) {
             closesocket(s);
-            return false;
+            return r;
         }
     }
+    r.connected = true;
 
-    // Connected. Send HTTP/2 client preface (Linux probe does this style of
-    // filtering). Then try to read a small response.
+    // Optional: send HTTP/2 client preface and look for SETTINGS (type 0x04).
     send(s, kHttp2ClientPreface, static_cast<int>(sizeof(kHttp2ClientPreface) - 1), 0);
 
-    // Brief wait for peer data
     fd_set rset;
     FD_ZERO(&rset);
     FD_SET(s, &rset);
     timeval rtv{};
     rtv.tv_sec = 0;
-    rtv.tv_usec = static_cast<long>(timeoutMs * 1000);
-    if (rtv.tv_usec > 500000) rtv.tv_usec = 500000; // cap read wait 500ms
+    rtv.tv_usec = static_cast<long>((std::min)(timeoutMs, 500u) * 1000);
     if (select(0, &rset, nullptr, nullptr, &rtv) > 0) {
-        unsigned char buf[24] = {};
+        unsigned char buf[32] = {};
         int n = recv(s, reinterpret_cast<char*>(buf), sizeof(buf), 0);
-        // HTTP/2 frame: length(3) type(1) flags(1) stream(4) ...
-        // SETTINGS type == 0x04. Peer may also send server preface first.
         if (n >= 9) {
-            unsigned char type = buf[3];
-            if (type == 0x04) {
-                *http2Ok = true;
+            // Standard HTTP/2 frame header: length[3] type[1] ...
+            if (buf[3] == 0x04) {
+                r.http2 = true;
+            }
+            // Some peers prepend the 24-byte client-preface echo path or
+            // server connection preface; search first 24 bytes for type 0x04
+            // at offset 3 of any aligned frame.
+            for (int i = 0; i + 9 <= n; ++i) {
+                if (buf[i + 3] == 0x04) {
+                    r.http2 = true;
+                    break;
+                }
             }
         }
-        // Some stacks reply with fewer bytes; treat any readable peer that
-        // accepted the TCP connect after preface as a soft candidate only if
-        // type matched. Strict mode: require type==4 (Linux reference).
     }
 
     closesocket(s);
-    return *http2Ok;
+    return r;
 }
 
 } // namespace
@@ -114,12 +126,13 @@ std::vector<PortCandidate> ScanHttp2Preface(const NcmEndpoint& endpoint,
     const unsigned total = static_cast<unsigned>(options.portEnd - options.portBegin) + 1;
     std::atomic<unsigned> next{0};
     std::atomic<unsigned> tried{0};
+    std::atomic<unsigned> tcpHits{0};
+    std::atomic<unsigned> http2Hits{0};
     std::mutex hitsMu;
 
     unsigned workers = options.concurrency;
     if (workers == 0) workers = 1;
     if (workers > total) workers = total;
-    // Cap threads to something reasonable for a user-mode CLI.
     if (workers > 64) workers = 64;
 
     auto worker = [&]() {
@@ -127,24 +140,25 @@ std::vector<PortCandidate> ScanHttp2Preface(const NcmEndpoint& endpoint,
             unsigned i = next.fetch_add(1);
             if (i >= total) break;
             uint16_t port = static_cast<uint16_t>(options.portBegin + i);
-            bool http2 = false;
-            if (ProbePort(endpoint, port, options.connectTimeoutMs, &http2) && http2) {
-                std::lock_guard<std::mutex> lock(hitsMu);
-                hits.push_back(PortCandidate{port, true});
+            ProbeResult pr = ProbePort(endpoint, port, options.connectTimeoutMs);
+            if (pr.connected) {
+                tcpHits.fetch_add(1);
+                if (pr.http2) http2Hits.fetch_add(1);
+                if (pr.http2 || options.includeTcpOnly) {
+                    std::lock_guard<std::mutex> lock(hitsMu);
+                    hits.push_back(PortCandidate{port, true, pr.http2});
+                }
             }
             unsigned t = tried.fetch_add(1) + 1;
             if (options.onProgress && (t % 512 == 0 || t == total)) {
-                std::lock_guard<std::mutex> lock(hitsMu);
-                options.onProgress(t, total, static_cast<unsigned>(hits.size()));
+                options.onProgress(t, total, tcpHits.load(), http2Hits.load());
             }
         }
     };
 
     std::vector<std::thread> threads;
     threads.reserve(workers);
-    for (unsigned w = 0; w < workers; ++w) {
-        threads.emplace_back(worker);
-    }
+    for (unsigned w = 0; w < workers; ++w) threads.emplace_back(worker);
     for (auto& th : threads) th.join();
 
     std::sort(hits.begin(), hits.end(),

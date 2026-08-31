@@ -271,30 +271,48 @@ static int CmdNetwork(int argc, wchar_t* argv[]) {
     const auto& ep = endpoints.front();
     ScanOptions opt;
     opt.concurrency = 64;
-    opt.connectTimeoutMs = 150;
-    opt.onProgress = [](unsigned tried, unsigned total, unsigned hits) {
+    opt.connectTimeoutMs = 400;
+    opt.includeTcpOnly = true; // diagnostic: show TCP-open even without SETTINGS
+    opt.onProgress = [](unsigned tried, unsigned total, unsigned tcp, unsigned http2) {
         std::wcout << L"  scanned " << tried << L"/" << total
-                   << L"  hits=" << hits << L"\r" << std::flush;
+                   << L"  tcp=" << tcp << L"  http2=" << http2 << L"\r" << std::flush;
     };
 
-    std::wcout << L"HTTP/2 preface scan " << opt.portBegin << L"-" << opt.portEnd
-               << L" (concurrency " << opt.concurrency << L")...\n";
+    std::wcout << L"port scan " << opt.portBegin << L"-" << opt.portEnd
+               << L" (concurrency " << opt.concurrency
+               << L", timeout " << opt.connectTimeoutMs << L"ms)...\n";
     auto hits = ScanHttp2Preface(ep, opt);
     std::wcout << L"\n";
 
+    unsigned nTcp = 0, nHttp2 = 0;
+    for (const auto& h : hits) {
+        if (h.tcpOpen) ++nTcp;
+        if (h.http2PrefaceOk) ++nHttp2;
+    }
+
     if (hits.empty()) {
-        std::wcout << L"no HTTP/2 preface responders in dynamic range.\n";
-        std::wcout << L"RemoteXPC (RSD) handshake not yet wired — cannot resolve "
-                      L"com.apple.eos.BiometricKit port from decoys alone.\n";
+        std::wcout << L"no TCP listeners in " << opt.portBegin << L"-" << opt.portEnd << L".\n";
+        std::wcout << L"possible causes:\n"
+                   << L"  - bridgeOS services not exposing RemoteXPC on this boot\n"
+                   << L"  - Windows Firewall blocking outbound link-local\n"
+                   << L"  - T2 NCM data path up but no listeners yet\n";
         return 2;
     }
 
-    std::wcout << L"HTTP/2 candidates (" << hits.size() << L"):\n";
+    std::wcout << L"candidates: tcp_open=" << nTcp << L"  http2_settings=" << nHttp2 << L"\n";
     for (const auto& h : hits) {
-        std::wcout << L"  port " << h.port << L"\n";
+        std::wcout << L"  port " << h.port;
+        if (h.http2PrefaceOk) std::wcout << L"  [HTTP/2 SETTINGS]";
+        else std::wcout << L"  [TCP only]";
+        std::wcout << L"\n";
     }
-    std::wcout << L"next: RemoteXPC handshake on each candidate to read Services["
-                  L"com.apple.eos.BiometricKit].Port (Gate 6 phase 2).\n";
+    if (nHttp2 == 0) {
+        std::wcout << L"note: no HTTP/2 SETTINGS frames seen; TCP-only ports may still be "
+                      L"RemoteXPC decoys or other services. RSD handshake is Gate 6 phase 2.\n";
+    } else {
+        std::wcout << L"next: RemoteXPC handshake on HTTP/2 candidates for "
+                      L"Services[com.apple.eos.BiometricKit].Port\n";
+    }
     return 0;
 }
 

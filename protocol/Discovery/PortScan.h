@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-// PortScan.h — HTTP/2-preface probe of the dynamic port range (Linux
-// discover-biometric-port.py equivalent, Phase 1 of Gate 6).
+// PortScan.h — dynamic-port probe (Linux discover-biometric-port.py phase 1).
 #pragma once
 #include "Adapter.h"
 #include <cstdint>
@@ -12,30 +11,25 @@ namespace t2::discovery {
 
 struct PortCandidate {
     uint16_t port = 0;
-    // True if TCP connected and the peer's first bytes looked like an
-    // HTTP/2 SETTINGS frame (type byte == 4), matching the Linux probe.
-    bool http2PrefaceOk = false;
+    bool tcpOpen = false;       // connect() succeeded
+    bool http2PrefaceOk = false; // peer frame type == SETTINGS (0x04)
 };
 
 struct ScanOptions {
     uint16_t portBegin = 49152;
     uint16_t portEnd   = 65535; // inclusive
-    // Concurrent outstanding connects (Linux default 512).
-    unsigned concurrency = 256;
-    // Per-connect timeout in milliseconds.
-    unsigned connectTimeoutMs = 200;
-    // Optional progress callback: (portsTried, portsTotal, hitsSoFar).
-    std::function<void(unsigned, unsigned, unsigned)> onProgress;
+    unsigned concurrency = 64;
+    unsigned connectTimeoutMs = 400;
+    // If true, keep ports that only accepted TCP (no HTTP/2 SETTINGS).
+    // Useful for diagnostics when HTTP/2 filtering yields zero hits.
+    bool includeTcpOnly = true;
+    std::function<void(unsigned, unsigned, unsigned, unsigned)> onProgress;
+    // args: tried, total, tcpHits, http2Hits
 };
 
-// Scans [portBegin, portEnd] on endpoint.linkLocal%ifIndex.
-// Returns only ports that accepted TCP and passed the HTTP/2 preface check.
-// Does NOT perform RemoteXPC/RSD handshake — that is Gate 6 phase 2.
 std::vector<PortCandidate> ScanHttp2Preface(const NcmEndpoint& endpoint,
                                             const ScanOptions& options = {});
 
-// HTTP/2 connection preface client sends; we also accept a peer that
-// speaks first with a SETTINGS frame (type 0x04).
 constexpr char kHttp2ClientPreface[] =
     "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
