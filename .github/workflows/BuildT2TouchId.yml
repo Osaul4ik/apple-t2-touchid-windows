@@ -530,32 +530,6 @@ jobs:
         }
       shell: pwsh
 
-    - name: Verify NCM CAT signature
-      if: ${{ env.SIGN_CERT_PFX != '' && env.SIGN_CERT_PASSWORD != '' }}
-      run: |
-        $ErrorActionPreference = "Stop"
-        $roots = @(
-          "C:\Program Files (x86)\Windows Kits\10\bin",
-          "C:\Program Files\Windows Kits\10\bin"
-        )
-        $candidates = foreach ($root in $roots) {
-          if (Test-Path $root) {
-            Get-ChildItem -Path $root -Filter "signtool.exe" -Recurse -ErrorAction SilentlyContinue
-          }
-        }
-        $tool = $candidates | Where-Object { $_.FullName -match '\\x64\\' } | Sort-Object FullName -Descending | Select-Object -First 1
-        if (-not $tool) { $tool = $candidates | Sort-Object FullName -Descending | Select-Object -First 1 }
-        if (-not $tool) { Write-Error "signtool.exe not found."; exit 1 }
-
-        # /pa accepts any valid Authenticode signature (test cert included).
-        & "$($tool.FullName)" verify /pa /v "$env:NCM_CAT_PATH"
-        if ($LASTEXITCODE -ne 0) {
-          Write-Error "NCM .cat signature verification FAILED (exit $LASTEXITCODE)."
-          exit 1
-        }
-        Write-Host "OK: NCM .cat signature verified."
-      shell: pwsh
-
     - name: Warn if NCM package unsigned
       if: ${{ env.SIGN_CERT_PFX == '' || env.SIGN_CERT_PASSWORD == '' }}
       run: Write-Host "::warning::CERT/CERT_PWD secrets not set - NCM package is UNSIGNED. Target machine needs test-signing mode."

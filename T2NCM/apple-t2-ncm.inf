@@ -1,43 +1,30 @@
 ; apple-t2-ncm.inf
 ;
-; Apple T2 USB CDC-NCM function (VID_05AC&PID_8233)
+; Apple T2 USB CDC-NCM (VID_05AC&PID_8233)
 ; Project-owned package that binds the Windows inbox UsbNcm.sys to the
-; T2 NCM control interface. No private copy of UsbNcm.sys is shipped.
+; T2 NCM composite parent. No private copy of UsbNcm.sys is shipped.
 ;
-; Topology (required):
+; Why parent, not MI_00/MI_01:
+;   When Apple oem15.inf Null is bound to the parent, child PDOs for
+;   MI_00/MI_01 are never created. Matching only &MI_00 therefore can
+;   never install. Hardware confirmation: installing the stock Microsoft
+;   NCM driver on the parent causes MI_00/MI_01 to appear.
 ;
-;   USB\VID_05AC&PID_8233                  parent composite
+; Topology after this package wins the parent match (PnP rank over
+; Apple null — we do NOT edit oem15.inf):
+;
+;   USB\VID_05AC&PID_8233
 ;           │
 ;           ▼
-;      usbccgp.sys                         (generic parent — never replaced)
+;      this INF → UsbNcm.sys (inbox)
 ;           │
-;           ├── MI_00  CDC NCM Control (class 02 / subclass 0D)
-;           │            │
-;           │            └── this INF  →  UsbNcm.sys  →  one NDIS adapter
-;           │
-;           └── MI_01  CDC NCM Data   (class 0A)
-;                        (associated via CDC Union Functional Descriptor;
-;                         claimed by the same UsbNcm instance)
+;           ├── MI_00  CDC NCM Control   (appear once parent is NCM)
+;           └── MI_01  CDC NCM Data
+;                    │
+;                    ▼
+;              one NDIS network adapter
 ;
-; Parent device remains under Apple's existing null package
-; (oem15.inf / AppleNull64):
-;   %NCM_DEVICE% = NullDeviceInstall, USB\VID_05AC&PID_8233
-; This INF deliberately does NOT match the parent.
-;
-; Design decisions:
-; - Match only MI_00 (control). Matching both MI_00 and MI_01 independently
-;   would risk two separate UsbNcm instances; the Union descriptor already
-;   ties data interface 1 to control interface 0.
-; - Use Include/Needs against the inbox usbncm.inf so the Service=UsbNcm
-;   and Ndi registry values come from Microsoft's package.
-; - No filter driver, no custom bus driver, no redistribution of
-;   UsbNcm.sys.
-;
-; Hardware validation on real T2 is required to confirm that UsbNcm.sys
-; accepts this descriptor set when installed via a third-party INF.
-; If it rejects the device (missing MS_COMP_WINNCM compatible ID or
-; other internal checks), report "INBOX NCM DRIVER BINDING: NOT SUPPORTED"
-; with SetupAPI evidence rather than inventing workarounds.
+; No filter driver, no custom bus driver, no redistribution of UsbNcm.sys.
 ;
 ; SPDX-License-Identifier: GPL-2.0-only
 
@@ -52,7 +39,6 @@ PnpLockdown = 1
 
 [DestinationDirs]
 ; No files are copied; UsbNcm.sys lives in the Windows inbox Driver Store.
-; DestinationDirs is still required for InfVerif.
 
 [SourceDisksNames]
 1 = %DiskName%,,,""
@@ -64,16 +50,15 @@ PnpLockdown = 1
 %ManufacturerName% = Standard,NTamd64
 
 [Standard.NTamd64]
-; Exact hardware ID observed on the target T2.
-; Do not broaden to USB\Class_02&SubClass_0d without documented need —
-; that would claim unrelated NCM devices.
-%AppleT2Ncm.DeviceDesc% = AppleT2Ncm_Install, USB\VID_05AC&PID_8233&MI_00
+; Parent composite device — same HWID Apple null uses.
+; Winning this match (higher rank / our signed package) is what allows
+; MI_00/MI_01 to enumerate; we do not modify oem15.inf.
+%AppleT2Ncm.DeviceDesc% = AppleT2Ncm_Install, USB\VID_05AC&PID_8233
 
 ; ---------------------------------------------------------------------------
-; Pull DDInstall / Services / HW content from the Microsoft inbox
-; usbncm.inf. Section names follow the public form of that INF
-; (UsbNcm_Device.NT / .Services / .HW) present on Windows 10 1709+
-; and Windows 11.
+; Pull DDInstall / Services / HW from the Microsoft inbox usbncm.inf.
+; Section names match the public form of that INF on Windows 10 1709+ /
+; Windows 11 (UsbNcm_Device.NT / .Services / .HW).
 ; ---------------------------------------------------------------------------
 
 [AppleT2Ncm_Install]
