@@ -1,30 +1,13 @@
 ; apple-t2-ncm.inf
 ;
-; Apple T2 USB CDC-NCM (VID_05AC&PID_8233)
-; Project-owned package that binds the Windows inbox UsbNcm.sys to the
-; T2 NCM composite parent. No private copy of UsbNcm.sys is shipped.
+; Apple T2 USB CDC-NCM (VID_05AC&PID_8233) — parent composite.
+; Binds inbox UsbNcm.sys. Does not ship UsbNcm.sys. Does not edit oem15.inf.
 ;
-; Why parent, not MI_00/MI_01:
-;   When Apple oem15.inf Null is bound to the parent, child PDOs for
-;   MI_00/MI_01 are never created. Matching only &MI_00 therefore can
-;   never install. Hardware confirmation: installing the stock Microsoft
-;   NCM driver on the parent causes MI_00/MI_01 to appear.
-;
-; Topology after this package wins the parent match (PnP rank over
-; Apple null — we do NOT edit oem15.inf):
-;
-;   USB\VID_05AC&PID_8233
-;           │
-;           ▼
-;      this INF → UsbNcm.sys (inbox)
-;           │
-;           ├── MI_00  CDC NCM Control   (appear once parent is NCM)
-;           └── MI_01  CDC NCM Data
-;                    │
-;                    ▼
-;              one NDIS network adapter
-;
-; No filter driver, no custom bus driver, no redistribution of UsbNcm.sys.
+; Hardware note: Apple null on the parent hides MI_00/MI_01. Installing NCM
+; on the parent is what makes those interfaces appear. Code 56
+; (CM_PROB_NEED_CLASS_CONFIG) was observed when only Include/Needs was used;
+; this revision adds explicit Ndi/Characteristics AddReg mirroring the
+; public usbncm.inf layout so the Net class installer can finish.
 ;
 ; SPDX-License-Identifier: GPL-2.0-only
 
@@ -38,32 +21,37 @@ CatalogFile = apple-t2-ncm.cat
 PnpLockdown = 1
 
 [DestinationDirs]
-; No files are copied; UsbNcm.sys lives in the Windows inbox Driver Store.
+DefaultDestDir = 12
 
 [SourceDisksNames]
 1 = %DiskName%,,,""
 
 [SourceDisksFiles]
-; Intentionally empty — inbox driver only.
 
 [Manufacturer]
 %ManufacturerName% = Standard,NTamd64
 
 [Standard.NTamd64]
-; Parent composite device — same HWID Apple null uses.
-; Winning this match (higher rank / our signed package) is what allows
-; MI_00/MI_01 to enumerate; we do not modify oem15.inf.
 %AppleT2Ncm.DeviceDesc% = AppleT2Ncm_Install, USB\VID_05AC&PID_8233
 
 ; ---------------------------------------------------------------------------
-; Pull DDInstall / Services / HW from the Microsoft inbox usbncm.inf.
-; Section names match the public form of that INF on Windows 10 1709+ /
-; Windows 11 (UsbNcm_Device.NT / .Services / .HW).
+; DDInstall: pull Microsoft service definition + explicit Ndi keys.
 ; ---------------------------------------------------------------------------
 
 [AppleT2Ncm_Install]
-Include = usbncm.inf
-Needs   = UsbNcm_Device.NT
+Characteristics = 0x84
+BusType         = 15
+*IfType             = 6
+*MediaType          = 0
+*PhysicalMediaType  = 0
+*IfConnectorPresent = 1
+*ConnectionType     = 1
+*DirectionType      = 0
+*AccessType         = 2
+*HardwareLoopback   = 0
+AddReg          = AppleT2Ncm_AddReg
+Include         = usbncm.inf
+Needs           = UsbNcm_Device.NT
 
 [AppleT2Ncm_Install.Services]
 Include = usbncm.inf
@@ -72,6 +60,14 @@ Needs   = UsbNcm_Device.NT.Services
 [AppleT2Ncm_Install.HW]
 Include = usbncm.inf
 Needs   = UsbNcm_Device.NT.HW
+
+; Explicit Ndi — same shape as inbox usbncm.inf UsbNcm_AddReg.
+; Guarantees UpperRange/LowerRange even if Needs expansion is incomplete.
+[AppleT2Ncm_AddReg]
+HKR, Ndi,            Service,    0, "UsbNcm"
+HKR, Ndi\Interfaces, UpperRange, 0, "ndis5"
+HKR, Ndi\Interfaces, LowerRange, 0, "ethernet"
+HKR,,                EnumPropPages32, 0, "netcfgx.dll,NetPropPageProvider"
 
 [Strings]
 ManufacturerName      = "Apple T2 Touch ID (community)"
