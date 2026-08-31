@@ -6,6 +6,12 @@
 // result or reports the specific failure — there is no "assume it worked"
 // path anywhere in this file.
 #define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+// winsock2 MUST come before windows.h / Client.h, otherwise winsock.h is
+// pulled first and winsock2.h redefinition errors kill the build (/WX).
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
 #include "../../protocol/AppleKeyStore/Client.h"
 #include "../../protocol/Discovery/Adapter.h"
 #include "../../protocol/Discovery/PortScan.h"

@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Adapter.h — locate the T2 CDC-NCM IPv6 link-local endpoint on Windows.
 #pragma once
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <winsock2.h>
+#include <ws2tcpip.h>
 #include <ws2ipdef.h>
 #include <string>
 #include <vector>
