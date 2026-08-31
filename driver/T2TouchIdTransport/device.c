@@ -771,7 +771,24 @@ T2EvtIoDeviceControl(
     }
 }
 
-// Milestone 2B §4: EvtIoStop for the power-managed default queue.
+// Milestone 2B §4 (revisited — EvtIoStop/cancellation lifecycle audit,
+// see docs/milestone-2b-evtiostop-cancellation-audit.md for the full
+// writeup): EvtIoStop for the power-managed default queue.
+//
+// KMDF only invokes this callback for a request that has already been
+// DELIVERED to (and is owned by) this driver - i.e. a request currently
+// executing inside T2EvtIoDeviceControl on some dispatch thread, blocked
+// inside T2SepControl/T2SepAksTransaction's receive loop under
+// ExchangeLock. A request still sitting in the queue, not yet dispatched
+// (e.g. queued behind another one - this is a WdfIoQueueDispatchSequential
+// queue), is never handed to the driver at all while the queue is being
+// stopped/purged: the framework retains or cancels those itself and never
+// calls this callback for them (VERIFIED per Microsoft's KMDF "Canceled
+// and Suspended Requests" documentation: "If the request has been
+// delivered and is owned by the driver, the framework does not cancel
+// it"). So the "the owning handler will complete this" assumption below
+// always holds for every request this callback actually sees - there is
+// no undispatched-request case to additionally handle here.
 //
 // A long-running IOCTL_T2_AKS_EXCHANGE or IOCTL_T2_REGISTER_OOL request may
 // still be executing (blocked inside T2AksExchange/T2DmaRegisterOolBuffers
@@ -785,10 +802,37 @@ T2EvtIoDeviceControl(
 //     double-completion (explicitly out of scope per the Definition of
 //     Done and §12);
 //   - whether the transaction can even be safely aborted mid-flight is
-//     unknown for this protocol, so the conservative choice is to let it
-//     run to its own conclusion.
+//     unknown for this protocol (no SEP opcode exists to cancel a
+//     control/AKS exchange already sent), so the conservative choice is to
+//     let it run to its own conclusion rather than invent a fake abort;
+//   - registering the request as cancelable (WdfRequestMarkCancelable) so
+//     an app-initiated CancelIoEx/process-exit could interrupt the wait
+//     was deliberately NOT added: T2MailboxReceive's poll loop has no safe
+//     mid-iteration abort point that wouldn't risk completing the request
+//     from the EvtRequestCancel callback at the same time the owning
+//     handler thread is still touching MMIO/the reply buffer under
+//     ExchangeLock - exactly the double-completion/use-after-free shape
+//     this callback already avoids by not force-completing on its own.
 // T2_SEP_TRANSACTION_DEADLINE_US already bounds how long that "let it
-// finish" can take, so this can never hang forever. We call
+// finish" can take (~15s per control/AKS transaction, ~30s worst case for
+// IOCTL_T2_REGISTER_OOL's two sequential SET_OOL_IN/SET_OOL_OUT calls) -
+// this can never hang forever, satisfying the "guaranteed to complete in a
+// bounded amount of time" condition under which Microsoft's own KMDF
+// documentation says a driver may legitimately take this
+// acknowledge-and-let-finish approach in EvtIoStop instead of requeuing or
+// force-completing. Per WdfRequestStopAcknowledge's documented contract,
+// the framework itself will not let the device actually leave D0 (or
+// complete a remove) until this acknowledged request is completed - so
+// this bound is also the actual upper limit on how long a sleep/
+// Disable-device transition can be held up by an in-flight exchange, on
+// top of (not instead of) the ExchangeLock-based serialization
+// T2EvtDeviceD0Exit/T2EvtDeviceReleaseHardware already do.
+//
+// ActionFlags (WdfRequestStopActionSuspend vs ...Purge) only changes
+// whether the framework can later resume dispatching to this queue - it
+// does not change what we do here (both cases: acknowledge, let the
+// in-flight handler finish and complete it itself), so both are logged
+// identically for diagnostics and handled the same way. We call
 // WdfRequestStopAcknowledge(Request, FALSE) to tell the framework "I see
 // this request, I am not completing/requeuing it right now, I will
 // complete it myself later" - the correct response either for
@@ -804,13 +848,16 @@ T2EvtIoStop(
 {
     UNREFERENCED_PARAMETER(Queue);
 
-    // ActionFlags (WdfRequestStopActionSuspend vs ...Purge) only changes
-    // whether the framework can later resume dispatching to this queue -
-    // it does not change what we do here, so it's logged for diagnostics
-    // only and otherwise ignored.
     T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-        "T2TouchIdTransport: EvtIoStop for in-flight request 0x%p (ActionFlags=0x%x); "
-        "letting the owning handler complete it\n", Request, ActionFlags));
+        "T2TouchIdTransport: EvtIoStop for in-flight request 0x%p "
+        "(ActionFlags=0x%x: Suspend=%d Purge=%d RequestCancelable=%d); "
+        "acknowledging without completing - letting the owning handler "
+        "finish and complete it itself (bounded by "
+        "T2_SEP_TRANSACTION_DEADLINE_US per SEP transaction)\n",
+        Request, ActionFlags,
+        (ActionFlags & WdfRequestStopActionSuspend) != 0,
+        (ActionFlags & WdfRequestStopActionPurge) != 0,
+        (ActionFlags & WdfRequestStopRequestCancelable) != 0));
 
     WdfRequestStopAcknowledge(Request, FALSE);
 }
