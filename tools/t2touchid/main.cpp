@@ -7,6 +7,8 @@
 // path anywhere in this file.
 #define NOMINMAX
 #include "../../protocol/AppleKeyStore/Client.h"
+#include "../../protocol/Discovery/Adapter.h"
+#include "../../protocol/Discovery/PortScan.h"
 #include <iostream>
 #include <string>
 #include <fstream>
@@ -209,6 +211,87 @@ static int CmdDeviceState(Client& client, int64_t handle, uint32_t selector) {
     return 0;
 }
 
+
+static int CmdNetwork(int argc, wchar_t* argv[]) {
+    using namespace t2::discovery;
+
+    // Optional: network [ifIndex]
+    // ifIndex override for the T2 NCM adapter (e.g. 27 from Get-NetIPAddress).
+    unsigned long ifIndexOverride = 0;
+    bool doScan = true;
+    for (int i = 2; i < argc; ++i) {
+        std::wstring a = argv[i];
+        if (a == L"--no-scan") {
+            doScan = false;
+        } else if (a == L"--ifindex" && i + 1 < argc) {
+            ifIndexOverride = static_cast<unsigned long>(_wtoi(argv[++i]));
+        } else if (a[0] >= L'0' && a[0] <= L'9') {
+            ifIndexOverride = static_cast<unsigned long>(_wtoi(a.c_str()));
+        }
+    }
+
+    std::vector<NcmEndpoint> endpoints;
+    if (ifIndexOverride != 0) {
+        NcmEndpoint ep;
+        if (!GetEndpointByIfIndex(ifIndexOverride, &ep)) {
+            std::wcout << L"no Preferred IPv6 link-local on ifIndex " << ifIndexOverride << L"\n";
+            return 1;
+        }
+        endpoints.push_back(ep);
+    } else {
+        endpoints = FindT2NcmEndpoints();
+        if (endpoints.empty()) {
+            std::wcout << L"no T2 NCM adapter found (description must contain T2+NCM or UsbNcm).\n";
+            std::wcout << L"hint: t2touchid.exe network <ifIndex>   e.g. network 27\n";
+            return 1;
+        }
+    }
+
+    for (const auto& ep : endpoints) {
+        std::string ll = FormatLinkLocal(ep.linkLocal, ep.ifIndex);
+        std::wcout << L"adapter:  " << ep.friendlyName << L"\n";
+        std::wcout << L"desc:     " << ep.description << L"\n";
+        std::wcout << L"ifIndex:  " << ep.ifIndex << L"\n";
+        std::wcout << L"link-local: ";
+        for (char c : ll) std::wcout << static_cast<wchar_t>(c);
+        std::wcout << L"\n";
+    }
+
+    if (!doScan) {
+        std::wcout << L"scan skipped (--no-scan). RemoteXPC handshake not yet implemented.\n";
+        return 0;
+    }
+
+    const auto& ep = endpoints.front();
+    ScanOptions opt;
+    opt.concurrency = 64;
+    opt.connectTimeoutMs = 150;
+    opt.onProgress = [](unsigned tried, unsigned total, unsigned hits) {
+        std::wcout << L"  scanned " << tried << L"/" << total
+                   << L"  hits=" << hits << L"\r" << std::flush;
+    };
+
+    std::wcout << L"HTTP/2 preface scan " << opt.portBegin << L"-" << opt.portEnd
+               << L" (concurrency " << opt.concurrency << L")...\n";
+    auto hits = ScanHttp2Preface(ep, opt);
+    std::wcout << L"\n";
+
+    if (hits.empty()) {
+        std::wcout << L"no HTTP/2 preface responders in dynamic range.\n";
+        std::wcout << L"RemoteXPC (RSD) handshake not yet wired — cannot resolve "
+                      L"com.apple.eos.BiometricKit port from decoys alone.\n";
+        return 2;
+    }
+
+    std::wcout << L"HTTP/2 candidates (" << hits.size() << L"):\n";
+    for (const auto& h : hits) {
+        std::wcout << L"  port " << h.port << L"\n";
+    }
+    std::wcout << L"next: RemoteXPC handshake on each candidate to read Services["
+                  L"com.apple.eos.BiometricKit].Port (Gate 6 phase 2).\n";
+    return 0;
+}
+
 int wmain(int argc, wchar_t* argv[]) {
     if (argc < 2) {
         std::wcout << L"usage: t2touchid.exe <status|register-ool|capabilities|device-state|load-keybag|set-system-keybag|unlock|network|identities|verify>\n";
@@ -250,13 +333,13 @@ int wmain(int argc, wchar_t* argv[]) {
         if (argc < 3) { std::wcout << L"usage: unlock <handle>\n"; return 1; }
         return CmdUnlock(client, _wtoi(argv[2]));
     }
-    if (cmd == L"network" || cmd == L"identities" || cmd == L"verify") {
-        // These require the BridgeXpc/BiometricKit protocol layer wired
-        // against a discovered port (see protocol/BridgeXpc,
-        // protocol/BiometricKit). Left as an explicit next-step rather
-        // than a fake "OK" — see docs/milestone-2-hardware-results.md.
-        std::wcout << L"not yet wired in this PoC skeleton - requires RemoteXPC "
-                      L"discovery + a live BridgeXpc connection on real hardware\n";
+    if (cmd == L"network") {
+        // Does not need the transport device handle — pure user-mode IPv6 scan.
+        return CmdNetwork(argc, argv);
+    }
+    if (cmd == L"identities" || cmd == L"verify") {
+        std::wcout << L"not yet wired — requires RemoteXPC BiometricKit port "
+                      L"+ live BridgeXpc connection (Gate 6 phase 2 / Gate 7)\n";
         return 2;
     }
 

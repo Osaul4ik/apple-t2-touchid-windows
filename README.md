@@ -35,6 +35,7 @@ macOS).
 ## Layout
 
 ```
+T2NCM/                       apple-t2-ncm.inf — inbox UsbNcm binding for T2 CDC-NCM
 driver/T2TouchIdTransport/   KMDF PCI driver — SEP mailbox, DMA/OOL buffers,
                               AppleKeyStore opcode allow-list (T2TouchIdTransport.sys)
 protocol/AppleKeyStore/      User-mode client wrapping the transport's AKS IOCTL
@@ -57,8 +58,8 @@ has real hardware results as of 30.08.2026:
 | SEP PCI transport / mailbox | **Confirmed on hardware** — BAR4 `0xc1620000`, mailbox live |
 | DMA / OOL registration | **Confirmed on hardware** — 16 KiB endpoint-7 in/out buffers registered |
 | AppleKeyStore exchange | **Confirmed on hardware** — `capabilities` returns `capability[1] = 0x2`; sleep/wake lifecycle in testing |
-| CDC-NCM / IPv6 discovery | Not implemented |
-| RemoteXPC discovery | Not implemented |
+| CDC-NCM / IPv6 discovery | **Confirmed on hardware** — inbox UsbNcm via `T2NCM/apple-t2-ncm.inf` (see `docs/apple-t2-ncm-binding.md`) |
+| RemoteXPC discovery | Phase 1 in tree (`t2touchid network`); RSD handshake pending |
 | BridgeXPC | `Connection.cpp` has TODOs; needs `PlistPayload.cpp` completion |
 | BiometricKit / real MATCH-NO_MATCH | Blocked on BridgeXPC |
 
