@@ -46,7 +46,7 @@ Signature   = "$WINDOWS NT$"
 Class       = Net
 ClassGUID   = {4d36e972-e325-11ce-bfc1-08002be10318}
 Provider    = %ManufacturerName%
-DriverVer   = 09/01/2026,1.0.0.0
+DriverVer   = 08/30/2026,1.0.0.0
 CatalogFile = apple-t2-ncm.cat
 PnpLockdown = 1
 

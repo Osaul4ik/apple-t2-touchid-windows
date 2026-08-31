@@ -435,6 +435,22 @@ jobs:
         Add-Content -Path $env:GITHUB_ENV -Value "NCM_CAT_PATH=$ncmPkgDir\apple-t2-ncm.cat"
       shell: pwsh
 
+    - name: Stamp NCM INF (date / version)
+      run: |
+        $ErrorActionPreference = "Stop"
+        $infPath = (Resolve-Path $env:NCM_INF_PATH).Path
+        # Same date/version as the transport driver package so artifacts
+        # stay consistent. No KMDF -k flag needed for a pure Net INF.
+        & "$env:STAMPINF_PATH" -f "$infPath" -a amd64 -d "$env:DRIVER_DATE" -v "$env:DRIVER_VERSION"
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "StampInf for NCM INF failed (exit $LASTEXITCODE)."
+          exit 1
+        }
+        Write-Host "==> Stamped NCM INF DriverVer:"
+        Get-Content -Path $infPath | Select-String -Pattern 'DriverVer'
+        Write-Host "OK: NCM INF stamped."
+      shell: pwsh
+
     - name: Validate NCM INF (InfVerif)
       run: |
         $ErrorActionPreference = "Stop"
