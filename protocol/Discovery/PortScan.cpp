@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
-// PortScan.cpp
+// PortScan.cpp — VERIFIED FROM SOURCE: jmurth1234/t2-touchid-linux
+// src/discover-biometric-port.py probe_port()
+//
+// Linux does NOT send an HTTP/2 client preface. It connects, then
+// sock_recv(21) and checks:
+//   len >= 9 && greeting[3] == 4 (SETTINGS) && greeting[5:9] == 00 00 00 00
+// (stream id 0). Sending a preface first was wrong and yielded zero hits.
 #include "PortScan.h"
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -24,7 +30,6 @@ bool EnsureWinsock() {
     return ok;
 }
 
-// Returns: connected (TCP), http2 (SETTINGS seen).
 struct ProbeResult { bool connected = false; bool http2 = false; };
 
 ProbeResult ProbePort(const NcmEndpoint& ep, uint16_t port, unsigned timeoutMs) {
@@ -32,12 +37,7 @@ ProbeResult ProbePort(const NcmEndpoint& ep, uint16_t port, unsigned timeoutMs) 
     SOCKET s = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
     if (s == INVALID_SOCKET) return r;
 
-    // Bind to the T2 NCM interface so link-local traffic leaves the right NIC.
-    sockaddr_in6 bindAddr{};
-    bindAddr.sin6_family = AF_INET6;
-    bindAddr.sin6_addr = in6addr_any;
-    bindAddr.sin6_scope_id = ep.ifIndex;
-    // Binding with scope_id only is not always enough; IPV6_UNICAST_IF helps.
+    // Prefer the T2 NCM interface for link-local (Windows routing).
     DWORD ifIndex = ep.ifIndex;
     setsockopt(s, IPPROTO_IPV6, IPV6_UNICAST_IF,
                reinterpret_cast<const char*>(&ifIndex), sizeof(ifIndex));
@@ -81,32 +81,21 @@ ProbeResult ProbePort(const NcmEndpoint& ep, uint16_t port, unsigned timeoutMs) 
     }
     r.connected = true;
 
-    // Optional: send HTTP/2 client preface and look for SETTINGS (type 0x04).
-    send(s, kHttp2ClientPreface, static_cast<int>(sizeof(kHttp2ClientPreface) - 1), 0);
-
+    // VERIFIED FROM SOURCE: peer speaks first. Do NOT send client preface.
+    // sock_recv up to 21 bytes; require SETTINGS type and stream id 0.
     fd_set rset;
     FD_ZERO(&rset);
     FD_SET(s, &rset);
     timeval rtv{};
-    rtv.tv_sec = 0;
-    rtv.tv_usec = static_cast<long>((std::min)(timeoutMs, 500u) * 1000);
+    rtv.tv_sec = static_cast<long>(timeoutMs / 1000);
+    rtv.tv_usec = static_cast<long>((timeoutMs % 1000) * 1000);
     if (select(0, &rset, nullptr, nullptr, &rtv) > 0) {
-        unsigned char buf[32] = {};
+        unsigned char buf[21] = {};
         int n = recv(s, reinterpret_cast<char*>(buf), sizeof(buf), 0);
-        if (n >= 9) {
-            // Standard HTTP/2 frame header: length[3] type[1] ...
-            if (buf[3] == 0x04) {
-                r.http2 = true;
-            }
-            // Some peers prepend the 24-byte client-preface echo path or
-            // server connection preface; search first 24 bytes for type 0x04
-            // at offset 3 of any aligned frame.
-            for (int i = 0; i + 9 <= n; ++i) {
-                if (buf[i + 3] == 0x04) {
-                    r.http2 = true;
-                    break;
-                }
-            }
+        // greeting[3] == 4 (SETTINGS), greeting[5:9] == \0\0\0\0 (stream 0)
+        if (n >= 9 && buf[3] == 0x04 &&
+            buf[5] == 0 && buf[6] == 0 && buf[7] == 0 && buf[8] == 0) {
+            r.http2 = true;
         }
     }
 

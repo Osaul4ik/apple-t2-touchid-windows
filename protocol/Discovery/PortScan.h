@@ -30,7 +30,7 @@ struct ScanOptions {
 std::vector<PortCandidate> ScanHttp2Preface(const NcmEndpoint& endpoint,
                                             const ScanOptions& options = {});
 
-constexpr char kHttp2ClientPreface[] =
-    "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+// Linux probe does not send a client preface; peer SETTINGS arrives first.
+// (discover-biometric-port.py probe_port — sock_recv only.)
 
 } // namespace t2::discovery

@@ -271,7 +271,7 @@ static int CmdNetwork(int argc, wchar_t* argv[]) {
     const auto& ep = endpoints.front();
     ScanOptions opt;
     opt.concurrency = 64;
-    opt.connectTimeoutMs = 400;
+    opt.connectTimeoutMs = 150; // Linux discover default --probe-timeout 0.15
     opt.includeTcpOnly = true; // diagnostic: show TCP-open even without SETTINGS
     opt.onProgress = [](unsigned tried, unsigned total, unsigned tcp, unsigned http2) {
         std::wcout << L"  scanned " << tried << L"/" << total
