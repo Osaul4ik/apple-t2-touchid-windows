@@ -70,25 +70,41 @@ public:
     // secretUtf8 is zeroed by this call before returning, regardless of
     // outcome — caller must not reuse the buffer contents afterward.
     //
-    // session: the AKS wire protocol's session field. This is NOT an
-    // arbitrary token — SEP enforces it as a fixed protocol constant.
-    // Linux's t2-keybag-load.sh / t2-aks-tool.c hardcode 1 here, and
-    // copy_keybag_uuid rejects any exchange where session != 1. Defaults
-    // to 1 to match that; the parameter exists mainly so callers/tests can
-    // still probe other values explicitly.
+    // session: an opaque caller-chosen value in this op's wire body.
+    // CORRECTED (was wrongly documented as a fixed "must be 1" protocol
+    // constant — verified against jmurth1234/t2-touchid-linux's
+    // t2-aks-tool.c): the `session != 1` hard check in that source lives
+    // only in build_copy_keybag_uuid_request() (opcode 0x06,
+    // copy-keybag-uuid) and, separately, in the verify-password-acm (0x21)
+    // path — neither of which this Client implements. load_keybag (0x03),
+    // set_system_keybag (0x0d), and unlock_keybag (0x04) apply no
+    // validation to this field at all in that source; the reference CLI's
+    // own default for load-keybag when the caller omits it is 0.
+    // Empirically, on real T2 hardware, sending session=1 here changed
+    // load-keybag's SEP status from -11 to -19 (still a rejection, but a
+    // different one) versus session=0 — so the field does matter to the
+    // real SEP applet even though this open-source reference doesn't
+    // encode why. Default is 0 to match the reference tool's own default;
+    // override explicitly to probe other values (e.g. 1) against hardware.
     //
     // outSepStatus (optional): see GetDeviceState's doc below — same
     // semantics here. A nonzero value means the transport exchange
     // succeeded but SEP rejected the request (e.g. bad session/handle).
     AksResult LoadKeybag(const std::vector<uint8_t>& bagBytes, int32_t* outHandle,
-                        uint64_t session = 1, int8_t* outSepStatus = nullptr);
+                        uint64_t session = 0, int8_t* outSepStatus = nullptr);
     AksResult MakeSystemKeybag(int32_t handle, int32_t specialUserBag,
-                                uint64_t session = 1, int8_t* outSepStatus = nullptr);
+                                uint64_t session = 0, int8_t* outSepStatus = nullptr);
     AksResult Unlock(int32_t handle, std::vector<uint8_t>& secretUtf8 /* zeroed on return */,
-                    uint64_t session = 1);
+                    uint64_t session = 0);
     AksResult GetCapabilities(uint64_t selector, uint64_t* outValue);
     // Differential test vs capabilities: same V2 transport, op 0x19.
     // body = [result:u32=0][handle:u64][selector:u32] (20 bytes).
+    // VERIFIED against jmurth1234/t2-touchid-linux's t2-aks-tool.c: this
+    // matches its plain get_device_state() exactly (also opcode 0x19,
+    // no session field). That source also has a get-device-state-v1
+    // variant on the SAME opcode 0x19 with a different, 24-byte,
+    // session-bearing body (codec_version, session, handle, selector) —
+    // not implemented here; don't confuse the two if extending this call.
     // outSepStatus (optional): the signed EP7 reply status. A nonzero value
     // here (with the call still returning AksResult::Ok — the IOCTL/transport
     // itself succeeded) means AppleKeyStore understood and rejected the
