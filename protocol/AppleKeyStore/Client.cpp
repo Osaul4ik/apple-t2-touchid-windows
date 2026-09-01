@@ -79,7 +79,10 @@ AksResult Client::RegisterOol() {
 }
 
 AksResult Client::Exchange(uint8_t operation, const std::vector<uint8_t>& request,
-                            std::vector<uint8_t>* response) {
+                            std::vector<uint8_t>* response, int8_t* outSepStatus) {
+    if (outSepStatus) {
+        *outSepStatus = 0;
+    }
     std::vector<uint8_t> in(sizeof(T2_AKS_EXCHANGE_IN) + request.size(), 0);
     auto* inHeader = reinterpret_cast<T2_AKS_EXCHANGE_IN*>(in.data());
     inHeader->Operation = operation;
@@ -105,6 +108,14 @@ AksResult Client::Exchange(uint8_t operation, const std::vector<uint8_t>& reques
     size_t responseLength = outHeader->ResponseLength;
     if (sizeof(T2_AKS_EXCHANGE_OUT) + responseLength > out.size()) {
         return AksResult::IoError; // defensive: driver must never claim more than our capacity
+    }
+
+    // SepStatus != 0 means SEP itself rejected the operation (e.g. invalid
+    // handle) - the IOCTL still succeeded as a transport-level exchange, so
+    // this is reported via outSepStatus, not as an AksResult error. The
+    // driver guarantees ResponseLength==0 in that case (akstore.c).
+    if (outSepStatus) {
+        *outSepStatus = outHeader->SepStatus;
     }
 
     response->assign(out.begin() + sizeof(T2_AKS_EXCHANGE_OUT),
@@ -237,7 +248,8 @@ AksResult Client::GetCapabilities(uint64_t selector, uint64_t* outValue) {
 
 
 AksResult Client::GetDeviceState(int64_t handle, uint32_t selector,
-                                 std::vector<uint8_t>* responseBody) {
+                                 std::vector<uint8_t>* responseBody,
+                                 int8_t* outSepStatus) {
     // VERIFIED FROM SOURCE (t2-aks-tool.c get_device_state): 20-byte request
     // [result:u32le=0][handle:u64le][selector:u32le]. Same V2 transport as
     // every other allow-listed op — useful differential vs 0x4d.
@@ -249,8 +261,11 @@ AksResult Client::GetDeviceState(int64_t handle, uint32_t selector,
     std::memcpy(req.data() + 12, &selector, 4);
 
     std::vector<uint8_t> response;
-    AksResult r = Exchange(static_cast<uint8_t>(T2AksOpGetDeviceState), req, &response);
+    AksResult r = Exchange(static_cast<uint8_t>(T2AksOpGetDeviceState), req, &response, outSepStatus);
     if (r != AksResult::Ok) return r;
+    // A nonzero SEP status (e.g. handle not found/loaded) means `response`
+    // is empty by contract (akstore.c) - hand that back as-is rather than
+    // treating it as a short/invalid response; the caller checks outSepStatus.
     if (responseBody) *responseBody = std::move(response);
     return AksResult::Ok;
 }

@@ -196,13 +196,23 @@ static int CmdUnlock(Client& client, int32_t handle) {
 
 static int CmdDeviceState(Client& client, int64_t handle, uint32_t selector) {
     std::vector<uint8_t> response;
-    AksResult r = client.GetDeviceState(handle, selector, &response);
+    int8_t sepStatus = 0;
+    AksResult r = client.GetDeviceState(handle, selector, &response, &sepStatus);
     if (r == AksResult::NotReady) {
         std::wcout << L"device-state failed: DMA / OOL is not registered; run register-ool first\n";
         return 1;
     }
     if (r != AksResult::Ok) {
-        std::wcout << L"device-state failed (same timeout as capabilities implies EP7 dead)\n";
+        std::wcout << L"device-state failed (transport-level: timeout/IO error - EP7 not answering at all)\n";
+        return 1;
+    }
+    if (sepStatus != 0) {
+        // The exchange with SEP succeeded - this is AppleKeyStore itself
+        // rejecting the request (e.g. `handle` isn't a currently-loaded
+        // keybag handle), not an EP7/transport problem. handle=0 in
+        // particular is not a valid "liveness probe" value for this op.
+        std::wcout << L"device-state: SEP rejected the request, status=" << (int)sepStatus
+                   << L" (handle=" << handle << L" selector=" << selector << L")\n";
         return 1;
     }
     std::wcout << L"device-state: OK, response_length=" << response.size();

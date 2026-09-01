@@ -884,6 +884,7 @@ T2EvtIoDeviceControlAksExchange(_In_ WDFREQUEST Request, _In_ PT2_DEVICE_CONTEXT
     UINT8 operation;
     PUCHAR requestBody = NULL;
     PUCHAR responseBody = NULL;
+    INT8 sepStatus = 0;
 
     status = WdfRequestRetrieveInputBuffer(Request, sizeof(*in), (PVOID*)&in, &inLen);
     if (!NT_SUCCESS(status)) {
@@ -959,7 +960,7 @@ T2EvtIoDeviceControlAksExchange(_In_ WDFREQUEST Request, _In_ PT2_DEVICE_CONTEXT
         status = STATUS_DEVICE_NOT_READY;
     } else {
         status = T2AksExchange(Ctx, operation, requestBody, requestLength,
-            responseBody, responseCapacity, &responseLength);
+            responseBody, responseCapacity, &responseLength, &sepStatus);
     }
     WdfWaitLockRelease(Ctx->ExchangeLock);
 
@@ -996,6 +997,8 @@ T2EvtIoDeviceControlAksExchange(_In_ WDFREQUEST Request, _In_ PT2_DEVICE_CONTEXT
             RtlCopyMemory((PUCHAR)out + sizeof(*out), responseBody, responseLength);
         }
         out->ResponseLength = (UINT32)responseLength;
+        out->SepStatus = sepStatus;
+        RtlZeroMemory(out->Reserved1, sizeof(out->Reserved1));
     }
 
     if (responseBody) {

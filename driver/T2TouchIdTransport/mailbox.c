@@ -258,7 +258,7 @@ T2SepControl(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Opcode, _In_ UINT8 Tag,
 NTSTATUS
 T2SepAksTransaction(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
                      _In_ UINT8 Transaction, _In_ SIZE_T RequestWireLength,
-                     _Out_ UINT16 *ReplyWireLength)
+                     _Out_ UINT16 *ReplyWireLength, _Out_ INT8 *SepStatus)
 {
     T2_SEP_MESSAGE request = { 0 };
     T2_SEP_MESSAGE reply;
@@ -266,6 +266,7 @@ T2SepAksTransaction(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
     NTSTATUS status;
 
     *ReplyWireLength = 0;
+    *SepStatus = 0;
 
     if (RequestWireLength > MAXUINT16) {
         // VERIFIED FROM SOURCE: reply/request length lives in the upper 16
@@ -337,13 +338,18 @@ T2SepAksTransaction(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
         }
     }
 
-    // VERIFIED FROM SOURCE: unlike EP0, Word[1] here is NOT a result code —
-    // it is purely the reply wire length in its upper 16 bits. Success or
-    // failure of the AKS operation itself is only knowable after parsing
-    // and digest-validating the OOL_OUT buffer contents (caller's job).
+    // VERIFIED FROM SOURCE (t2_sep_transport.c: "EP7 reply: endpoint,
+    // operation|response, transaction, signed status"): bits [31:24] of
+    // Word[0] carry a signed per-reply status from SEP, independent of the
+    // reply wire length in Word[1]'s upper 16 bits. This can be nonzero
+    // (e.g. invalid handle) even when SEP replies almost instantly with no
+    // OOL body at all — do not mistake that for "EP7 dead"/timeout, and do
+    // not let the caller trust replyWireLength/OOL_OUT when this is nonzero.
+    *SepStatus = (INT8)(reply.Word[0] >> 24);
     *ReplyWireLength = (UINT16)(reply.Word[1] >> 16);
     T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-        "T2TouchIdTransport: AKS exchange matched operation=0x%02x transaction=0x%02x replyWireLength=%u (skipped=%u)\n",
-        Operation, Transaction, *ReplyWireLength, skipped));
+        "T2TouchIdTransport: AKS exchange matched operation=0x%02x transaction=0x%02x "
+        "sepStatus=%d replyWireLength=%u (skipped=%u)\n",
+        Operation, Transaction, *SepStatus, *ReplyWireLength, skipped));
     return STATUS_SUCCESS;
 }

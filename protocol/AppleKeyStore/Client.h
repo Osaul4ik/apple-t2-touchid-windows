@@ -75,15 +75,24 @@ public:
     AksResult GetCapabilities(uint64_t selector, uint64_t* outValue);
     // Differential test vs capabilities: same V2 transport, op 0x19.
     // body = [result:u32=0][handle:u64][selector:u32] (20 bytes).
+    // outSepStatus (optional): the signed EP7 reply status. A nonzero value
+    // here (with the call still returning AksResult::Ok — the IOCTL/transport
+    // itself succeeded) means AppleKeyStore understood and rejected the
+    // request, e.g. because `handle` isn't a currently-loaded keybag handle.
+    // Do not mistake this for AksResult::IoError/NotReady: SEP replied fine.
     AksResult GetDeviceState(int64_t handle, uint32_t selector,
-                            std::vector<uint8_t>* responseBody);
+                            std::vector<uint8_t>* responseBody,
+                            int8_t* outSepStatus = nullptr);
 
 private:
     HANDLE handle_ = INVALID_HANDLE_VALUE;
 
+    // outSepStatus (optional): see GetDeviceState's doc above — same
+    // semantics for every AKS operation, not just device-state.
     AksResult Exchange(uint8_t operation,
                         const std::vector<uint8_t>& request,
-                        std::vector<uint8_t>* response);
+                        std::vector<uint8_t>* response,
+                        int8_t* outSepStatus = nullptr);
 };
 
 } // namespace t2::applekeystore

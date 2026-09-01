@@ -308,9 +308,20 @@ NTSTATUS T2SepControl(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Opcode, _In_ UINT8
 // operation<<8 | transaction<<16 ; Word[1] = requestWireLength<<16. The
 // reply's Word[1] is NOT a result code here (unlike EP0) — success/failure
 // is determined by the AKS response header + digest, checked by the caller.
+//
+// SepStatus (VERIFIED FROM SOURCE, t2_sep_transport.c t2_aks_exchange_locked):
+// bits [31:24] of the matched reply's Word[0] are a SIGNED status byte the
+// SEP fills in on every EP7 reply, independent of whether any OOL body
+// follows. A nonzero value means the SEP understood and processed the
+// request and is reporting a real result (e.g. invalid handle) — this is
+// NOT a transport failure, and *ReplyWireLength/the OOL_OUT buffer must
+// not be trusted when SepStatus != 0. *SepStatus is only meaningful when
+// this function returns STATUS_SUCCESS (a reply was actually matched); on
+// STATUS_IO_TIMEOUT/STATUS_DEVICE_PROTOCOL_ERROR it is left unwritten by
+// the caller's zero-initialization, since no reply arrived to read it from.
 NTSTATUS T2SepAksTransaction(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
                               _In_ UINT8 Transaction, _In_ SIZE_T RequestWireLength,
-                              _Out_ UINT16 *ReplyWireLength);
+                              _Out_ UINT16 *ReplyWireLength, _Out_ INT8 *SepStatus);
 
 // dma.c
 NTSTATUS T2DmaAllocateOolBuffers(_In_ PT2_DEVICE_CONTEXT Ctx);
@@ -323,7 +334,14 @@ NTSTATUS T2EnablePciBusMaster(_In_ WDFDEVICE Device);
 // akstore.c
 BOOLEAN T2AksOperationAllowed(_In_ UINT8 Operation);
 NTSTATUS T2AksDigest(_Inout_updates_bytes_(Length) PUCHAR Message, _In_ SIZE_T Length);
+// SepStatus is always written (0 on entry-guaranteed success paths, the raw
+// signed SEP status byte otherwise) whenever this function returns
+// STATUS_SUCCESS. A STATUS_SUCCESS + nonzero *SepStatus means the exchange
+// with SEP completed normally but the operation itself was rejected by
+// AppleKeyStore (e.g. invalid handle) — *ResponseLength is 0 in that case.
+// Callers that don't care can pass NULL.
 NTSTATUS T2AksExchange(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
                         _In_reads_bytes_opt_(RequestLength) PUCHAR RequestBody, _In_ SIZE_T RequestLength,
                         _Out_writes_bytes_to_opt_(ResponseCapacity, *ResponseLength) PUCHAR ResponseBody,
-                        _In_ SIZE_T ResponseCapacity, _Out_ SIZE_T *ResponseLength);
+                        _In_ SIZE_T ResponseCapacity, _Out_ SIZE_T *ResponseLength,
+                        _Out_opt_ PINT8 SepStatus);

@@ -56,6 +56,16 @@ typedef struct _T2_AKS_EXCHANGE_IN
 typedef struct _T2_AKS_EXCHANGE_OUT
 {
     UINT32  ResponseLength;     // out: actual response body bytes written after this header
+    // Signed status byte from the matched EP7 reply (VERIFIED FROM SOURCE,
+    // t2_sep_transport.c: "EP7 reply: endpoint, operation|response,
+    // transaction, signed status"). 0 = SEP accepted the operation.
+    // Nonzero = SEP understood and rejected it (e.g. invalid handle) - this
+    // is a real AppleKeyStore-level result, NOT a transport failure, and
+    // ResponseLength is always 0 when this is nonzero. Only meaningful when
+    // the IOCTL itself returned success; on a transport-level failure
+    // (timeout etc.) this field is left as the driver wrote it (0).
+    INT8    SepStatus;
+    UINT8   Reserved1[3];       // must be zero; padding to keep the body offset stable
     // Response body follows immediately; caller must size OutputBufferLength
     // to sizeof(T2_AKS_EXCHANGE_OUT) + however many bytes it wants to receive
     // (max T2_AKS_MAX_BODY_SIZE).

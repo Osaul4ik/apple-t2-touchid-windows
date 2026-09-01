@@ -201,7 +201,8 @@ NTSTATUS
 T2AksExchange(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
               _In_reads_bytes_opt_(RequestLength) PUCHAR RequestBody, _In_ SIZE_T RequestLength,
               _Out_writes_bytes_to_opt_(ResponseCapacity, *ResponseLength) PUCHAR ResponseBody,
-              _In_ SIZE_T ResponseCapacity, _Out_ SIZE_T *ResponseLength)
+              _In_ SIZE_T ResponseCapacity, _Out_ SIZE_T *ResponseLength,
+              _Out_opt_ PINT8 SepStatus)
 {
     NTSTATUS status;
     T2_AKS_HEADER_V2 header;
@@ -209,11 +210,15 @@ T2AksExchange(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
     PUCHAR outBase;
     SIZE_T requestWireLength;
     UINT16 replyWireLength;
+    INT8 sepStatus;
     UINT8 transaction;
     UINT32 replyHeaderSize;
     UINT32 replyVersion;
 
     *ResponseLength = 0;
+    if (SepStatus) {
+        *SepStatus = 0;
+    }
 
     if (!T2AksOperationAllowed(Operation)) {
         return STATUS_ACCESS_DENIED; // defense in depth; device.c already checked
@@ -341,10 +346,29 @@ T2AksExchange(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
     }
     transaction = Ctx->NextTransaction;
 
-    status = T2SepAksTransaction(Ctx, Operation, transaction, requestWireLength, &replyWireLength);
+    status = T2SepAksTransaction(Ctx, Operation, transaction, requestWireLength, &replyWireLength, &sepStatus);
     RtlSecureZeroMemory(inBase, requestWireLength);
     if (!NT_SUCCESS(status)) {
         return status;
+    }
+
+    // VERIFIED FROM SOURCE (t2_sep_transport.c t2_aks_exchange_locked): a
+    // nonzero reply_status means SEP fully processed the request and is
+    // reporting a real result — e.g. an invalid handle — not a transport
+    // problem. This can arrive in well under a millisecond with
+    // replyWireLength==0 (no OOL body), which is easy to misdiagnose as
+    // "EP7 dead" if only replyWireLength is inspected. Surface it to the
+    // caller now, before replyWireLength/OOL_OUT are given any credence.
+    if (SepStatus) {
+        *SepStatus = sepStatus;
+    }
+    if (sepStatus != 0) {
+        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+            "T2TouchIdTransport: AKS operation 0x%02x rejected by SEP, status=%d "
+            "(transaction=0x%02x) — not a transport failure, OOL_OUT not consulted\n",
+            Operation, sepStatus, transaction));
+        *ResponseLength = 0;
+        return STATUS_SUCCESS;
     }
 
     // Device -> CPU: invalidate cache so we observe SEP's write to OOL_OUT.
