@@ -319,10 +319,16 @@ static int CmdNetwork(int argc, wchar_t* argv[]) {
     }
 
     std::wcout << L"candidates: tcp_open=" << nTcp << L"  http2_settings=" << nHttp2 << L"\n";
+    unsigned nActiveHttp2 = 0;
     for (const auto& h : hits) {
         std::wcout << L"  port " << h.port;
-        if (h.http2PrefaceOk) std::wcout << L"  [HTTP/2 SETTINGS]";
-        else std::wcout << L"  [TCP only]";
+        if (h.http2PrefaceOk) {
+            std::wcout << (h.activePrefaceTried ? L"  [HTTP/2 SETTINGS after active preface]"
+                                                 : L"  [HTTP/2 SETTINGS]");
+            if (h.activePrefaceTried) ++nActiveHttp2;
+        } else {
+            std::wcout << L"  [TCP only]";
+        }
         std::wcout << L"  recv=" << h.recvLen << L"B";
         if (h.recvLen > 0) {
             std::wcout << L"  hex=";
@@ -332,13 +338,22 @@ static int CmdNetwork(int argc, wchar_t* argv[]) {
                 swprintf(tmp, 4, L"%02x", h.recvHead[i]);
                 std::wcout << tmp;
             }
+        } else if (h.activePrefaceTried) {
+            std::wcout << L"  (silent even after we sent client preface)";
         } else {
             std::wcout << L"  (no data - peer silent)";
         }
         std::wcout << L"\n";
     }
-    if (nHttp2 == 0) {
-        std::wcout << L"note: no HTTP/2 SETTINGS frames seen; TCP-only ports may still be "
+    if (nActiveHttp2 > 0) {
+        std::wcout << L"note: " << nActiveHttp2 << L" port(s) only answered after we sent our "
+                      L"own HTTP/2 client preface - this contradicts the \"peer speaks first\" "
+                      L"reference assumption (discover-biometric-port.py). Phase 1 passive "
+                      L"detection is likely missing real candidates and needs the active send "
+                      L"made unconditional, not just a silent-peer fallback.\n";
+    }
+    if (nHttp2 == nActiveHttp2) {
+        std::wcout << L"note: no peer sent SETTINGS unprompted; TCP-only ports may still be "
                       L"RemoteXPC decoys or other services. RSD handshake is Gate 6 phase 2.\n";
     } else {
         std::wcout << L"next: RemoteXPC handshake on HTTP/2 candidates for "
