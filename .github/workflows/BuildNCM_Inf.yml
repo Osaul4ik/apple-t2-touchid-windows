@@ -1,11 +1,13 @@
 name: BuildNCM_Inf
 
-# Package-only workflow: stamps, validates (InfVerif), catalogs (Inf2Cat),
-# optionally signs, and uploads ONLY T2NCM/apple-t2-composite.inf and
-# T2NCM/apple-t2-ncm.inf. Deliberately does NOT build the KMDF transport
-# driver, run tests, or touch vcpkg/libplist — those live in
-# BuildT2TouchId.yml. Own concurrency group so the two workflows can never
-# cancel each other (they previously shared one by accident).
+# Builds the Apple T2 NCM driver (T2NCM/driver/T2Ncm.vcxproj -> T2Ncm.sys),
+# then stamps, validates (InfVerif), catalogs (Inf2Cat), optionally signs,
+# and uploads it together with T2NCM/apple-t2-ncm.inf and
+# T2NCM/apple-t2-composite.inf. Modeled on BuildT2TouchId.yml's
+# build-then-package flow, scoped to the T2NCM driver only. Deliberately
+# does NOT touch T2TouchId.sln, the T2TouchIdTransport driver, or
+# vcpkg/libplist - those live in BuildT2TouchId.yml. Own concurrency group
+# so the two workflows can never cancel each other.
 on:
   push:
     branches: [ main, Dev_lifecycle ]
@@ -28,12 +30,17 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  DRIVER_PROJECT: T2NCM/driver/T2Ncm.vcxproj
+  DRIVER_DIR: T2NCM/driver
+  DRIVER_NAME: T2Ncm
+  CONFIGURATION: Release
+  PLATFORM: x64
   SIGN_CERT_PFX: ${{ secrets.CERT }}
   SIGN_CERT_PASSWORD: ${{ secrets.CERT_PWD }}
 
 jobs:
   build:
-    name: Stamp, validate, catalog, sign Apple T2 NCM INFs
+    name: Build T2Ncm driver, stamp, validate, catalog, sign
     runs-on: windows-2022
     timeout-minutes: 30
     outputs:
@@ -41,6 +48,9 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+
+    - name: Add MSBuild to PATH
+      uses: microsoft/setup-msbuild@v2
 
     - name: Install WDK
       run: |
@@ -88,6 +98,22 @@ jobs:
         Add-Content -Path $env:GITHUB_ENV -Value "DRIVER_DATE=$driverDate"
         Add-Content -Path $env:GITHUB_ENV -Value "DRIVER_VERSION=$driverVersion"
         Add-Content -Path $env:GITHUB_OUTPUT -Value "version=$driverVersion"
+      shell: pwsh
+
+    # =====================================================================
+    # Builds T2NCM/driver/T2Ncm.vcxproj directly (it is intentionally not
+    # part of T2TouchId.sln - see the comment in that .vcxproj). Same
+    # WindowsTargetPlatformVersion pin as BuildT2TouchId.yml uses for the
+    # transport driver, so both track whatever the WDK installer above
+    # actually shipped.
+    # =====================================================================
+    - name: Build T2Ncm driver
+      run: |
+        msbuild $env:DRIVER_PROJECT `
+          /p:Configuration=$env:CONFIGURATION `
+          /p:Platform=$env:PLATFORM `
+          /p:WindowsTargetPlatformVersion=10.0.26100.0 `
+          /nologo /verbosity:minimal /clp:Summary
       shell: pwsh
 
     - name: Locate StampInf.exe
@@ -154,13 +180,37 @@ jobs:
         Add-Content -Path $env:GITHUB_ENV -Value "INF2CAT_PATH=$($tool.FullName)"
       shell: pwsh
 
+    # =====================================================================
+    # Package folder now carries three files: the built T2Ncm.sys plus
+    # both INFs. apple-t2-composite.inf owns the composite PARENT
+    # (usbccgp.sys, no Net class, ships no binary of its own);
+    # apple-t2-ncm.inf owns the NCM function on the &MI_00 child PDO and
+    # references T2Ncm.sys via [T2Ncm.CopyDriverFiles] / ServiceBinary.
+    # All three ship in the same folder/artifact so pnputil can stage them
+    # together.
+    # =====================================================================
     - name: Prepare Apple T2 NCM package folder
       run: |
         $ErrorActionPreference = "Stop"
-        $ncmPkgDir = "artifacts\ncm"
-        $infs = @("apple-t2-ncm.inf", "apple-t2-composite.inf")
-        New-Item -ItemType Directory -Path $ncmPkgDir -Force | Out-Null
 
+        $buildOutDir = "$env:DRIVER_DIR\build\$env:DRIVER_NAME\$env:PLATFORM\$env:CONFIGURATION"
+        $sysPath     = "$buildOutDir\$env:DRIVER_NAME.sys"
+        $ncmPkgDir   = "artifacts\ncm"
+
+        if (-not (Test-Path $sysPath)) {
+          Write-Error "Built .sys not found: $sysPath"
+          exit 1
+        }
+
+        New-Item -ItemType Directory -Path $ncmPkgDir -Force | Out-Null
+        Copy-Item -Path $sysPath -Destination $ncmPkgDir -Force
+
+        $pdbPath = "$buildOutDir\$env:DRIVER_NAME.pdb"
+        if (Test-Path $pdbPath) {
+          Copy-Item -Path $pdbPath -Destination $ncmPkgDir -Force
+        }
+
+        $infs = @("apple-t2-ncm.inf", "apple-t2-composite.inf")
         foreach ($name in $infs) {
           $srcInf = Join-Path "T2NCM" $name
           if (-not (Test-Path $srcInf)) {
@@ -170,10 +220,11 @@ jobs:
           Copy-Item -Path $srcInf -Destination (Join-Path $ncmPkgDir $name) -Force
         }
 
-        Write-Host "OK: staged NCM + Composite INFs (only these two files):"
+        Write-Host "OK: staged T2Ncm.sys + NCM + Composite INFs:"
         Get-ChildItem $ncmPkgDir | ForEach-Object { Write-Host "  - $($_.Name)" }
 
         Add-Content -Path $env:GITHUB_ENV -Value "NCM_PACKAGE_DIR=$ncmPkgDir"
+        Add-Content -Path $env:GITHUB_ENV -Value "NCM_SYS_PATH=$ncmPkgDir\$env:DRIVER_NAME.sys"
         Add-Content -Path $env:GITHUB_ENV -Value "NCM_INF_PATH=$ncmPkgDir\apple-t2-ncm.inf"
         Add-Content -Path $env:GITHUB_ENV -Value "NCM_CAT_PATH=$ncmPkgDir\apple-t2-ncm.cat"
         Add-Content -Path $env:GITHUB_ENV -Value "COMPOSITE_INF_PATH=$ncmPkgDir\apple-t2-composite.inf"
@@ -184,6 +235,11 @@ jobs:
       run: |
         $ErrorActionPreference = "Stop"
         $infPath = (Resolve-Path $env:NCM_INF_PATH).Path
+        # KmdfLibraryVersion (1.15) is already hardcoded in
+        # [T2Ncm_wdfsect] in the INF itself, tracking T2Ncm.vcxproj's
+        # KMDF_VERSION_MAJOR/MINOR - no -k flag needed here (unlike the
+        # transport driver's INF, which has StampInf generate that
+        # section from scratch).
         & "$env:STAMPINF_PATH" -f "$infPath" -a amd64 -d "$env:DRIVER_DATE" -v "$env:DRIVER_VERSION"
         if ($LASTEXITCODE -ne 0) {
           Write-Error "StampInf for NCM INF failed (exit $LASTEXITCODE)."
@@ -232,6 +288,9 @@ jobs:
         Write-Host "OK: InfVerif passed for apple-t2-composite.inf"
       shell: pwsh
 
+    # Both INFs live in the same folder and each declares its own
+    # CatalogFile, so one Inf2Cat pass over the folder produces both
+    # apple-t2-ncm.cat and apple-t2-composite.cat.
     - name: Generate NCM + Composite CATs (Inf2Cat)
       run: |
         $ErrorActionPreference = "Stop"
@@ -253,11 +312,17 @@ jobs:
         Write-Host "OK: Composite .cat generated -> $env:COMPOSITE_CAT_PATH"
       shell: pwsh
 
-    - name: Sign NCM + Composite CATs with SignTool
+    # =====================================================================
+    # Signing is OPTIONAL: apple-t2-ncm.inf targets a PoC-only, not WHQL
+    # signed driver (same rationale as BuildT2TouchId.yml), so a missing
+    # cert just means unsigned/test-signable output.
+    # =====================================================================
+    - name: Sign T2Ncm.sys and CATs with SignTool
       if: ${{ env.SIGN_CERT_PFX != '' && env.SIGN_CERT_PASSWORD != '' }}
       run: |
         $ErrorActionPreference = "Stop"
         $pfxPath = Join-Path $env:TEMP "ncm-signcert.pfx"
+        $cerPath = Join-Path $env:NCM_PACKAGE_DIR "$env:DRIVER_NAME.cer"
         try {
           $bytes = [Convert]::FromBase64String($env:SIGN_CERT_PFX)
           [IO.File]::WriteAllBytes($pfxPath, $bytes)
@@ -275,6 +340,10 @@ jobs:
           if (-not $tool) { $tool = $candidates | Sort-Object FullName -Descending | Select-Object -First 1 }
           if (-not $tool) { Write-Error "signtool.exe not found."; exit 1 }
 
+          & "$($tool.FullName)" sign /v /fd SHA256 /f "$pfxPath" /p "$env:SIGN_CERT_PASSWORD" `
+            /tr http://timestamp.digicert.com /td SHA256 "$env:NCM_SYS_PATH"
+          if ($LASTEXITCODE -ne 0) { Write-Error "Signing T2Ncm.sys failed (exit code $LASTEXITCODE)."; exit 1 }
+
           foreach ($catPath in @($env:NCM_CAT_PATH, $env:COMPOSITE_CAT_PATH)) {
             & "$($tool.FullName)" sign /v /fd SHA256 /f "$pfxPath" /p "$env:SIGN_CERT_PASSWORD" `
               /tr http://timestamp.digicert.com /td SHA256 "$catPath"
@@ -284,6 +353,13 @@ jobs:
             }
             Write-Host "OK: $catPath signed."
           }
+
+          $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(
+            $pfxPath, $env:SIGN_CERT_PASSWORD,
+            [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable
+          )
+          Export-Certificate -Cert $cert -FilePath $cerPath | Out-Null
+          Write-Host "OK: T2Ncm.sys and CATs signed; .cer exported."
         }
         finally {
           if (Test-Path $pfxPath) { Remove-Item -Path $pfxPath -Force }
@@ -292,7 +368,7 @@ jobs:
 
     - name: Warn if NCM package unsigned
       if: ${{ env.SIGN_CERT_PFX == '' || env.SIGN_CERT_PASSWORD == '' }}
-      run: Write-Host "::warning::CERT/CERT_PWD secrets not set - NCM + Composite packages are UNSIGNED. Target machine needs test-signing mode."
+      run: Write-Host "::warning::CERT/CERT_PWD secrets not set - T2Ncm.sys + NCM + Composite packages are UNSIGNED. Target machine needs test-signing mode."
       shell: pwsh
 
     - name: Upload Apple T2 NCM package
