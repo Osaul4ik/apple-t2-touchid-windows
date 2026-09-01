@@ -414,25 +414,40 @@ jobs:
 
     # =====================================================================
     # Apple T2 NCM package (inbox UsbNcm.sys binding via project INF)
-    # Directory: T2NCM/   INF: apple-t2-ncm.inf
-    # No .sys is shipped; Inf2Cat + optional SignTool on the CAT only.
+    # Directory: T2NCM/   INFs: apple-t2-ncm.inf, apple-t2-composite.inf
+    # apple-t2-composite.inf owns the composite PARENT (usbccgp.sys, no
+    # Net class); apple-t2-ncm.inf owns the NCM function on the &MI_00
+    # child PDO. Both ship in the same folder/artifact so pnputil can
+    # stage them together. No .sys is shipped for either; Inf2Cat +
+    # optional SignTool on each CAT only.
     # =====================================================================
     - name: Prepare Apple T2 NCM package folder
       run: |
         $ErrorActionPreference = "Stop"
-        $ncmSrcInf = "T2NCM\apple-t2-ncm.inf"
         $ncmPkgDir = "artifacts\ncm"
-        if (-not (Test-Path $ncmSrcInf)) {
-          Write-Error "NCM INF not found: $ncmSrcInf"
-          exit 1
+        $infs = @{
+          "apple-t2-ncm.inf"       = "NCM"
+          "apple-t2-composite.inf" = "COMPOSITE"
         }
         New-Item -ItemType Directory -Path $ncmPkgDir -Force | Out-Null
-        Copy-Item -Path $ncmSrcInf -Destination (Join-Path $ncmPkgDir "apple-t2-ncm.inf") -Force
-        Write-Host "OK: staged NCM INF"
+
+        foreach ($name in $infs.Keys) {
+          $srcInf = Join-Path "T2NCM" $name
+          if (-not (Test-Path $srcInf)) {
+            Write-Error "INF not found: $srcInf"
+            exit 1
+          }
+          Copy-Item -Path $srcInf -Destination (Join-Path $ncmPkgDir $name) -Force
+        }
+
+        Write-Host "OK: staged NCM + Composite INFs"
         Get-ChildItem $ncmPkgDir | ForEach-Object { Write-Host "  - $($_.Name)" }
+
         Add-Content -Path $env:GITHUB_ENV -Value "NCM_PACKAGE_DIR=$ncmPkgDir"
         Add-Content -Path $env:GITHUB_ENV -Value "NCM_INF_PATH=$ncmPkgDir\apple-t2-ncm.inf"
         Add-Content -Path $env:GITHUB_ENV -Value "NCM_CAT_PATH=$ncmPkgDir\apple-t2-ncm.cat"
+        Add-Content -Path $env:GITHUB_ENV -Value "COMPOSITE_INF_PATH=$ncmPkgDir\apple-t2-composite.inf"
+        Add-Content -Path $env:GITHUB_ENV -Value "COMPOSITE_CAT_PATH=$ncmPkgDir\apple-t2-composite.cat"
       shell: pwsh
 
     - name: Stamp NCM INF (date / version)
@@ -449,6 +464,22 @@ jobs:
         Write-Host "==> Stamped NCM INF DriverVer:"
         Get-Content -Path $infPath | Select-String -Pattern 'DriverVer'
         Write-Host "OK: NCM INF stamped."
+      shell: pwsh
+
+    - name: Stamp Composite INF (date / version)
+      run: |
+        $ErrorActionPreference = "Stop"
+        $infPath = (Resolve-Path $env:COMPOSITE_INF_PATH).Path
+        # Same date/version scheme as the NCM INF and the transport
+        # driver package, so all three artifacts stay consistent.
+        & "$env:STAMPINF_PATH" -f "$infPath" -a amd64 -d "$env:DRIVER_DATE" -v "$env:DRIVER_VERSION"
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "StampInf for Composite INF failed (exit $LASTEXITCODE)."
+          exit 1
+        }
+        Write-Host "==> Stamped Composite INF DriverVer:"
+        Get-Content -Path $infPath | Select-String -Pattern 'DriverVer'
+        Write-Host "OK: Composite INF stamped."
       shell: pwsh
 
     - name: Validate NCM INF (InfVerif)
@@ -479,7 +510,38 @@ jobs:
         Write-Host "OK: InfVerif passed for apple-t2-ncm.inf"
       shell: pwsh
 
-    - name: Generate NCM CAT (Inf2Cat)
+    - name: Validate Composite INF (InfVerif)
+      run: |
+        $ErrorActionPreference = "Stop"
+        $roots = @(
+          "C:\Program Files (x86)\Windows Kits\10\Tools",
+          "C:\Program Files (x86)\Windows Kits\10\bin",
+          "C:\Program Files\Windows Kits\10\bin"
+        )
+        $candidates = foreach ($root in $roots) {
+          if (Test-Path $root) {
+            Get-ChildItem -Path $root -Filter "InfVerif.exe" -Recurse -ErrorAction SilentlyContinue
+          }
+        }
+        if (-not $candidates) {
+          Write-Error "InfVerif.exe not found. Cannot validate apple-t2-composite.inf."
+          exit 1
+        }
+        $tool = $candidates | Where-Object { $_.FullName -match '\\x64\\' } | Sort-Object FullName -Descending | Select-Object -First 1
+        if (-not $tool) { $tool = $candidates | Sort-Object FullName -Descending | Select-Object -First 1 }
+        Write-Host "Using InfVerif: $($tool.FullName)"
+        & "$($tool.FullName)" /v "$env:COMPOSITE_INF_PATH"
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "InfVerif failed for apple-t2-composite.inf (exit $LASTEXITCODE)."
+          exit 1
+        }
+        Write-Host "OK: InfVerif passed for apple-t2-composite.inf"
+      shell: pwsh
+
+    # Both INFs live in the same folder and each declares its own
+    # CatalogFile, so one Inf2Cat pass over the folder produces both
+    # apple-t2-ncm.cat and apple-t2-composite.cat.
+    - name: Generate NCM + Composite CATs (Inf2Cat)
       run: |
         $ErrorActionPreference = "Stop"
         $fullPkg = (Resolve-Path $env:NCM_PACKAGE_DIR).Path
@@ -492,10 +554,15 @@ jobs:
           Write-Error "Inf2Cat did not produce $env:NCM_CAT_PATH"
           exit 1
         }
+        if (-not (Test-Path $env:COMPOSITE_CAT_PATH)) {
+          Write-Error "Inf2Cat did not produce $env:COMPOSITE_CAT_PATH"
+          exit 1
+        }
         Write-Host "OK: NCM .cat generated -> $env:NCM_CAT_PATH"
+        Write-Host "OK: Composite .cat generated -> $env:COMPOSITE_CAT_PATH"
       shell: pwsh
 
-    - name: Sign NCM CAT with SignTool
+    - name: Sign NCM + Composite CATs with SignTool
       if: ${{ env.SIGN_CERT_PFX != '' && env.SIGN_CERT_PASSWORD != '' }}
       run: |
         $ErrorActionPreference = "Stop"
@@ -517,13 +584,15 @@ jobs:
           if (-not $tool) { $tool = $candidates | Sort-Object FullName -Descending | Select-Object -First 1 }
           if (-not $tool) { Write-Error "signtool.exe not found."; exit 1 }
 
-          & "$($tool.FullName)" sign /v /fd SHA256 /f "$pfxPath" /p "$env:SIGN_CERT_PASSWORD" `
-            /tr http://timestamp.digicert.com /td SHA256 "$env:NCM_CAT_PATH"
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "Signing NCM .cat failed (exit $LASTEXITCODE)."
-            exit 1
+          foreach ($catPath in @($env:NCM_CAT_PATH, $env:COMPOSITE_CAT_PATH)) {
+            & "$($tool.FullName)" sign /v /fd SHA256 /f "$pfxPath" /p "$env:SIGN_CERT_PASSWORD" `
+              /tr http://timestamp.digicert.com /td SHA256 "$catPath"
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "Signing $catPath failed (exit $LASTEXITCODE)."
+              exit 1
+            }
+            Write-Host "OK: $catPath signed."
           }
-          Write-Host "OK: NCM .cat signed."
         }
         finally {
           if (Test-Path $pfxPath) { Remove-Item -Path $pfxPath -Force }
@@ -532,7 +601,7 @@ jobs:
 
     - name: Warn if NCM package unsigned
       if: ${{ env.SIGN_CERT_PFX == '' || env.SIGN_CERT_PASSWORD == '' }}
-      run: Write-Host "::warning::CERT/CERT_PWD secrets not set - NCM package is UNSIGNED. Target machine needs test-signing mode."
+      run: Write-Host "::warning::CERT/CERT_PWD secrets not set - NCM + Composite packages are UNSIGNED. Target machine needs test-signing mode."
       shell: pwsh
 
     - name: Upload Apple T2 NCM package

@@ -1,0 +1,86 @@
+; apple-t2-composite.inf
+;
+; Apple T2 USB Composite Parent (VID_05AC&PID_8233).
+;
+; Forces the Microsoft USB Generic Parent Driver (usbccgp.sys) onto the
+; parent PDO so that child function PDOs MI_00 (NCM Control) and MI_01
+; (NCM Data) are created. Does NOT install a Net-class driver here — this
+; INF only owns the parent/bus level. The NCM function itself is bound
+; separately by apple-t2-ncm.inf against USB\VID_05AC&PID_8233&MI_00.
+;
+; Why this file exists: on this hardware, without any vendor package
+; present, Windows already resolves USB\VID_05AC&PID_8233 to usbccgp.sys
+; via inbox usb.inf by default (confirmed on hardware 01.09.2026 — Driver
+; Inf = C:\Windows\inf\usb.inf, Service = usbccgp). This INF exists purely
+; to make that outcome explicit and durable against Apple's oem15.inf
+; (AppleNull64), which is present in the DriverStore on every T2 Boot Camp
+; install and matches the SAME parent hardware ID with a null/no-op
+; driver. Whichever package wins Windows' rank calculation for
+; USB\VID_05AC&PID_8233 owns the parent; this file is our entry in that
+; contest, scoped ONLY to "let usbccgp.sys run," nothing else.
+;
+; IMPORTANT — verify before relying on this for auto-win against oem15.inf:
+; Windows driver *rank* is decided first by signature tier (Microsoft/WHQL
+; beats Authenticode/test-signed beats unsigned), second by hardware-ID
+; match specificity, and ONLY THEN by DriverVer date/version as a
+; tie-breaker among otherwise-equal candidates. A newer DriverVer date
+; here does NOT override a better signature tier on oem15.inf. Before
+; shipping, pull the actual oem15.inf from C:\Windows\INF\ on the test
+; machine and check: (1) its exact HWID match line for this device (exact
+; VID_PID vs a broader/compatible match), (2) its signature type
+; (WHQL/Microsoft vs Authenticode). If oem15.inf turns out to be
+; WHQL/Microsoft-signed at the same HWID specificity, a test-signed CI
+; catalog will lose the rank contest regardless of date, and rank alone
+; cannot be relied on — see setupapi.dev.log "Ranking driver..." entries
+; for the authoritative comparison on the real machine.
+;
+; Does not modify Microsoft's usb.inf. Does not modify or replace
+; C:\Windows\INF\oem15.inf. Does not ship or modify usbccgp.sys.
+;
+; SPDX-License-Identifier: GPL-2.0-only
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = USB
+ClassGUID   = {36FC9E60-C465-11CF-8056-444553540000}
+Provider    = %ManufacturerName%
+DriverVer   = 09/01/2026,2.0.0.0
+CatalogFile = apple-t2-composite.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTamd64
+
+; ---------------------------------------------------------------------------
+; Parent-only match. Deliberately the exact device HWID, no &MI_xx suffix —
+; this section owns bus enumeration for the whole composite device, not any
+; single function.
+; ---------------------------------------------------------------------------
+
+[Standard.NTamd64]
+%AppleT2Composite.DeviceDesc% = AppleT2Composite_Install, USB\VID_05AC&PID_8233
+
+[AppleT2Composite_Install]
+Include = usb.inf
+Needs   = Composite.Dev.NT
+
+[AppleT2Composite_Install.Services]
+Include = usb.inf
+Needs   = Composite.Dev.NT.Services
+
+[AppleT2Composite_Install.HW]
+Include = usb.inf
+Needs   = Composite.Dev.NT.HW
+
+[Strings]
+ManufacturerName          = "Osaul4ik"
+DiskName                  = "Apple T2 USB Composite Parent Driver Package"
+AppleT2Composite.DeviceDesc = "Apple T2 Controller (Composite)"
