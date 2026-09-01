@@ -1,0 +1,111 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{7B2C0B0E-2F0B-4E1E-9E6A-6E6A3B5C7B10}</ProjectGuid>
+    <RootNamespace>$(MSBuildProjectName)</RootNamespace>
+    <!-- Same rationale and same pinned version as
+         driver/T2TouchIdTransport/T2TouchIdTransport.vcxproj: KMDF >= 1.13
+         needs the exact stamped version present natively in the OS on
+         Windows 10 (no co-installer), so this MUST track the -k value
+         StampInf uses for this INF in CI. -->
+    <KMDF_VERSION_MAJOR>1</KMDF_VERSION_MAJOR>
+    <KMDF_VERSION_MINOR>15</KMDF_VERSION_MINOR>
+    <Configuration Condition="'$(Configuration)' == ''">Debug</Configuration>
+    <Platform Condition="'$(Platform)' == ''">x64</Platform>
+    <WindowsTargetPlatformVersion>$(LatestTargetPlatformVersion)</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <TargetVersion>Windows10</TargetVersion>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <DriverTargetPlatform>Universal</DriverTargetPlatform>
+    <!-- KMDF for PnP/USB, with an NDIS 6 miniport registered from within
+         it (NdisMiniport.c) — the same hybrid model Microsoft's own
+         mobile-broadband/RNDIS-class miniports use
+         (NDIS_WDF_PNP_POWER_EVENT_CALLBACKS), not a plain NDIS-only
+         driver. DriverType stays KMDF; Ndis.lib is added explicitly below. -->
+    <DriverType>KMDF</DriverType>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+    <ConfigurationType>Driver</ConfigurationType>
+  </PropertyGroup>
+  <PropertyGroup Label="Configuration" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <TargetVersion>Windows10</TargetVersion>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <DriverTargetPlatform>Universal</DriverTargetPlatform>
+    <DriverType>KMDF</DriverType>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+    <ConfigurationType>Driver</ConfigurationType>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup>
+    <TargetName>T2Ncm</TargetName>
+    <TargetExt>.sys</TargetExt>
+    <!-- Matches the layout BuildT2Ncm.yml expects:
+         driver\T2Ncm\build\T2Ncm\x64\Release\ -->
+    <OutDir>build\$(TargetName)\$(Platform)\$(Configuration)\</OutDir>
+    <IntDir>build\$(TargetName)\$(Platform)\$(Configuration)\obj\</IntDir>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <TreatWarningAsError>true</TreatWarningAsError>
+      <ExceptionHandling>
+      </ExceptionHandling>
+      <PreprocessorDefinitions>%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <!-- Ndis.lib for the NDIS 6 miniport entry points (Tasks 18-20);
+           needed even though NdisMiniport.c is currently a stub, so the
+           driver links cleanly once it's filled in without a project
+           file change. -->
+      <AdditionalDependencies>Ndis.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+    <DriverSign>
+      <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
+    </DriverSign>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="Driver.c" />
+    <ClCompile Include="Device.c" />
+    <ClCompile Include="UsbTransport.c" />
+    <ClCompile Include="NcmProtocol.c" />
+    <ClCompile Include="NcmRx.c" />
+    <ClCompile Include="NcmTx.c" />
+    <ClCompile Include="NdisMiniport.c" />
+    <ClCompile Include="Power.c" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="Driver.h" />
+    <ClInclude Include="Device.h" />
+    <ClInclude Include="UsbTransport.h" />
+    <ClInclude Include="NcmProtocol.h" />
+    <ClInclude Include="NcmRx.h" />
+    <ClInclude Include="NcmTx.h" />
+    <ClInclude Include="NdisMiniport.h" />
+    <ClInclude Include="Power.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- No <Inf> item here — same reason as T2TouchIdTransport.vcxproj:
+         MSBuild's automatic InfVerif on an included .inf needs an x86
+         InfVerif.dll that isn't reliably present on CI runners, and that
+         automatic invocation can't be disabled. BuildT2Ncm.yml stamps,
+         verifies (InfVerif), catalogs (Inf2Cat) and signs
+         inf/apple-t2-ncm.inf as separate workflow steps instead. -->
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

@@ -1,38 +1,34 @@
 ; ============================================================================
-; apple-t2-ncm.inf
+; apple-t2-ncm.inf  (Task 3)
 ;
-; Apple T2 USB CDC-NCM function driver binding
+; Apple T2 USB CDC-NCM function driver binding — REPLACES the previous
+; T2NCM/apple-t2-ncm.inf, which rebound MI_00 to the inbox UsbNcm.sys and
+; produced Code 10 / STATUS_DEVICE_HARDWARE_ERROR (confirmed by USBPcap:
+; no transactions after SET_CONFIGURATION before the failure). This INF
+; installs the custom T2Ncm.sys instead and does not reference UsbNcm.sys,
+; usbncm.inf, or usb.inf in any way.
 ;
 ; Parent:
 ;   USB\VID_05AC&PID_8233
 ;       |
 ;       +--> usbccgp.sys
 ;              |
-;              +--> MI_00 = NCM Control
+;              +--> MI_00 = NCM Control  <-- THIS driver binds here
 ;              |
-;              +--> MI_01 = NCM Data
+;              +--> MI_01 = NCM Data     (opened directly by T2Ncm.sys,
+;                                          no separate driver — Task 3/
+;                                          Critical constraints)
 ;
-; This INF binds ONLY the NCM control interface MI_00.
+; IMPORTANT (Task 3 requirements):
+;   - Matches ONLY:
+;       USB\VID_05AC&PID_8233&REV_0201&MI_00
+;       USB\VID_05AC&PID_8233&MI_00
+;   - Does NOT match the composite parent (USB\VID_05AC&PID_8233).
+;   - Does NOT match MI_01 (USB\VID_05AC&PID_8233&MI_01).
+;   - Does NOT Include=usbncm.inf or Needs=UsbNcm_Device.NT.
+;   - Ships and installs T2Ncm.sys as its own service — completely
+;     replaces the Microsoft UsbNcm.sys binding for MI_00.
 ;
-; MI_01 is intentionally NOT matched by this package. It is the subordinate
-; CDC-Data interface of the same CDC-NCM function.
-;
-; This package:
-;   - matches only VID/PID hardware IDs
-;   - reuses Microsoft usbncm.inf installation sections
-;   - installs/uses the inbox UsbNcm service
-;   - does not ship UsbNcm.sys
-;   - does not modify usb.inf
-;   - does not modify usbncm.inf
-;   - does not modify Apple's oem*.inf
-;   - does not match the composite parent
-;   - does not match MI_01
-;
-; The installed Microsoft usbncm.inf uses USB\MS_COMP_WINNCM as its primary
-; model match. Its generic USB\Class_02&SubClass_0d&Prot_00 model entry is
-; commented out. We therefore provide a T2-specific VID/PID/MI_00 match here.
-;
-; SPDX-License-Identifier: GPL-2.0-only
 ; ============================================================================
 
 [Version]
@@ -44,100 +40,85 @@ DriverVer   = 09/01/2026,2.0.0.0
 CatalogFile = apple-t2-ncm.cat
 PnpLockdown = 1
 
-
 [DestinationDirs]
-DefaultDestDir = 12
-
+DefaultDestDir      = 12
+T2Ncm.CopyDriverFiles = 12
 
 [SourceDisksNames]
 1 = %DiskName%,,,""
 
-
 [SourceDisksFiles]
-
+T2Ncm.sys = 1
 
 [Manufacturer]
 %ManufacturerName% = Standard,NTamd64
 
-
-; ============================================================================
-; Device models
-;
-; IMPORTANT:
-; Do NOT add:
-;
-;   USB\Class_02
-;   USB\Class_02&SubClass_0d
-;   USB\Class_02&SubClass_0d&Prot_00
-;
-; Third-party USB function packages must use VID/PID-based device IDs.
-; ============================================================================
-
 [Standard.NTamd64]
 
-; Exact T2 revision-specific NCM control interface.
+; Prefer the exact revision-specific hardware ID.
 %AppleT2Ncm.DeviceDesc% = AppleT2Ncm_Install, USB\VID_05AC&PID_8233&REV_0201&MI_00
 
-; T2 NCM control interface without revision component.
+; Also support the same T2 NCM control interface without the revision
+; component in the hardware ID (Task 5: don't hard-code assumptions that
+; only hold for one T2 revision).
 %AppleT2Ncm.DeviceDesc% = AppleT2Ncm_Install, USB\VID_05AC&PID_8233&MI_00
 
 
 ; ============================================================================
-; DDInstall
-;
-; Reuse Microsoft's inbox UsbNcm installation definition.
+; NCM network adapter installation
 ; ============================================================================
 
 [AppleT2Ncm_Install]
+CopyFiles           = T2Ncm.CopyDriverFiles
 
-AddReg  = AppleT2Ncm_AddReg
+Characteristics     = 0x84
+BusType             = 15
 
-Include = usbncm.inf
-Needs   = UsbNcm_Device.NT
+*IfType             = 6
+*MediaType          = 0
+*PhysicalMediaType  = 0
+*IfConnectorPresent = 1
+*ConnectionType     = 1
+*DirectionType      = 0
+*AccessType         = 2
+*HardwareLoopback   = 0
+
+AddReg              = AppleT2Ncm_AddReg
+
+[T2Ncm.CopyDriverFiles]
+T2Ncm.sys
 
 
 ; ============================================================================
-; Service installation
-;
-; Reuse Microsoft's inbox UsbNcm service installation.
+; T2Ncm.sys service — our own KMDF+NDIS driver, NOT UsbNcm.
 ; ============================================================================
 
 [AppleT2Ncm_Install.Services]
+AddService = T2Ncm, %SPSVCINST_ASSOCSERVICE%, T2Ncm_Service_Inst
 
-Include = usbncm.inf
-Needs   = UsbNcm_Device.NT.Services
+[T2Ncm_Service_Inst]
+DisplayName   = %T2Ncm.SVCDESC%
+ServiceType   = 1               ; SERVICE_KERNEL_DRIVER
+StartType     = 3               ; SERVICE_DEMAND_START
+ErrorControl  = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary = %12%\T2Ncm.sys
 
+[AppleT2Ncm_Install.Wdf]
+KmdfService = T2Ncm, T2Ncm_wdfsect
 
-; ============================================================================
-; Hardware configuration
-;
-; Reuse Microsoft's inbox UsbNcm hardware configuration.
-; ============================================================================
-
-[AppleT2Ncm_Install.HW]
-
-Include = usbncm.inf
-Needs   = UsbNcm_Device.NT.HW
+[T2Ncm_wdfsect]
+; Must track T2Ncm.vcxproj's KMDF_VERSION_MAJOR/MINOR (currently 1.15,
+; pinned for Windows 10 compatibility — see that file's comment).
+KmdfLibraryVersion = 1.15
 
 
 ; ============================================================================
 ; NDI configuration
-;
-; These entries provide the Net-class configuration required for the
-; third-party package.
 ; ============================================================================
 
 [AppleT2Ncm_AddReg]
-
-; Associate the NDI device with Microsoft's inbox UsbNcm service.
-HKR, Ndi, Service, 0, "UsbNcm"
-
-; Network stack interface ranges.
-HKR, Ndi\Interfaces, UpperRange, 0, "ndis5"
-HKR, Ndi\Interfaces, LowerRange, 0, "ethernet"
-
-; Standard network property-page provider.
-HKR,, EnumPropPages32, 0, "netcfgx.dll,NetPropPageProvider"
+HKR, Ndi, Service, 0, "T2Ncm"
+HKR, Ndi\params\NetworkAddress, Optional, 0, "1"
 
 
 ; ============================================================================
@@ -145,7 +126,10 @@ HKR,, EnumPropPages32, 0, "netcfgx.dll,NetPropPageProvider"
 ; ============================================================================
 
 [Strings]
-
 ManufacturerName      = "Osaul4ik"
 DiskName              = "Apple T2 USB NCM Driver Package"
+
 AppleT2Ncm.DeviceDesc = "Apple T2 USB NCM Network Adapter"
+
+T2Ncm.SVCDESC          = "Apple T2 NCM Transport"
+SPSVCINST_ASSOCSERVICE = 0x00000002
