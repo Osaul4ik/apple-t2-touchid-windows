@@ -2,12 +2,7 @@
 // PortScan.cpp — VERIFIED FROM SOURCE: jmurth1234/t2-touchid-linux
 // src/discover-biometric-port.py probe_port()
 //
-// Connect, then recv only (peer SETTINGS first). No client preface — that
-// is the reference behavior. If the peer stays fully silent, we optionally
-// retry by sending our own HTTP/2 client preface (see ProbePort below);
-// that retry is NOT part of the verified reference and is flagged in the
-// result via activePrefaceTried so callers never confuse it with the
-// passive Phase-1 result.
+// Connect, then recv only (peer SETTINGS first). No client preface.
 #include "PortScan.h"
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -33,22 +28,12 @@ bool EnsureWinsock() {
     return ok;
 }
 
-// RFC 7540 §3.5 client connection preface, followed by an empty SETTINGS
-// frame (length=0, type=0x4, flags=0, stream=0). Only sent as a fallback —
-// never part of the verified passive reference behavior.
-constexpr unsigned char kHttp2ClientPreface[] = {
-    'P','R','I',' ','*',' ','H','T','T','P','/','2','.','0','\r','\n',
-    '\r','\n','S','M','\r','\n','\r','\n',
-    0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
-};
-
 struct ProbeResult {
     bool connected = false;
     bool http2 = false;
     // First bytes received after connect (for diagnostics when SETTINGS missing).
     unsigned char head[21]{};
     int headLen = 0;
-    bool activePrefaceTried = false;
 };
 
 // Deadline-based wait until readable or timeout_ms elapsed.
@@ -62,39 +47,8 @@ bool WaitReadable(SOCKET s, unsigned timeoutMs) {
     return select(0, &rset, nullptr, nullptr, &tv) > 0;
 }
 
-// Accumulates up to 21 bytes (Linux sock_recv(21) size) within timeoutMs.
-// Returns bytes written into head. Shared by the passive attempt and the
-// active-preface retry.
-int RecvHead(SOCKET s, unsigned char* head, unsigned timeoutMs) {
-    ULONGLONG deadline = GetTickCount64() + static_cast<ULONGLONG>(timeoutMs);
-    int got = 0;
-    while (got < 21) {
-        ULONGLONG now = GetTickCount64();
-        if (now >= deadline) break;
-        unsigned left = static_cast<unsigned>(deadline - now);
-        if (!WaitReadable(s, left)) break;
-        int n = recv(s, reinterpret_cast<char*>(head + got), 21 - got, 0);
-        if (n == 0) break; // peer closed
-        if (n < 0) {
-            int e = WSAGetLastError();
-            if (e == WSAEWOULDBLOCK) continue;
-            break;
-        }
-        got += n;
-        if (got >= 9) break; // enough for the Linux SETTINGS check
-    }
-    return got;
-}
-
-bool LooksLikeSettingsFrame(const unsigned char* head, int len) {
-    // Linux: len >= 9 && type==4 && stream id == 0
-    return len >= 9 && head[3] == 0x04 &&
-           head[5] == 0 && head[6] == 0 && head[7] == 0 && head[8] == 0;
-}
-
 ProbeResult ProbePort(const NcmEndpoint& ep, uint16_t port,
-                      unsigned connectTimeoutMs, unsigned recvTimeoutMs,
-                      bool activePrefaceFallback) {
+                      unsigned connectTimeoutMs, unsigned recvTimeoutMs) {
     ProbeResult r;
     SOCKET s = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
     if (s == INVALID_SOCKET) return r;
@@ -114,7 +68,7 @@ ProbeResult ProbePort(const NcmEndpoint& ep, uint16_t port,
     sockaddr_in6 addr{};
     addr.sin6_family = AF_INET6;
     addr.sin6_port = htons(port);
-    addr.sin6_addr = ep.linkLocal;
+    addr.sin6_addr = ep.peerLinkLocal;
     addr.sin6_scope_id = ep.ifIndex;
 
     int cr = connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
@@ -150,31 +104,34 @@ ProbeResult ProbePort(const NcmEndpoint& ep, uint16_t port,
     // VERIFIED FROM SOURCE: peer speaks first. Accumulate up to 21 bytes
     // within recvTimeoutMs (Linux sock_recv(21) with the same timeout).
     // Partial reads are common on Windows NCM; loop until 9+ or deadline.
-    r.headLen = RecvHead(s, r.head, recvTimeoutMs);
-    r.http2 = LooksLikeSettingsFrame(r.head, r.headLen);
-
-    // Fallback: peer was completely silent on the passive attempt. Send our
-    // own HTTP/2 client preface and see if that unlocks a SETTINGS reply —
-    // i.e. this is an ordinary RFC 7540 server that waits for the client to
-    // go first, not one matching the "peer speaks first" reference model.
-    if (!r.http2 && r.headLen == 0 && activePrefaceFallback) {
-        r.activePrefaceTried = true;
-        int sent = send(s, reinterpret_cast<const char*>(kHttp2ClientPreface),
-                         static_cast<int>(sizeof(kHttp2ClientPreface)), 0);
-        if (sent > 0) {
-            unsigned char retryHead[21]{};
-            int retryLen = RecvHead(s, retryHead, recvTimeoutMs);
-            if (LooksLikeSettingsFrame(retryHead, retryLen)) {
-                r.http2 = true;
-                r.headLen = retryLen;
-                std::memcpy(r.head, retryHead, sizeof(r.head));
-            } else if (retryLen > r.headLen) {
-                // Keep the more informative diagnostic head even if it's
-                // still not a SETTINGS frame.
-                r.headLen = retryLen;
-                std::memcpy(r.head, retryHead, sizeof(r.head));
-            }
+    ULONGLONG deadline =
+        GetTickCount64() + static_cast<ULONGLONG>(recvTimeoutMs);
+    int got = 0;
+    while (got < 21) {
+        ULONGLONG now = GetTickCount64();
+        if (now >= deadline) break;
+        unsigned left = static_cast<unsigned>(deadline - now);
+        if (!WaitReadable(s, left)) break;
+        int n = recv(s, reinterpret_cast<char*>(r.head + got), 21 - got, 0);
+        if (n == 0) break; // peer closed
+        if (n < 0) {
+            int e = WSAGetLastError();
+            if (e == WSAEWOULDBLOCK) continue;
+            break;
         }
+        got += n;
+        // Fast-path: enough for the Linux check
+        if (got >= 9) {
+            // Can stop early if SETTINGS already clear; still keep what we have.
+            break;
+        }
+    }
+    r.headLen = got;
+
+    // Linux: len >= 9 && type==4 && stream id == 0
+    if (got >= 9 && r.head[3] == 0x04 &&
+        r.head[5] == 0 && r.head[6] == 0 && r.head[7] == 0 && r.head[8] == 0) {
+        r.http2 = true;
     }
 
     closesocket(s);
@@ -214,8 +171,8 @@ std::vector<PortCandidate> ScanHttp2Preface(const NcmEndpoint& endpoint,
             unsigned i = next.fetch_add(1);
             if (i >= total) break;
             uint16_t port = static_cast<uint16_t>(options.portBegin + i);
-            ProbeResult pr = ProbePort(endpoint, port, options.connectTimeoutMs,
-                                       recvMs, options.activePrefaceFallback);
+            ProbeResult pr =
+                ProbePort(endpoint, port, options.connectTimeoutMs, recvMs);
             if (pr.connected) {
                 tcpHits.fetch_add(1);
                 if (pr.http2) http2Hits.fetch_add(1);
@@ -225,7 +182,6 @@ std::vector<PortCandidate> ScanHttp2Preface(const NcmEndpoint& endpoint,
                     c.tcpOpen = true;
                     c.http2PrefaceOk = pr.http2;
                     c.recvLen = pr.headLen;
-                    c.activePrefaceTried = pr.activePrefaceTried;
                     std::memcpy(c.recvHead, pr.head, sizeof(c.recvHead));
                     std::lock_guard<std::mutex> lock(hitsMu);
                     hits.push_back(c);

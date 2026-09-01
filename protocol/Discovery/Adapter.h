@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-// Adapter.h — locate the T2 CDC-NCM IPv6 link-local endpoint on Windows.
+// Adapter.h — T2 NCM local interface + peer (T2) link-local for RemoteXPC.
 #pragma once
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -14,25 +14,22 @@
 namespace t2::discovery {
 
 struct NcmEndpoint {
-    // ifIndex used as IPv6 scope_id for fe80:: addresses.
     unsigned long ifIndex = 0;
-    in6_addr linkLocal{};
+    in6_addr localLinkLocal{};
+    // Destination: T2 peer (NOT the Windows host address on the adapter).
+    in6_addr peerLinkLocal{};
+    bool peerDerivedFromMac = false;
+    unsigned char mac[6]{};
+    bool hasMac = false;
     std::wstring friendlyName;
     std::wstring description;
-    std::wstring adapterName; // e.g. "Ethernet 2"
+    std::wstring adapterName;
 };
 
-// Finds adapters that look like the Apple T2 NCM function:
-//   - IPv6 link-local present and Preferred
-//   - description/friendly name contains "T2" / "NCM" / "UsbNcm", OR
-//   - caller can pass an explicit ifIndex override
-// Returns empty vector if none found (never invents a success).
 std::vector<NcmEndpoint> FindT2NcmEndpoints();
-
-// Resolve a single endpoint by ifIndex (e.g. 27 from Get-NetIPAddress).
-// Returns false if that interface has no Preferred fe80:: address.
 bool GetEndpointByIfIndex(unsigned long ifIndex, NcmEndpoint* out);
-
+bool ParseIpv6(const char* text, in6_addr* out);
+in6_addr LinkLocalFromMac(const unsigned char mac[6]);
 std::string FormatLinkLocal(const in6_addr& addr, unsigned long scopeId);
 
 } // namespace t2::discovery

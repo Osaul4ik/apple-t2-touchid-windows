@@ -146,21 +146,12 @@ static int CmdLoadKeybag(Client& client, const std::wstring& path) {
     }
 
     int32_t handle = 0;
-    int8_t sepStatus = 0;
-    AksResult r = client.LoadKeybag(bag, &handle, /*session=*/1, &sepStatus);
+    AksResult r = client.LoadKeybag(bag, &handle);
     SecureZeroMemory(bag.data(), bag.size());
     bag.clear();
 
     if (r == AksResult::NotReady) {
         std::wcout << L"load-keybag failed: DMA / OOL is not registered; run register-ool first\n";
-        return 1;
-    }
-    if (sepStatus != 0) {
-        // Transport succeeded but SEP rejected the request (e.g. bad
-        // session/handle or malformed keybag) - the Linux tool always
-        // prints this status; surface it here too instead of the previous
-        // generic "load-keybag failed" that hid it.
-        std::wcout << L"load-keybag failed: SEP status=" << (int)sepStatus << L"\n";
         return 1;
     }
     if (r != AksResult::Ok) {
@@ -173,21 +164,13 @@ static int CmdLoadKeybag(Client& client, const std::wstring& path) {
 }
 
 static int CmdSetSystemKeybag(Client& client, int32_t handle, int32_t specialUserBag) {
-    int8_t sepStatus = 0;
-    AksResult r = client.MakeSystemKeybag(handle, specialUserBag, /*session=*/1, &sepStatus);
+    AksResult r = client.MakeSystemKeybag(handle, specialUserBag);
     if (r == AksResult::NotReady) {
         std::wcout << L"set-system-keybag failed: DMA / OOL is not registered; run register-ool first\n";
         return 1;
     }
     if (r != AksResult::Ok) {
         std::wcout << L"set-system-keybag failed\n";
-        return 1;
-    }
-    if (sepStatus != 0) {
-        // Transport succeeded but SEP rejected the request (e.g. bad
-        // handle/special-user bag) - previously dropped silently.
-        std::wcout << L"set-system-keybag: SEP rejected the request, status=" << (int)sepStatus
-                   << L" (handle=" << handle << L" special=" << specialUserBag << L")\n";
         return 1;
     }
 
@@ -201,19 +184,9 @@ static int CmdUnlock(Client& client, int32_t handle) {
         std::wcout << L"no password entered\n";
         return 1;
     }
-    int8_t sepStatus = 0;
-    // zeroes `secret` internally
-    AksResult r = client.Unlock(handle, secret, /*session=*/1, &sepStatus);
+    AksResult r = client.Unlock(handle, secret); // zeroes `secret` internally
     if (r != AksResult::Ok) {
         std::wcout << L"unlock failed\n";
-        return 1;
-    }
-    if (sepStatus != 0) {
-        // This was previously unreachable: AksResult::Ok only ever meant
-        // the mailbox round-trip completed, so a wrong password still
-        // printed "unlock: OK". SepStatus is SEP's actual verdict.
-        std::wcout << L"unlock: SEP rejected the password, status=" << (int)sepStatus
-                   << L" (handle=" << handle << L")\n";
         return 1;
     }
     std::wcout << L"unlock: OK\n";
@@ -223,23 +196,13 @@ static int CmdUnlock(Client& client, int32_t handle) {
 
 static int CmdDeviceState(Client& client, int64_t handle, uint32_t selector) {
     std::vector<uint8_t> response;
-    int8_t sepStatus = 0;
-    AksResult r = client.GetDeviceState(handle, selector, &response, &sepStatus);
+    AksResult r = client.GetDeviceState(handle, selector, &response);
     if (r == AksResult::NotReady) {
         std::wcout << L"device-state failed: DMA / OOL is not registered; run register-ool first\n";
         return 1;
     }
     if (r != AksResult::Ok) {
-        std::wcout << L"device-state failed (transport-level: timeout/IO error - EP7 not answering at all)\n";
-        return 1;
-    }
-    if (sepStatus != 0) {
-        // The exchange with SEP succeeded - this is AppleKeyStore itself
-        // rejecting the request (e.g. `handle` isn't a currently-loaded
-        // keybag handle), not an EP7/transport problem. handle=0 in
-        // particular is not a valid "liveness probe" value for this op.
-        std::wcout << L"device-state: SEP rejected the request, status=" << (int)sepStatus
-                   << L" (handle=" << handle << L" selector=" << selector << L")\n";
+        std::wcout << L"device-state failed (same timeout as capabilities implies EP7 dead)\n";
         return 1;
     }
     std::wcout << L"device-state: OK, response_length=" << response.size();
@@ -255,19 +218,25 @@ static int CmdDeviceState(Client& client, int64_t handle, uint32_t selector) {
 }
 
 
+
 static int CmdNetwork(int argc, wchar_t* argv[]) {
     using namespace t2::discovery;
 
-    // Optional: network [ifIndex]
-    // ifIndex override for the T2 NCM adapter (e.g. 27 from Get-NetIPAddress).
     unsigned long ifIndexOverride = 0;
     bool doScan = true;
+    std::string hostOverride; // peer IPv6 without zone
+
     for (int i = 2; i < argc; ++i) {
         std::wstring a = argv[i];
         if (a == L"--no-scan") {
             doScan = false;
         } else if (a == L"--ifindex" && i + 1 < argc) {
             ifIndexOverride = static_cast<unsigned long>(_wtoi(argv[++i]));
+        } else if (a == L"--host" && i + 1 < argc) {
+            // Narrow wide arg to UTF-8-ish for InetPton
+            std::wstring w = argv[++i];
+            hostOverride.clear();
+            for (wchar_t c : w) hostOverride.push_back(static_cast<char>(c & 0xFF));
         } else if (a[0] >= L'0' && a[0] <= L'9') {
             ifIndexOverride = static_cast<unsigned long>(_wtoi(a.c_str()));
         }
@@ -284,38 +253,64 @@ static int CmdNetwork(int argc, wchar_t* argv[]) {
     } else {
         endpoints = FindT2NcmEndpoints();
         if (endpoints.empty()) {
-            std::wcout << L"no T2 NCM adapter found (description must contain T2+NCM or UsbNcm).\n";
-            std::wcout << L"hint: t2touchid.exe network <ifIndex>   e.g. network 27\n";
+            std::wcout << L"no T2 NCM adapter found.\n";
+            std::wcout << L"hint: t2touchid.exe network <ifIndex> [--host fe80::...]\n";
             return 1;
         }
     }
 
-    for (const auto& ep : endpoints) {
-        std::string ll = FormatLinkLocal(ep.linkLocal, ep.ifIndex);
+    for (auto& ep : endpoints) {
+        if (!hostOverride.empty()) {
+            in6_addr parsed{};
+            if (!ParseIpv6(hostOverride.c_str(), &parsed)) {
+                std::wcout << L"invalid --host IPv6\n";
+                return 1;
+            }
+            ep.peerLinkLocal = parsed;
+            ep.peerDerivedFromMac = false;
+        }
+
+        std::string local = FormatLinkLocal(ep.localLinkLocal, ep.ifIndex);
+        std::string peer = FormatLinkLocal(ep.peerLinkLocal, ep.ifIndex);
         std::wcout << L"adapter:  " << ep.friendlyName << L"\n";
         std::wcout << L"desc:     " << ep.description << L"\n";
         std::wcout << L"ifIndex:  " << ep.ifIndex << L"\n";
-        std::wcout << L"link-local: ";
-        for (char c : ll) std::wcout << static_cast<wchar_t>(c);
-        std::wcout << L"\n";
+        if (ep.hasMac) {
+            std::wcout << L"mac:      ";
+            for (int i = 0; i < 6; ++i) {
+                wchar_t b[4];
+                swprintf(b, 4, L"%02X%s", ep.mac[i], i < 5 ? L"-" : L"");
+                std::wcout << b;
+            }
+            std::wcout << L"\n";
+        }
+        std::wcout << L"local:    ";
+        for (char c : local) std::wcout << static_cast<wchar_t>(c);
+        std::wcout << L"  (Windows — do NOT scan this)\n";
+        std::wcout << L"peer:     ";
+        for (char c : peer) std::wcout << static_cast<wchar_t>(c);
+        if (ep.peerDerivedFromMac)
+            std::wcout << L"  (EUI-64 from MAC — scan target)\n";
+        else
+            std::wcout << L"  (--host override — scan target)\n";
     }
 
     if (!doScan) {
-        std::wcout << L"scan skipped (--no-scan). RemoteXPC handshake not yet implemented.\n";
+        std::wcout << L"scan skipped (--no-scan).\n";
         return 0;
     }
 
     const auto& ep = endpoints.front();
     ScanOptions opt;
     opt.concurrency = 64;
-    opt.connectTimeoutMs = 150; // Linux discover default --probe-timeout 0.15
-    opt.includeTcpOnly = true; // diagnostic: show TCP-open even without SETTINGS
+    opt.connectTimeoutMs = 150;
+    opt.includeTcpOnly = true;
     opt.onProgress = [](unsigned tried, unsigned total, unsigned tcp, unsigned http2) {
         std::wcout << L"  scanned " << tried << L"/" << total
                    << L"  tcp=" << tcp << L"  http2=" << http2 << L"\r" << std::flush;
     };
 
-    std::wcout << L"port scan " << opt.portBegin << L"-" << opt.portEnd
+    std::wcout << L"scanning PEER ports " << opt.portBegin << L"-" << opt.portEnd
                << L" (concurrency " << opt.concurrency
                << L", timeout " << opt.connectTimeoutMs << L"ms)...\n";
     auto hits = ScanHttp2Preface(ep, opt);
@@ -328,25 +323,17 @@ static int CmdNetwork(int argc, wchar_t* argv[]) {
     }
 
     if (hits.empty()) {
-        std::wcout << L"no TCP listeners in " << opt.portBegin << L"-" << opt.portEnd << L".\n";
-        std::wcout << L"possible causes:\n"
-                   << L"  - bridgeOS services not exposing RemoteXPC on this boot\n"
-                   << L"  - Windows Firewall blocking outbound link-local\n"
-                   << L"  - T2 NCM data path up but no listeners yet\n";
+        std::wcout << L"no TCP listeners on peer in " << opt.portBegin << L"-"
+                   << opt.portEnd << L".\n";
+        std::wcout << L"try: t2touchid.exe network 4 --host fe80::aede:48ff:fe00:1122\n";
         return 2;
     }
 
     std::wcout << L"candidates: tcp_open=" << nTcp << L"  http2_settings=" << nHttp2 << L"\n";
-    unsigned nActiveHttp2 = 0;
     for (const auto& h : hits) {
         std::wcout << L"  port " << h.port;
-        if (h.http2PrefaceOk) {
-            std::wcout << (h.activePrefaceTried ? L"  [HTTP/2 SETTINGS after active preface]"
-                                                 : L"  [HTTP/2 SETTINGS]");
-            if (h.activePrefaceTried) ++nActiveHttp2;
-        } else {
-            std::wcout << L"  [TCP only]";
-        }
+        if (h.http2PrefaceOk) std::wcout << L"  [HTTP/2 SETTINGS]";
+        else std::wcout << L"  [TCP only]";
         std::wcout << L"  recv=" << h.recvLen << L"B";
         if (h.recvLen > 0) {
             std::wcout << L"  hex=";
@@ -356,29 +343,19 @@ static int CmdNetwork(int argc, wchar_t* argv[]) {
                 swprintf(tmp, 4, L"%02x", h.recvHead[i]);
                 std::wcout << tmp;
             }
-        } else if (h.activePrefaceTried) {
-            std::wcout << L"  (silent even after we sent client preface)";
         } else {
-            std::wcout << L"  (no data - peer silent)";
+            std::wcout << L"  (no data)";
         }
         std::wcout << L"\n";
     }
-    if (nActiveHttp2 > 0) {
-        std::wcout << L"note: " << nActiveHttp2 << L" port(s) only answered after we sent our "
-                      L"own HTTP/2 client preface - this contradicts the \"peer speaks first\" "
-                      L"reference assumption (discover-biometric-port.py). Phase 1 passive "
-                      L"detection is likely missing real candidates and needs the active send "
-                      L"made unconditional, not just a silent-peer fallback.\n";
-    }
-    if (nHttp2 == nActiveHttp2) {
-        std::wcout << L"note: no peer sent SETTINGS unprompted; TCP-only ports may still be "
-                      L"RemoteXPC decoys or other services. RSD handshake is Gate 6 phase 2.\n";
+    if (nHttp2 == 0) {
+        std::wcout << L"note: no HTTP/2 SETTINGS yet. Confirm peer address matches Linux T2_TOUCHID_HOST.\n";
     } else {
-        std::wcout << L"next: RemoteXPC handshake on HTTP/2 candidates for "
-                      L"Services[com.apple.eos.BiometricKit].Port\n";
+        std::wcout << L"next: RemoteXPC handshake for Services[com.apple.eos.BiometricKit].Port\n";
     }
     return 0;
 }
+
 
 int wmain(int argc, wchar_t* argv[]) {
     if (argc < 2) {
@@ -426,7 +403,7 @@ int wmain(int argc, wchar_t* argv[]) {
         return CmdNetwork(argc, argv);
     }
     if (cmd == L"identities" || cmd == L"verify") {
-        std::wcout << L"not yet wired - requires RemoteXPC BiometricKit port "
+        std::wcout << L"not yet wired — requires RemoteXPC BiometricKit port "
                       L"+ live BridgeXpc connection (Gate 6 phase 2 / Gate 7)\n";
         return 2;
     }
