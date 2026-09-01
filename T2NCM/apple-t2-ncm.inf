@@ -1,84 +1,37 @@
 ; apple-t2-ncm.inf
-;
-; Apple T2 USB CDC-NCM function (VID_05AC&PID_8233&MI_00 — NCM Control
-; child interface, NOT the composite parent).
-;
-; Binds inbox UsbNcm.sys. Does not ship UsbNcm.sys. Does not edit oem15.inf.
-;
-; REVISED 01.09.2026: previous revision matched the bare parent HWID
-; (USB\VID_05AC&PID_8233). Confirmed on hardware that this was wrong —
-; when this INF (or Apple's oem15.inf null) wins rank on the *parent*
-; node, usbccgp.sys never runs on this device, so MI_00/MI_01 child PDOs
-; are never created, and UsbNcm.sys ends up bound as if it owned the
-; whole composite device instead of a single interface — not the model
-; inbox usbncm.inf is written for. Confirmed via UsbTreeView + PnpDevice
-; dump: with a plain "USB Composite Device" (usbccgp.sys, inbox usb.inf)
-; on the parent, Windows creates two separate child PDOs on its own:
-;   USB\VID_05AC&PID_8233&MI_00  "NCM Control"  (class 02/0D/00)
-;   USB\VID_05AC&PID_8233&MI_01  "NCM Data"     (class 0A/00/01)
-; matching the descriptor's Interface 0 (control, EP 0x81 interrupt) and
-; Interface 1 (data, altsetting 1 has EP 0x82 bulk IN / 0x01 bulk OUT).
-; Inbox usbncm.inf itself only ever matches the control interface
-; (USB\MS_COMP_WINNCM or USB\Class_02&SubClass_0d&Prot_00) — it has no
-; rule for the data interface's class (0x0A). UsbNcm.sys is expected to
-; locate MI_01 itself via the CDC Union Functional Descriptor
-; (ControlInterface=0, SubordinateInterface=1) and drive its pipes
-; through the shared USB device handle from the composite parent. MI_01
-; showing CM_PROB_FAILED_INSTALL with no driver bound is therefore
-; EXPECTED, not a bug to fix with a second INF.
-;
-; Parent-level enumeration (usbccgp.sys winning USB\VID_05AC&PID_8233
-; against Apple's oem15.inf null) is handled separately by
-; apple-t2-composite.inf — this file only owns the NCM function.
-;
-; Hardware note: Code 56 (CM_PROB_NEED_CLASS_CONFIG) was observed when
-; only Include/Needs was used; this revision adds explicit
-; Ndi/Characteristics AddReg mirroring the public usbncm.inf layout so
-; the Net class installer can finish.
-;
-; SPDX-License-Identifier: GPL-2.0-only
+; Binds Microsoft Inbox UsbNcm.sys only to USB\VID_05AC&PID_8233&MI_00.
+; Does NOT match MI_01 or the parent device.
 
 [Version]
 Signature   = "$WINDOWS NT$"
 Class       = Net
-ClassGUID   = {4d36e972-e325-11ce-bfc1-08002be10318}
-Provider    = %ManufacturerName%
+ClassGuid   = {4d36e972-e325-11ce-bfc1-08002be10318}
+Provider    = %ProviderName%
 DriverVer   = 09/01/2026,2.0.0.0
 CatalogFile = apple-t2-ncm.cat
 PnpLockdown = 1
 
-[DestinationDirs]
-DefaultDestDir = 12
-
-[SourceDisksNames]
-1 = %DiskName%,,,""
-
-[SourceDisksFiles]
-
 [Manufacturer]
-%ManufacturerName% = Standard,NTamd64
+%ProviderName% = DeviceList, NTamd64
 
-[Standard.NTamd64]
+[DeviceList.NTamd64]
 %AppleT2Ncm.DeviceDesc% = AppleT2Ncm_Install, USB\VID_05AC&PID_8233&MI_00
 
-; ---------------------------------------------------------------------------
-; DDInstall: pull Microsoft service definition + explicit Ndi keys.
-; ---------------------------------------------------------------------------
-
 [AppleT2Ncm_Install]
-Characteristics = 0x84
-BusType         = 15
-*IfType             = 6
-*MediaType          = 0
-*PhysicalMediaType  = 0
-*IfConnectorPresent = 1
-*ConnectionType     = 1
-*DirectionType      = 0
-*AccessType         = 2
-*HardwareLoopback   = 0
-AddReg          = AppleT2Ncm_AddReg
-Include         = usbncm.inf
-Needs           = UsbNcm_Device.NT
+Characteristics     = 0x84               ; NCF_PHYSICAL | NCF_NDIS_PROTOCOL
+BusType             = 15                 ; PNPBus (USB)
+*IfType             = 6                  ; IF_TYPE_ETHERNET_CSMACD
+*MediaType          = 0                  ; NdisMedium802_3
+*PhysicalMediaType  = 0                  ; NdisPhysicalMediumUnspecified
+*IfConnectorPresent = 1                  ; TRUE
+*ConnectionType     = 1                  ; NET_IF_CONNECTION_DEDICATED
+*DirectionType      = 0                  ; NET_IF_DIRECTION_SENDRECEIVE
+*AccessType         = 2                  ; NET_IF_ACCESS_BROADCAST
+*HardwareLoopback   = 0                  ; FALSE
+
+AddReg  = AppleT2Ncm_AddReg
+Include = usbncm.inf
+Needs   = UsbNcm_Device.NT
 
 [AppleT2Ncm_Install.Services]
 Include = usbncm.inf
@@ -88,15 +41,13 @@ Needs   = UsbNcm_Device.NT.Services
 Include = usbncm.inf
 Needs   = UsbNcm_Device.NT.HW
 
-; Explicit Ndi — same shape as inbox usbncm.inf UsbNcm_AddReg.
-; Guarantees UpperRange/LowerRange even if Needs expansion is incomplete.
 [AppleT2Ncm_AddReg]
-HKR, Ndi,            Service,    0, "UsbNcm"
+; Minimal Net-class / NDIS registration required to avoid Code 56.
+HKR, Ndi, Service,           0, "UsbNcm"
 HKR, Ndi\Interfaces, UpperRange, 0, "ndis5"
 HKR, Ndi\Interfaces, LowerRange, 0, "ethernet"
-HKR,,                EnumPropPages32, 0, "netcfgx.dll,NetPropPageProvider"
+HKR,, EnumPropPages32,       0, "netcfgx.dll,NetPropPageProvider"
 
 [Strings]
-ManufacturerName      = "Osaul4ik"
-DiskName              = "Apple T2 USB NCM Driver Package"
+ProviderName        = "Osaul4ik"
 AppleT2Ncm.DeviceDesc = "Apple T2 USB NCM Network Adapter"
