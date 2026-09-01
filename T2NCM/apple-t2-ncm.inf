@@ -1,22 +1,54 @@
 ; ============================================================================
 ; apple-t2-ncm.inf
 ;
-; Apple T2 CDC-NCM binding
+; Apple T2 USB CDC-NCM function binding
+;
+; Target:
+;   USB\VID_05AC&PID_8233&REV_0201&MI_00
+;   USB\VID_05AC&PID_8233&MI_00
 ;
 ; Parent:
-;   USB\VID_05AC&PID_8233 -> usbccgp.sys
+;   USB\VID_05AC&PID_8233
+;       |
+;       +--> usbccgp.sys
+;              |
+;              +--> MI_00 = NCM Control
+;              |
+;              +--> MI_01 = NCM Data
 ;
-; NCM control interface:
-;   USB\VID_05AC&PID_8233&MI_00
-;   Compatible ID:
+; This INF binds ONLY the NCM control/function interface (MI_00).
+;
+; MI_01 is intentionally NOT matched by this INF. It is the CDC-NCM
+; subordinate data interface and is handled as part of the same NCM
+; function by UsbNcm.sys.
+;
+; The Microsoft inbox usbncm.inf normally has:
+;
+;   USB\MS_COMP_WINNCM
+;
+; and also contains the generic CDC-NCM match:
+;
 ;   USB\Class_02&SubClass_0d&Prot_00
 ;
-; Data interface:
-;   USB\VID_05AC&PID_8233&MI_01
-;   No separate driver.
+; but that generic match is commented out in the installed Microsoft
+; usbncm.inf.
 ;
-; This version intentionally reuses Microsoft's inbox UsbNcm_Device
-; configuration instead of duplicating its service/WDF configuration.
+; Third-party USB function packages must not install through generic
+; USB\Class_* compatible IDs. Therefore this package uses only the
+; Apple T2 VID/PID hardware IDs.
+;
+; The Microsoft UsbNcm installation sections are reused through
+; Include/Needs. This package does NOT ship or replace UsbNcm.sys.
+;
+; Does not:
+;   - match the composite parent
+;   - match MI_01
+;   - modify usb.inf
+;   - modify usbncm.inf
+;   - modify Apple's oem*.inf
+;   - ship UsbNcm.sys
+;
+; SPDX-License-Identifier: GPL-2.0-only
 ; ============================================================================
 
 [Version]
@@ -28,29 +60,57 @@ DriverVer   = 09/01/2026,2.0.0.0
 CatalogFile = apple-t2-ncm.cat
 PnpLockdown = 1
 
+
 [DestinationDirs]
 DefaultDestDir = 12
+
 
 [SourceDisksNames]
 1 = %DiskName%,,,""
 
+
 [SourceDisksFiles]
+
 
 [Manufacturer]
 %ManufacturerName% = Standard,NTamd64
 
+
+; ============================================================================
+; Device models
+;
+; Only VID/PID hardware IDs are used.
+;
+; MI_00 is the CDC-NCM Communication/Class interface:
+;
+;   Class    = 02
+;   SubClass = 0D
+;   Protocol = 00
+;
+; Its Compatible IDs are:
+;
+;   USB\Class_02&SubClass_0d&Prot_00
+;   USB\Class_02&SubClass_0d
+;   USB\Class_02
+;
+; We deliberately DO NOT put those generic compatible IDs here because
+; Inf2Cat/USB third-party signability rejects USB\Class_* matches.
+; ============================================================================
+
 [Standard.NTamd64]
 
-; T2-specific hardware match.
 %AppleT2Ncm.DeviceDesc% = AppleT2Ncm_Install, USB\VID_05AC&PID_8233&REV_0201&MI_00
 %AppleT2Ncm.DeviceDesc% = AppleT2Ncm_Install, USB\VID_05AC&PID_8233&MI_00
 
 
-; Also expose the same generic CDC-NCM match used by Microsoft's
-; usbncm.inf. This corresponds exactly to the Compatible ID generated
-; by usbccgp for T2 MI_00.
-%AppleT2Ncm.DeviceDesc% = AppleT2Ncm_Install, USB\Class_02&SubClass_0d&Prot_00
-
+; ============================================================================
+; DDInstall
+;
+; Reuse Microsoft's inbox UsbNcm installation definition.
+;
+; The referenced Microsoft section provides the actual NCM driver
+; configuration used to install UsbNcm.sys.
+; ============================================================================
 
 [AppleT2Ncm_Install]
 
@@ -58,17 +118,33 @@ Include = usbncm.inf
 Needs   = UsbNcm_Device.NT
 
 
+; ============================================================================
+; Service installation
+;
+; Reuse the Microsoft inbox UsbNcm service definition.
+; ============================================================================
+
 [AppleT2Ncm_Install.Services]
 
 Include = usbncm.inf
 Needs   = UsbNcm_Device.NT.Services
 
 
+; ============================================================================
+; Hardware-specific configuration
+;
+; Reuse the Microsoft inbox UsbNcm hardware configuration.
+; ============================================================================
+
 [AppleT2Ncm_Install.HW]
 
 Include = usbncm.inf
 Needs   = UsbNcm_Device.NT.HW
 
+
+; ============================================================================
+; Strings
+; ============================================================================
 
 [Strings]
 
