@@ -173,13 +173,21 @@ static int CmdLoadKeybag(Client& client, const std::wstring& path) {
 }
 
 static int CmdSetSystemKeybag(Client& client, int32_t handle, int32_t specialUserBag) {
-    AksResult r = client.MakeSystemKeybag(handle, specialUserBag);
+    int8_t sepStatus = 0;
+    AksResult r = client.MakeSystemKeybag(handle, specialUserBag, /*session=*/1, &sepStatus);
     if (r == AksResult::NotReady) {
         std::wcout << L"set-system-keybag failed: DMA / OOL is not registered; run register-ool first\n";
         return 1;
     }
     if (r != AksResult::Ok) {
         std::wcout << L"set-system-keybag failed\n";
+        return 1;
+    }
+    if (sepStatus != 0) {
+        // Transport succeeded but SEP rejected the request (e.g. bad
+        // handle/special-user bag) - previously dropped silently.
+        std::wcout << L"set-system-keybag: SEP rejected the request, status=" << (int)sepStatus
+                   << L" (handle=" << handle << L" special=" << specialUserBag << L")\n";
         return 1;
     }
 
@@ -193,9 +201,19 @@ static int CmdUnlock(Client& client, int32_t handle) {
         std::wcout << L"no password entered\n";
         return 1;
     }
-    AksResult r = client.Unlock(handle, secret); // zeroes `secret` internally
+    int8_t sepStatus = 0;
+    // zeroes `secret` internally
+    AksResult r = client.Unlock(handle, secret, /*session=*/1, &sepStatus);
     if (r != AksResult::Ok) {
         std::wcout << L"unlock failed\n";
+        return 1;
+    }
+    if (sepStatus != 0) {
+        // This was previously unreachable: AksResult::Ok only ever meant
+        // the mailbox round-trip completed, so a wrong password still
+        // printed "unlock: OK". SepStatus is SEP's actual verdict.
+        std::wcout << L"unlock: SEP rejected the password, status=" << (int)sepStatus
+                   << L" (handle=" << handle << L")\n";
         return 1;
     }
     std::wcout << L"unlock: OK\n";

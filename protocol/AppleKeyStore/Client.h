@@ -91,8 +91,15 @@ public:
                         uint64_t session = 1, int8_t* outSepStatus = nullptr);
     AksResult MakeSystemKeybag(int32_t handle, int32_t specialUserBag,
                                 uint64_t session = 1, int8_t* outSepStatus = nullptr);
+    // outSepStatus (optional): same semantics as LoadKeybag/MakeSystemKeybag.
+    // Previously missing on this call — AksResult::Ok only ever meant "the
+    // mailbox round-trip completed", never "SEP accepted the password".
+    // A wrong password still returns AksResult::Ok from Exchange(); the
+    // rejection is opcode 0x04's SepStatus, which went undecoded and
+    // silently dropped. Callers that skip this parameter get exactly the
+    // old (misleading) behavior.
     AksResult Unlock(int32_t handle, std::vector<uint8_t>& secretUtf8 /* zeroed on return */,
-                    uint64_t session = 1);
+                    uint64_t session = 1, int8_t* outSepStatus = nullptr);
     AksResult GetCapabilities(uint64_t selector, uint64_t* outValue);
     // Differential test vs capabilities: same V2 transport, op 0x19.
     // body = [result:u32=0][handle:u64][selector:u32] (20 bytes).

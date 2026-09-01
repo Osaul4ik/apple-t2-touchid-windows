@@ -186,7 +186,8 @@ AksResult Client::MakeSystemKeybag(int32_t handle, int32_t specialUserBag,
     return (status == 0) ? AksResult::Ok : AksResult::IoError;
 }
 
-AksResult Client::Unlock(int32_t handle, std::vector<uint8_t>& secretUtf8, uint64_t session) {
+AksResult Client::Unlock(int32_t handle, std::vector<uint8_t>& secretUtf8, uint64_t session,
+                          int8_t* outSepStatus) {
     // VERIFIED FROM SOURCE (jmurth1234/t2-touchid-linux, t2-aks-tool.c
     // unlock_keybag): the secret blob is padded to a 4-byte boundary on
     // the wire; secretLen still records the true, unpadded length, and
@@ -223,8 +224,13 @@ AksResult Client::Unlock(int32_t handle, std::vector<uint8_t>& secretUtf8, uint6
     // this function would never touch them again. uint8_t is trivial, so
     // writing zero bytes out to capacity() is well-defined even though
     // those bytes are past size().
+    // Same pattern as LoadKeybag: SepStatus != 0 means SEP itself rejected
+    // the request — for this opcode that's the actual "wrong password"
+    // signal, not a transport error, so it must go through outSepStatus,
+    // not get swallowed as a bare AksResult::Ok.
     std::vector<uint8_t> response;
-    AksResult r = Exchange(static_cast<uint8_t>(T2AksOpChangeLockState), req, &response);
+    AksResult r = Exchange(static_cast<uint8_t>(T2AksOpChangeLockState), req, &response,
+                            outSepStatus);
 
     SecureZeroMemory(req.data(), req.capacity());
     SecureZeroMemory(secretUtf8.data(), secretUtf8.capacity());
