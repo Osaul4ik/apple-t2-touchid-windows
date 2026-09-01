@@ -15,16 +15,30 @@ T2DmaAllocateOolBuffers(_In_ PT2_DEVICE_CONTEXT Ctx)
     WDF_DMA_ENABLER_CONFIG dmaConfig;
     PHYSICAL_ADDRESS systemPaIn, systemPaOut;
 
-    // Prefer 32-bit packet profile so OOL stays in lower 4GB when possible.
-    // AddressWidthOverride is used when the WDK headers expose it.
+    // VERIFIED FROM SOURCE (jmurth1234/t2-touchid-linux, t2_sep_transport.c
+    // probe): Linux calls dma_set_mask_and_coherent(DMA_BIT_MASK(44)) —
+    // the SAME T2_SEP_DMA_BITS (44) that T2SepControl already enforces on
+    // the logical address it's given (see mailbox.c). There is no 32-bit
+    // restriction in that source at all: word[1] carries dma>>12, which
+    // only needs to fit a 32-bit register if dma<2^44, not dma<2^32. A
+    // prior version of this function forced AddressWidthOverride=32
+    // ("prefer 32-bit... so OOL stays in lower 4GB") — that was a
+    // self-imposed constraint with no protocol or Linux-source basis, and
+    // diverges from the reference driver's actual DMA mask.
+    // VERIFIED (learn.microsoft.com/.../ns-wdfdmaenabler-_wdf_dma_enabler_config):
+    // AddressWidthOverride accepts 0 (defer to Profile) or any value from
+    // 24 to 63 — 32 is not a ceiling, so requesting 44 directly here is
+    // valid and matches Linux's mask exactly, rather than approximating it.
     WDF_DMA_ENABLER_CONFIG_INIT(&dmaConfig, WdfDmaProfilePacket, T2_SEP_OOL_SIZE);
 #if defined(WDF_DMA_ENABLER_CONFIG_SIZE_V2) || (defined(WDK_NTDDI_VERSION) && (WDK_NTDDI_VERSION >= NTDDI_WIN10))
-    dmaConfig.AddressWidthOverride = 32;
+    dmaConfig.AddressWidthOverride = T2_SEP_DMA_BITS; // 44 — matches Linux's DMA_BIT_MASK(44), not an arbitrary 32
 #endif
 
     status = WdfDmaEnablerCreate(Ctx->Device, &dmaConfig, WDF_NO_OBJECT_ATTRIBUTES, &Ctx->DmaEnabler);
     if (!NT_SUCCESS(status)) {
-        // Fallback: plain packet profile without width override.
+        // Fallback: plain packet profile without width override. Same
+        // rollback-safety reasoning as before — nothing SEP-visible has
+        // happened yet, so a second, unconstrained attempt is safe.
         WDF_DMA_ENABLER_CONFIG_INIT(&dmaConfig, WdfDmaProfilePacket, T2_SEP_OOL_SIZE);
         status = WdfDmaEnablerCreate(Ctx->Device, &dmaConfig, WDF_NO_OBJECT_ATTRIBUTES, &Ctx->DmaEnabler);
     }
