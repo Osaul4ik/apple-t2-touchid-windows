@@ -299,7 +299,7 @@ T2AksExchange(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
                 "T2TouchIdTransport: OolIn readback after flush: %s (checked %Iu bytes)%s\n",
                 mismatch ? "MISMATCH" : "OK",
                 snapLen,
-                mismatch ? " — VA may not match device-visible memory" : ""));
+                mismatch ? " - VA may not match device-visible memory" : ""));
             if (mismatch) {
                 T2AksDumpWire(inBase, requestWireLength, snapLen);
             }
@@ -365,7 +365,7 @@ T2AksExchange(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
     if (sepStatus != 0) {
         T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
             "T2TouchIdTransport: AKS operation 0x%02x rejected by SEP, status=%d "
-            "(transaction=0x%02x) — not a transport failure, OOL_OUT not consulted\n",
+            "(transaction=0x%02x) - not a transport failure, OOL_OUT not consulted\n",
             Operation, sepStatus, transaction));
         *ResponseLength = 0;
         return STATUS_SUCCESS;
@@ -379,7 +379,7 @@ T2AksExchange(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
     if (replyWireLength == 0) {
         T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
             "T2TouchIdTransport: AKS reply has zero wire length "
-            "(operation=0x%02x transaction=0x%02x) — mailbox ack only, no OOL body\n",
+            "(operation=0x%02x transaction=0x%02x) - mailbox ack only, no OOL body\n",
             Operation, transaction));
         *ResponseLength = 0;
         return STATUS_INVALID_DEVICE_STATE;

@@ -333,7 +333,7 @@ static int CmdNetwork(int argc, wchar_t* argv[]) {
                 std::wcout << tmp;
             }
         } else {
-            std::wcout << L"  (no data — peer silent)";
+            std::wcout << L"  (no data - peer silent)";
         }
         std::wcout << L"\n";
     }
@@ -393,7 +393,7 @@ int wmain(int argc, wchar_t* argv[]) {
         return CmdNetwork(argc, argv);
     }
     if (cmd == L"identities" || cmd == L"verify") {
-        std::wcout << L"not yet wired — requires RemoteXPC BiometricKit port "
+        std::wcout << L"not yet wired - requires RemoteXPC BiometricKit port "
                       L"+ live BridgeXpc connection (Gate 6 phase 2 / Gate 7)\n";
         return 2;
     }

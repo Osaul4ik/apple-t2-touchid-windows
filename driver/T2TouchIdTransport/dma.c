@@ -165,7 +165,7 @@ T2DmaRegisterOolBuffers(_In_ PT2_DEVICE_CONTEXT Ctx)
             "T2TouchIdTransport: OOL input registered but output "
             "registration failed, status=0x%x (sentToDevice=%d); SEP now holds "
             "the OOL_IN logical address (0x%llx) and no deregistration opcode "
-            "exists (Milestone 1 §3) - deliberately NOT freeing OolInBuffer/"
+            "exists (Milestone 1 section 3) - deliberately NOT freeing OolInBuffer/"
             "DmaEnabler, this device context is now terminal until reboot\n",
             status, sentOut, Ctx->OolInPa.QuadPart));
         // Milestone 2B §5/§7: OolInRegistered (confirmed) and
