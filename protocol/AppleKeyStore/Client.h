@@ -70,32 +70,29 @@ public:
     // secretUtf8 is zeroed by this call before returning, regardless of
     // outcome — caller must not reuse the buffer contents afterward.
     //
-    // session: an opaque caller-chosen value in this op's wire body.
-    // CORRECTED (was wrongly documented as a fixed "must be 1" protocol
-    // constant — verified against jmurth1234/t2-touchid-linux's
-    // t2-aks-tool.c): the `session != 1` hard check in that source lives
-    // only in build_copy_keybag_uuid_request() (opcode 0x06,
-    // copy-keybag-uuid) and, separately, in the verify-password-acm (0x21)
-    // path — neither of which this Client implements. load_keybag (0x03),
-    // set_system_keybag (0x0d), and unlock_keybag (0x04) apply no
-    // validation to this field at all in that source; the reference CLI's
-    // own default for load-keybag when the caller omits it is 0.
-    // Empirically, on real T2 hardware, sending session=1 here changed
-    // load-keybag's SEP status from -11 to -19 (still a rejection, but a
-    // different one) versus session=0 — so the field does matter to the
-    // real SEP applet even though this open-source reference doesn't
-    // encode why. Default is 0 to match the reference tool's own default;
-    // override explicitly to probe other values (e.g. 1) against hardware.
+    // session: VERIFIED FROM SOURCE (jmurth1234/t2-touchid-linux). The
+    // t2-aks-tool.c CLI treats this as an untyped, unvalidated argument
+    // for load_keybag (0x03) / set_system_keybag (0x0d) / unlock_keybag
+    // (0x04) — no "must be 1" check exists in that file for these three
+    // ops (that check is real, but scoped to the unrelated copy-keybag-uuid
+    // opcode 0x06 and verify-password-acm opcode 0x21). However, the
+    // project's own production path — src/t2-keybag-load.sh, which is
+    // what actually runs on boot — hardcodes SESSION=1 and passes it to
+    // BOTH load-keybag and set-system-keybag; README.md's manual unlock
+    // instructions likewise show `unlock-keybag 1 HANDLE`. So 1 is the
+    // value this reference project actually uses end-to-end on real T2
+    // hardware, even though the bare CLI tool would accept other values
+    // without complaint. Default is 1 to match that working path.
     //
     // outSepStatus (optional): see GetDeviceState's doc below — same
     // semantics here. A nonzero value means the transport exchange
     // succeeded but SEP rejected the request (e.g. bad session/handle).
     AksResult LoadKeybag(const std::vector<uint8_t>& bagBytes, int32_t* outHandle,
-                        uint64_t session = 0, int8_t* outSepStatus = nullptr);
+                        uint64_t session = 1, int8_t* outSepStatus = nullptr);
     AksResult MakeSystemKeybag(int32_t handle, int32_t specialUserBag,
-                                uint64_t session = 0, int8_t* outSepStatus = nullptr);
+                                uint64_t session = 1, int8_t* outSepStatus = nullptr);
     AksResult Unlock(int32_t handle, std::vector<uint8_t>& secretUtf8 /* zeroed on return */,
-                    uint64_t session = 0);
+                    uint64_t session = 1);
     AksResult GetCapabilities(uint64_t selector, uint64_t* outValue);
     // Differential test vs capabilities: same V2 transport, op 0x19.
     // body = [result:u32=0][handle:u64][selector:u32] (20 bytes).

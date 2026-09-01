@@ -129,10 +129,10 @@ AksResult Client::LoadKeybag(const std::vector<uint8_t>& bagBytes, int32_t* outH
     // load_keybag): request body is [result:u32le=0][session:u64le]
     // [size:u32le=unpadded bag length] followed by the bag bytes
     // themselves padded to a 4-byte boundary (the padding bytes are NOT
-    // reflected in the size field). session default (0) matches that
-    // source's own default when its CLI arg is omitted; see the "session"
-    // doc in Client.h for what is/isn't actually verified about this
-    // field's required value on real hardware.
+    // reflected in the size field). session default (1) matches what the
+    // project's actual production loader (src/t2-keybag-load.sh,
+    // `SESSION=1`) passes to this exact call on real hardware — see the
+    // "session" doc in Client.h.
     constexpr size_t kHeaderSize = 4 + 8 + 4;
     size_t paddedSize = (bagBytes.size() + 3) & ~size_t(3);
 
@@ -160,12 +160,11 @@ AksResult Client::MakeSystemKeybag(int32_t handle, int32_t specialUserBag,
     // VERIFIED FROM SOURCE (jmurth1234/t2-touchid-linux, t2-aks-tool.c
     // set_system_keybag): exact 24-byte request body —
     // [result:u32le=0][session:u64le][handle:u32le][special:i32le]
-    // [trailing empty blob length:u32le=0]. That source requires session
-    // as a caller-supplied CLI argument with no default and no validation
-    // of its value — no "must be 1" constraint applies to this opcode
-    // (0x0d); see Client.h. The Linux tool never sends anything after
-    // byte 24 for this operation: "the final empty blob is encoded as a
-    // zero length word at +20".
+    // [trailing empty blob length:u32le=0]. session default (1) matches
+    // src/t2-keybag-load.sh, which passes the same SESSION=1 it used for
+    // load-keybag into this call too — see Client.h. The Linux tool never
+    // sends anything after byte 24 for this operation: "the final empty
+    // blob is encoded as a zero length word at +20".
     std::vector<uint8_t> req(24, 0);
     uint32_t resultField = 0;
     uint32_t handleField = static_cast<uint32_t>(handle);
@@ -191,9 +190,9 @@ AksResult Client::Unlock(int32_t handle, std::vector<uint8_t>& secretUtf8, uint6
     // VERIFIED FROM SOURCE (jmurth1234/t2-touchid-linux, t2-aks-tool.c
     // unlock_keybag): the secret blob is padded to a 4-byte boundary on
     // the wire; secretLen still records the true, unpadded length, and
-    // the pad bytes themselves are zero. session is, again, just a
-    // caller-supplied CLI argument in that source — no default, no
-    // validation; see Client.h.
+    // the pad bytes themselves are zero. session default (1) matches
+    // README.md's documented manual unlock step (`unlock-keybag 1
+    // HANDLE`) — see Client.h.
     size_t paddedSecretLen = (secretUtf8.size() + 3) & ~size_t(3);
 
     std::vector<uint8_t> req;
