@@ -221,13 +221,14 @@ T2SepControl(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Opcode, _In_ UINT8 Tag,
             return status;
         }
 
-        // Endpoint occupies the full low byte (tag<<8 begins immediately
-        // after it in the wire layout above) — mask 0xff, matching the
-        // equivalent parse in T2SepAksTransaction below. Do not narrow this
-        // to 0x1f: that would fold any garbage/unrelated queued message
-        // whose low byte happens to be e.g. 0x20 or 0xE0 into "endpoint 0"
-        // and misroute it as our own reply.
-        UINT8 endpoint = (UINT8)(reply.Word[0] & 0xff);
+        // VERIFIED FROM SOURCE (t2_sep_transport.c t2_sep_control):
+        // endpoint = FIELD_GET(T2_SEP_ENDPOINT_MASK, reply.word[0]) — only
+        // the low 5 bits of the byte are the endpoint; bits [7:5] are not
+        // part of it and must be masked off before comparing, or a reply
+        // whose upper bits happen to be nonzero (legitimately, per the
+        // real reference driver) will be wrongly treated as "unrelated"
+        // and skipped/timed out instead of matched.
+        UINT8 endpoint = (UINT8)(reply.Word[0] & T2_SEP_ENDPOINT_MASK);
         UINT8 replyTag = (UINT8)((reply.Word[0] >> 8) & 0xff);
         if (endpoint == T2_SEP_CONTROL_ENDPOINT && replyTag == Tag) {
             break;
@@ -316,16 +317,21 @@ T2SepAksTransaction(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
             return status;
         }
 
-        // VERIFIED FROM SOURCE: reply match is (endpoint==7 &&
-        // operation-bits-match && transaction-bits-match) — NOT the EP0
-        // (endpoint,tag) pair. Operation occupies bits [14:8] (7 bits,
-        // masked 0x7f) in the reply, transaction occupies bits [23:16].
+        // VERIFIED FROM SOURCE (t2_sep_transport.c t2_aks_exchange_locked):
+        // reply match is (endpoint==7 && operation-byte == (operation|0x80)
+        // && transaction-bits-match). The 0x80 bit is SEP's "this is a
+        // response" flag on the operation byte, not something we're free
+        // to ignore — masking it off (0x7f) makes this check accept any
+        // reply whose low 7 bits happen to match Operation regardless of
+        // whether SEP actually flagged it as a response to OUR request,
+        // which is looser than the reference and can let a stale/unrelated
+        // EP7 message be mistaken for the real reply.
         UINT8 replyEndpoint = (UINT8)(reply.Word[0] & 0xff);
-        UINT8 replyOperation = (UINT8)((reply.Word[0] >> 8) & 0x7f);
+        UINT8 replyOperation = (UINT8)((reply.Word[0] >> 8) & 0xff);
         UINT8 replyTransaction = (UINT8)((reply.Word[0] >> 16) & 0xff);
 
         if (replyEndpoint == T2_SEP_AKS_ENDPOINT &&
-            replyOperation == Operation &&
+            replyOperation == (UINT8)(Operation | 0x80) &&
             replyTransaction == Transaction) {
             break;
         }

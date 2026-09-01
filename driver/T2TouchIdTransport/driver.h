@@ -55,6 +55,11 @@
 // ---- Endpoint / control-message layout (VERIFIED FROM SOURCE) ----
 #define T2_SEP_CONTROL_ENDPOINT     0
 #define T2_SEP_AKS_ENDPOINT         7
+// VERIFIED FROM SOURCE (t2_sep_transport.c: T2_SEP_ENDPOINT_MASK = GENMASK(4,0)).
+// The EP0 control-reply endpoint field is only 5 bits wide; bits [7:5] of
+// that byte are NOT part of the endpoint and must be ignored when matching
+// a control reply, exactly as the Linux reference does.
+#define T2_SEP_ENDPOINT_MASK        0x1F
 #define T2_SEP_CMSG_SET_OOL_IN      2
 #define T2_SEP_CMSG_SET_OOL_OUT     3
 

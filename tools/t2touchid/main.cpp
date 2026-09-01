@@ -146,12 +146,21 @@ static int CmdLoadKeybag(Client& client, const std::wstring& path) {
     }
 
     int32_t handle = 0;
-    AksResult r = client.LoadKeybag(bag, &handle);
+    int8_t sepStatus = 0;
+    AksResult r = client.LoadKeybag(bag, &handle, /*session=*/1, &sepStatus);
     SecureZeroMemory(bag.data(), bag.size());
     bag.clear();
 
     if (r == AksResult::NotReady) {
         std::wcout << L"load-keybag failed: DMA / OOL is not registered; run register-ool first\n";
+        return 1;
+    }
+    if (sepStatus != 0) {
+        // Transport succeeded but SEP rejected the request (e.g. bad
+        // session/handle or malformed keybag) - the Linux tool always
+        // prints this status; surface it here too instead of the previous
+        // generic "load-keybag failed" that hid it.
+        std::wcout << L"load-keybag failed: SEP status=" << (int)sepStatus << L"\n";
         return 1;
     }
     if (r != AksResult::Ok) {
