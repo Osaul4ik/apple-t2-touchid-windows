@@ -1,42 +1,52 @@
+; ============================================================================
 ; apple-t2-ncm.inf
 ;
-; Apple T2 USB CDC-NCM function (VID_05AC&PID_8233&MI_00 — NCM Control
-; child interface, NOT the composite parent).
+; Apple T2 USB CDC-NCM function driver binding
 ;
-; Binds inbox UsbNcm.sys. Does not ship UsbNcm.sys. Does not edit oem15.inf.
+; Parent:
+;   USB\VID_05AC&PID_8233
+;       |
+;       +--> usbccgp.sys
+;              |
+;              +--> MI_00 = NCM Control
+;              |       |
+;              |       +--> UsbNcm.sys
+;              |
+;              +--> MI_01 = NCM Data
+;                      |
+;                      +--> part of the same CDC-NCM function
 ;
-; REVISED 01.09.2026: previous revision matched the bare parent HWID
-; (USB\VID_05AC&PID_8233). Confirmed on hardware that this was wrong —
-; when this INF (or Apple's oem15.inf null) wins rank on the *parent*
-; node, usbccgp.sys never runs on this device, so MI_00/MI_01 child PDOs
-; are never created, and UsbNcm.sys ends up bound as if it owned the
-; whole composite device instead of a single interface — not the model
-; inbox usbncm.inf is written for. Confirmed via UsbTreeView + PnpDevice
-; dump: with a plain "USB Composite Device" (usbccgp.sys, inbox usb.inf)
-; on the parent, Windows creates two separate child PDOs on its own:
-;   USB\VID_05AC&PID_8233&MI_00  "NCM Control"  (class 02/0D/00)
-;   USB\VID_05AC&PID_8233&MI_01  "NCM Data"     (class 0A/00/01)
-; matching the descriptor's Interface 0 (control, EP 0x81 interrupt) and
-; Interface 1 (data, altsetting 1 has EP 0x82 bulk IN / 0x01 bulk OUT).
-; Inbox usbncm.inf itself only ever matches the control interface
-; (USB\MS_COMP_WINNCM or USB\Class_02&SubClass_0d&Prot_00) — it has no
-; rule for the data interface's class (0x0A). UsbNcm.sys is expected to
-; locate MI_01 itself via the CDC Union Functional Descriptor
-; (ControlInterface=0, SubordinateInterface=1) and drive its pipes
-; through the shared USB device handle from the composite parent. MI_01
-; showing CM_PROB_FAILED_INSTALL with no driver bound is therefore
-; EXPECTED, not a bug to fix with a second INF.
+; IMPORTANT:
+;   - This INF MUST NOT match the composite parent.
+;   - This INF MUST NOT match MI_01.
+;   - This INF does not ship UsbNcm.sys.
+;   - This INF does not modify usbncm.inf.
+;   - This INF does not modify usb.inf.
+;   - This INF does not modify Apple's oem15.inf.
 ;
-; Parent-level enumeration (usbccgp.sys winning USB\VID_05AC&PID_8233
-; against Apple's oem15.inf null) is handled separately by
-; apple-t2-composite.inf — this file only owns the NCM function.
+; The Microsoft inbox usbncm.inf normally matches:
 ;
-; Hardware note: Code 56 (CM_PROB_NEED_CLASS_CONFIG) was observed when
-; only Include/Needs was used; this revision adds explicit
-; Ndi/Characteristics AddReg mirroring the public usbncm.inf layout so
-; the Net class installer can finish.
+;   USB\MS_COMP_WINNCM
 ;
-; SPDX-License-Identifier: GPL-2.0-only
+; and its generic CDC-NCM class match:
+;
+;   USB\Class_02&SubClass_0d&Prot_00
+;
+; is commented out in the installed Microsoft INF.
+;
+; Apple T2 MI_00 exposes:
+;
+;   HWID:
+;       USB\VID_05AC&PID_8233&REV_0201&MI_00
+;       USB\VID_05AC&PID_8233&MI_00
+;
+;   Compatible ID:
+;       USB\Class_02&SubClass_0d&Prot_00
+;
+; Therefore this package provides a vendor-specific HWID match for MI_00
+; while reusing the inbox Microsoft UsbNcm service/driver configuration.
+;
+; ============================================================================
 
 [Version]
 Signature   = "$WINDOWS NT$"
@@ -55,19 +65,30 @@ DefaultDestDir = 12
 
 [SourceDisksFiles]
 
+
 [Manufacturer]
 %ManufacturerName% = Standard,NTamd64
 
+
 [Standard.NTamd64]
+
+; Prefer the exact revision-specific hardware ID.
+%AppleT2Ncm.DeviceDesc% = AppleT2Ncm_Install, USB\VID_05AC&PID_8233&REV_0201&MI_00
+
+; Also support the same T2 NCM control interface without the revision
+; component in the hardware ID.
 %AppleT2Ncm.DeviceDesc% = AppleT2Ncm_Install, USB\VID_05AC&PID_8233&MI_00
 
-; ---------------------------------------------------------------------------
-; DDInstall: pull Microsoft service definition + explicit Ndi keys.
-; ---------------------------------------------------------------------------
+
+; ============================================================================
+; NCM network adapter installation
+; ============================================================================
 
 [AppleT2Ncm_Install]
-Characteristics = 0x84
-BusType         = 15
+
+Characteristics     = 0x84
+BusType             = 15
+
 *IfType             = 6
 *MediaType          = 0
 *PhysicalMediaType  = 0
@@ -76,27 +97,77 @@ BusType         = 15
 *DirectionType      = 0
 *AccessType         = 2
 *HardwareLoopback   = 0
-AddReg          = AppleT2Ncm_AddReg
-Include         = usbncm.inf
-Needs           = UsbNcm_Device.NT
+
+AddReg              = AppleT2Ncm_AddReg
+
+
+; ============================================================================
+; Microsoft UsbNcm service
+;
+; Equivalent to the relevant service definition in the inbox usbncm.inf.
+; UsbNcm.sys itself is NOT supplied by this package; Windows must already
+; have the inbox UsbNcm.sys installed.
+; ============================================================================
 
 [AppleT2Ncm_Install.Services]
-Include = usbncm.inf
-Needs   = UsbNcm_Device.NT.Services
 
-[AppleT2Ncm_Install.HW]
-Include = usbncm.inf
-Needs   = UsbNcm_Device.NT.HW
+AddService = UsbNcm, %SPSVCINST_ASSOCSERVICE%, UsbNcm_Service_Inst
 
-; Explicit Ndi — same shape as inbox usbncm.inf UsbNcm_AddReg.
-; Guarantees UpperRange/LowerRange even if Needs expansion is incomplete.
+
+[UsbNcm_Service_Inst]
+
+DisplayName   = %UsbNcm.SVCDESC%
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %12%\UsbNcm.sys
+
+
+; ============================================================================
+; Microsoft UsbNcm WDF configuration
+;
+; Equivalent to:
+;
+; [UsbNcm_Device.NT.Wdf]
+; KmdfService = UsbNcm, UsbNcm_wdfsect
+;
+; [UsbNcm_wdfsect]
+; KmdfLibraryVersion = 1.15
+; ============================================================================
+
+[AppleT2Ncm_Install.Wdf]
+
+KmdfService = UsbNcm, UsbNcm_wdfsect
+
+
+[UsbNcm_wdfsect]
+
+KmdfLibraryVersion = 1.15
+
+
+; ============================================================================
+; NDI configuration
+;
+; These values are taken from the installed Microsoft usbncm.inf.
+; NetworkAddress is optional and is provided by Microsoft's inbox INF.
+; ============================================================================
+
 [AppleT2Ncm_AddReg]
-HKR, Ndi,            Service,    0, "UsbNcm"
-HKR, Ndi\Interfaces, UpperRange, 0, "ndis5"
-HKR, Ndi\Interfaces, LowerRange, 0, "ethernet"
-HKR,,                EnumPropPages32, 0, "netcfgx.dll,NetPropPageProvider"
+
+HKR, Ndi, Service, 0, "UsbNcm"
+HKR, Ndi\params\NetworkAddress, Optional, 0, "1"
+
+
+; ============================================================================
+; Strings
+; ============================================================================
 
 [Strings]
+
 ManufacturerName      = "Osaul4ik"
 DiskName              = "Apple T2 USB NCM Driver Package"
+
 AppleT2Ncm.DeviceDesc = "Apple T2 USB NCM Network Adapter"
+
+UsbNcm.SVCDESC        = "USB NCM"
+SPSVCINST_ASSOCSERVICE = 0x00000002
