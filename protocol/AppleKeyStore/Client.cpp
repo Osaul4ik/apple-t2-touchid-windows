@@ -123,19 +123,20 @@ AksResult Client::Exchange(uint8_t operation, const std::vector<uint8_t>& reques
     return AksResult::Ok;
 }
 
-AksResult Client::LoadKeybag(const std::vector<uint8_t>& bagBytes, int32_t* outHandle) {
+AksResult Client::LoadKeybag(const std::vector<uint8_t>& bagBytes, int32_t* outHandle,
+                            uint64_t session, int8_t* outSepStatus) {
     // VERIFIED FROM SOURCE (t2-aks-tool.c load_keybag): request body is
     // [result:u32le=0][session:u64le][size:u32le=unpadded bag length]
     // followed by the bag bytes themselves padded to a 4-byte boundary
-    // (the padding bytes are NOT reflected in the size field). Session is
-    // left at 0, matching this client's other calls (no session-handle
-    // plumbing exists yet in this PoC's Client API).
+    // (the padding bytes are NOT reflected in the size field). session
+    // defaults to 1 — SEP hardcodes/enforces this as a fixed protocol
+    // constant (see Client.h), not an arbitrary handle; sending 0 here
+    // gets the exchange rejected with SepStatus=-11.
     constexpr size_t kHeaderSize = 4 + 8 + 4;
     size_t paddedSize = (bagBytes.size() + 3) & ~size_t(3);
 
     std::vector<uint8_t> req(kHeaderSize + paddedSize, 0);
     uint32_t resultField = 0;
-    uint64_t session = 0;
     uint32_t size = static_cast<uint32_t>(bagBytes.size());
     std::memcpy(req.data() + 0, &resultField, 4);
     std::memcpy(req.data() + 4, &session, 8);
@@ -145,22 +146,25 @@ AksResult Client::LoadKeybag(const std::vector<uint8_t>& bagBytes, int32_t* outH
     }
 
     std::vector<uint8_t> response;
-    AksResult r = Exchange(static_cast<uint8_t>(T2AksOpLoadKeybag), req, &response);
+    AksResult r = Exchange(static_cast<uint8_t>(T2AksOpLoadKeybag), req, &response, outSepStatus);
     if (r != AksResult::Ok) return r;
+    if (outSepStatus && *outSepStatus != 0) return AksResult::Ok; // transport ok, SEP rejected — response body is empty
     if (response.size() < 8) return AksResult::IoError;
     std::memcpy(outHandle, response.data() + 4, 4); // status:u32 | handle:i32
     return AksResult::Ok;
 }
 
-AksResult Client::MakeSystemKeybag(int32_t handle, int32_t specialUserBag) {
+AksResult Client::MakeSystemKeybag(int32_t handle, int32_t specialUserBag,
+                                    uint64_t session, int8_t* outSepStatus) {
     // VERIFIED FROM SOURCE (t2-aks-tool.c set_system_keybag): exact 24-byte
-    // request body — [result:u32le=0][session:u64le=0][handle:u32le]
-    // [special:i32le][trailing empty blob length:u32le=0]. The Linux tool
-    // never sends anything after byte 24 for this operation: "the final
-    // empty blob is encoded as a zero length word at +20".
+    // request body — [result:u32le=0][session:u64le][handle:u32le]
+    // [special:i32le][trailing empty blob length:u32le=0]. session
+    // defaults to 1, same protocol-constant reasoning as LoadKeybag above.
+    // The Linux tool never sends anything after byte 24 for this
+    // operation: "the final empty blob is encoded as a zero length word
+    // at +20".
     std::vector<uint8_t> req(24, 0);
     uint32_t resultField = 0;
-    uint64_t session = 0;
     uint32_t handleField = static_cast<uint32_t>(handle);
     uint32_t specialField = static_cast<uint32_t>(specialUserBag);
     uint32_t trailingBlobLength = 0;
@@ -171,24 +175,26 @@ AksResult Client::MakeSystemKeybag(int32_t handle, int32_t specialUserBag) {
     std::memcpy(req.data() + 20, &trailingBlobLength, 4);
 
     std::vector<uint8_t> response;
-    AksResult r = Exchange(static_cast<uint8_t>(T2AksOpMakeSystemKeybag), req, &response);
+    AksResult r = Exchange(static_cast<uint8_t>(T2AksOpMakeSystemKeybag), req, &response, outSepStatus);
     if (r != AksResult::Ok) return r;
+    if (outSepStatus && *outSepStatus != 0) return AksResult::Ok; // transport ok, SEP rejected — response body is empty
     if (response.size() < 4) return AksResult::IoError; // status:u32, VERIFIED FROM SOURCE
     uint32_t status = 0;
     std::memcpy(&status, response.data(), 4);
     return (status == 0) ? AksResult::Ok : AksResult::IoError;
 }
 
-AksResult Client::Unlock(int32_t handle, std::vector<uint8_t>& secretUtf8) {
+AksResult Client::Unlock(int32_t handle, std::vector<uint8_t>& secretUtf8, uint64_t session) {
     // VERIFIED FROM SOURCE (t2-aks-tool.c unlock_keybag): the secret blob
     // is padded to a 4-byte boundary on the wire; secretLen still records
     // the true, unpadded length, and the pad bytes themselves are zero.
+    // session defaults to 1 — same protocol-constant reasoning as
+    // LoadKeybag/MakeSystemKeybag above.
     size_t paddedSecretLen = (secretUtf8.size() + 3) & ~size_t(3);
 
     std::vector<uint8_t> req;
     req.reserve(4 + 8 + 4 + 4 + paddedSecretLen);
     uint32_t resultField = 0;
-    uint64_t session = 0;
     uint32_t lockState = 0; // 0 = unlock
     uint32_t secretLen = static_cast<uint32_t>(secretUtf8.size());
 

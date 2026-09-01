@@ -69,9 +69,23 @@ public:
 
     // secretUtf8 is zeroed by this call before returning, regardless of
     // outcome — caller must not reuse the buffer contents afterward.
-    AksResult LoadKeybag(const std::vector<uint8_t>& bagBytes, int32_t* outHandle);
-    AksResult MakeSystemKeybag(int32_t handle, int32_t specialUserBag);
-    AksResult Unlock(int32_t handle, std::vector<uint8_t>& secretUtf8 /* zeroed on return */);
+    //
+    // session: the AKS wire protocol's session field. This is NOT an
+    // arbitrary token — SEP enforces it as a fixed protocol constant.
+    // Linux's t2-keybag-load.sh / t2-aks-tool.c hardcode 1 here, and
+    // copy_keybag_uuid rejects any exchange where session != 1. Defaults
+    // to 1 to match that; the parameter exists mainly so callers/tests can
+    // still probe other values explicitly.
+    //
+    // outSepStatus (optional): see GetDeviceState's doc below — same
+    // semantics here. A nonzero value means the transport exchange
+    // succeeded but SEP rejected the request (e.g. bad session/handle).
+    AksResult LoadKeybag(const std::vector<uint8_t>& bagBytes, int32_t* outHandle,
+                        uint64_t session = 1, int8_t* outSepStatus = nullptr);
+    AksResult MakeSystemKeybag(int32_t handle, int32_t specialUserBag,
+                                uint64_t session = 1, int8_t* outSepStatus = nullptr);
+    AksResult Unlock(int32_t handle, std::vector<uint8_t>& secretUtf8 /* zeroed on return */,
+                    uint64_t session = 1);
     AksResult GetCapabilities(uint64_t selector, uint64_t* outValue);
     // Differential test vs capabilities: same V2 transport, op 0x19.
     // body = [result:u32=0][handle:u64][selector:u32] (20 bytes).
