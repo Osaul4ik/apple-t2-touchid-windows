@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
-// NcmProtocol.h — CDC-NCM control-plane (Tasks 7-11). Not yet implemented
-// in this milestone; declared now so Device.c's future D0Entry call site
-// and UsbTransport.c's Task 12 call site compile against a stable API.
+// NcmProtocol.h — CDC-NCM control-plane (Tasks 7-11): GET_NTB_PARAMETERS,
+// NTB16 format negotiation, SET_NTB_INPUT_SIZE, and MAC address readout.
+// Called from Device.c's D0Entry; UsbTransport.c's Task 12 alt-setting
+// switch (T2NcmUsbActivateDataInterface) is gated on these succeeding.
 
 #pragma once
 #include "Driver.h"

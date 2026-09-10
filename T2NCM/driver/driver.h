@@ -54,6 +54,9 @@
 #define T2NCM_SUBCLASS_NCM          0x0Du
 #define T2NCM_CLASS_CDC_DATA        0x0Au
 
+// ---- Pool tag (NcmProtocol.c string-descriptor reads) ----
+#define T2NCM_POOL_TAG              ((ULONG)'TNcm')
+
 // ---- Lifecycle states (Task 4) ----
 // All transitions are explicit — see Device.c T2NcmSetState().
 typedef enum _T2NCM_LIFECYCLE_STATE

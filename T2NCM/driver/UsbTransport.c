@@ -159,15 +159,120 @@ T2NcmUsbReleaseHardware(
     DeviceContext->UsbDevice = NULL;
 }
 
+static
+NTSTATUS
+T2NcmUsbSelectDataAltSetting(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext,
+    _In_ UCHAR                 SettingIndex
+    )
+{
+    WDF_USB_INTERFACE_SELECT_SETTING_PARAMS params;
+
+    WDF_USB_INTERFACE_SELECT_SETTING_PARAMS_INIT_SETTING(&params, SettingIndex);
+
+    return WdfUsbInterfaceSelectSetting(
+        DeviceContext->DataInterface, WDF_NO_OBJECT_ATTRIBUTES, &params);
+}
+
 NTSTATUS
 T2NcmUsbActivateDataInterface(
     _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
     )
 {
-    // Task 12 — implemented once NCM control-plane negotiation (Tasks
-    // 7-11, NcmProtocol.c) exists to gate this call. Left as an explicit
-    // not-implemented status rather than a silent stub so the Task 25
-    // diagnostic IOCTL reports real state, not a fabricated success.
-    UNREFERENCED_PARAMETER(DeviceContext);
-    return STATUS_NOT_IMPLEMENTED;
+    NTSTATUS status;
+    WDFUSBPIPE bulkIn = NULL;
+    WDFUSBPIPE bulkOut = NULL;
+
+    // Task 12: only reachable once NCM control-plane negotiation (Tasks
+    // 7-11) has already succeeded — callers (Device.c) are responsible
+    // for that ordering.
+    status = T2NcmUsbSelectDataAltSetting(DeviceContext, T2NCM_DATA_ALT_ACTIVE);
+    if (!NT_SUCCESS(status))
+    {
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+            "T2Ncm: MI_01 SelectSetting(alt %u) failed 0x%08X\n",
+            T2NCM_DATA_ALT_ACTIVE, status));
+        return status;
+    }
+
+    status = T2NcmFindPipeByDirectionAndType(
+        DeviceContext->DataInterface, T2NCM_DATA_ALT_ACTIVE,
+        WdfUsbPipeTypeBulk, TRUE, &bulkIn);
+    if (!NT_SUCCESS(status))
+    {
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+            "T2Ncm: MI_01 bulk IN pipe not found on alt %u: 0x%08X\n",
+            T2NCM_DATA_ALT_ACTIVE, status));
+        goto Unwind;
+    }
+
+    status = T2NcmFindPipeByDirectionAndType(
+        DeviceContext->DataInterface, T2NCM_DATA_ALT_ACTIVE,
+        WdfUsbPipeTypeBulk, FALSE, &bulkOut);
+    if (!NT_SUCCESS(status))
+    {
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+            "T2Ncm: MI_01 bulk OUT pipe not found on alt %u: 0x%08X\n",
+            T2NCM_DATA_ALT_ACTIVE, status));
+        goto Unwind;
+    }
+
+    // Cross-check against the reference revision's endpoint addresses —
+    // same "log, don't fail" discipline as the MI_00 interrupt pipe in
+    // T2NcmUsbPrepareHardware. Discovery above is authoritative.
+    {
+        WDF_USB_PIPE_INFORMATION info;
+
+        WDF_USB_PIPE_INFORMATION_INIT(&info);
+        WdfUsbTargetPipeGetInformation(bulkIn, &info);
+        if (info.EndpointAddress != T2NCM_EXPECTED_BULK_IN_EP)
+        {
+            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
+                "T2Ncm: MI_01 bulk IN EP is 0x%02X, not the 0x%02X seen on the "
+                "reference revision — continuing, discovery is authoritative\n",
+                info.EndpointAddress, T2NCM_EXPECTED_BULK_IN_EP));
+        }
+
+        WDF_USB_PIPE_INFORMATION_INIT(&info);
+        WdfUsbTargetPipeGetInformation(bulkOut, &info);
+        if (info.EndpointAddress != T2NCM_EXPECTED_BULK_OUT_EP)
+        {
+            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
+                "T2Ncm: MI_01 bulk OUT EP is 0x%02X, not the 0x%02X seen on the "
+                "reference revision — continuing, discovery is authoritative\n",
+                info.EndpointAddress, T2NCM_EXPECTED_BULK_OUT_EP));
+        }
+    }
+
+    DeviceContext->BulkInPipe = bulkIn;
+    DeviceContext->BulkOutPipe = bulkOut;
+
+    T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
+        "T2Ncm: MI_01 switched to alt %u, bulk IN/OUT pipes bound\n",
+        T2NCM_DATA_ALT_ACTIVE));
+
+    return STATUS_SUCCESS;
+
+Unwind:
+    // Leave MI_01 in a known state (idle alt 0) rather than stranded on
+    // alt 1 with pipes we failed to fully discover. If even the unwind
+    // fails, log it loudly — Task 22 requires the device context never
+    // hold a pipe handle we didn't validate, so BulkIn/OutPipe stay NULL
+    // either way.
+    {
+        NTSTATUS unwindStatus =
+            T2NcmUsbSelectDataAltSetting(DeviceContext, T2NCM_DATA_ALT_IDLE);
+        if (!NT_SUCCESS(unwindStatus))
+        {
+            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+                "T2Ncm: unwind to alt %u after failed activation ALSO failed "
+                "0x%08X — MI_01 alt-setting state is now unknown\n",
+                T2NCM_DATA_ALT_IDLE, unwindStatus));
+        }
+    }
+
+    DeviceContext->BulkInPipe = NULL;
+    DeviceContext->BulkOutPipe = NULL;
+
+    return status;
 }

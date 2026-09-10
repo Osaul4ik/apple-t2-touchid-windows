@@ -10,6 +10,7 @@
 
 #include "Device.h"
 #include "UsbTransport.h"
+#include "NcmProtocol.h"
 
 static const char* T2NcmStateName(T2NCM_LIFECYCLE_STATE s)
 {
@@ -221,12 +222,79 @@ T2NcmEvtDeviceD0Entry(
     UNREFERENCED_PARAMETER(PreviousState);
     PT2NCM_DEVICE_CONTEXT context = T2NcmGetDeviceContext(Device);
 
-    // Tasks 6-12 (USB config/pipes, NCM negotiation, alt-setting switch)
-    // and Task 18 (NDIS registration) plug in here in later passes; for
-    // this milestone we only advance to UsbReady so I/O-allowed checks
-    // and the diagnostic IOCTL (Task 25) have a real, honestly-reported
-    // state instead of a fabricated one.
+    // Task 18 (NDIS registration) plugs in here in a later pass; for
+    // this milestone D0Entry advances to UsbReady, then attempts the
+    // Tasks 7-12 NCM control-plane negotiation and MI_01 activation so
+    // I/O-allowed checks have a real, honestly-reported state instead
+    // of a fabricated one.
     (void)T2NcmTrySetState(context, T2NcmStatePrepared, T2NcmStateUsbReady);
+
+    if (T2NcmIsIoAllowed(context))
+    {
+        T2NCM_NTB_PARAMETERS ntbParams;
+        NTSTATUS ncmStatus;
+
+        // Tasks 7-12: negotiate the CDC-NCM control plane and switch
+        // MI_01 to its active alt setting. This re-runs on EVERY
+        // D0Entry — cold start and resume alike — rather than only
+        // once. These are all idempotent USB control transfers, so
+        // that's simpler and safer than trying to distinguish
+        // "first bring-up" from "resume" before Task 21's power
+        // orchestration exists. A resume-fast-path (skip
+        // renegotiation, verify liveness only — the same pattern
+        // T2TouchIdTransport's mailbox liveness check uses) is a
+        // Task 21 optimization, not a Task 7-12 correctness
+        // requirement.
+        //
+        // Failure here is NOT fatal to D0Entry: nothing downstream
+        // (NDIS registration, Task 18+) exists yet to depend on
+        // NcmReady, so this logs and stays at UsbReady rather than
+        // failing the whole PnP power-up and knocking the device out
+        // of Device Manager on a transient negotiation failure.
+        ncmStatus = T2NcmGetNtbParameters(context, &ntbParams);
+
+        if (NT_SUCCESS(ncmStatus))
+        {
+            ncmStatus = T2NcmNegotiateNtbFormat(context, &ntbParams);
+        }
+
+        if (NT_SUCCESS(ncmStatus))
+        {
+            ncmStatus = T2NcmSetNtbInputSize(context, &ntbParams);
+            if (NT_SUCCESS(ncmStatus))
+            {
+                context->NtbInMaxSize  = ntbParams.dwNtbInMaxSize;
+                context->NtbOutMaxSize = ntbParams.dwNtbOutMaxSize;
+            }
+        }
+
+        if (NT_SUCCESS(ncmStatus))
+        {
+            // Independent of NTB format negotiation, but required
+            // before declaring NcmReady since the eventual NDIS
+            // miniport (Task 18) needs a real permanent address —
+            // never a fabricated one.
+            ncmStatus = T2NcmReadMacAddress(context);
+        }
+
+        if (NT_SUCCESS(ncmStatus))
+        {
+            ncmStatus = T2NcmUsbActivateDataInterface(context);
+        }
+
+        if (NT_SUCCESS(ncmStatus))
+        {
+            (void)T2NcmTrySetState(context, T2NcmStateUsbReady, T2NcmStateNcmReady);
+            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
+                "T2Ncm: NCM control-plane negotiated, MI_01 active -> NcmReady\n"));
+        }
+        else
+        {
+            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
+                "T2Ncm: NCM negotiation incomplete (0x%08X) — staying at UsbReady\n",
+                ncmStatus));
+        }
+    }
 
     return STATUS_SUCCESS;
 }
