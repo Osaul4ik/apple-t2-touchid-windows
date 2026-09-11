@@ -13,6 +13,7 @@ EVT_WDF_DEVICE_SELF_MANAGED_IO_INIT      T2NcmEvtSelfManagedIoInit;
 EVT_WDF_DEVICE_SELF_MANAGED_IO_SUSPEND   T2NcmEvtSelfManagedIoSuspend;
 EVT_WDF_DEVICE_SELF_MANAGED_IO_RESTART   T2NcmEvtSelfManagedIoRestart;
 EVT_WDF_IO_QUEUE_IO_STOP                 T2NcmEvtIoStop;
+EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL       T2NcmEvtIoDeviceControl;
 
 // ----------------------------------------------------------------------
 // Explicit state-machine transition helper (Task 4 requirement: "all

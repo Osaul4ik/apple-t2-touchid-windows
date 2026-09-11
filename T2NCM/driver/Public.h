@@ -1,0 +1,66 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// public.h
+// Public IOCTL interface exposed by T2Ncm.sys — Task 25's diagnostic
+// milestone. Mirrors T2TouchIdTransport's public.h (same GUID pattern,
+// same METHOD_BUFFERED/inline-payload rationale). Deliberately read-only:
+// this is a status query, not a control surface — negotiation is driven
+// entirely by D0Entry (Device.c), never by a user-mode request, so there
+// is no equivalent of T2TouchIdTransport's IOCTL_T2_REGISTER_OOL here.
+//
+// Purpose (per docs/T2Ncm-Architecture.md sequencing note): let Tasks
+// 7-12 (NCM control-plane negotiation, MI_01 activation) be validated on
+// real hardware — real negotiated sizes, a real decoded MAC, a real
+// lifecycle state — before any RX/TX/NDIS wire code (Tasks 13+) is
+// written against them.
+
+#pragma once
+
+#include <initguid.h>
+
+// {32401F84-3D34-43AD-94B5-D0B8CF033DB0}
+DEFINE_GUID(GUID_DEVINTERFACE_T2NCM,
+    0x32401f84, 0x3d34, 0x43ad, 0x94, 0xb5, 0xd0, 0xb8, 0xcf, 0x03, 0x3d, 0xb0);
+
+// Mirrors T2NCM_LIFECYCLE_STATE (Driver.h) numerically so a user-mode
+// tool doesn't need the kernel header — but this enum is intentionally
+// declared separately (not shared) so a Driver.h reorder can never
+// silently change the wire values a released diagnostic tool depends on.
+typedef enum _T2NCM_WIRE_STATE
+{
+    T2NcmWireStateCreated = 0,
+    T2NcmWireStatePrepared,
+    T2NcmWireStateUsbReady,
+    T2NcmWireStateNcmReady,
+    T2NcmWireStateNdisRegistered,
+    T2NcmWireStateRunning,
+    T2NcmWireStateStopping,
+    T2NcmWireStateReleased,
+} T2NCM_WIRE_STATE;
+
+#pragma pack(push, 1)
+typedef struct _T2NCM_STATUS
+{
+    UINT32  LifecycleState;        // one of T2NCM_WIRE_STATE
+
+    // Tasks 7-11 (NcmProtocol.c) — all zero/FALSE until GET_NTB_PARAMETERS
+    // + SET_NTB_FORMAT(NTB16) + SET_NTB_INPUT_SIZE have all succeeded at
+    // least once. Never a guessed or default-filled value.
+    BOOLEAN Ntb16Supported;
+    UINT8   Reserved0[3];
+    UINT32  NtbInMaxSize;
+    UINT32  NtbOutMaxSize;
+
+    // Task 8 — FALSE until a real 12-hex-char iMACAddress string was
+    // decoded and passed the all-zero/all-FF sentinel check.
+    BOOLEAN MacAddressValid;
+    UINT8   MacAddress[6];         // meaningful only if MacAddressValid
+    UINT8   Reserved1;
+
+    // Task 12 — MI_01 switched to alt 1 and both bulk pipes discovered.
+    BOOLEAN DataInterfaceActive;
+    UINT8   Reserved2[3];
+} T2NCM_STATUS, *PT2NCM_STATUS;
+#pragma pack(pop)
+
+#define IOCTL_T2NCM_GET_STATUS \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x900, METHOD_BUFFERED, FILE_READ_ACCESS)

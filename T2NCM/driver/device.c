@@ -12,6 +12,12 @@
 #include "UsbTransport.h"
 #include "NcmProtocol.h"
 
+// Task 25: same posture as T2TouchIdTransport's public.h — restrict the
+// diagnostic device interface to Administrators/SYSTEM. This is a
+// read-only status query, not a control surface, but there's no reason
+// to expose even that to every logged-on user.
+DECLARE_CONST_UNICODE_STRING(g_T2NcmSddlDevObjSysAllAdmAll, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
+
 static const char* T2NcmStateName(T2NCM_LIFECYCLE_STATE s)
 {
     switch (s)
@@ -100,6 +106,18 @@ T2NcmEvtDeviceAdd(
     pnpPowerCallbacks.EvtDeviceSelfManagedIoRestart    = T2NcmEvtSelfManagedIoRestart;
     WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit, &pnpPowerCallbacks);
 
+    // Task 25: restrict the diagnostic device interface before
+    // WdfDeviceCreate consumes DeviceInit — WdfDeviceInitAssignSDDLString
+    // after WdfDeviceCreate passes a NULL DeviceInit and trips a WDF
+    // violation (same ordering requirement T2TouchIdTransport documents).
+    status = WdfDeviceInitAssignSDDLString(DeviceInit, &g_T2NcmSddlDevObjSysAllAdmAll);
+    if (!NT_SUCCESS(status))
+    {
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+            "T2Ncm: WdfDeviceInitAssignSDDLString failed 0x%08X\n", status));
+        return status;
+    }
+
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, T2NCM_DEVICE_CONTEXT);
 
     status = WdfDeviceCreate(&DeviceInit, &attributes, &device);
@@ -123,14 +141,29 @@ T2NcmEvtDeviceAdd(
         return status;
     }
 
+    // Task 25: device interface for the diagnostic status IOCTL. Created
+    // once here (not per-D0Entry) — WDF handles enabling/disabling it
+    // across PnP/power transitions on its own.
+    status = WdfDeviceCreateDeviceInterface(device, &GUID_DEVINTERFACE_T2NCM, NULL);
+    if (!NT_SUCCESS(status))
+    {
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+            "T2Ncm: WdfDeviceCreateDeviceInterface failed 0x%08X\n", status));
+        return status;
+    }
+
     // Task 4: default queue takes ownership of EvtIoStop so pending
     // requests are handled correctly across D0Exit/remove (Task 22).
+    // Task 25: same queue also dispatches IOCTL_T2NCM_GET_STATUS — it's
+    // a fast, synchronous, always-completes-immediately handler, so it
+    // doesn't need a queue of its own.
     {
         WDF_IO_QUEUE_CONFIG queueConfig;
         WDFQUEUE queue;
 
         WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&queueConfig, WdfIoQueueDispatchSequential);
         queueConfig.EvtIoStop = T2NcmEvtIoStop;
+        queueConfig.EvtIoDeviceControl = T2NcmEvtIoDeviceControl;
 
         status = WdfIoQueueCreate(device, &queueConfig, WDF_NO_OBJECT_ATTRIBUTES, &queue);
         if (!NT_SUCCESS(status))
@@ -373,5 +406,112 @@ T2NcmEvtIoStop(
     else if (ActionFlags & WdfRequestStopActionPurge)
     {
         WdfRequestCancelSentRequest(Request);
+    }
+}
+
+// ---------------------------------------------------------------------
+// Task 25: diagnostic status IOCTL. Reports exactly what the device
+// context currently holds — never a fabricated or "assumed" value.
+// Everything in T2NCM_STATUS defaults to zero/FALSE from
+// RtlZeroMemory(out, sizeof(*out)) and is only set to something else if
+// the corresponding real state exists (e.g. MacAddress is only filled
+// in when MacAddressValid is also set from the same read).
+// ---------------------------------------------------------------------
+static
+VOID
+T2NcmEvtIoDeviceControlGetStatus(
+    _In_ WDFREQUEST            Request,
+    _In_ PT2NCM_DEVICE_CONTEXT Context
+    )
+{
+    NTSTATUS status;
+    PT2NCM_STATUS out;
+    size_t outLen;
+    T2NCM_LIFECYCLE_STATE state;
+
+    status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*out), (PVOID*)&out, &outLen);
+    if (!NT_SUCCESS(status))
+    {
+        WdfRequestComplete(Request, status);
+        return;
+    }
+
+    // WdfRequestRetrieveOutputBuffer's success contract guarantees outLen
+    // >= the MinimumRequiredSize (sizeof(*out)) passed in above; the
+    // KMDF header's SAL doesn't express that tie, so /analyze can't
+    // derive it on its own — restated explicitly (same pattern
+    // T2TouchIdTransport's GetStatus handler uses).
+    _Analysis_assume_(outLen >= sizeof(*out));
+    RtlZeroMemory(out, sizeof(*out));
+
+    WdfSpinLockAcquire(Context->StateLock);
+    state = Context->State;
+    WdfSpinLockRelease(Context->StateLock);
+
+    // T2NCM_LIFECYCLE_STATE (Driver.h) and T2NCM_WIRE_STATE (public.h)
+    // are deliberately separate enums with matching values — assert the
+    // mapping stays in sync rather than silently drifting.
+    C_ASSERT((int)T2NcmStateCreated        == (int)T2NcmWireStateCreated);
+    C_ASSERT((int)T2NcmStatePrepared       == (int)T2NcmWireStatePrepared);
+    C_ASSERT((int)T2NcmStateUsbReady       == (int)T2NcmWireStateUsbReady);
+    C_ASSERT((int)T2NcmStateNcmReady       == (int)T2NcmWireStateNcmReady);
+    C_ASSERT((int)T2NcmStateNdisRegistered == (int)T2NcmWireStateNdisRegistered);
+    C_ASSERT((int)T2NcmStateRunning        == (int)T2NcmWireStateRunning);
+    C_ASSERT((int)T2NcmStateStopping       == (int)T2NcmWireStateStopping);
+    C_ASSERT((int)T2NcmStateReleased       == (int)T2NcmWireStateReleased);
+
+    out->LifecycleState = (UINT32)state;
+
+    // Tasks 7-11. Read without the state lock — these fields are only
+    // ever written from D0Entry on the PASSIVE_LEVEL power thread, and a
+    // torn read here is at worst one IOCTL reporting a value from just
+    // before/after a negotiation pass, never a fabricated one.
+    out->Ntb16Supported = Context->Ntb16Supported;
+    out->NtbInMaxSize   = Context->NtbInMaxSize;
+    out->NtbOutMaxSize  = Context->NtbOutMaxSize;
+
+    // Task 8.
+    out->MacAddressValid = Context->MacAddressValid;
+    if (Context->MacAddressValid)
+    {
+        RtlCopyMemory(out->MacAddress, Context->PermanentMacAddress, sizeof(out->MacAddress));
+    }
+
+    // Task 12 — both pipes are only ever non-NULL together (set together
+    // in T2NcmUsbActivateDataInterface, cleared together on its failure
+    // path and in T2NcmUsbReleaseHardware), so checking one is enough,
+    // but check both anyway: reporting DataInterfaceActive=TRUE from a
+    // half-set pair would itself be a fabricated status.
+    out->DataInterfaceActive =
+        (Context->BulkInPipe != NULL) && (Context->BulkOutPipe != NULL);
+
+    WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, sizeof(*out));
+}
+
+VOID
+T2NcmEvtIoDeviceControl(
+    _In_ WDFQUEUE   Queue,
+    _In_ WDFREQUEST Request,
+    _In_ size_t     OutputBufferLength,
+    _In_ size_t     InputBufferLength,
+    _In_ ULONG      IoControlCode
+    )
+{
+    PT2NCM_DEVICE_CONTEXT context = T2NcmGetDeviceContext(WdfIoQueueGetDevice(Queue));
+
+    UNREFERENCED_PARAMETER(OutputBufferLength);
+    UNREFERENCED_PARAMETER(InputBufferLength);
+
+    switch (IoControlCode)
+    {
+    case IOCTL_T2NCM_GET_STATUS:
+        T2NcmEvtIoDeviceControlGetStatus(Request, context);
+        break;
+
+    default:
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
+            "T2Ncm: unrecognized IOCTL 0x%08X\n", IoControlCode));
+        WdfRequestComplete(Request, STATUS_INVALID_DEVICE_REQUEST);
+        break;
     }
 }

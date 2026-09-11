@@ -98,6 +98,7 @@
     <ClInclude Include="NcmTx.h" />
     <ClInclude Include="NdisMiniport.h" />
     <ClInclude Include="Power.h" />
+    <ClInclude Include="public.h" />
   </ItemGroup>
   <ItemGroup>
     <!-- No <Inf> item here — same reason as T2TouchIdTransport.vcxproj:

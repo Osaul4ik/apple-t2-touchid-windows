@@ -7,8 +7,9 @@
 //
 // Module layout (Task 1/2):
 //   Driver.c        DriverEntry / WDF driver object
-//   Device.c        PnP/Power callbacks, lifecycle state machine (Task 4)
-//   UsbTransport.c  USB target/pipe/descriptor discovery (Tasks 5-6)
+//   Device.c        PnP/Power callbacks, lifecycle state machine (Task 4),
+//                    diagnostic IOCTL_T2NCM_GET_STATUS (Task 25, public.h)
+//   UsbTransport.c  USB target/pipe/descriptor discovery (Tasks 5-6, 12)
 //   NcmProtocol.c   NCM control-plane (GET_NTB_PARAMETERS, format neg.) (Tasks 7-11)
 //   NcmRx.c         NTB16 RX parser + bulk-IN engine (Tasks 14-15)
 //   NcmTx.c         NTB16 TX builder + bulk-OUT engine (Tasks 13,16)
@@ -24,6 +25,8 @@
 #include <usbdlib.h>
 #include <wdfusb.h>
 #include <ndis.h>
+
+#include "public.h"
 
 // ---- Logging ----
 // Reuses the T2TouchIdTransport convention (see driver/T2TouchIdTransport/driver.h):
