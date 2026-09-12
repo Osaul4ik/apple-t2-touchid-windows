@@ -48,11 +48,6 @@ C_ASSERT(sizeof(T2NCM_WIRE_NTB_PARAMETERS) == T2NCM_NTB_PARAM_WIRE_LENGTH);
 #define T2NCM_NTB_MIN_SANE_SIZE  2048u
 #define T2NCM_NTB_MAX_SANE_SIZE  65536u
 
-// CDC Ethernet Functional Descriptor (USB CDC 1.20 table 25).
-#define T2NCM_CS_INTERFACE_DESCRIPTOR_TYPE   0x24u
-#define T2NCM_ETHERNET_FUNCTIONAL_DESCRIPTOR 0x0Fu
-#define T2NCM_CONFIG_DESC_BUFFER_SIZE        512u
-
 // ---------------------------------------------------------------------
 // Task 9 helper: an NDP geometry triple (divisor/remainder/alignment) is
 // only meaningful if the divisor and alignment are non-zero powers of
@@ -322,155 +317,34 @@ T2NcmSetNtbInputSize(
 }
 
 // ---------------------------------------------------------------------
-// Task 8 helper: walk the configuration descriptor to find the CDC
-// Ethernet Functional Descriptor nested under MI_00 and return its
-// iMACAddress string index. Never guesses an index — returns
-// STATUS_NOT_FOUND / STATUS_DEVICE_PROTOCOL_ERROR if the descriptor
-// isn't exactly where the CDC spec says it must be.
+// HISTORICAL NOTE (Task 8, superseded — code removed, not just unused,
+// because this driver builds /W4 /WX and an unused static function is a
+// hard error here, not a warning to ignore):
 //
-// Deliberately does NOT use WdfUsbTargetDeviceRetrieveConfigDescriptor.
-// Real hardware showed that call returns a descriptor SCOPED to this
-// WDFUSBDEVICE's own PDO (MI_01) — the same "independent PDOs, no IAD"
-// finding that broke WdfUsbTargetDeviceGetInterface(1) earlier — so
-// MI_00's interface descriptor is simply not present in that buffer at
-// all (USBD_ParseConfigurationDescriptorEx correctly returns NULL for
-// it, every time). A raw standard GET_DESCRIPTOR(CONFIGURATION) request
-// sent directly over EP0 is a device-level USB operation, not a
-// PDO-scoped one — per the USB spec it always returns the COMPLETE
-// configuration descriptor set (every interface, including MI_00's),
-// regardless of which specific interface this driver instance is bound
-// to. This is the same "wIndex reaches MI_00 over the shared control
-// pipe" principle NcmProtocol.c's other class requests already rely on,
-// just using a standard (not class) request here.
+// The original approach walked the USB configuration descriptor looking
+// for the CDC Ethernet Functional Descriptor nested under MI_00, on the
+// theory that a raw standard GET_DESCRIPTOR(CONFIGURATION) is a
+// device-level USB operation that bypasses PDO scoping and always
+// returns every interface. Real hardware disproved that: usbccgp
+// filters/synthesizes the configuration descriptor per child PDO
+// regardless of whether the request is sent via
+// WdfUsbTargetDeviceRetrieveConfigDescriptor or a manually-built raw
+// control transfer. A WDFUSBDEVICE bound to MI_01 gets back a
+// descriptor buffer that simply does not contain MI_00's interface
+// descriptor or the CS_INTERFACE Ethernet Functional Descriptor nested
+// under it — USBD_ParseConfigurationDescriptorEx correctly returned
+// NULL for T2NCM_CONTROL_IFACE_NUM every time, producing exactly the
+// "MI_00 interface descriptor not found" error this approach hit in
+// practice. Unlike class requests addressed by
+// wIndex=T2NCM_CONTROL_IFACE_NUM (those DO reach MI_00's control logic,
+// because wIndex routing happens at the EP0/class-request layer, not
+// the config-descriptor-synthesis layer), this cannot work from an
+// MI_01-only binding, full stop.
+//
+// Replaced below by T2NcmScanForMacStringIndex, which sidesteps the
+// whole problem: it never touches the configuration descriptor at all,
+// only the (unfiltered) string table.
 // ---------------------------------------------------------------------
-static
-NTSTATUS
-T2NcmFindMacStringIndex(
-    _In_  PT2NCM_DEVICE_CONTEXT DeviceContext,
-    _Out_ UCHAR*                MacStringIndex
-    )
-{
-    NTSTATUS status;
-    UCHAR configBuffer[T2NCM_CONFIG_DESC_BUFFER_SIZE];
-    PUSB_CONFIGURATION_DESCRIPTOR configDesc = (PUSB_CONFIGURATION_DESCRIPTOR)configBuffer;
-    PUSB_INTERFACE_DESCRIPTOR ifaceDesc;
-    PUSB_COMMON_DESCRIPTOR walker;
-    PUCHAR bufferEnd;
-    WDF_USB_CONTROL_SETUP_PACKET setupPacket;
-    WDF_MEMORY_DESCRIPTOR memDesc;
-    ULONG bytesReturned = 0;
-
-    *MacStringIndex = 0;
-
-    RtlZeroMemory(configBuffer, sizeof(configBuffer));
-
-    // WDF_USB_CONTROL_SETUP_PACKET_INIT_GET_DESCRIPTOR doesn't exist in
-    // this KMDF version (1.15) — build the standard GET_DESCRIPTOR
-    // request manually with the same _INIT_STANDARD macro already used
-    // successfully elsewhere in this file (mirrors _INIT_CLASS's proven
-    // shape: Packet, Direction, Recipient, Request, Value, Index).
-    // wValue = (DescriptorType << 8) | Index per the USB spec's standard
-    // GET_DESCRIPTOR encoding.
-    WDF_USB_CONTROL_SETUP_PACKET_INIT_STANDARD(
-        &setupPacket,
-        BmRequestDeviceToHost,
-        BmRequestToDevice,
-        USB_REQUEST_GET_DESCRIPTOR,
-        (USHORT)((USB_CONFIGURATION_DESCRIPTOR_TYPE << 8) | 0), // index 0 — one configuration
-        0);     // wIndex/LanguageId is meaningless for a CONFIGURATION descriptor
-
-    WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&memDesc, configBuffer, (ULONG)sizeof(configBuffer));
-
-    status = WdfUsbTargetDeviceSendControlTransferSynchronously(
-        DeviceContext->UsbDevice,
-        WDF_NO_HANDLE,
-        NULL,
-        &setupPacket,
-        &memDesc,
-        &bytesReturned);
-
-    if (!NT_SUCCESS(status))
-    {
-        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2Ncm: raw GET_DESCRIPTOR(CONFIGURATION) failed 0x%08X\n", status));
-        return status;
-    }
-
-    if (bytesReturned < (ULONG)sizeof(USB_CONFIGURATION_DESCRIPTOR))
-    {
-        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2Ncm: GET_DESCRIPTOR(CONFIGURATION) returned only %u bytes, "
-            "too small to even hold the configuration header\n", bytesReturned));
-        return STATUS_DEVICE_PROTOCOL_ERROR;
-    }
-
-    if (configDesc->wTotalLength > bytesReturned)
-    {
-        // The device says its full configuration descriptor is bigger
-        // than what fit in our fixed buffer. Not expected for this
-        // simple 2-interface device — fail loudly rather than parse a
-        // silently truncated descriptor.
-        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2Ncm: configuration descriptor wTotalLength=%u exceeds our "
-            "%u-byte buffer (got %u bytes) — never silently truncated\n",
-            configDesc->wTotalLength, (ULONG)sizeof(configBuffer), bytesReturned));
-        return STATUS_DEVICE_PROTOCOL_ERROR;
-    }
-
-    // Bound the walk to what the device itself says is the real
-    // descriptor length, not just how many bytes the control transfer
-    // happened to return (which can legitimately be less than the
-    // buffer size but must not be trusted beyond wTotalLength either).
-    bufferEnd = configBuffer + configDesc->wTotalLength;
-
-    ifaceDesc = (PUSB_INTERFACE_DESCRIPTOR)USBD_ParseConfigurationDescriptorEx(
-        configDesc, configDesc,
-        T2NCM_CONTROL_IFACE_NUM, 0, -1, -1, -1);
-
-    if (ifaceDesc == NULL)
-    {
-        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2Ncm: MI_00 interface descriptor not found in config descriptor\n"));
-        return STATUS_DEVICE_PROTOCOL_ERROR;
-    }
-
-    walker = (PUSB_COMMON_DESCRIPTOR)((PUCHAR)ifaceDesc + ifaceDesc->bLength);
-
-    while ((PUCHAR)walker + sizeof(USB_COMMON_DESCRIPTOR) <= bufferEnd)
-    {
-        if (walker->bLength == 0 || (PUCHAR)walker + walker->bLength > bufferEnd)
-        {
-            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-                "T2Ncm: malformed descriptor chain searching for the Ethernet "
-                "Functional Descriptor\n"));
-            return STATUS_DEVICE_PROTOCOL_ERROR;
-        }
-
-        // A standard INTERFACE descriptor ends MI_00's own functional
-        // block — stop before reading into MI_01's descriptors.
-        if (walker->bDescriptorType == USB_INTERFACE_DESCRIPTOR_TYPE)
-        {
-            break;
-        }
-
-        if (walker->bDescriptorType == T2NCM_CS_INTERFACE_DESCRIPTOR_TYPE &&
-            walker->bLength >= 4)
-        {
-            PUCHAR raw = (PUCHAR)walker;
-            if (raw[2] == T2NCM_ETHERNET_FUNCTIONAL_DESCRIPTOR)
-            {
-                *MacStringIndex = raw[3];
-                return STATUS_SUCCESS;
-            }
-        }
-
-        walker = (PUSB_COMMON_DESCRIPTOR)((PUCHAR)walker + walker->bLength);
-    }
-
-    T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-        "T2Ncm: Ethernet Functional Descriptor not found under MI_00\n"));
-    return STATUS_NOT_FOUND;
-}
 
 static
 BOOLEAN
@@ -490,6 +364,145 @@ T2NcmHexNibble(
 // needed.
 #define T2NCM_MAC_STRING_CHARS 12u
 
+// ---------------------------------------------------------------------
+// Variant 1 fix: T2NcmFindMacStringIndex (above) cannot work from an
+// MI_01-only binding — MI_00's slice of the configuration descriptor is
+// invisible to this WDFUSBDEVICE, full stop (see its comment). This is
+// the actual replacement path.
+//
+// GET_DESCRIPTOR(STRING, index, langId) is NOT scoped by usbccgp the
+// way GET_DESCRIPTOR(CONFIGURATION) is — a child PDO's string requests
+// are answered straight from the device's own flat string table, since
+// usbccgp has no per-function string list to synthesize (strings aren't
+// tied to any one interface the way configuration-descriptor bytes
+// are). So instead of reading iMACAddress out of the (invisible)
+// Ethernet Functional Descriptor, this scans the string table directly,
+// index by index, and accepts the string whose content has exactly the
+// CDC MAC-address shape: 12 hex digits. iManufacturer/iProduct/
+// iSerialNumber are excluded up front (pulled from the cached Device
+// Descriptor — WdfUsbTargetDeviceGetDeviceDescriptor is a no-I/O cache
+// read, not a request) so a hex-looking serial number could never be
+// mistaken for the MAC.
+//
+// If more than one remaining string matches the shape, that is
+// AMBIGUOUS and this fails closed (STATUS_DEVICE_PROTOCOL_ERROR) rather
+// than pick one — Task 8's "never invent a MAC" rule covers "never
+// guess among several candidates" too. A missing index is an expected,
+// silent skip during the scan (the device NAKs/stalls it) — only the
+// summary after the full scan is logged, not each probe.
+// ---------------------------------------------------------------------
+#define T2NCM_MAC_SCAN_MIN_INDEX   1u
+#define T2NCM_MAC_SCAN_MAX_INDEX   32u  // generous; a real T2 has a handful of strings
+
+static
+NTSTATUS
+T2NcmScanForMacStringIndex(
+    _In_  PT2NCM_DEVICE_CONTEXT DeviceContext,
+    _Out_ UCHAR*                MacStringIndex
+    )
+{
+    USB_DEVICE_DESCRIPTOR deviceDesc;
+    UCHAR excludeManufacturer, excludeProduct, excludeSerial;
+    UCHAR candidateIndex = 0;
+    ULONG matchCount = 0;
+    UCHAR idx;
+
+    *MacStringIndex = 0;
+    RtlZeroMemory(&deviceDesc, sizeof(deviceDesc));
+
+    // Cached by WDF at device creation — synchronous, no bus I/O, cannot
+    // fail the way a real control transfer can.
+    WdfUsbTargetDeviceGetDeviceDescriptor(DeviceContext->UsbDevice, &deviceDesc);
+
+    excludeManufacturer = deviceDesc.iManufacturer;
+    excludeProduct      = deviceDesc.iProduct;
+    excludeSerial       = deviceDesc.iSerialNumber;
+
+    for (idx = T2NCM_MAC_SCAN_MIN_INDEX; idx <= T2NCM_MAC_SCAN_MAX_INDEX; idx++)
+    {
+        NTSTATUS status;
+        USHORT numChars;
+        WCHAR chars[T2NCM_MAC_STRING_CHARS];
+        UCHAR i;
+        BOOLEAN allHex;
+
+        if ((excludeManufacturer != 0 && idx == excludeManufacturer) ||
+            (excludeProduct      != 0 && idx == excludeProduct)      ||
+            (excludeSerial       != 0 && idx == excludeSerial))
+        {
+            continue;
+        }
+
+        // Length-probe call (String == NULL). A non-existent index
+        // fails here (the device stalls/NAKs it) — that is a routine,
+        // expected outcome of scanning, not something to log per index.
+        numChars = 0;
+        status = WdfUsbTargetDeviceQueryString(
+            DeviceContext->UsbDevice, NULL, NULL, NULL, &numChars, idx, 0);
+        if (!NT_SUCCESS(status) || numChars != T2NCM_MAC_STRING_CHARS)
+        {
+            continue;
+        }
+
+        RtlZeroMemory(chars, sizeof(chars));
+        numChars = T2NCM_MAC_STRING_CHARS;
+        status = WdfUsbTargetDeviceQueryString(
+            DeviceContext->UsbDevice, NULL, NULL, (PUSHORT)chars, &numChars, idx, 0);
+        if (!NT_SUCCESS(status) || numChars != T2NCM_MAC_STRING_CHARS)
+        {
+            continue;
+        }
+
+        allHex = TRUE;
+        for (i = 0; i < T2NCM_MAC_STRING_CHARS; i++)
+        {
+            UCHAR nibble;
+            if (!T2NcmHexNibble(chars[i], &nibble))
+            {
+                allHex = FALSE;
+                break;
+            }
+        }
+
+        if (!allHex)
+        {
+            continue;
+        }
+
+        matchCount++;
+        candidateIndex = idx;
+
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
+            "T2Ncm: string index %u has MAC-address shape (12 hex chars) — "
+            "candidate #%lu\n", idx, matchCount));
+    }
+
+    if (matchCount == 0)
+    {
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+            "T2Ncm: no string descriptor in indices %u..%u matched the "
+            "MAC-address shape (12 hex chars)\n",
+            T2NCM_MAC_SCAN_MIN_INDEX, T2NCM_MAC_SCAN_MAX_INDEX));
+        return STATUS_NOT_FOUND;
+    }
+
+    if (matchCount > 1)
+    {
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+            "T2Ncm: %lu string descriptors matched the MAC-address shape — "
+            "ambiguous, refusing to guess which one is real\n", matchCount));
+        return STATUS_DEVICE_PROTOCOL_ERROR;
+    }
+
+    *MacStringIndex = candidateIndex;
+
+    T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
+        "T2Ncm: MAC address string found unambiguously at index %u\n",
+        candidateIndex));
+
+    return STATUS_SUCCESS;
+}
+
 NTSTATUS
 T2NcmReadMacAddress(
     _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
@@ -506,7 +519,10 @@ T2NcmReadMacAddress(
     // Task 8: must fail explicitly, never fabricate a MAC.
     DeviceContext->MacAddressValid = FALSE;
 
-    status = T2NcmFindMacStringIndex(DeviceContext, &macStringIndex);
+    // Variant 1: T2NcmFindMacStringIndex (config-descriptor walk) cannot
+    // see MI_00 from here — T2NcmScanForMacStringIndex (string-table
+    // scan) is the one that actually works from an MI_01-only binding.
+    status = T2NcmScanForMacStringIndex(DeviceContext, &macStringIndex);
     if (!NT_SUCCESS(status))
     {
         return status;
@@ -514,8 +530,12 @@ T2NcmReadMacAddress(
 
     if (macStringIndex == 0)
     {
+        // Not reachable in practice — T2NcmScanForMacStringIndex only
+        // ever returns STATUS_SUCCESS with an index from its scan range
+        // (>= T2NCM_MAC_SCAN_MIN_INDEX), never 0. Kept as a defensive
+        // check rather than trusted implicitly.
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2Ncm: Ethernet Functional Descriptor has iMACAddress == 0 (no string)\n"));
+            "T2Ncm: MAC string index resolved to 0 — treating as absent\n"));
         return STATUS_DEVICE_PROTOCOL_ERROR;
     }
 

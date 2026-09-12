@@ -323,11 +323,25 @@ T2NcmEvtDeviceD0Entry(
 
         if (NT_SUCCESS(ncmStatus))
         {
-            // Independent of NTB format negotiation, but required
-            // before declaring NcmReady since the eventual NDIS
-            // miniport (Task 18) needs a real permanent address —
-            // never a fabricated one.
-            ncmStatus = T2NcmReadMacAddress(context);
+            // T2NcmReadMacAddress now discovers the MAC via a string-
+            // table scan (T2NcmScanForMacStringIndex in NcmProtocol.c),
+            // which works from an MI_01-only binding — expected to
+            // succeed on every real T2 unit. Still deliberately NOT
+            // gating NcmReady on it: a firmware/revision variant whose
+            // string table doesn't contain exactly one 12-hex-char
+            // string would otherwise take the whole data path down with
+            // it for what is, at worst, a missing permanent address.
+            // MacAddressValid stays FALSE on failure — the honest,
+            // "never fabricate a MAC" result this driver has always
+            // required.
+            NTSTATUS macStatus = T2NcmReadMacAddress(context);
+            if (!NT_SUCCESS(macStatus))
+            {
+                T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
+                    "T2Ncm: permanent MAC address discovery failed (0x%08X) — "
+                    "unexpected on known-good hardware; continuing without "
+                    "one\n", macStatus));
+            }
         }
 
         if (NT_SUCCESS(ncmStatus))
