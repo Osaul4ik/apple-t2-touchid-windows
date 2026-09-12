@@ -364,12 +364,20 @@ T2NcmFindMacStringIndex(
 
     RtlZeroMemory(configBuffer, sizeof(configBuffer));
 
-    WDF_USB_CONTROL_SETUP_PACKET_INIT_GET_DESCRIPTOR(
+    // WDF_USB_CONTROL_SETUP_PACKET_INIT_GET_DESCRIPTOR doesn't exist in
+    // this KMDF version (1.15) — build the standard GET_DESCRIPTOR
+    // request manually with the same _INIT_STANDARD macro already used
+    // successfully elsewhere in this file (mirrors _INIT_CLASS's proven
+    // shape: Packet, Direction, Recipient, Request, Value, Index).
+    // wValue = (DescriptorType << 8) | Index per the USB spec's standard
+    // GET_DESCRIPTOR encoding.
+    WDF_USB_CONTROL_SETUP_PACKET_INIT_STANDARD(
         &setupPacket,
+        BmRequestDeviceToHost,
         BmRequestToDevice,
-        USB_CONFIGURATION_DESCRIPTOR_TYPE,
-        0,      // descriptor index 0 — this device has exactly one configuration
-        0);     // LanguageId is meaningless for a CONFIGURATION descriptor
+        USB_REQUEST_GET_DESCRIPTOR,
+        (USHORT)((USB_CONFIGURATION_DESCRIPTOR_TYPE << 8) | 0), // index 0 — one configuration
+        0);     // wIndex/LanguageId is meaningless for a CONFIGURATION descriptor
 
     WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&memDesc, configBuffer, (ULONG)sizeof(configBuffer));
 
