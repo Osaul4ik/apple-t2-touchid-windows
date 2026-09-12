@@ -61,7 +61,6 @@ T2NcmUsbPrepareHardware(
     NTSTATUS status;
     WDF_USB_DEVICE_CREATE_CONFIG createConfig;
     WDF_USB_DEVICE_SELECT_CONFIG_PARAMS configParams;
-    WDFUSBPIPE pipe;
 
     WDF_USB_DEVICE_CREATE_CONFIG_INIT(&createConfig, USBD_CLIENT_CONTRACT_VERSION_602);
 
@@ -78,47 +77,15 @@ T2NcmUsbPrepareHardware(
         return status;
     }
 
-    // Task 6: select configuration 1 with BOTH interfaces (MI_00 default
-    // setting, MI_01 explicitly on alt 0 — "idle" — until NCM negotiation
-    // completes and Task 12 switches it to alt 1). Do NOT assume a
-    // pre-existing UsbNcm configuration is already selected.
-    //
-    // WDF_USB_INTERFACE_SETTING_PAIR.UsbInterface is an INPUT for the
-    // multi-interface case, not an output WDF fills in — it identifies
-    // WHICH already-enumerated interface each SettingIndex applies to.
-    // WdfUsbTargetDeviceGetInterface works immediately after
-    // WdfUsbTargetDeviceCreateWithParameters (USBD parses the config
-    // descriptor's interface list right there, independent of any
-    // config being "selected" yet), so fetch both handles first. Leaving
-    // this NULL — even zero-initialized NULL, not just stack garbage —
-    // is just as much an invalid parameter to WdfUsbTargetDeviceSelectConfig
-    // and was the real cause of the 0xC000000D failure, not the
-    // uninitialized-memory issue fixed earlier (that was real too, just
-    // not the whole story).
-    WDFUSBINTERFACE controlInterfaceHandle =
-        WdfUsbTargetDeviceGetInterface(DeviceContext->UsbDevice, T2NCM_CONTROL_IFACE_NUM);
-    WDFUSBINTERFACE dataInterfaceHandle =
-        WdfUsbTargetDeviceGetInterface(DeviceContext->UsbDevice, T2NCM_DATA_IFACE_NUM);
-
-    if (controlInterfaceHandle == NULL || dataInterfaceHandle == NULL)
-    {
-        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2Ncm: WdfUsbTargetDeviceGetInterface returned NULL "
-            "(MI_00=%p, MI_01=%p) — config descriptor doesn't have the "
-            "2 interfaces this driver expects\n",
-            controlInterfaceHandle, dataInterfaceHandle));
-        return STATUS_DEVICE_CONFIGURATION_ERROR;
-    }
-
-    WDF_USB_INTERFACE_SETTING_PAIR settingPairs[2];
-    RtlZeroMemory(settingPairs, sizeof(settingPairs));
-    settingPairs[0].UsbInterface = controlInterfaceHandle;
-    settingPairs[0].SettingIndex = 0; // MI_00 has only one setting
-    settingPairs[1].UsbInterface = dataInterfaceHandle;
-    settingPairs[1].SettingIndex = T2NCM_DATA_ALT_IDLE;
-
-    WDF_USB_DEVICE_SELECT_CONFIG_PARAMS_INIT_MULTIPLE_INTERFACES(
-        &configParams, 2, settingPairs);
+    // Variant 1 (see Driver.h top comment): real hardware showed MI_00
+    // and MI_01 are two INDEPENDENT PDOs, not one IAD-grouped function —
+    // WdfUsbTargetDeviceGetInterface(UsbDevice, 1) came back NULL from a
+    // WDFUSBDEVICE created against MI_00's PDO. This driver instance now
+    // binds directly to MI_01's own PDO, which exposes exactly ONE
+    // interface to itself — a plain single-interface select-config is
+    // all that's needed, no WDF_USB_INTERFACE_SETTING_PAIR array, no
+    // pre-fetched interface handles.
+    WDF_USB_DEVICE_SELECT_CONFIG_PARAMS_INIT_SINGLE_INTERFACE(&configParams);
 
     status = WdfUsbTargetDeviceSelectConfig(
         DeviceContext->UsbDevice, WDF_NO_OBJECT_ATTRIBUTES, &configParams);
@@ -130,48 +97,76 @@ T2NcmUsbPrepareHardware(
         return status;
     }
 
-    // Task 6: on success, settingPairs[i].UsbInterface is the same
-    // controlInterfaceHandle/dataInterfaceHandle we already validated
-    // non-NULL above and passed in — WdfUsbTargetDeviceSelectConfig
-    // doesn't replace it with something else, it just applies
-    // SettingIndex to that interface. Assign straight from the handles
-    // we already confirmed rather than re-reading through the Pairs
-    // array as if they were an output we hadn't seen yet.
-    DeviceContext->ControlInterface = controlInterfaceHandle;
-    DeviceContext->DataInterface    = dataInterfaceHandle;
+    // Index 0 here means "this PDO's own, only interface" (WDF's
+    // interface array is scoped to what this specific WDFUSBDEVICE
+    // exposes, not the composite device's full interface list) — it
+    // resolves to MI_01 regardless of MI_01's real bInterfaceNumber (1).
+    DeviceContext->DataInterface = WdfUsbTargetDeviceGetInterface(DeviceContext->UsbDevice, 0);
 
-    // Task 5: discover the interrupt IN pipe on MI_00 dynamically. MI_00
-    // has only one setting (0), already made current by the
-    // WdfUsbTargetDeviceSelectConfig call above.
-    status = T2NcmFindPipeByDirectionAndType(
-        DeviceContext->ControlInterface, WdfUsbPipeTypeInterrupt, TRUE, &pipe);
+    if (DeviceContext->DataInterface == NULL)
+    {
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+            "T2Ncm: WdfUsbTargetDeviceGetInterface(0) returned NULL after a "
+            "successful SelectConfig — should not happen\n"));
+        return STATUS_DEVICE_CONFIGURATION_ERROR;
+    }
+
+    // Alt 0 has zero endpoints by design (idle state) — bulk pipes are
+    // only enumerated after Task 12 switches to alt 1. Control-plane
+    // requests to MI_00 (GET_NTB_PARAMETERS etc., NcmProtocol.c) go over
+    // this same UsbDevice's shared control endpoint (EP0), addressed by
+    // wIndex=T2NCM_CONTROL_IFACE_NUM — that's a device-level resource,
+    // not an interface-level one, so it doesn't require owning MI_00's
+    // own interface object (which this driver instance never has).
+    T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
+        "T2Ncm: USB configuration selected, MI_01 interface bound "
+        "(control-plane reaches MI_00 via shared EP0)\n"));
+
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS
+T2NcmUsbPrepareHardwareStub(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
+    )
+{
+    NTSTATUS status;
+    WDF_USB_DEVICE_CREATE_CONFIG createConfig;
+    WDF_USB_DEVICE_SELECT_CONFIG_PARAMS configParams;
+
+    WDF_USB_DEVICE_CREATE_CONFIG_INIT(&createConfig, USBD_CLIENT_CONTRACT_VERSION_602);
+
+    status = WdfUsbTargetDeviceCreateWithParameters(
+        DeviceContext->WdfDevice,
+        &createConfig,
+        WDF_NO_OBJECT_ATTRIBUTES,
+        &DeviceContext->UsbDevice);
+
     if (!NT_SUCCESS(status))
     {
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2Ncm: MI_00 interrupt IN pipe not found: 0x%08X\n", status));
+            "T2Ncm(stub): WdfUsbTargetDeviceCreateWithParameters failed 0x%08X\n", status));
         return status;
     }
-    DeviceContext->InterruptInPipe = pipe;
 
+    // MI_00 has exactly one interface, one alt setting — claim it and
+    // stop. No pipe discovery, no control-plane use: this instance exists
+    // solely so MI_00 has a working driver bound to it.
+    WDF_USB_DEVICE_SELECT_CONFIG_PARAMS_INIT_SINGLE_INTERFACE(&configParams);
+
+    status = WdfUsbTargetDeviceSelectConfig(
+        DeviceContext->UsbDevice, WDF_NO_OBJECT_ATTRIBUTES, &configParams);
+
+    if (!NT_SUCCESS(status))
     {
-        WDF_USB_PIPE_INFORMATION info;
-        WDF_USB_PIPE_INFORMATION_INIT(&info);
-        WdfUsbTargetPipeGetInformation(pipe, &info);
-        if (info.EndpointAddress != T2NCM_EXPECTED_INT_IN_EP)
-        {
-            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
-                "T2Ncm: MI_00 interrupt EP is 0x%02X, not the 0x%02X seen on the "
-                "reference revision — continuing, discovery is authoritative\n",
-                info.EndpointAddress, T2NCM_EXPECTED_INT_IN_EP));
-        }
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+            "T2Ncm(stub): WdfUsbTargetDeviceSelectConfig failed 0x%08X\n", status));
+        return status;
     }
 
-    // MI_01 alt 0 has zero endpoints by design (idle state) — bulk pipes
-    // are only enumerated after Task 12 switches to alt 1. Nothing more
-    // to discover here yet.
-
     T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
-        "T2Ncm: USB configuration selected, MI_00/MI_01 interfaces bound\n"));
+        "T2Ncm(stub): MI_00 claimed and idle — NCM function lives on the "
+        "MI_01 instance\n"));
 
     return STATUS_SUCCESS;
 }
@@ -185,11 +180,9 @@ T2NcmUsbReleaseHardware(
     // WdfDevice and are torn down by the framework on device removal;
     // this function exists as the single place that clears the cached
     // handles so no later callback can dereference a stale pipe object
-    // (Task 22).
-    DeviceContext->InterruptInPipe = NULL;
+    // (Task 22). Harmless no-op for fields the stub role never set.
     DeviceContext->BulkInPipe = NULL;
     DeviceContext->BulkOutPipe = NULL;
-    DeviceContext->ControlInterface = NULL;
     DeviceContext->DataInterface = NULL;
     DeviceContext->UsbDevice = NULL;
 }

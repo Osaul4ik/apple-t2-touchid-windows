@@ -1,0 +1,118 @@
+; ============================================================================
+; apple-t2-ncm-ctrl-stub.inf  ("Variant 1" stub half)
+;
+; Minimal stub binding for MI_00 (Apple T2 NCM Control interface). Ships
+; the SAME T2Ncm.sys binary as apple-t2-ncm.inf (which binds MI_01, the
+; real NCM function), but registers it under a DIFFERENT service name
+; ("T2NcmCtrlStub" vs "T2Ncm"). T2Ncm.sys's DriverEntry reads its own
+; RegistryPath to tell which service — and therefore which role — it was
+; loaded as (see Driver.c/g_T2NcmStubRole).
+;
+; Why this exists: real hardware showed MI_00 and MI_01 enumerate as two
+; INDEPENDENT PDOs under usbccgp (no IAD grouping them), so the driver
+; bound to MI_01 cannot reach MI_00's interface object at all. Without
+; SOME driver claiming MI_00, Device Manager shows it as an unclaimed
+; device (Code 28/31, yellow bang) and — more importantly — an
+; un-power-managed PDO can interfere with system sleep. This stub does
+; nothing but claim the PDO and handle PnP/power cleanly (D0Entry/D0Exit
+; both return STATUS_SUCCESS immediately, no blocking, no I/O), so
+; Windows treats MI_00 as a normal, working, sleep-friendly device.
+;
+; Deliberately Class=System, not Net — this is not a network adapter and
+; must not register an NDIS miniport or appear as a NIC. (Class is a
+; whole-INF directive, which is exactly why this is a separate file from
+; apple-t2-ncm.inf rather than a second model section in it.)
+;
+; IMPORTANT:
+;   - Matches ONLY:
+;       USB\VID_05AC&PID_8233&REV_0201&MI_00
+;       USB\VID_05AC&PID_8233&MI_00
+;   - Does NOT match the composite parent (USB\VID_05AC&PID_8233).
+;   - Does NOT match MI_01 (USB\VID_05AC&PID_8233&MI_01) — that's
+;     apple-t2-ncm.inf's job.
+;   - No NDI/AddReg section, no *IfType etc. — not a network device.
+;
+; ============================================================================
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGUID   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %ManufacturerName%
+DriverVer   = 09/01/2026,2.0.0.0
+CatalogFile = apple-t2-ncm-ctrl-stub.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir           = 12
+T2NcmCtrlStub.CopyDriverFiles = 12
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+T2Ncm.sys = 1
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTamd64
+
+[Standard.NTamd64]
+
+; Prefer the exact revision-specific hardware ID.
+%AppleT2NcmCtrlStub.DeviceDesc% = AppleT2NcmCtrlStub_Install, USB\VID_05AC&PID_8233&REV_0201&MI_00
+
+; Also support the same T2 NCM control interface without the revision
+; component in the hardware ID.
+%AppleT2NcmCtrlStub.DeviceDesc% = AppleT2NcmCtrlStub_Install, USB\VID_05AC&PID_8233&MI_00
+
+
+; ============================================================================
+; Stub device installation — no NDI section, this is not a NIC.
+; ============================================================================
+
+[AppleT2NcmCtrlStub_Install]
+CopyFiles = T2NcmCtrlStub.CopyDriverFiles
+
+[T2NcmCtrlStub.CopyDriverFiles]
+T2Ncm.sys
+
+
+; ============================================================================
+; T2NcmCtrlStub service — SAME T2Ncm.sys binary as apple-t2-ncm.inf,
+; different service name. This is what lets one .sys tell the two roles
+; apart via RegistryPath in DriverEntry.
+; ============================================================================
+
+[AppleT2NcmCtrlStub_Install.Services]
+AddService = T2NcmCtrlStub, %SPSVCINST_ASSOCSERVICE%, T2NcmCtrlStub_Service_Inst
+
+[T2NcmCtrlStub_Service_Inst]
+DisplayName   = %T2NcmCtrlStub.SVCDESC%
+ServiceType   = 1               ; SERVICE_KERNEL_DRIVER
+StartType     = 3               ; SERVICE_DEMAND_START
+ErrorControl  = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary = %12%\T2Ncm.sys
+
+[AppleT2NcmCtrlStub_Install.Wdf]
+KmdfService = T2NcmCtrlStub, T2NcmCtrlStub_wdfsect
+
+[T2NcmCtrlStub_wdfsect]
+; Must track T2Ncm.vcxproj's KMDF_VERSION_MAJOR/MINOR (currently 1.15,
+; pinned for Windows 10 compatibility — see that file's comment). Same
+; binary as apple-t2-ncm.inf, so this must always match that file's
+; T2Ncm_wdfsect value.
+KmdfLibraryVersion = 1.15
+
+
+; ============================================================================
+; Strings
+; ============================================================================
+
+[Strings]
+ManufacturerName            = "Osaul4ik"
+DiskName                    = "Apple T2 USB NCM Driver Package"
+
+AppleT2NcmCtrlStub.DeviceDesc = "Apple T2 USB NCM Control Interface"
+
+T2NcmCtrlStub.SVCDESC        = "Apple T2 NCM Control (stub)"
+SPSVCINST_ASSOCSERVICE       = 0x00000002

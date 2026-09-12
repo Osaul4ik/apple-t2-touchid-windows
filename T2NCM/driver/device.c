@@ -126,28 +126,26 @@ T2NcmEvtDeviceAdd(
         return status;
     }
 
-    // Task 25: device interface for the diagnostic status IOCTL. Created
-    // once here (not per-D0Entry) — WDF handles enabling/disabling it
-    // across PnP/power transitions on its own. Uses WDF's default
-    // security descriptor (no custom SDDL) — a hand-rolled SDDL string
-    // here previously broke device bring-up entirely (Code 31 /
-    // STATUS_INVALID_SECURITY_DESCR on both MI_00 and MI_01) for a
-    // reason not yet root-caused; not worth re-attempting for a
-    // read-only diagnostic query until it can be tested in isolation.
-    status = WdfDeviceCreateDeviceInterface(device, &GUID_DEVINTERFACE_T2NCM, NULL);
-    if (!NT_SUCCESS(status))
+    // Task 25: device interface for the diagnostic status IOCTL — full
+    // (MI_01) role only. The stub role never negotiates anything worth
+    // reporting, so it doesn't get this surface at all.
+    if (!g_T2NcmStubRole)
     {
-        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2Ncm: WdfDeviceCreateDeviceInterface failed 0x%08X\n", status));
-        return status;
-    }
+        status = WdfDeviceCreateDeviceInterface(device, &GUID_DEVINTERFACE_T2NCM, NULL);
+        if (!NT_SUCCESS(status))
+        {
+            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+                "T2Ncm: WdfDeviceCreateDeviceInterface failed 0x%08X\n", status));
+            return status;
+        }
 
-    // Task 4: default queue takes ownership of EvtIoStop so pending
-    // requests are handled correctly across D0Exit/remove (Task 22).
-    // Task 25: same queue also dispatches IOCTL_T2NCM_GET_STATUS — it's
-    // a fast, synchronous, always-completes-immediately handler, so it
-    // doesn't need a queue of its own.
-    {
+        // Task 4: default queue takes ownership of EvtIoStop so pending
+        // requests are handled correctly across D0Exit/remove (Task 22).
+        // Task 25: same queue also dispatches IOCTL_T2NCM_GET_STATUS —
+        // it's a fast, synchronous, always-completes-immediately handler,
+        // so it doesn't need a queue of its own. The stub role never
+        // receives application-initiated requests at all, so it doesn't
+        // need a custom queue — WDF's built-in default handling is fine.
         WDF_IO_QUEUE_CONFIG queueConfig;
         WDFQUEUE queue;
 
@@ -165,7 +163,7 @@ T2NcmEvtDeviceAdd(
     }
 
     T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
-        "T2Ncm: EvtDeviceAdd OK\n"));
+        "T2Ncm: EvtDeviceAdd OK (role=%s)\n", g_T2NcmStubRole ? "stub" : "full"));
 
     return STATUS_SUCCESS;
 }
@@ -184,16 +182,20 @@ T2NcmEvtDevicePrepareHardware(
     PT2NCM_DEVICE_CONTEXT context = T2NcmGetDeviceContext(Device);
 
     T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_TRACE_LEVEL,
-        "T2Ncm: EvtDevicePrepareHardware entered\n"));
+        "T2Ncm: EvtDevicePrepareHardware entered (role=%s)\n",
+        g_T2NcmStubRole ? "stub" : "full"));
 
-    // Task 6: create the WDFUSBDEVICE, select config 1, discover MI_00/MI_01.
+    // Task 6: create the WDFUSBDEVICE, select the interface config.
     // Implemented in UsbTransport.c; kept out of Device.c so USB transport
     // stays a separate module per Task 1's "clean separation" requirement.
-    status = T2NcmUsbPrepareHardware(context);
+    // Variant 1: two different entry points per role — see UsbTransport.h.
+    status = g_T2NcmStubRole
+        ? T2NcmUsbPrepareHardwareStub(context)
+        : T2NcmUsbPrepareHardware(context);
     if (!NT_SUCCESS(status))
     {
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2Ncm: T2NcmUsbPrepareHardware failed 0x%08X\n", status));
+            "T2Ncm: USB prepare-hardware failed 0x%08X\n", status));
         return status;
     }
 
@@ -255,13 +257,15 @@ T2NcmEvtDeviceD0Entry(
         "T2Ncm: EvtDeviceD0Entry entered (PreviousState=%u)\n", (ULONG)PreviousState));
 
     // Task 18 (NDIS registration) plugs in here in a later pass; for
-    // this milestone D0Entry advances to UsbReady, then attempts the
-    // Tasks 7-12 NCM control-plane negotiation and MI_01 activation so
-    // I/O-allowed checks have a real, honestly-reported state instead
-    // of a fabricated one.
+    // this milestone D0Entry advances to UsbReady, then (full role only)
+    // attempts the Tasks 7-12 NCM control-plane negotiation and MI_01
+    // activation so I/O-allowed checks have a real, honestly-reported
+    // state instead of a fabricated one. The stub role has nothing to
+    // negotiate — it stops at UsbReady every time, which is fine since
+    // nothing ever checks T2NcmIsIoAllowed() for it.
     (void)T2NcmTrySetState(context, T2NcmStatePrepared, T2NcmStateUsbReady);
 
-    if (T2NcmIsIoAllowed(context))
+    if (!g_T2NcmStubRole && T2NcmIsIoAllowed(context))
     {
         T2NCM_NTB_PARAMETERS ntbParams;
         NTSTATUS ncmStatus;

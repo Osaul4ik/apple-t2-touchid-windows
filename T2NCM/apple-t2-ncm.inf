@@ -1,33 +1,40 @@
 ; ============================================================================
-; apple-t2-ncm.inf  (Task 3)
+; apple-t2-ncm.inf  (Task 3, revised for "Variant 1")
 ;
-; Apple T2 USB CDC-NCM function driver binding — REPLACES the previous
-; T2NCM/apple-t2-ncm.inf, which rebound MI_00 to the inbox UsbNcm.sys and
-; produced Code 10 / STATUS_DEVICE_HARDWARE_ERROR (confirmed by USBPcap:
-; no transactions after SET_CONFIGURATION before the failure). This INF
-; installs the custom T2Ncm.sys instead and does not reference UsbNcm.sys,
-; usbncm.inf, or usb.inf in any way.
+; Apple T2 USB CDC-NCM function driver binding. Installs T2Ncm.sys — no
+; UsbNcm.sys, usbncm.inf, or usb.inf involved.
+;
+; ARCHITECTURE CHANGE from the original design: real hardware showed
+; MI_00 and MI_01 enumerate as TWO INDEPENDENT PDOs under usbccgp (no IAD
+; grouping them), so a single WDFUSBDEVICE can never see both interfaces
+; at once (WdfUsbTargetDeviceGetInterface(UsbDevice, 1) came back NULL
+; from a device object created against MI_00's PDO). This driver now
+; binds directly to MI_01 (NCM Data) instead of MI_00. Control-plane
+; requests (GET_NTB_PARAMETERS etc., addressed by wIndex over the shared
+; EP0) still work fine from here — they don't need MI_00's own interface
+; object. MI_00 gets its own separate binding, same T2Ncm.sys binary but
+; a different service name, in apple-t2-ncm-ctrl-stub.inf — a minimal
+; stub so MI_00 doesn't sit as an unclaimed Code-28/31 device.
 ;
 ; Parent:
 ;   USB\VID_05AC&PID_8233
 ;       |
 ;       +--> usbccgp.sys
 ;              |
-;              +--> MI_00 = NCM Control  <-- THIS driver binds here
+;              +--> MI_00 = NCM Control  (apple-t2-ncm-ctrl-stub.inf,
+;              |                          service "T2NcmCtrlStub")
 ;              |
-;              +--> MI_01 = NCM Data     (opened directly by T2Ncm.sys,
-;                                          no separate driver — Task 3/
-;                                          Critical constraints)
+;              +--> MI_01 = NCM Data     <-- THIS driver binds here
+;                                            (service "T2Ncm")
 ;
-; IMPORTANT (Task 3 requirements):
+; IMPORTANT:
 ;   - Matches ONLY:
-;       USB\VID_05AC&PID_8233&REV_0201&MI_00
-;       USB\VID_05AC&PID_8233&MI_00
+;       USB\VID_05AC&PID_8233&REV_0201&MI_01
+;       USB\VID_05AC&PID_8233&MI_01
 ;   - Does NOT match the composite parent (USB\VID_05AC&PID_8233).
-;   - Does NOT match MI_01 (USB\VID_05AC&PID_8233&MI_01).
+;   - Does NOT match MI_00 (USB\VID_05AC&PID_8233&MI_00) — that's
+;     apple-t2-ncm-ctrl-stub.inf's job.
 ;   - Does NOT Include=usbncm.inf or Needs=UsbNcm_Device.NT.
-;   - Ships and installs T2Ncm.sys as its own service — completely
-;     replaces the Microsoft UsbNcm.sys binding for MI_00.
 ;
 ; ============================================================================
 
@@ -56,12 +63,12 @@ T2Ncm.sys = 1
 [Standard.NTamd64]
 
 ; Prefer the exact revision-specific hardware ID.
-%AppleT2Ncm.DeviceDesc% = AppleT2Ncm_Install, USB\VID_05AC&PID_8233&REV_0201&MI_00
+%AppleT2Ncm.DeviceDesc% = AppleT2Ncm_Install, USB\VID_05AC&PID_8233&REV_0201&MI_01
 
-; Also support the same T2 NCM control interface without the revision
+; Also support the same T2 NCM data interface without the revision
 ; component in the hardware ID (Task 5: don't hard-code assumptions that
 ; only hold for one T2 revision).
-%AppleT2Ncm.DeviceDesc% = AppleT2Ncm_Install, USB\VID_05AC&PID_8233&MI_00
+%AppleT2Ncm.DeviceDesc% = AppleT2Ncm_Install, USB\VID_05AC&PID_8233&MI_01
 
 
 ; ============================================================================
