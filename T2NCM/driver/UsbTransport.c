@@ -13,13 +13,18 @@ static
 NTSTATUS
 T2NcmFindPipeByDirectionAndType(
     _In_  WDFUSBINTERFACE  UsbInterface,
-    _In_  UCHAR            SettingIndex,
     _In_  WDF_USB_PIPE_TYPE ExpectedType,
     _In_  BOOLEAN          WantIn,
     _Out_ WDFUSBPIPE*      Pipe
     )
 {
-    UCHAR pipeCount = WdfUsbInterfaceGetNumConfiguredPipes(UsbInterface, SettingIndex);
+    // KMDF 1.15's WdfUsbInterfaceGetNumConfiguredPipes/GetConfiguredPipe
+    // don't take an alternate-setting parameter at all — they report
+    // pipes for whichever setting is CURRENTLY selected on UsbInterface
+    // (via WdfUsbTargetDeviceSelectConfig or WdfUsbInterfaceSelectSetting).
+    // Precondition: the caller has already made the desired setting
+    // current before calling this helper.
+    UCHAR pipeCount = WdfUsbInterfaceGetNumConfiguredPipes(UsbInterface);
 
     for (UCHAR i = 0; i < pipeCount; i++)
     {
@@ -27,14 +32,14 @@ T2NcmFindPipeByDirectionAndType(
         WDF_USB_PIPE_INFORMATION_INIT(&pipeInfo);
 
         WDFUSBPIPE candidate = WdfUsbInterfaceGetConfiguredPipe(
-            UsbInterface, SettingIndex, i, &pipeInfo);
+            UsbInterface, i, &pipeInfo);
 
         if (candidate == NULL)
         {
             continue;
         }
 
-        BOOLEAN isIn = WDF_USB_PIPE_TYPE_ISOCHRONOUS != pipeInfo.PipeType &&
+        BOOLEAN isIn = WdfUsbPipeTypeIsochronous != pipeInfo.PipeType &&
                         WdfUsbTargetPipeIsInEndpoint(candidate);
 
         if (pipeInfo.PipeType == ExpectedType && isIn == WantIn)
@@ -94,22 +99,30 @@ T2NcmUsbPrepareHardware(
         return status;
     }
 
-    if (configParams.Types.MultiInterface.NumberOfInterfaces != 2)
+    // Task 6: this KMDF version's WDF_USB_DEVICE_SELECT_CONFIG_PARAMS
+    // doesn't echo the interface count back (no NumberOfInterfaces
+    // field on Types.MultiInterface here) — the real per-interface
+    // confirmation is that WDF filled in both Pairs[].UsbInterface
+    // handles. WdfUsbTargetDeviceSelectConfig succeeding should
+    // guarantee this, but never assume — check both explicitly rather
+    // than dereferencing a handle we didn't verify.
+    if (settingPairs[0].UsbInterface == NULL || settingPairs[1].UsbInterface == NULL)
     {
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2Ncm: expected 2 interfaces, got %u\n",
-            configParams.Types.MultiInterface.NumberOfInterfaces));
+            "T2Ncm: WdfUsbTargetDeviceSelectConfig succeeded but left an interface "
+            "handle NULL (MI_00=%p, MI_01=%p)\n",
+            settingPairs[0].UsbInterface, settingPairs[1].UsbInterface));
         return STATUS_DEVICE_CONFIGURATION_ERROR;
     }
 
-    DeviceContext->ControlInterface =
-        configParams.Types.MultiInterface.Pairs[0].UsbInterface;
-    DeviceContext->DataInterface =
-        configParams.Types.MultiInterface.Pairs[1].UsbInterface;
+    DeviceContext->ControlInterface = settingPairs[0].UsbInterface;
+    DeviceContext->DataInterface    = settingPairs[1].UsbInterface;
 
-    // Task 5: discover the interrupt IN pipe on MI_00 dynamically.
+    // Task 5: discover the interrupt IN pipe on MI_00 dynamically. MI_00
+    // has only one setting (0), already made current by the
+    // WdfUsbTargetDeviceSelectConfig call above.
     status = T2NcmFindPipeByDirectionAndType(
-        DeviceContext->ControlInterface, 0, WdfUsbPipeTypeInterrupt, TRUE, &pipe);
+        DeviceContext->ControlInterface, WdfUsbPipeTypeInterrupt, TRUE, &pipe);
     if (!NT_SUCCESS(status))
     {
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
@@ -195,8 +208,10 @@ T2NcmUsbActivateDataInterface(
         return status;
     }
 
+    // T2NcmUsbSelectDataAltSetting above already made alt 1 the
+    // interface's current setting, so the pipe queries below reflect it.
     status = T2NcmFindPipeByDirectionAndType(
-        DeviceContext->DataInterface, T2NCM_DATA_ALT_ACTIVE,
+        DeviceContext->DataInterface,
         WdfUsbPipeTypeBulk, TRUE, &bulkIn);
     if (!NT_SUCCESS(status))
     {
@@ -207,7 +222,7 @@ T2NcmUsbActivateDataInterface(
     }
 
     status = T2NcmFindPipeByDirectionAndType(
-        DeviceContext->DataInterface, T2NCM_DATA_ALT_ACTIVE,
+        DeviceContext->DataInterface,
         WdfUsbPipeTypeBulk, FALSE, &bulkOut);
     if (!NT_SUCCESS(status))
     {

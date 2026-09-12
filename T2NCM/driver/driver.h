@@ -24,7 +24,16 @@
 #include <usb.h>
 #include <usbdlib.h>
 #include <wdfusb.h>
+
+// ndis.h itself uses nameless struct/union extensions and trips C4201 at
+// /W4; with /WX that becomes a hard error (C2220) even though we didn't
+// write the offending code. This is Microsoft's own header, not ours —
+// scope the suppression tightly to just this include rather than
+// disabling C4201 project-wide.
+#pragma warning(push)
+#pragma warning(disable: 4201)
 #include <ndis.h>
+#pragma warning(pop)
 
 #include "public.h"
 

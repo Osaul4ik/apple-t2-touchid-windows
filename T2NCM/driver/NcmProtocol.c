@@ -420,6 +420,11 @@ T2NcmHexNibble(
     return FALSE;
 }
 
+// The CDC Ethernet MAC-address string is always exactly 12 hex
+// characters (6 bytes) — fixed-size stack buffer, no pool allocation
+// needed.
+#define T2NCM_MAC_STRING_CHARS 12u
+
 NTSTATUS
 T2NcmReadMacAddress(
     _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
@@ -428,9 +433,7 @@ T2NcmReadMacAddress(
     NTSTATUS status;
     UCHAR macStringIndex = 0;
     USHORT numChars = 0;
-    WDFMEMORY stringMemory = NULL;
-    WDF_OBJECT_ATTRIBUTES memAttributes;
-    PWCHAR wideBuffer;
+    WCHAR macChars[T2NCM_MAC_STRING_CHARS];
     UCHAR macBytes[6];
     UCHAR i;
     BOOLEAN allZero, allFF;
@@ -451,8 +454,10 @@ T2NcmReadMacAddress(
         return STATUS_DEVICE_PROTOCOL_ERROR;
     }
 
+    // First call: String == NULL means "just tell me the length" — WDF
+    // fills in *NumCharacters with the string's actual character count.
     status = WdfUsbTargetDeviceQueryString(
-        DeviceContext->UsbDevice, NULL, NULL, &numChars, macStringIndex, 0);
+        DeviceContext->UsbDevice, NULL, NULL, NULL, &numChars, macStringIndex, 0);
     if (!NT_SUCCESS(status))
     {
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
@@ -465,54 +470,50 @@ T2NcmReadMacAddress(
     // characters (6 bytes). Anything else means this isn't a real MAC
     // string, so refuse to parse it instead of taking a truncated or
     // padded guess.
-    if (numChars != 12)
+    if (numChars != T2NCM_MAC_STRING_CHARS)
     {
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2Ncm: iMACAddress string is %u characters, expected exactly 12\n",
-            numChars));
+            "T2Ncm: iMACAddress string is %u characters, expected exactly %u\n",
+            numChars, T2NCM_MAC_STRING_CHARS));
         return STATUS_DEVICE_PROTOCOL_ERROR;
     }
 
-    WDF_OBJECT_ATTRIBUTES_INIT(&memAttributes);
-    memAttributes.ParentObject = DeviceContext->WdfDevice;
-
-    status = WdfMemoryCreate(
-        &memAttributes, NonPagedPoolNx, T2NCM_POOL_TAG,
-        (size_t)numChars * sizeof(WCHAR), &stringMemory, NULL);
-    if (!NT_SUCCESS(status))
-    {
-        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2Ncm: WdfMemoryCreate for MAC string failed 0x%08X\n", status));
-        return status;
-    }
-
+    // Second call: String points at our buffer, *NumCharacters on input
+    // is that buffer's capacity in characters; on output it's the
+    // number actually copied.
+    RtlZeroMemory(macChars, sizeof(macChars));
+    numChars = T2NCM_MAC_STRING_CHARS;
     status = WdfUsbTargetDeviceQueryString(
-        DeviceContext->UsbDevice, NULL, stringMemory, &numChars, macStringIndex, 0);
+        DeviceContext->UsbDevice, NULL, NULL, (PUSHORT)macChars, &numChars, macStringIndex, 0);
     if (!NT_SUCCESS(status))
     {
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
             "T2Ncm: QueryString(data) for iMACAddress failed 0x%08X\n", status));
-        WdfObjectDelete(stringMemory);
         return status;
     }
 
-    wideBuffer = (PWCHAR)WdfMemoryGetBuffer(stringMemory, NULL);
+    if (numChars != T2NCM_MAC_STRING_CHARS)
+    {
+        // Never trust the first call's length to still hold — re-verify
+        // what actually came back on the second call before indexing it.
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+            "T2Ncm: iMACAddress data call returned %u characters, expected exactly %u\n",
+            numChars, T2NCM_MAC_STRING_CHARS));
+        return STATUS_DEVICE_PROTOCOL_ERROR;
+    }
 
     for (i = 0; i < 6; i++)
     {
         UCHAR hi, lo;
-        if (!T2NcmHexNibble(wideBuffer[2 * i], &hi) ||
-            !T2NcmHexNibble(wideBuffer[2 * i + 1], &lo))
+        if (!T2NcmHexNibble(macChars[2 * i], &hi) ||
+            !T2NcmHexNibble(macChars[2 * i + 1], &lo))
         {
             T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
                 "T2Ncm: iMACAddress string contains a non-hex character\n"));
-            WdfObjectDelete(stringMemory);
             return STATUS_DEVICE_PROTOCOL_ERROR;
         }
         macBytes[i] = (UCHAR)((hi << 4) | lo);
     }
-
-    WdfObjectDelete(stringMemory);
 
     allZero = TRUE;
     allFF = TRUE;

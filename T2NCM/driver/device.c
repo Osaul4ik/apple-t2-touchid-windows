@@ -267,6 +267,23 @@ T2NcmEvtDeviceD0Entry(
         T2NCM_NTB_PARAMETERS ntbParams;
         NTSTATUS ncmStatus;
 
+        // Reset every Tasks 7-12 output BEFORE attempting renegotiation.
+        // Without this, a partial/failed attempt this cycle (e.g. on
+        // resume from suspend) would leave stale TRUE/non-zero values
+        // from a PREVIOUS successful cycle behind — the state would
+        // correctly fall back to UsbReady, but Ntb16Supported,
+        // MacAddressValid, and the bulk pipe handles would still read
+        // as "known good" from before. Task 25's diagnostic IOCTL must
+        // never report a field as confirmed when THIS cycle didn't
+        // actually confirm it — that's exactly the kind of fabricated
+        // status this driver's whole design is built to avoid.
+        context->Ntb16Supported  = FALSE;
+        context->NtbInMaxSize    = 0;
+        context->NtbOutMaxSize   = 0;
+        context->MacAddressValid = FALSE;
+        context->BulkInPipe      = NULL;
+        context->BulkOutPipe     = NULL;
+
         // Tasks 7-12: negotiate the CDC-NCM control plane and switch
         // MI_01 to its active alt setting. This re-runs on EVERY
         // D0Entry — cold start and resume alike — rather than only
@@ -450,7 +467,12 @@ T2NcmEvtIoDeviceControlGetStatus(
 
     // T2NCM_LIFECYCLE_STATE (Driver.h) and T2NCM_WIRE_STATE (public.h)
     // are deliberately separate enums with matching values — assert the
-    // mapping stays in sync rather than silently drifting.
+    // mapping stays in sync rather than silently drifting. MSVC's C5287
+    // fires on enum-vs-enum comparisons even through an explicit (int)
+    // cast in C mode; that's exactly what this comparison intentionally
+    // does, so silence it locally rather than restructuring the check.
+#pragma warning(push)
+#pragma warning(disable: 5287)
     C_ASSERT((int)T2NcmStateCreated        == (int)T2NcmWireStateCreated);
     C_ASSERT((int)T2NcmStatePrepared       == (int)T2NcmWireStatePrepared);
     C_ASSERT((int)T2NcmStateUsbReady       == (int)T2NcmWireStateUsbReady);
@@ -459,6 +481,7 @@ T2NcmEvtIoDeviceControlGetStatus(
     C_ASSERT((int)T2NcmStateRunning        == (int)T2NcmWireStateRunning);
     C_ASSERT((int)T2NcmStateStopping       == (int)T2NcmWireStateStopping);
     C_ASSERT((int)T2NcmStateReleased       == (int)T2NcmWireStateReleased);
+#pragma warning(pop)
 
     out->LifecycleState = (UINT32)state;
 
