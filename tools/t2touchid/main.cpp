@@ -146,7 +146,8 @@ static int CmdLoadKeybag(Client& client, const std::wstring& path) {
     }
 
     int32_t handle = 0;
-    AksResult r = client.LoadKeybag(bag, &handle);
+    int8_t sepStatus = 0;
+    AksResult r = client.LoadKeybag(bag, &handle, 1, &sepStatus);
     SecureZeroMemory(bag.data(), bag.size());
     bag.clear();
 
@@ -158,19 +159,39 @@ static int CmdLoadKeybag(Client& client, const std::wstring& path) {
         std::wcout << L"load-keybag failed\n";
         return 1;
     }
+    if (sepStatus != 0) {
+        // AksResult::Ok here only means the mailbox round-trip completed —
+        // Client::LoadKeybag returns Ok even when SEP itself rejected the
+        // request (bad session, malformed bag, etc.), leaving outHandle
+        // untouched (still 0 from the init above). Printing "OK,
+        // handle=0" in that case would be a fabricated success, not a
+        // real one — report the real SEP status instead.
+        std::wcout << L"load-keybag: SEP rejected the request, sep_status="
+                   << static_cast<int>(sepStatus) << L"\n";
+        return 1;
+    }
 
     std::wcout << L"load-keybag: OK, handle=" << handle << L"\n";
     return 0;
 }
 
 static int CmdSetSystemKeybag(Client& client, int32_t handle, int32_t specialUserBag) {
-    AksResult r = client.MakeSystemKeybag(handle, specialUserBag);
+    int8_t sepStatus = 0;
+    AksResult r = client.MakeSystemKeybag(handle, specialUserBag, 1, &sepStatus);
     if (r == AksResult::NotReady) {
         std::wcout << L"set-system-keybag failed: DMA / OOL is not registered; run register-ool first\n";
         return 1;
     }
     if (r != AksResult::Ok) {
         std::wcout << L"set-system-keybag failed\n";
+        return 1;
+    }
+    if (sepStatus != 0) {
+        // Same pattern as load-keybag: Ok only means the exchange
+        // completed, not that SEP accepted the handle/session — check
+        // the real status before declaring success.
+        std::wcout << L"set-system-keybag: SEP rejected the request, sep_status="
+                   << static_cast<int>(sepStatus) << L"\n";
         return 1;
     }
 
@@ -184,9 +205,19 @@ static int CmdUnlock(Client& client, int32_t handle) {
         std::wcout << L"no password entered\n";
         return 1;
     }
-    AksResult r = client.Unlock(handle, secret); // zeroes `secret` internally
+    int8_t sepStatus = 0;
+    AksResult r = client.Unlock(handle, secret, 1, &sepStatus); // zeroes `secret` internally
     if (r != AksResult::Ok) {
         std::wcout << L"unlock failed\n";
+        return 1;
+    }
+    if (sepStatus != 0) {
+        // Client::Unlock's own comment: SepStatus != 0 on this opcode IS
+        // the wrong-password signal — it must never be reported as a
+        // bare "unlock: OK". Without this check the CLI previously
+        // printed success on a WRONG password.
+        std::wcout << L"unlock: SEP rejected the request (wrong password or bad handle), "
+                      L"sep_status=" << static_cast<int>(sepStatus) << L"\n";
         return 1;
     }
     std::wcout << L"unlock: OK\n";
