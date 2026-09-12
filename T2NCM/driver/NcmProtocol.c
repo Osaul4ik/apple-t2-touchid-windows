@@ -327,6 +327,21 @@ T2NcmSetNtbInputSize(
 // iMACAddress string index. Never guesses an index — returns
 // STATUS_NOT_FOUND / STATUS_DEVICE_PROTOCOL_ERROR if the descriptor
 // isn't exactly where the CDC spec says it must be.
+//
+// Deliberately does NOT use WdfUsbTargetDeviceRetrieveConfigDescriptor.
+// Real hardware showed that call returns a descriptor SCOPED to this
+// WDFUSBDEVICE's own PDO (MI_01) — the same "independent PDOs, no IAD"
+// finding that broke WdfUsbTargetDeviceGetInterface(1) earlier — so
+// MI_00's interface descriptor is simply not present in that buffer at
+// all (USBD_ParseConfigurationDescriptorEx correctly returns NULL for
+// it, every time). A raw standard GET_DESCRIPTOR(CONFIGURATION) request
+// sent directly over EP0 is a device-level USB operation, not a
+// PDO-scoped one — per the USB spec it always returns the COMPLETE
+// configuration descriptor set (every interface, including MI_00's),
+// regardless of which specific interface this driver instance is bound
+// to. This is the same "wIndex reaches MI_00 over the shared control
+// pipe" principle NcmProtocol.c's other class requests already rely on,
+// just using a standard (not class) request here.
 // ---------------------------------------------------------------------
 static
 NTSTATUS
@@ -337,25 +352,68 @@ T2NcmFindMacStringIndex(
 {
     NTSTATUS status;
     UCHAR configBuffer[T2NCM_CONFIG_DESC_BUFFER_SIZE];
-    USHORT configLength = (USHORT)sizeof(configBuffer);
     PUSB_CONFIGURATION_DESCRIPTOR configDesc = (PUSB_CONFIGURATION_DESCRIPTOR)configBuffer;
     PUSB_INTERFACE_DESCRIPTOR ifaceDesc;
     PUSB_COMMON_DESCRIPTOR walker;
     PUCHAR bufferEnd;
+    WDF_USB_CONTROL_SETUP_PACKET setupPacket;
+    WDF_MEMORY_DESCRIPTOR memDesc;
+    ULONG bytesReturned = 0;
 
     *MacStringIndex = 0;
 
-    status = WdfUsbTargetDeviceRetrieveConfigDescriptor(
-        DeviceContext->UsbDevice, configBuffer, &configLength);
+    RtlZeroMemory(configBuffer, sizeof(configBuffer));
+
+    WDF_USB_CONTROL_SETUP_PACKET_INIT_GET_DESCRIPTOR(
+        &setupPacket,
+        BmRequestToDevice,
+        USB_CONFIGURATION_DESCRIPTOR_TYPE,
+        0,      // descriptor index 0 — this device has exactly one configuration
+        0);     // LanguageId is meaningless for a CONFIGURATION descriptor
+
+    WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&memDesc, configBuffer, (ULONG)sizeof(configBuffer));
+
+    status = WdfUsbTargetDeviceSendControlTransferSynchronously(
+        DeviceContext->UsbDevice,
+        WDF_NO_HANDLE,
+        NULL,
+        &setupPacket,
+        &memDesc,
+        &bytesReturned);
 
     if (!NT_SUCCESS(status))
     {
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2Ncm: RetrieveConfigDescriptor failed 0x%08X (fixed %u-byte buffer "
-            "may be too small — never silently truncated)\n",
-            status, (ULONG)sizeof(configBuffer)));
+            "T2Ncm: raw GET_DESCRIPTOR(CONFIGURATION) failed 0x%08X\n", status));
         return status;
     }
+
+    if (bytesReturned < (ULONG)sizeof(USB_CONFIGURATION_DESCRIPTOR))
+    {
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+            "T2Ncm: GET_DESCRIPTOR(CONFIGURATION) returned only %u bytes, "
+            "too small to even hold the configuration header\n", bytesReturned));
+        return STATUS_DEVICE_PROTOCOL_ERROR;
+    }
+
+    if (configDesc->wTotalLength > bytesReturned)
+    {
+        // The device says its full configuration descriptor is bigger
+        // than what fit in our fixed buffer. Not expected for this
+        // simple 2-interface device — fail loudly rather than parse a
+        // silently truncated descriptor.
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+            "T2Ncm: configuration descriptor wTotalLength=%u exceeds our "
+            "%u-byte buffer (got %u bytes) — never silently truncated\n",
+            configDesc->wTotalLength, (ULONG)sizeof(configBuffer), bytesReturned));
+        return STATUS_DEVICE_PROTOCOL_ERROR;
+    }
+
+    // Bound the walk to what the device itself says is the real
+    // descriptor length, not just how many bytes the control transfer
+    // happened to return (which can legitimately be less than the
+    // buffer size but must not be trusted beyond wTotalLength either).
+    bufferEnd = configBuffer + configDesc->wTotalLength;
 
     ifaceDesc = (PUSB_INTERFACE_DESCRIPTOR)USBD_ParseConfigurationDescriptorEx(
         configDesc, configDesc,
@@ -368,7 +426,6 @@ T2NcmFindMacStringIndex(
         return STATUS_DEVICE_PROTOCOL_ERROR;
     }
 
-    bufferEnd = configBuffer + configLength;
     walker = (PUSB_COMMON_DESCRIPTOR)((PUCHAR)ifaceDesc + ifaceDesc->bLength);
 
     while ((PUCHAR)walker + sizeof(USB_COMMON_DESCRIPTOR) <= bufferEnd)
