@@ -72,8 +72,12 @@
       <!-- Ndis.lib for the NDIS 6 miniport entry points (Tasks 18-20);
            needed even though NdisMiniport.c is currently a stub, so the
            driver links cleanly once it's filled in without a project
-           file change. -->
-      <AdditionalDependencies>Ndis.lib;%(AdditionalDependencies)</AdditionalDependencies>
+           file change.
+           Usbd.lib for USBD_ParseConfigurationDescriptorEx (NcmProtocol.c,
+           Task 8's Ethernet Functional Descriptor lookup) — this WDK's
+           usbdlib.h declares it __declspec(dllimport) rather than
+           inlining it, so it needs a real import library. -->
+      <AdditionalDependencies>Ndis.lib;Usbd.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <DriverSign>
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
