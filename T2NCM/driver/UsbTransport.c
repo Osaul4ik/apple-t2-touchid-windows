@@ -82,7 +82,17 @@ T2NcmUsbPrepareHardware(
     // setting, MI_01 explicitly on alt 0 — "idle" — until NCM negotiation
     // completes and Task 12 switches it to alt 1). Do NOT assume a
     // pre-existing UsbNcm configuration is already selected.
+    //
+    // WDF_USB_INTERFACE_SETTING_PAIR.UsbInterface is an OUTPUT field —
+    // WDF fills it in on success. Zero the array first: an uninitialized
+    // stack UsbInterface here is garbage, not NULL, and
+    // WdfUsbTargetDeviceSelectConfig validates it on input for the
+    // multi-interface case — garbage there fails the whole call with
+    // STATUS_INVALID_PARAMETER (0xC000000D), which cost real bring-up
+    // time to track down on hardware. Never leave a WDF out-param
+    // uninitialized on entry again.
     WDF_USB_INTERFACE_SETTING_PAIR settingPairs[2];
+    RtlZeroMemory(settingPairs, sizeof(settingPairs));
     settingPairs[0].SettingIndex = 0; // MI_00 has only one setting
     settingPairs[1].SettingIndex = T2NCM_DATA_ALT_IDLE;
 
