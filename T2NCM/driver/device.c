@@ -90,6 +90,9 @@ T2NcmEvtDeviceAdd(
     WDFDEVICE device;
     PT2NCM_DEVICE_CONTEXT context;
 
+    T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_TRACE_LEVEL,
+        "T2Ncm: EvtDeviceAdd entered\n"));
+
     WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&pnpPowerCallbacks);
     pnpPowerCallbacks.EvtDevicePrepareHardware        = T2NcmEvtDevicePrepareHardware;
     pnpPowerCallbacks.EvtDeviceReleaseHardware         = T2NcmEvtDeviceReleaseHardware;
@@ -180,6 +183,9 @@ T2NcmEvtDevicePrepareHardware(
     NTSTATUS status;
     PT2NCM_DEVICE_CONTEXT context = T2NcmGetDeviceContext(Device);
 
+    T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_TRACE_LEVEL,
+        "T2Ncm: EvtDevicePrepareHardware entered\n"));
+
     // Task 6: create the WDFUSBDEVICE, select config 1, discover MI_00/MI_01.
     // Implemented in UsbTransport.c; kept out of Device.c so USB transport
     // stays a separate module per Task 1's "clean separation" requirement.
@@ -202,6 +208,9 @@ T2NcmEvtDevicePrepareHardware(
             return STATUS_INVALID_DEVICE_STATE;
         }
     }
+
+    T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_TRACE_LEVEL,
+        "T2Ncm: EvtDevicePrepareHardware OK\n"));
 
     return STATUS_SUCCESS;
 }
@@ -241,6 +250,9 @@ T2NcmEvtDeviceD0Entry(
 {
     UNREFERENCED_PARAMETER(PreviousState);
     PT2NCM_DEVICE_CONTEXT context = T2NcmGetDeviceContext(Device);
+
+    T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_TRACE_LEVEL,
+        "T2Ncm: EvtDeviceD0Entry entered (PreviousState=%u)\n", (ULONG)PreviousState));
 
     // Task 18 (NDIS registration) plugs in here in a later pass; for
     // this milestone D0Entry advances to UsbReady, then attempts the
@@ -345,6 +357,9 @@ T2NcmEvtDeviceD0Exit(
     UNREFERENCED_PARAMETER(TargetState);
     PT2NCM_DEVICE_CONTEXT context = T2NcmGetDeviceContext(Device);
 
+    T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_TRACE_LEVEL,
+        "T2Ncm: EvtDeviceD0Exit entered (TargetState=%u)\n", (ULONG)TargetState));
+
     // Per Task 21: stop RX/TX rearming and cancel pending USB before
     // returning. RX/TX engines don't exist yet in this milestone
     // (Tasks 15/16), so this currently only flips the gate that
@@ -356,6 +371,10 @@ T2NcmEvtDeviceD0Exit(
         context->State = T2NcmStatePrepared;
     }
     WdfSpinLockRelease(context->StateLock);
+
+    T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_TRACE_LEVEL,
+        "T2Ncm: EvtDeviceD0Exit -> Prepared (NCM control-plane will "
+        "renegotiate on next D0Entry)\n"));
 
     return STATUS_SUCCESS;
 }
@@ -494,6 +513,15 @@ T2NcmEvtIoDeviceControlGetStatus(
     // half-set pair would itself be a fabricated status.
     out->DataInterfaceActive =
         (Context->BulkInPipe != NULL) && (Context->BulkOutPipe != NULL);
+
+    T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_TRACE_LEVEL,
+        "T2Ncm: IOCTL_T2NCM_GET_STATUS -> state=%u ntb16=%u inMax=%u outMax=%u "
+        "macValid=%u mac=%02X:%02X:%02X:%02X:%02X:%02X dataActive=%u\n",
+        out->LifecycleState, out->Ntb16Supported, out->NtbInMaxSize, out->NtbOutMaxSize,
+        out->MacAddressValid,
+        out->MacAddress[0], out->MacAddress[1], out->MacAddress[2],
+        out->MacAddress[3], out->MacAddress[4], out->MacAddress[5],
+        out->DataInterfaceActive));
 
     WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, sizeof(*out));
 }

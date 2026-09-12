@@ -13,6 +13,9 @@ DriverEntry(
     NTSTATUS status;
     WDF_DRIVER_CONFIG config;
 
+    T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_TRACE_LEVEL,
+        "T2Ncm: DriverEntry entered\n"));
+
     WDF_DRIVER_CONFIG_INIT(&config, T2NcmEvtDeviceAdd);
 
     status = WdfDriverCreate(
