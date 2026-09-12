@@ -376,23 +376,132 @@ T2NcmHexNibble(
 // usbccgp has no per-function string list to synthesize (strings aren't
 // tied to any one interface the way configuration-descriptor bytes
 // are). So instead of reading iMACAddress out of the (invisible)
-// Ethernet Functional Descriptor, this scans the string table directly,
-// index by index, and accepts the string whose content has exactly the
-// CDC MAC-address shape: 12 hex digits. iManufacturer/iProduct/
-// iSerialNumber are excluded up front (pulled from the cached Device
-// Descriptor — WdfUsbTargetDeviceGetDeviceDescriptor is a no-I/O cache
-// read, not a request) so a hex-looking serial number could never be
-// mistaken for the MAC.
+// Ethernet Functional Descriptor, this scans the string table directly
+// for whichever string has exactly the CDC MAC-address shape: 12 hex
+// digits.
 //
-// If more than one remaining string matches the shape, that is
-// AMBIGUOUS and this fails closed (STATUS_DEVICE_PROTOCOL_ERROR) rather
-// than pick one — Task 8's "never invent a MAC" rule covers "never
-// guess among several candidates" too. A missing index is an expected,
-// silent skip during the scan (the device NAKs/stalls it) — only the
-// summary after the full scan is logged, not each probe.
+// Two passes, in order:
+//   1. Every index EXCEPT iManufacturer/iProduct/iSerialNumber. A
+//      dedicated, standalone MAC string is the strongest evidence, so
+//      it always wins when present. More than one match here is
+//      AMBIGUOUS and fails closed (STATUS_DEVICE_PROTOCOL_ERROR) rather
+//      than guessing — Task 8's "never invent a MAC" rule covers "never
+//      pick among several candidates" too.
+//   2. Only if pass 1 found nothing at all: iSerialNumber itself, in
+//      case this device reuses its serial number as the Ethernet
+//      address (real T2 hardware does — pass 1 alone came up empty on
+//      it). This never runs, and never overrides pass 1's result, when
+//      pass 1 found even one dedicated match.
+// A missing index is an expected, silent skip during scanning (the
+// device NAKs/stalls it) — only pass summaries are logged, not each
+// probe. If BOTH passes come up empty, every non-empty string
+// descriptor is dumped for diagnosis (T2NcmLogAllStringDescriptors).
 // ---------------------------------------------------------------------
 #define T2NCM_MAC_SCAN_MIN_INDEX   1u
 #define T2NCM_MAC_SCAN_MAX_INDEX   32u  // generous; a real T2 has a handful of strings
+
+// Probes one string index and reports whether its content is exactly
+// T2NCM_MAC_STRING_CHARS hex digits. Shared by both scan passes below
+// and by the diagnostic dump, so the "what counts as MAC-shaped" rule
+// lives in exactly one place.
+static
+BOOLEAN
+T2NcmStringIsMacShape(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext,
+    _In_ UCHAR                 Index
+    )
+{
+    NTSTATUS status;
+    USHORT numChars;
+    WCHAR chars[T2NCM_MAC_STRING_CHARS];
+    UCHAR i;
+
+    numChars = 0;
+    status = WdfUsbTargetDeviceQueryString(
+        DeviceContext->UsbDevice, NULL, NULL, NULL, &numChars, Index, 0);
+    if (!NT_SUCCESS(status) || numChars != T2NCM_MAC_STRING_CHARS)
+    {
+        return FALSE;
+    }
+
+    RtlZeroMemory(chars, sizeof(chars));
+    numChars = T2NCM_MAC_STRING_CHARS;
+    status = WdfUsbTargetDeviceQueryString(
+        DeviceContext->UsbDevice, NULL, NULL, (PUSHORT)chars, &numChars, Index, 0);
+    if (!NT_SUCCESS(status) || numChars != T2NCM_MAC_STRING_CHARS)
+    {
+        return FALSE;
+    }
+
+    for (i = 0; i < T2NCM_MAC_STRING_CHARS; i++)
+    {
+        UCHAR nibble;
+        if (!T2NcmHexNibble(chars[i], &nibble))
+        {
+            return FALSE;
+        }
+    }
+
+    return TRUE;
+}
+
+// Diagnostic-only: called after BOTH scan passes below have come up
+// completely empty, to dump every non-empty string descriptor's raw
+// content so a failure can be root-caused from the log alone, without
+// needing a USB capture. Never called on a successful path — this is
+// pure last-resort visibility, not part of the discovery logic itself.
+static
+VOID
+T2NcmLogAllStringDescriptors(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
+    )
+{
+    UCHAR idx;
+
+    T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
+        "T2Ncm: MAC discovery failed both passes — dumping every non-empty "
+        "string descriptor in indices %u..%u for diagnosis\n",
+        T2NCM_MAC_SCAN_MIN_INDEX, T2NCM_MAC_SCAN_MAX_INDEX));
+
+    for (idx = T2NCM_MAC_SCAN_MIN_INDEX; idx <= T2NCM_MAC_SCAN_MAX_INDEX; idx++)
+    {
+        NTSTATUS status;
+        USHORT numChars = 0;
+        WCHAR buffer[64];
+        USHORT toRead;
+
+        status = WdfUsbTargetDeviceQueryString(
+            DeviceContext->UsbDevice, NULL, NULL, NULL, &numChars, idx, 0);
+        if (!NT_SUCCESS(status) || numChars == 0)
+        {
+            continue;
+        }
+
+        if (numChars > (sizeof(buffer) / sizeof(buffer[0])) - 1)
+        {
+            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
+                "T2Ncm:   index %u: %u chars (too long to dump here)\n",
+                idx, numChars));
+            continue;
+        }
+
+        RtlZeroMemory(buffer, sizeof(buffer));
+        toRead = numChars;
+        status = WdfUsbTargetDeviceQueryString(
+            DeviceContext->UsbDevice, NULL, NULL, (PUSHORT)buffer, &toRead, idx, 0);
+        if (!NT_SUCCESS(status))
+        {
+            continue;
+        }
+
+        buffer[toRead < ((sizeof(buffer) / sizeof(buffer[0])) - 1)
+                   ? toRead
+                   : ((sizeof(buffer) / sizeof(buffer[0])) - 1)] = L'\0';
+
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
+            "T2Ncm:   index %u (%u chars): \"%ws\"\n", idx, numChars, buffer));
+    }
+}
 
 static
 NTSTATUS
@@ -402,7 +511,7 @@ T2NcmScanForMacStringIndex(
     )
 {
     USB_DEVICE_DESCRIPTOR deviceDesc;
-    UCHAR excludeManufacturer, excludeProduct, excludeSerial;
+    UCHAR excludeManufacturer, excludeProduct, serialIndex;
     UCHAR candidateIndex = 0;
     ULONG matchCount = 0;
     UCHAR idx;
@@ -416,91 +525,79 @@ T2NcmScanForMacStringIndex(
 
     excludeManufacturer = deviceDesc.iManufacturer;
     excludeProduct      = deviceDesc.iProduct;
-    excludeSerial       = deviceDesc.iSerialNumber;
+    serialIndex         = deviceDesc.iSerialNumber;
 
+    // Pass 1: every index EXCEPT iManufacturer/iProduct/iSerialNumber.
+    // A dedicated, standalone MAC-address string (if the device has
+    // one) is the strongest evidence and always wins over the fallback
+    // below — a device that reuses its serial number for the MAC
+    // wouldn't also carry a second, unrelated 12-hex-char string, so
+    // there's no real ambiguity between the two passes in practice.
     for (idx = T2NCM_MAC_SCAN_MIN_INDEX; idx <= T2NCM_MAC_SCAN_MAX_INDEX; idx++)
     {
-        NTSTATUS status;
-        USHORT numChars;
-        WCHAR chars[T2NCM_MAC_STRING_CHARS];
-        UCHAR i;
-        BOOLEAN allHex;
-
         if ((excludeManufacturer != 0 && idx == excludeManufacturer) ||
             (excludeProduct      != 0 && idx == excludeProduct)      ||
-            (excludeSerial       != 0 && idx == excludeSerial))
+            (serialIndex         != 0 && idx == serialIndex))
         {
             continue;
         }
 
-        // Length-probe call (String == NULL). A non-existent index
-        // fails here (the device stalls/NAKs it) — that is a routine,
-        // expected outcome of scanning, not something to log per index.
-        numChars = 0;
-        status = WdfUsbTargetDeviceQueryString(
-            DeviceContext->UsbDevice, NULL, NULL, NULL, &numChars, idx, 0);
-        if (!NT_SUCCESS(status) || numChars != T2NCM_MAC_STRING_CHARS)
+        if (T2NcmStringIsMacShape(DeviceContext, idx))
         {
-            continue;
+            matchCount++;
+            candidateIndex = idx;
+
+            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
+                "T2Ncm: string index %u has MAC-address shape (12 hex chars) — "
+                "candidate #%lu\n", idx, matchCount));
         }
-
-        RtlZeroMemory(chars, sizeof(chars));
-        numChars = T2NCM_MAC_STRING_CHARS;
-        status = WdfUsbTargetDeviceQueryString(
-            DeviceContext->UsbDevice, NULL, NULL, (PUSHORT)chars, &numChars, idx, 0);
-        if (!NT_SUCCESS(status) || numChars != T2NCM_MAC_STRING_CHARS)
-        {
-            continue;
-        }
-
-        allHex = TRUE;
-        for (i = 0; i < T2NCM_MAC_STRING_CHARS; i++)
-        {
-            UCHAR nibble;
-            if (!T2NcmHexNibble(chars[i], &nibble))
-            {
-                allHex = FALSE;
-                break;
-            }
-        }
-
-        if (!allHex)
-        {
-            continue;
-        }
-
-        matchCount++;
-        candidateIndex = idx;
-
-        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
-            "T2Ncm: string index %u has MAC-address shape (12 hex chars) — "
-            "candidate #%lu\n", idx, matchCount));
     }
 
-    if (matchCount == 0)
+    if (matchCount == 1)
     {
-        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2Ncm: no string descriptor in indices %u..%u matched the "
-            "MAC-address shape (12 hex chars)\n",
-            T2NCM_MAC_SCAN_MIN_INDEX, T2NCM_MAC_SCAN_MAX_INDEX));
-        return STATUS_NOT_FOUND;
+        *MacStringIndex = candidateIndex;
+
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
+            "T2Ncm: MAC address string found unambiguously at index %u\n",
+            candidateIndex));
+
+        return STATUS_SUCCESS;
     }
 
     if (matchCount > 1)
     {
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2Ncm: %lu string descriptors matched the MAC-address shape — "
-            "ambiguous, refusing to guess which one is real\n", matchCount));
+            "T2Ncm: %lu dedicated string descriptors matched the "
+            "MAC-address shape — ambiguous, refusing to guess which one "
+            "is real\n", matchCount));
         return STATUS_DEVICE_PROTOCOL_ERROR;
     }
 
-    *MacStringIndex = candidateIndex;
+    // Pass 2 (fallback, only reached when pass 1 found NOTHING): some
+    // devices don't carry a separate MAC string at all and instead
+    // derive/reuse the Ethernet address from iSerialNumber whenever it
+    // happens to already be 12 hex characters. Real T2 hardware appears
+    // to be one of them — this is exactly the shape observed after pass
+    // 1 came up empty on it.
+    if (serialIndex != 0 && T2NcmStringIsMacShape(DeviceContext, serialIndex))
+    {
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
+            "T2Ncm: no dedicated MAC string found — falling back to "
+            "iSerialNumber (index %u), which has the right shape\n",
+            serialIndex));
 
-    T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
-        "T2Ncm: MAC address string found unambiguously at index %u\n",
-        candidateIndex));
+        *MacStringIndex = serialIndex;
+        return STATUS_SUCCESS;
+    }
 
-    return STATUS_SUCCESS;
+    T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+        "T2Ncm: no string descriptor — dedicated or iSerialNumber — in "
+        "indices %u..%u matched the MAC-address shape (12 hex chars)\n",
+        T2NCM_MAC_SCAN_MIN_INDEX, T2NCM_MAC_SCAN_MAX_INDEX));
+
+    T2NcmLogAllStringDescriptors(DeviceContext);
+
+    return STATUS_NOT_FOUND;
 }
 
 NTSTATUS
