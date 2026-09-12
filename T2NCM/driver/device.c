@@ -12,12 +12,6 @@
 #include "UsbTransport.h"
 #include "NcmProtocol.h"
 
-// Task 25: same posture as T2TouchIdTransport's public.h — restrict the
-// diagnostic device interface to Administrators/SYSTEM. This is a
-// read-only status query, not a control surface, but there's no reason
-// to expose even that to every logged-on user.
-DECLARE_CONST_UNICODE_STRING(g_T2NcmSddlDevObjSysAllAdmAll, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
-
 static const char* T2NcmStateName(T2NCM_LIFECYCLE_STATE s)
 {
     switch (s)
@@ -106,18 +100,6 @@ T2NcmEvtDeviceAdd(
     pnpPowerCallbacks.EvtDeviceSelfManagedIoRestart    = T2NcmEvtSelfManagedIoRestart;
     WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit, &pnpPowerCallbacks);
 
-    // Task 25: restrict the diagnostic device interface before
-    // WdfDeviceCreate consumes DeviceInit — WdfDeviceInitAssignSDDLString
-    // after WdfDeviceCreate passes a NULL DeviceInit and trips a WDF
-    // violation (same ordering requirement T2TouchIdTransport documents).
-    status = WdfDeviceInitAssignSDDLString(DeviceInit, &g_T2NcmSddlDevObjSysAllAdmAll);
-    if (!NT_SUCCESS(status))
-    {
-        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2Ncm: WdfDeviceInitAssignSDDLString failed 0x%08X\n", status));
-        return status;
-    }
-
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, T2NCM_DEVICE_CONTEXT);
 
     status = WdfDeviceCreate(&DeviceInit, &attributes, &device);
@@ -143,7 +125,12 @@ T2NcmEvtDeviceAdd(
 
     // Task 25: device interface for the diagnostic status IOCTL. Created
     // once here (not per-D0Entry) — WDF handles enabling/disabling it
-    // across PnP/power transitions on its own.
+    // across PnP/power transitions on its own. Uses WDF's default
+    // security descriptor (no custom SDDL) — a hand-rolled SDDL string
+    // here previously broke device bring-up entirely (Code 31 /
+    // STATUS_INVALID_SECURITY_DESCR on both MI_00 and MI_01) for a
+    // reason not yet root-caused; not worth re-attempting for a
+    // read-only diagnostic query until it can be tested in isolation.
     status = WdfDeviceCreateDeviceInterface(device, &GUID_DEVINTERFACE_T2NCM, NULL);
     if (!NT_SUCCESS(status))
     {
