@@ -83,17 +83,38 @@ T2NcmUsbPrepareHardware(
     // completes and Task 12 switches it to alt 1). Do NOT assume a
     // pre-existing UsbNcm configuration is already selected.
     //
-    // WDF_USB_INTERFACE_SETTING_PAIR.UsbInterface is an OUTPUT field —
-    // WDF fills it in on success. Zero the array first: an uninitialized
-    // stack UsbInterface here is garbage, not NULL, and
-    // WdfUsbTargetDeviceSelectConfig validates it on input for the
-    // multi-interface case — garbage there fails the whole call with
-    // STATUS_INVALID_PARAMETER (0xC000000D), which cost real bring-up
-    // time to track down on hardware. Never leave a WDF out-param
-    // uninitialized on entry again.
+    // WDF_USB_INTERFACE_SETTING_PAIR.UsbInterface is an INPUT for the
+    // multi-interface case, not an output WDF fills in — it identifies
+    // WHICH already-enumerated interface each SettingIndex applies to.
+    // WdfUsbTargetDeviceGetInterface works immediately after
+    // WdfUsbTargetDeviceCreateWithParameters (USBD parses the config
+    // descriptor's interface list right there, independent of any
+    // config being "selected" yet), so fetch both handles first. Leaving
+    // this NULL — even zero-initialized NULL, not just stack garbage —
+    // is just as much an invalid parameter to WdfUsbTargetDeviceSelectConfig
+    // and was the real cause of the 0xC000000D failure, not the
+    // uninitialized-memory issue fixed earlier (that was real too, just
+    // not the whole story).
+    WDFUSBINTERFACE controlInterfaceHandle =
+        WdfUsbTargetDeviceGetInterface(DeviceContext->UsbDevice, T2NCM_CONTROL_IFACE_NUM);
+    WDFUSBINTERFACE dataInterfaceHandle =
+        WdfUsbTargetDeviceGetInterface(DeviceContext->UsbDevice, T2NCM_DATA_IFACE_NUM);
+
+    if (controlInterfaceHandle == NULL || dataInterfaceHandle == NULL)
+    {
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+            "T2Ncm: WdfUsbTargetDeviceGetInterface returned NULL "
+            "(MI_00=%p, MI_01=%p) — config descriptor doesn't have the "
+            "2 interfaces this driver expects\n",
+            controlInterfaceHandle, dataInterfaceHandle));
+        return STATUS_DEVICE_CONFIGURATION_ERROR;
+    }
+
     WDF_USB_INTERFACE_SETTING_PAIR settingPairs[2];
     RtlZeroMemory(settingPairs, sizeof(settingPairs));
+    settingPairs[0].UsbInterface = controlInterfaceHandle;
     settingPairs[0].SettingIndex = 0; // MI_00 has only one setting
+    settingPairs[1].UsbInterface = dataInterfaceHandle;
     settingPairs[1].SettingIndex = T2NCM_DATA_ALT_IDLE;
 
     WDF_USB_DEVICE_SELECT_CONFIG_PARAMS_INIT_MULTIPLE_INTERFACES(
@@ -109,24 +130,15 @@ T2NcmUsbPrepareHardware(
         return status;
     }
 
-    // Task 6: this KMDF version's WDF_USB_DEVICE_SELECT_CONFIG_PARAMS
-    // doesn't echo the interface count back (no NumberOfInterfaces
-    // field on Types.MultiInterface here) — the real per-interface
-    // confirmation is that WDF filled in both Pairs[].UsbInterface
-    // handles. WdfUsbTargetDeviceSelectConfig succeeding should
-    // guarantee this, but never assume — check both explicitly rather
-    // than dereferencing a handle we didn't verify.
-    if (settingPairs[0].UsbInterface == NULL || settingPairs[1].UsbInterface == NULL)
-    {
-        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2Ncm: WdfUsbTargetDeviceSelectConfig succeeded but left an interface "
-            "handle NULL (MI_00=%p, MI_01=%p)\n",
-            settingPairs[0].UsbInterface, settingPairs[1].UsbInterface));
-        return STATUS_DEVICE_CONFIGURATION_ERROR;
-    }
-
-    DeviceContext->ControlInterface = settingPairs[0].UsbInterface;
-    DeviceContext->DataInterface    = settingPairs[1].UsbInterface;
+    // Task 6: on success, settingPairs[i].UsbInterface is the same
+    // controlInterfaceHandle/dataInterfaceHandle we already validated
+    // non-NULL above and passed in — WdfUsbTargetDeviceSelectConfig
+    // doesn't replace it with something else, it just applies
+    // SettingIndex to that interface. Assign straight from the handles
+    // we already confirmed rather than re-reading through the Pairs
+    // array as if they were an output we hadn't seen yet.
+    DeviceContext->ControlInterface = controlInterfaceHandle;
+    DeviceContext->DataInterface    = dataInterfaceHandle;
 
     // Task 5: discover the interrupt IN pipe on MI_00 dynamically. MI_00
     // has only one setting (0), already made current by the
