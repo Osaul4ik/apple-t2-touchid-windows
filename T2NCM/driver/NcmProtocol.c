@@ -7,6 +7,7 @@
 // fabricated value for anything the device didn't actually report.
 
 #include "NcmProtocol.h"
+#include <ntstrsafe.h>  // RtlStringCbPrintfExA — raw-byte diagnostic dump only
 
 // ---- CDC-NCM class-specific request codes (USB CDC-NCM 1.20 table 6.2) ----
 #define T2NCM_REQ_GET_NTB_PARAMETERS    0x80u
@@ -499,7 +500,35 @@ T2NcmLogAllStringDescriptors(
                    : ((sizeof(buffer) / sizeof(buffer[0])) - 1)] = L'\0';
 
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
-            "T2Ncm:   index %u (%u chars): \"%ws\"\n", idx, numChars, buffer));
+            "T2Ncm:   index %u (%u chars, actually read %u): \"%ws\"\n",
+            idx, numChars, toRead, buffer));
+
+        // %ws stops at the first embedded NUL, which silently hides real
+        // content (e.g. binary/GUID-shaped strings, or a short read where
+        // toRead < numChars). Dump the raw bytes too so nothing is lost.
+        {
+            CHAR hex[3 * (sizeof(buffer) / sizeof(buffer[0])) + 1];
+            PCHAR cursor = hex;
+            SIZE_T remaining = sizeof(hex);
+            USHORT hi;
+
+            hex[0] = '\0';
+            for (hi = 0; hi < toRead; hi++)
+            {
+                UCHAR lo  = (UCHAR)(buffer[hi] & 0xFF);
+                UCHAR hib = (UCHAR)((buffer[hi] >> 8) & 0xFF);
+
+                if (!NT_SUCCESS(RtlStringCbPrintfExA(
+                        cursor, remaining, &cursor, &remaining, 0,
+                        "%02X%02X ", lo, hib)))
+                {
+                    break;
+                }
+            }
+
+            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
+                "T2Ncm:   index %u raw bytes (LE per char): %s\n", idx, hex));
+        }
     }
 }
 
