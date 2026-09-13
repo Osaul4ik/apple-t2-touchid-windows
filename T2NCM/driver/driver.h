@@ -139,6 +139,29 @@ typedef struct _T2NCM_DEVICE_CONTEXT
     ULONG                NtbInMaxSize;
     ULONG                NtbOutMaxSize;
 
+    // Task 14-15 (NcmRx.c). Diagnostic-only until NdisMiniport.c (Tasks
+    // 18-20) exists to actually indicate frames upstream — this proves
+    // the NTB16/NDP16 parsing is correct against real device traffic
+    // first, same "validate the layer below before building on it"
+    // rule Task 25 already established for the control plane. Counters
+    // are updated with Interlocked ops (pipe-read completions can run
+    // concurrently on different CPUs with NumPendingReads > 1); the
+    // LastFrame* snapshot fields are best-effort, not lock-protected —
+    // a torn read here means the diagnostic IOCTL reports one frame's
+    // fields mixed with another's, never a fabricated one.
+    LONG64               RxNtbsReceived;
+    LONG64               RxFramesParsed;
+    LONG64               RxFramesRejected;
+    UCHAR                RxLastFrameDest[6];
+    UCHAR                RxLastFrameSrc[6];
+    USHORT               RxLastFrameEtherType;
+    USHORT               RxLastFrameLength;
+
+    // WDFUSBPIPE's own continuous-reader machinery owns the actual read
+    // requests; nothing else to store here. Start/stop is idempotent —
+    // see NcmRx.c.
+    BOOLEAN              RxStarted;
+
 } T2NCM_DEVICE_CONTEXT, *PT2NCM_DEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(T2NCM_DEVICE_CONTEXT, T2NcmGetDeviceContext)

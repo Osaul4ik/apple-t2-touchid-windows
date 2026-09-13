@@ -69,6 +69,22 @@ typedef struct _T2NCM_STATUS
     // Task 12 — MI_01 switched to alt 1 and both bulk pipes discovered.
     BOOLEAN DataInterfaceActive;
     UINT8   Reserved2[3];
+
+    // Task 14-15 (NcmRx.c) — diagnostic-only RX counters and a snapshot
+    // of the most recently parsed frame. All zero until at least one
+    // NTB has been received on the bulk-IN pipe. Frames are validated
+    // and counted here but NOT yet indicated to NDIS (Tasks 18-20 don't
+    // exist yet) — this field set exists purely to prove the NTB16/
+    // NDP16 parser against real device traffic, same role
+    // IOCTL_T2NCM_GET_STATUS already played for the control plane.
+    UINT64  RxNtbsReceived;
+    UINT64  RxFramesParsed;
+    UINT64  RxFramesRejected;
+    UINT8   RxLastFrameDest[6];
+    UINT8   RxLastFrameSrc[6];
+    UINT16  RxLastFrameEtherType;   // host byte order (already converted
+                                      // from network byte order on read)
+    UINT16  RxLastFrameLength;
 } T2NCM_STATUS, *PT2NCM_STATUS;
 #pragma pack(pop)
 

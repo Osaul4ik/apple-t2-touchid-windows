@@ -11,6 +11,7 @@
 #include "Device.h"
 #include "UsbTransport.h"
 #include "NcmProtocol.h"
+#include "NcmRx.h"
 
 static const char* T2NcmStateName(T2NCM_LIFECYCLE_STATE s)
 {
@@ -232,6 +233,13 @@ T2NcmEvtDeviceReleaseHardware(
     // removal can arrive from any state) and let T2NcmUsbReleaseHardware
     // tear down pipes/interfaces/UsbDevice under the same lock discipline
     // T2NcmIsIoAllowed() readers use.
+    // Defense in depth: D0Exit already calls this on the normal path,
+    // but WdfIoTargetStop/RxStarted are idempotent, so a second call
+    // here costs nothing and guarantees no bulk-IN read is ever
+    // in-flight across a pipe object T2NcmUsbReleaseHardware is about
+    // to tear down, regardless of which PnP path got us here.
+    T2NcmRxStop(context);
+
     WdfSpinLockAcquire(context->StateLock);
     context->State = T2NcmStateReleased;
     WdfSpinLockRelease(context->StateLock);
@@ -353,6 +361,24 @@ T2NcmEvtDeviceD0Entry(
 
         if (NT_SUCCESS(ncmStatus))
         {
+            // Task 14-15: bring up the RX path now that alt 1 is active
+            // and BulkInPipe/NtbInMaxSize are both valid. Deliberately
+            // NOT gating NcmReady on this succeeding — same "don't take
+            // the whole milestone down for a secondary piece" policy
+            // already applied to MAC discovery above. A failure here
+            // just means no RX frames get parsed until the next
+            // PrepareHardware; TX and the control plane are unaffected.
+            NTSTATUS rxStatus = T2NcmRxStart(context);
+            if (!NT_SUCCESS(rxStatus))
+            {
+                T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
+                    "T2Ncm: RX engine did not start (0x%08X) — continuing "
+                    "without it\n", rxStatus));
+            }
+        }
+
+        if (NT_SUCCESS(ncmStatus))
+        {
             (void)T2NcmTrySetState(context, T2NcmStateUsbReady, T2NcmStateNcmReady);
             T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
                 "T2Ncm: NCM control-plane negotiated, MI_01 active -> NcmReady\n"));
@@ -380,11 +406,14 @@ T2NcmEvtDeviceD0Exit(
     T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_TRACE_LEVEL,
         "T2Ncm: EvtDeviceD0Exit entered (TargetState=%u)\n", (ULONG)TargetState));
 
-    // Per Task 21: stop RX/TX rearming and cancel pending USB before
-    // returning. RX/TX engines don't exist yet in this milestone
-    // (Tasks 15/16), so this currently only flips the gate that
-    // T2NcmIsIoAllowed() checks — later passes add the actual
-    // cancel/flush calls here.
+    // Task 21: stop RX rearming and cancel pending USB before returning.
+    // T2NcmRxStop is idempotent (no-op if RX was never started, e.g.
+    // D0Exit firing before negotiation ever reached UsbReady) and waits
+    // for in-flight reads to complete before returning, so nothing here
+    // races EvtDeviceReleaseHardware's later pipe teardown. TX doesn't
+    // exist yet (Task 16) — this only covers the RX side so far.
+    T2NcmRxStop(context);
+
     WdfSpinLockAcquire(context->StateLock);
     if (context->State != T2NcmStateReleased)
     {
@@ -405,7 +434,10 @@ T2NcmEvtSelfManagedIoInit(
     )
 {
     UNREFERENCED_PARAMETER(Device);
-    // RX rearm loop / periodic housekeeping starts here once Task 15 lands.
+    // RX now starts from EvtDeviceD0Entry once NCM negotiation succeeds
+    // (T2NcmRxStart, NcmRx.c) rather than here — nothing left for this
+    // callback to do until Task 16's TX engine needs its own
+    // self-managed-I/O hook.
     return STATUS_SUCCESS;
 }
 
@@ -535,14 +567,30 @@ T2NcmEvtIoDeviceControlGetStatus(
     out->DataInterfaceActive =
         (Context->BulkInPipe != NULL) && (Context->BulkOutPipe != NULL);
 
+    // Task 14-15. LONG64 counters read without a lock, same rationale
+    // as Ntb16Supported/NtbInMaxSize above: RX completions can only
+    // ever increase them, so a torn/interleaved read is at worst a
+    // slightly-stale count, never a fabricated one. The Interlocked ops
+    // on the write side (NcmRx.c) matter for correctness *between*
+    // concurrent RX completions, not for this read.
+    out->RxNtbsReceived   = (UINT64)Context->RxNtbsReceived;
+    out->RxFramesParsed   = (UINT64)Context->RxFramesParsed;
+    out->RxFramesRejected = (UINT64)Context->RxFramesRejected;
+    RtlCopyMemory(out->RxLastFrameDest, Context->RxLastFrameDest, sizeof(out->RxLastFrameDest));
+    RtlCopyMemory(out->RxLastFrameSrc, Context->RxLastFrameSrc, sizeof(out->RxLastFrameSrc));
+    out->RxLastFrameEtherType = Context->RxLastFrameEtherType;
+    out->RxLastFrameLength    = Context->RxLastFrameLength;
+
     T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_TRACE_LEVEL,
         "T2Ncm: IOCTL_T2NCM_GET_STATUS -> state=%u ntb16=%u inMax=%u outMax=%u "
-        "macValid=%u macPermanent=%u mac=%02X:%02X:%02X:%02X:%02X:%02X dataActive=%u\n",
+        "macValid=%u macPermanent=%u mac=%02X:%02X:%02X:%02X:%02X:%02X dataActive=%u "
+        "rxNtbs=%llu rxFrames=%llu rxRejected=%llu\n",
         out->LifecycleState, out->Ntb16Supported, out->NtbInMaxSize, out->NtbOutMaxSize,
         out->MacAddressValid, out->MacAddressIsPermanent,
         out->MacAddress[0], out->MacAddress[1], out->MacAddress[2],
         out->MacAddress[3], out->MacAddress[4], out->MacAddress[5],
-        out->DataInterfaceActive));
+        out->DataInterfaceActive,
+        out->RxNtbsReceived, out->RxFramesParsed, out->RxFramesRejected));
 
     WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, sizeof(*out));
 }
