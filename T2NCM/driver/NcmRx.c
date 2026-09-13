@@ -294,6 +294,9 @@ T2NcmRxStart(
     )
 {
     WDF_USB_CONTINUOUS_READER_CONFIG readerConfig;
+    WDF_USB_PIPE_INFORMATION pipeInfo;
+    ULONG maxPacketSize;
+    ULONG readerBufferSize;
     NTSTATUS status;
 
     if (DeviceContext->RxStarted)
@@ -317,11 +320,37 @@ T2NcmRxStart(
         return STATUS_INVALID_DEVICE_STATE;
     }
 
+    // WdfUsbTargetPipeConfigContinuousReader requires TransferLength to
+    // be a multiple of the pipe's MaximumPacketSize (STATUS_INVALID_
+    // BUFFER_SIZE otherwise — confirmed on real hardware: negotiated
+    // NtbInMaxSize=32764 is NOT a multiple of the bulk endpoint's
+    // 512-byte MaximumPacketSize). The device's own NtbInMaxSize is a
+    // content-size limit, not a USB transfer-chunking one, so rounding
+    // the READ buffer up to the next multiple is correct — it only
+    // changes how much slack the last packet of a transfer can have,
+    // never what T2NcmRxParseNtb is allowed to trust (that still
+    // validates against the actual NumBytesTransferred, not this
+    // buffer size).
+    WDF_USB_PIPE_INFORMATION_INIT(&pipeInfo);
+    WdfUsbTargetPipeGetInformation(DeviceContext->BulkInPipe, &pipeInfo);
+
+    maxPacketSize = pipeInfo.MaximumPacketSize;
+    if (maxPacketSize == 0)
+    {
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+            "T2Ncm: BulkInPipe reports MaximumPacketSize=0 — cannot size "
+            "the continuous reader buffer\n"));
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
+    readerBufferSize =
+        ((DeviceContext->NtbInMaxSize + maxPacketSize - 1) / maxPacketSize) * maxPacketSize;
+
     WDF_USB_CONTINUOUS_READER_CONFIG_INIT(
         &readerConfig,
         T2NcmEvtRxReadComplete,
         DeviceContext,
-        DeviceContext->NtbInMaxSize);
+        readerBufferSize);
 
     readerConfig.EvtUsbTargetPipeReadersFailed = T2NcmEvtRxReadersFailed;
     readerConfig.NumPendingReads = T2NCM_RX_PENDING_READS;
@@ -347,8 +376,10 @@ T2NcmRxStart(
     DeviceContext->RxStarted = TRUE;
 
     T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
-        "T2Ncm: RX continuous reader started (bufferSize=%lu, pendingReads=%u)\n",
-        DeviceContext->NtbInMaxSize, T2NCM_RX_PENDING_READS));
+        "T2Ncm: RX continuous reader started (ntbMax=%lu, bufferSize=%lu, "
+        "maxPacketSize=%lu, pendingReads=%u)\n",
+        DeviceContext->NtbInMaxSize, readerBufferSize, maxPacketSize,
+        T2NCM_RX_PENDING_READS));
 
     return STATUS_SUCCESS;
 }
