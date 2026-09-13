@@ -162,6 +162,32 @@ typedef struct _T2NCM_DEVICE_CONTEXT
     // see NcmRx.c.
     BOOLEAN              RxStarted;
 
+    // Task 13/16 (NcmTx.c). GET_NTB_PARAMETERS (NcmProtocol.c) already
+    // computes and validates these via T2NcmValidateNdpGeometry, but
+    // until now the local T2NCM_NTB_PARAMETERS in EvtDeviceD0Entry went
+    // out of scope right after — TX has no way to place NDP16/datagrams
+    // at offsets the device's OUT direction actually requires without
+    // them persisted here. wNtbOutMaxDatagrams==0 is the spec's own
+    // "device imposes no limit" value, not a missing/invalid one.
+    USHORT               NdpOutDivisor;
+    USHORT               NdpOutPayloadRemainder;
+    USHORT               NdpOutAlignment;
+    USHORT               NtbOutMaxDatagrams;
+
+    // Running wSequence for outgoing NTBs — only needs to be
+    // non-repeating within a reasonable window per the NCM spec, not
+    // globally unique, so a wrapping USHORT is fine. Only ever touched
+    // from T2NcmTxSendFrame, which this milestone only reaches from the
+    // sequential default I/O queue (one IOCTL processed at a time) —
+    // not Interlocked, since there is no concurrent writer yet. Revisit
+    // if Task 18-20's NDIS MiniportSendNetBufferLists ends up calling
+    // into TX from a different, possibly concurrent, context.
+    USHORT               TxSequence;
+
+    LONG64               TxNtbsSent;
+    LONG64               TxFramesSent;
+    LONG64               TxFramesRejected;
+
 } T2NCM_DEVICE_CONTEXT, *PT2NCM_DEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(T2NCM_DEVICE_CONTEXT, T2NcmGetDeviceContext)

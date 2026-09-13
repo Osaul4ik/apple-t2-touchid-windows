@@ -85,8 +85,30 @@ typedef struct _T2NCM_STATUS
     UINT16  RxLastFrameEtherType;   // host byte order (already converted
                                       // from network byte order on read)
     UINT16  RxLastFrameLength;
+
+    // Task 13/16 (NcmTx.c) — diagnostic-only TX counters, populated by
+    // IOCTL_T2NCM_SEND_TEST_FRAME calls. All zero until at least one
+    // test frame has been sent.
+    UINT64  TxNtbsSent;
+    UINT64  TxFramesSent;
+    UINT64  TxFramesRejected;
 } T2NCM_STATUS, *PT2NCM_STATUS;
 #pragma pack(pop)
 
 #define IOCTL_T2NCM_GET_STATUS \
     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x900, METHOD_BUFFERED, FILE_READ_ACCESS)
+
+// Task 13/16 diagnostic milestone — same rationale as
+// IOCTL_T2NCM_GET_STATUS existing for the control plane and RX: there
+// is no NDIS miniport yet (Tasks 18-20) to originate outgoing frames,
+// so this lets a user-mode tool hand the driver one raw Ethernet II
+// frame (14-1514 bytes, no FCS) in the input buffer and have it
+// wrapped in a single-datagram NTB16 and written to the bulk-OUT pipe.
+// No output buffer — success/failure is the completion status alone;
+// a user-mode tool wanting frame-level confirmation should capture on
+// the receiving end (the Mac) rather than trust a driver-side
+// "it left the pipe" signal, which IOCTL_T2NCM_GET_STATUS's
+// RxFramesParsed/TxFramesSent counters already give without needing an
+// output struct here.
+#define IOCTL_T2NCM_SEND_TEST_FRAME \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x901, METHOD_BUFFERED, FILE_WRITE_ACCESS)

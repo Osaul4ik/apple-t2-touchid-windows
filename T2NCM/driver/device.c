@@ -12,6 +12,7 @@
 #include "UsbTransport.h"
 #include "NcmProtocol.h"
 #include "NcmRx.h"
+#include "NcmTx.h"
 
 static const char* T2NcmStateName(T2NCM_LIFECYCLE_STATE s)
 {
@@ -291,6 +292,10 @@ T2NcmEvtDeviceD0Entry(
         context->Ntb16Supported       = FALSE;
         context->NtbInMaxSize         = 0;
         context->NtbOutMaxSize        = 0;
+        context->NdpOutDivisor        = 0;
+        context->NdpOutPayloadRemainder = 0;
+        context->NdpOutAlignment      = 0;
+        context->NtbOutMaxDatagrams   = 0;
         context->MacAddressValid      = FALSE;
         context->MacAddressIsPermanent = FALSE;
         context->BulkInPipe           = NULL;
@@ -327,6 +332,14 @@ T2NcmEvtDeviceD0Entry(
             {
                 context->NtbInMaxSize  = ntbParams.dwNtbInMaxSize;
                 context->NtbOutMaxSize = ntbParams.dwNtbOutMaxSize;
+
+                // Task 13/16: persist the OUT-direction NDP geometry
+                // that T2NcmGetNtbParameters already validated — see
+                // driver.h's comment on why this wasn't kept before.
+                context->NdpOutDivisor          = ntbParams.wNdpOutDivisor;
+                context->NdpOutPayloadRemainder = ntbParams.wNdpOutPayloadRemainder;
+                context->NdpOutAlignment        = ntbParams.wNdpOutAlignment;
+                context->NtbOutMaxDatagrams     = ntbParams.wNtbOutMaxDatagrams;
             }
         }
 
@@ -581,6 +594,11 @@ T2NcmEvtIoDeviceControlGetStatus(
     out->RxLastFrameEtherType = Context->RxLastFrameEtherType;
     out->RxLastFrameLength    = Context->RxLastFrameLength;
 
+    // Task 13/16.
+    out->TxNtbsSent      = (UINT64)Context->TxNtbsSent;
+    out->TxFramesSent    = (UINT64)Context->TxFramesSent;
+    out->TxFramesRejected = (UINT64)Context->TxFramesRejected;
+
     T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_TRACE_LEVEL,
         "T2Ncm: IOCTL_T2NCM_GET_STATUS -> state=%u ntb16=%u inMax=%u outMax=%u "
         "macValid=%u macPermanent=%u mac=%02X:%02X:%02X:%02X:%02X:%02X dataActive=%u "
@@ -595,6 +613,44 @@ T2NcmEvtIoDeviceControlGetStatus(
     WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, sizeof(*out));
 }
 
+static
+VOID
+T2NcmEvtIoDeviceControlSendTestFrame(
+    _In_ WDFREQUEST            Request,
+    _In_ size_t                InputBufferLength,
+    _In_ PT2NCM_DEVICE_CONTEXT Context
+    )
+{
+    NTSTATUS status;
+    PVOID inputBuffer;
+    size_t inputLength;
+
+    if (g_T2NcmStubRole)
+    {
+        // The MI_00 stub role never has BulkOutPipe/NtbOutMaxSize/etc
+        // populated (Driver.h) — fail explicitly rather than let
+        // T2NcmTxSendFrame's own checks do it less clearly.
+        WdfRequestComplete(Request, STATUS_INVALID_DEVICE_STATE);
+        return;
+    }
+
+    status = WdfRequestRetrieveInputBuffer(Request, 1, &inputBuffer, &inputLength);
+    if (!NT_SUCCESS(status))
+    {
+        WdfRequestComplete(Request, status);
+        return;
+    }
+
+    UNREFERENCED_PARAMETER(InputBufferLength); // WdfRequestRetrieveInputBuffer's
+        // own inputLength is authoritative; the dispatch routine's
+        // InputBufferLength is only used elsewhere for the pre-check
+        // KMDF itself already did.
+
+    status = T2NcmTxSendFrame(Context, (const UCHAR*)inputBuffer, (ULONG)inputLength);
+
+    WdfRequestComplete(Request, status);
+}
+
 VOID
 T2NcmEvtIoDeviceControl(
     _In_ WDFQUEUE   Queue,
@@ -607,12 +663,15 @@ T2NcmEvtIoDeviceControl(
     PT2NCM_DEVICE_CONTEXT context = T2NcmGetDeviceContext(WdfIoQueueGetDevice(Queue));
 
     UNREFERENCED_PARAMETER(OutputBufferLength);
-    UNREFERENCED_PARAMETER(InputBufferLength);
 
     switch (IoControlCode)
     {
     case IOCTL_T2NCM_GET_STATUS:
         T2NcmEvtIoDeviceControlGetStatus(Request, context);
+        break;
+
+    case IOCTL_T2NCM_SEND_TEST_FRAME:
+        T2NcmEvtIoDeviceControlSendTestFrame(Request, InputBufferLength, context);
         break;
 
     default:
