@@ -280,12 +280,13 @@ T2NcmEvtDeviceD0Entry(
         // never report a field as confirmed when THIS cycle didn't
         // actually confirm it — that's exactly the kind of fabricated
         // status this driver's whole design is built to avoid.
-        context->Ntb16Supported  = FALSE;
-        context->NtbInMaxSize    = 0;
-        context->NtbOutMaxSize   = 0;
-        context->MacAddressValid = FALSE;
-        context->BulkInPipe      = NULL;
-        context->BulkOutPipe     = NULL;
+        context->Ntb16Supported       = FALSE;
+        context->NtbInMaxSize         = 0;
+        context->NtbOutMaxSize        = 0;
+        context->MacAddressValid      = FALSE;
+        context->MacAddressIsPermanent = FALSE;
+        context->BulkInPipe           = NULL;
+        context->BulkOutPipe          = NULL;
 
         // Tasks 7-12: negotiate the CDC-NCM control plane and switch
         // MI_01 to its active alt setting. This re-runs on EVERY
@@ -323,24 +324,25 @@ T2NcmEvtDeviceD0Entry(
 
         if (NT_SUCCESS(ncmStatus))
         {
-            // T2NcmReadMacAddress now discovers the MAC via a string-
-            // table scan (T2NcmScanForMacStringIndex in NcmProtocol.c),
-            // which works from an MI_01-only binding — expected to
-            // succeed on every real T2 unit. Still deliberately NOT
-            // gating NcmReady on it: a firmware/revision variant whose
-            // string table doesn't contain exactly one 12-hex-char
-            // string would otherwise take the whole data path down with
-            // it for what is, at worst, a missing permanent address.
-            // MacAddressValid stays FALSE on failure — the honest,
-            // "never fabricate a MAC" result this driver has always
-            // required.
-            NTSTATUS macStatus = T2NcmReadMacAddress(context);
+            // T2NcmEnsureMacAddress tries the real device string first
+            // (T2NcmScanForMacStringIndex in NcmProtocol.c); confirmed on
+            // REV_0201 hardware that this can legitimately come back
+            // empty (all-zero string table, not a parsing bug — see the
+            // raw byte dump in T2NcmLogAllStringDescriptors's log
+            // output). Rather than leave NDIS with no station address at
+            // all, it then falls back to a deterministic, locally-
+            // administered address derived from the device's
+            // ContainerID. Never gates NcmReady either way — a MAC
+            // (real or generated) is not required for the data path to
+            // come up. DeviceContext->MacAddressIsPermanent tells you
+            // which kind you got; MacAddressValid alone no longer
+            // implies "hardware-burned-in".
+            NTSTATUS macStatus = T2NcmEnsureMacAddress(context);
             if (!NT_SUCCESS(macStatus))
             {
                 T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
-                    "T2Ncm: permanent MAC address discovery failed (0x%08X) — "
-                    "unexpected on known-good hardware; continuing without "
-                    "one\n", macStatus));
+                    "T2Ncm: MAC address unavailable, real or generated "
+                    "(0x%08X) — continuing without one\n", macStatus));
             }
         }
 
@@ -519,6 +521,7 @@ T2NcmEvtIoDeviceControlGetStatus(
 
     // Task 8.
     out->MacAddressValid = Context->MacAddressValid;
+    out->MacAddressIsPermanent = Context->MacAddressIsPermanent;
     if (Context->MacAddressValid)
     {
         RtlCopyMemory(out->MacAddress, Context->PermanentMacAddress, sizeof(out->MacAddress));
@@ -534,9 +537,9 @@ T2NcmEvtIoDeviceControlGetStatus(
 
     T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_TRACE_LEVEL,
         "T2Ncm: IOCTL_T2NCM_GET_STATUS -> state=%u ntb16=%u inMax=%u outMax=%u "
-        "macValid=%u mac=%02X:%02X:%02X:%02X:%02X:%02X dataActive=%u\n",
+        "macValid=%u macPermanent=%u mac=%02X:%02X:%02X:%02X:%02X:%02X dataActive=%u\n",
         out->LifecycleState, out->Ntb16Supported, out->NtbInMaxSize, out->NtbOutMaxSize,
-        out->MacAddressValid,
+        out->MacAddressValid, out->MacAddressIsPermanent,
         out->MacAddress[0], out->MacAddress[1], out->MacAddress[2],
         out->MacAddress[3], out->MacAddress[4], out->MacAddress[5],
         out->DataInterfaceActive));

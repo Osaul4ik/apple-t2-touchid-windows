@@ -123,6 +123,14 @@ typedef struct _T2NCM_DEVICE_CONTEXT
     UCHAR                PermanentMacAddress[6];
     BOOLEAN              MacAddressValid;
 
+    // TRUE only when PermanentMacAddress came from a real device string
+    // (T2NcmReadMacAddress succeeded). FALSE when T2NcmEnsureMacAddress
+    // had to fall back to a generated locally-administered address —
+    // MacAddressValid is still TRUE in that case (NDIS has *an*
+    // address to use), this just tracks which kind it is so nothing
+    // downstream mistakes a generated address for hardware truth.
+    BOOLEAN              MacAddressIsPermanent;
+
     NDIS_HANDLE          NdisMiniportHandle;
     NDIS_HANDLE          NdisMiniportAdapterHandle;
 

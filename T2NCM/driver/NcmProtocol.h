@@ -67,3 +67,25 @@ NTSTATUS
 T2NcmReadMacAddress(
     _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
     );
+
+// Task 8 follow-up: real T2 units in the wild have turned up with an
+// all-zero iMACAddress/iSerialNumber string table (confirmed on
+// REV_0201 via raw string-descriptor byte dump — not a parsing bug,
+// the device genuinely reports nothing). NDIS still needs *some*
+// station address to bring an adapter up, so this wraps
+// T2NcmReadMacAddress: on success, behaves identically (real,
+// permanent address). On failure, deterministically derives a
+// locally-administered address from the device's ContainerID (stable
+// per physical device across reboots/replugs) instead of leaving the
+// adapter with no address at all.
+//
+// This never silently mislabels a generated address as permanent:
+// DeviceContext->MacAddressIsPermanent distinguishes the two cases for
+// anything downstream (IOCTL_T2NCM_GET_STATUS, logs) that cares which
+// kind of address it's looking at. MacAddressValid means "usable by
+// NDIS", not "burned into hardware" — check MacAddressIsPermanent for
+// that.
+NTSTATUS
+T2NcmEnsureMacAddress(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
+    );

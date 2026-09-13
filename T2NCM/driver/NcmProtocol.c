@@ -757,3 +757,154 @@ T2NcmReadMacAddress(
 
     return STATUS_SUCCESS;
 }
+
+// ---------------------------------------------------------------------
+// Fallback for devices with no usable MAC string at all (confirmed real
+// on REV_0201 — see the raw byte dump in T2NcmLogAllStringDescriptors's
+// output). FNV-1a is used purely as a fast, well-distributed
+// fingerprint — this has no security requirement, it only needs to map
+// the same 16-byte ContainerID to the same 6 bytes every time.
+// ---------------------------------------------------------------------
+static
+VOID
+T2NcmHashBytesToMac(
+    _In_reads_bytes_(Length) const UCHAR* Data,
+    _In_ ULONG                           Length,
+    _Out_writes_bytes_(6) UCHAR*         MacOut
+    )
+{
+    ULONGLONG hash = 0xcbf29ce484222325ULL;   // FNV-1a 64-bit offset basis
+    ULONG i;
+
+    for (i = 0; i < Length; i++)
+    {
+        hash ^= Data[i];
+        hash *= 0x100000001b3ULL;              // FNV-1a 64-bit prime
+    }
+
+    for (i = 0; i < 6; i++)
+    {
+        MacOut[i] = (UCHAR)(hash >> (8 * i));
+    }
+
+    // IEEE 802: bit 0 of the first octet = multicast/unicast, bit 1 =
+    // locally-administered/universally-administered. Clearing bit 0 and
+    // setting bit 1 marks this unambiguously as "not a registered-OUI
+    // burned-in address" — the honest way to hand out a generated
+    // address, never disguised as a real vendor-assigned one.
+    MacOut[0] = (UCHAR)((MacOut[0] & 0xFCu) | 0x02u);
+}
+
+// Seeds the generated address from the device's ContainerID: a GUID
+// Windows/PnP maintains specifically to identify "the same physical
+// device" across reboots and across replugging into a different port,
+// which is exactly the stability a station address needs. Falls back
+// to a VID/PID/REV-only seed if ContainerID is ever unavailable — that
+// fallback is deliberately weaker (every unit of this exact model would
+// collide) and is logged as such rather than silently accepted.
+static
+NTSTATUS
+T2NcmGenerateLocallyAdministeredMac(
+    _In_                   PT2NCM_DEVICE_CONTEXT DeviceContext,
+    _Out_writes_bytes_(6)  UCHAR*                 MacOut,
+    _Out_                  BOOLEAN*                UsedContainerId
+    )
+{
+    PDEVICE_OBJECT pdo;
+    GUID containerId;
+    ULONG resultLength = 0;
+    NTSTATUS status;
+
+    *UsedContainerId = FALSE;
+    RtlZeroMemory(MacOut, 6);
+
+    pdo = WdfDeviceWdmGetPhysicalDevice(DeviceContext->WdfDevice);
+    if (pdo != NULL)
+    {
+        RtlZeroMemory(&containerId, sizeof(containerId));
+        status = IoGetDeviceProperty(
+            pdo, DevicePropertyContainerID,
+            sizeof(containerId), &containerId, &resultLength);
+
+        if (NT_SUCCESS(status) && resultLength == sizeof(containerId))
+        {
+            T2NcmHashBytesToMac((const UCHAR*)&containerId, sizeof(containerId), MacOut);
+            *UsedContainerId = TRUE;
+            return STATUS_SUCCESS;
+        }
+
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
+            "T2Ncm: ContainerID query failed (0x%08X, len=%u) — falling "
+            "back to a VID/PID/REV seed\n", status, resultLength));
+    }
+    else
+    {
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
+            "T2Ncm: no physical device object available for ContainerID "
+            "query — falling back to a VID/PID/REV seed\n"));
+    }
+
+    // Weak fallback: identical on every unit of this exact VID/PID/REV,
+    // so two such devices on the same network segment WILL collide.
+    // Logged loudly on purpose rather than treated as an equally-good
+    // result.
+    {
+        struct { USHORT Vid; USHORT Pid; USHORT Rev; } seed;
+        seed.Vid = T2NCM_VID;
+        seed.Pid = T2NCM_PID;
+        seed.Rev = T2NCM_REV;
+        T2NcmHashBytesToMac((const UCHAR*)&seed, sizeof(seed), MacOut);
+    }
+
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS
+T2NcmEnsureMacAddress(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
+    )
+{
+    NTSTATUS status;
+    UCHAR generatedMac[6];
+    BOOLEAN usedContainerId;
+
+    status = T2NcmReadMacAddress(DeviceContext);
+    if (NT_SUCCESS(status))
+    {
+        // T2NcmReadMacAddress already set PermanentMacAddress and
+        // MacAddressValid = TRUE for a real, device-reported address.
+        DeviceContext->MacAddressIsPermanent = TRUE;
+        return STATUS_SUCCESS;
+    }
+
+    T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
+        "T2Ncm: no permanent MAC available (0x%08X) — generating a "
+        "locally-administered address instead of leaving NDIS without "
+        "one\n", status));
+
+    status = T2NcmGenerateLocallyAdministeredMac(DeviceContext, generatedMac, &usedContainerId);
+    if (!NT_SUCCESS(status))
+    {
+        // T2NcmGenerateLocallyAdministeredMac has no failing path today
+        // (its own fallback always produces something) — kept as a
+        // defensive check rather than trusted implicitly, matching this
+        // file's existing style for "not reachable in practice" guards.
+        DeviceContext->MacAddressValid = FALSE;
+        DeviceContext->MacAddressIsPermanent = FALSE;
+        return status;
+    }
+
+    RtlCopyMemory(DeviceContext->PermanentMacAddress, generatedMac, sizeof(generatedMac));
+    DeviceContext->MacAddressValid = TRUE;
+    DeviceContext->MacAddressIsPermanent = FALSE;
+
+    T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
+        "T2Ncm: using generated locally-administered MAC "
+        "%02X:%02X:%02X:%02X:%02X:%02X (seed: %s) — NOT a hardware "
+        "address\n",
+        generatedMac[0], generatedMac[1], generatedMac[2],
+        generatedMac[3], generatedMac[4], generatedMac[5],
+        usedContainerId ? "ContainerID" : "VID/PID/REV (weak, may collide)"));
+
+    return STATUS_SUCCESS;
+}

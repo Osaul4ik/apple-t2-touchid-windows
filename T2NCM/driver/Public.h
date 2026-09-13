@@ -54,7 +54,17 @@ typedef struct _T2NCM_STATUS
     // decoded and passed the all-zero/all-FF sentinel check.
     BOOLEAN MacAddressValid;
     UINT8   MacAddress[6];         // meaningful only if MacAddressValid
-    UINT8   Reserved1;
+
+    // Was Reserved1. MacAddressValid alone no longer means "hardware
+    // address" — on units with no usable MAC string at all (confirmed
+    // real on REV_0201), T2NcmEnsureMacAddress hands NDIS a generated
+    // locally-administered address instead of none. This flag is TRUE
+    // only for the former (real, device-reported) case; a user-mode
+    // tool built against an older version of this header that still
+    // treats this byte as reserved is unaffected — it was always
+    // zero-filled, and MacAddressIsPermanent==FALSE there simply reads
+    // as "not confirmed permanent", never as a fabricated positive.
+    BOOLEAN MacAddressIsPermanent;
 
     // Task 12 — MI_01 switched to alt 1 and both bulk pipes discovered.
     BOOLEAN DataInterfaceActive;
