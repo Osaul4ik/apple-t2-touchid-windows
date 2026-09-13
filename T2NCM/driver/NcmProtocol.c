@@ -8,6 +8,11 @@
 
 #include "NcmProtocol.h"
 #include <ntstrsafe.h>  // RtlStringCbPrintfExA — raw-byte diagnostic dump only
+#include <devpkey.h>    // DEVPKEY_Device_ContainerId — DEFINE_DEVPROPKEY expands
+                         // under the same INITGUID this file already gets via
+                         // Driver.h's <initguid.h>; DECLSPEC_SELECTANY lets any
+                         // other TU that also pulls this in fold to one instance,
+                         // same pattern as GUID_DEVINTERFACE_T2NCM in Public.h.
 
 // ---- CDC-NCM class-specific request codes (USB CDC-NCM 1.20 table 6.2) ----
 #define T2NCM_REQ_GET_NTB_PARAMETERS    0x80u
@@ -798,10 +803,25 @@ T2NcmHashBytesToMac(
 // Seeds the generated address from the device's ContainerID: a GUID
 // Windows/PnP maintains specifically to identify "the same physical
 // device" across reboots and across replugging into a different port,
-// which is exactly the stability a station address needs. Falls back
-// to a VID/PID/REV-only seed if ContainerID is ever unavailable — that
-// fallback is deliberately weaker (every unit of this exact model would
-// collide) and is logged as such rather than silently accepted.
+// which is exactly the stability a station address needs.
+//
+// Uses WdfDeviceQueryPropertyEx / DEVPKEY_Device_ContainerId — the
+// current, WDF-native property API (KMDF >= 1.11; this driver targets
+// 1.15) — NOT the legacy IoGetDeviceProperty(DevicePropertyContainerID).
+// That legacy call was tried first and turned out to be the wrong tool
+// here: on real hardware it came back STATUS_BUFFER_TOO_SMALL wanting
+// 78 bytes, not the 16 a GUID needs — evidence it was resolving to some
+// other, unrelated device property for this PDO rather than actually
+// reading a container ID. WdfDeviceQueryPropertyEx avoids that
+// ambiguity entirely by asking for DEVPKEY_Device_ContainerId
+// specifically and reporting back the actual DEVPROPTYPE it found, so
+// a type/size mismatch is caught explicitly instead of silently
+// misinterpreted.
+//
+// Falls back to a VID/PID/REV-only seed if the property is ever
+// unavailable — that fallback is deliberately weaker (every unit of
+// this exact model would collide) and is logged as such rather than
+// silently accepted.
 static
 NTSTATUS
 T2NcmGenerateLocallyAdministeredMac(
@@ -810,39 +830,39 @@ T2NcmGenerateLocallyAdministeredMac(
     _Out_                  BOOLEAN*                UsedContainerId
     )
 {
-    PDEVICE_OBJECT pdo;
+    WDF_DEVICE_PROPERTY_DATA propertyData;
     GUID containerId;
     ULONG resultLength = 0;
+    DEVPROPTYPE propertyType = DEVPROP_TYPE_EMPTY;
     NTSTATUS status;
 
     *UsedContainerId = FALSE;
     RtlZeroMemory(MacOut, 6);
+    RtlZeroMemory(&containerId, sizeof(containerId));
 
-    pdo = WdfDeviceWdmGetPhysicalDevice(DeviceContext->WdfDevice);
-    if (pdo != NULL)
+    WDF_DEVICE_PROPERTY_DATA_INIT(&propertyData, &DEVPKEY_Device_ContainerId);
+
+    status = WdfDeviceQueryPropertyEx(
+        DeviceContext->WdfDevice,
+        &propertyData,
+        sizeof(containerId),
+        &containerId,
+        &resultLength,
+        &propertyType);
+
+    if (NT_SUCCESS(status) &&
+        propertyType == DEVPROP_TYPE_GUID &&
+        resultLength == sizeof(containerId))
     {
-        RtlZeroMemory(&containerId, sizeof(containerId));
-        status = IoGetDeviceProperty(
-            pdo, DevicePropertyContainerID,
-            sizeof(containerId), &containerId, &resultLength);
-
-        if (NT_SUCCESS(status) && resultLength == sizeof(containerId))
-        {
-            T2NcmHashBytesToMac((const UCHAR*)&containerId, sizeof(containerId), MacOut);
-            *UsedContainerId = TRUE;
-            return STATUS_SUCCESS;
-        }
-
-        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
-            "T2Ncm: ContainerID query failed (0x%08X, len=%u) — falling "
-            "back to a VID/PID/REV seed\n", status, resultLength));
+        T2NcmHashBytesToMac((const UCHAR*)&containerId, sizeof(containerId), MacOut);
+        *UsedContainerId = TRUE;
+        return STATUS_SUCCESS;
     }
-    else
-    {
-        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
-            "T2Ncm: no physical device object available for ContainerID "
-            "query — falling back to a VID/PID/REV seed\n"));
-    }
+
+    T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
+        "T2Ncm: DEVPKEY_Device_ContainerId query failed (0x%08X, "
+        "type=%u, len=%u) — falling back to a VID/PID/REV seed\n",
+        status, propertyType, resultLength));
 
     // Weak fallback: identical on every unit of this exact VID/PID/REV,
     // so two such devices on the same network segment WILL collide.
