@@ -8,11 +8,21 @@
 
 #include "NcmProtocol.h"
 #include <ntstrsafe.h>  // RtlStringCbPrintfExA — raw-byte diagnostic dump only
-#include <devpkey.h>    // DEVPKEY_Device_ContainerId — DEFINE_DEVPROPKEY expands
-                         // under the same INITGUID this file already gets via
-                         // Driver.h's <initguid.h>; DECLSPEC_SELECTANY lets any
-                         // other TU that also pulls this in fold to one instance,
-                         // same pattern as GUID_DEVINTERFACE_T2NCM in Public.h.
+
+// DEVPKEY_Device_ContainerId, declared locally instead of #include
+// <devpkey.h>. That header defines ~150 DEVPKEY_* constants gated on
+// INITGUID being defined at the point of inclusion — and INITGUID is
+// already active for the rest of this TU (Driver.h pulls in
+// <initguid.h> before wdfusb.h/ndis.h, both of which end up including
+// devpkey.h themselves for their own property support). A second
+// explicit #include <devpkey.h> here re-processed the whole file under
+// INITGUID a second time in the same translation unit, which is a hard
+// redefinition (C2374) rather than the harmless COMDAT-folding
+// DECLSPEC_SELECTANY normally allows *across* TUs. Declaring only the
+// one key we actually use avoids re-including that header at all.
+DEFINE_DEVPROPKEY(T2Ncm_DEVPKEY_Device_ContainerId,
+    0x8c7ed206, 0x3f8a, 0x4827, 0xb3, 0xab, 0xae, 0x9e, 0x1f, 0xae, 0xfc, 0x6c, 2);
+    // DEVPROP_TYPE_GUID — verified against Microsoft's published value
 
 // ---- CDC-NCM class-specific request codes (USB CDC-NCM 1.20 table 6.2) ----
 #define T2NCM_REQ_GET_NTB_PARAMETERS    0x80u
@@ -840,7 +850,7 @@ T2NcmGenerateLocallyAdministeredMac(
     RtlZeroMemory(MacOut, 6);
     RtlZeroMemory(&containerId, sizeof(containerId));
 
-    WDF_DEVICE_PROPERTY_DATA_INIT(&propertyData, &DEVPKEY_Device_ContainerId);
+    WDF_DEVICE_PROPERTY_DATA_INIT(&propertyData, &T2Ncm_DEVPKEY_Device_ContainerId);
 
     status = WdfDeviceQueryPropertyEx(
         DeviceContext->WdfDevice,
