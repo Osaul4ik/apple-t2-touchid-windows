@@ -264,7 +264,7 @@ T2NcmEvtRxReadComplete(
 
 EVT_WDF_USB_READERS_FAILED T2NcmEvtRxReadersFailed;
 
-VOID
+BOOLEAN
 T2NcmEvtRxReadersFailed(
     _In_    WDFUSBPIPE Pipe,
     _In_    NTSTATUS   Status,
@@ -273,16 +273,19 @@ T2NcmEvtRxReadersFailed(
 {
     UNREFERENCED_PARAMETER(Pipe);
 
-    // KMDF stops requeuing reads on this pipe once the continuous
-    // reader gives up (repeated failures, e.g. device unplugged mid-
-    // transfer). Nothing to recover here — EvtDeviceReleaseHardware/
-    // the next PrepareHardware pass rebuilds the pipe from scratch.
-    // Logged, not treated as fatal to the whole device: TX and the
-    // control plane may still be fine.
+    // Returning FALSE: don't let the framework reset the pipe and
+    // restart the reader on its own — this milestone has no retry/
+    // backoff policy of its own yet, and an unbounded auto-restart
+    // loop on a device that's actually gone (unplugged) is worse than
+    // just stopping. The next EvtDevicePrepareHardware pass rebuilds
+    // the pipe from scratch instead. Logged, not treated as fatal to
+    // the whole device: TX and the control plane may still be fine.
     T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
         "T2Ncm: RX continuous reader stopped itself (status=0x%08X, "
         "usbdStatus=0x%08X) — bulk-IN reads will not resume until the "
         "next PrepareHardware\n", Status, UsbdStatus));
+
+    return FALSE;
 }
 
 NTSTATUS
