@@ -815,18 +815,35 @@ T2NcmHashBytesToMac(
 // device" across reboots and across replugging into a different port,
 // which is exactly the stability a station address needs.
 //
-// Uses WdfDeviceQueryPropertyEx / DEVPKEY_Device_ContainerId — the
-// current, WDF-native property API (KMDF >= 1.11; this driver targets
-// 1.15) — NOT the legacy IoGetDeviceProperty(DevicePropertyContainerID).
-// That legacy call was tried first and turned out to be the wrong tool
-// here: on real hardware it came back STATUS_BUFFER_TOO_SMALL wanting
-// 78 bytes, not the 16 a GUID needs — evidence it was resolving to some
-// other, unrelated device property for this PDO rather than actually
-// reading a container ID. WdfDeviceQueryPropertyEx avoids that
-// ambiguity entirely by asking for DEVPKEY_Device_ContainerId
-// specifically and reporting back the actual DEVPROPTYPE it found, so
-// a type/size mismatch is caught explicitly instead of silently
-// misinterpreted.
+// Reads DEVPKEY_Device_ContainerId straight off the WDM PDO via
+// IoGetDevicePropertyData — NOT WdfDeviceQueryPropertyEx.
+//
+// WdfDeviceQueryPropertyEx was tried first and looked right (it is the
+// current, WDF-native property API, KMDF >= 1.11), but
+// DeviceContext->WdfDevice was created with WdfDeviceMiniportCreate,
+// and WdfDeviceMiniportCreate's documented restrictions say that
+// handle "cannot be passed to any general framework device object
+// methods except WdfDeviceGetIoTarget, WdfDeviceWdmGetDeviceObject,
+// WdfDeviceWdmGetAttachedDevice, and WdfDeviceWdmGetPhysicalDevice" —
+// WdfDeviceQueryPropertyEx is not on that list. The framework's
+// verifier catches the violation at run time, not compile time:
+// MiniportInitializeEx bugchecks with WDF_VIOLATION (0x10D), arg1=5
+// ("a framework object handle of the incorrect type was passed to a
+// framework object method").
+//
+// The legacy IoGetDeviceProperty(DevicePropertyContainerID) was tried
+// before that and was also wrong: on real hardware it came back
+// STATUS_BUFFER_TOO_SMALL wanting 78 bytes, not the 16 a GUID needs —
+// evidence it was resolving to some other, unrelated device property.
+//
+// IoGetDevicePropertyData is the fix that is actually legal here: it
+// takes a raw PDEVICE_OBJECT (WdfDeviceWdmGetPhysicalDevice is on the
+// miniport-device whitelist above, so getting that PDO is fine) and
+// asks for DEVPKEY_Device_ContainerId specifically, reporting back the
+// actual DEVPROPTYPE it found so a type/size mismatch is caught
+// explicitly instead of silently misinterpreted — same safety property
+// WdfDeviceQueryPropertyEx would have given, without touching WDF's
+// device-property machinery that this device object never set up.
 //
 // Falls back to a VID/PID/REV-only seed if the property is ever
 // unavailable — that fallback is deliberately weaker (every unit of
@@ -840,7 +857,7 @@ T2NcmGenerateLocallyAdministeredMac(
     _Out_                  BOOLEAN*                UsedContainerId
     )
 {
-    WDF_DEVICE_PROPERTY_DATA propertyData;
+    PDEVICE_OBJECT pdo;
     GUID containerId;
     ULONG resultLength = 0;
     DEVPROPTYPE propertyType = DEVPROP_TYPE_EMPTY;
@@ -850,11 +867,13 @@ T2NcmGenerateLocallyAdministeredMac(
     RtlZeroMemory(MacOut, 6);
     RtlZeroMemory(&containerId, sizeof(containerId));
 
-    WDF_DEVICE_PROPERTY_DATA_INIT(&propertyData, &T2Ncm_DEVPKEY_Device_ContainerId);
+    pdo = WdfDeviceWdmGetPhysicalDevice(DeviceContext->WdfDevice);
 
-    status = WdfDeviceQueryPropertyEx(
-        DeviceContext->WdfDevice,
-        &propertyData,
+    status = IoGetDevicePropertyData(
+        pdo,
+        &T2Ncm_DEVPKEY_Device_ContainerId,
+        LOCALE_NEUTRAL,
+        0,
         sizeof(containerId),
         &containerId,
         &resultLength,
