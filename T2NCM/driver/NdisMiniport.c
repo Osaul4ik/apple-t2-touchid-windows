@@ -140,7 +140,7 @@ T2NcmWaitForDrain(
 }
 
 // ---------------------------------------------------------------------
-// Diagnostic control device (NdisMRegisterDeviceEx)
+// Diagnostic control device (NdisRegisterDeviceEx)
 // ---------------------------------------------------------------------
 
 _Dispatch_type_(IRP_MJ_CREATE)
@@ -294,7 +294,7 @@ T2NcmRegisterDiagnosticDevice(
 
     deviceAttributes.DefaultSDDLString = &sddl;
 
-    status = NdisMRegisterDeviceEx(
+    status = NdisRegisterDeviceEx(
         g_T2NcmMiniportDriverHandle,
         &deviceAttributes,
         &DeviceContext->ControlDeviceObject,
@@ -303,7 +303,7 @@ T2NcmRegisterDiagnosticDevice(
     if (status != NDIS_STATUS_SUCCESS)
     {
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
-            "T2Ncm: NdisMRegisterDeviceEx failed 0x%08X — continuing without "
+            "T2Ncm: NdisRegisterDeviceEx failed 0x%08X — continuing without "
             "the diagnostic device; the adapter itself is unaffected\n", status));
         DeviceContext->NdisDeviceHandle = NULL;
         DeviceContext->ControlDeviceObject = NULL;
