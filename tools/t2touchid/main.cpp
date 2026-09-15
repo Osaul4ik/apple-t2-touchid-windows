@@ -317,13 +317,13 @@ static int CmdNetwork(int argc, wchar_t* argv[]) {
         }
         std::wcout << L"local:    ";
         for (char c : local) std::wcout << static_cast<wchar_t>(c);
-        std::wcout << L"  (Windows — do NOT scan this)\n";
+        std::wcout << L"  (Windows - do NOT scan this)\n";
         std::wcout << L"peer:     ";
         for (char c : peer) std::wcout << static_cast<wchar_t>(c);
         if (ep.peerDerivedFromMac)
-            std::wcout << L"  (EUI-64 from MAC — scan target)\n";
+            std::wcout << L"  (EUI-64 from MAC - scan target)\n";
         else
-            std::wcout << L"  (--host override — scan target)\n";
+            std::wcout << L"  (--host override - scan target)\n";
     }
 
     if (!doScan) {
@@ -434,7 +434,7 @@ int wmain(int argc, wchar_t* argv[]) {
         return CmdNetwork(argc, argv);
     }
     if (cmd == L"identities" || cmd == L"verify") {
-        std::wcout << L"not yet wired — requires RemoteXPC BiometricKit port "
+        std::wcout << L"not yet wired - requires RemoteXPC BiometricKit port "
                       L"+ live BridgeXpc connection (Gate 6 phase 2 / Gate 7)\n";
         return 2;
     }
