@@ -6,7 +6,15 @@
 // result or reports the specific failure — there is no "assume it worked"
 // path anywhere in this file.
 #define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+// winsock2 MUST come before windows.h / Client.h, otherwise winsock.h is
+// pulled first and winsock2.h redefinition errors kill the build (/WX).
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
 #include "../../protocol/AppleKeyStore/Client.h"
+#include "../../protocol/Discovery/Adapter.h"
+#include "../../protocol/Discovery/PortScan.h"
 #include <iostream>
 #include <string>
 #include <fstream>
@@ -138,7 +146,8 @@ static int CmdLoadKeybag(Client& client, const std::wstring& path) {
     }
 
     int32_t handle = 0;
-    AksResult r = client.LoadKeybag(bag, &handle);
+    int8_t sepStatus = 0;
+    AksResult r = client.LoadKeybag(bag, &handle, 1, &sepStatus);
     SecureZeroMemory(bag.data(), bag.size());
     bag.clear();
 
@@ -150,19 +159,39 @@ static int CmdLoadKeybag(Client& client, const std::wstring& path) {
         std::wcout << L"load-keybag failed\n";
         return 1;
     }
+    if (sepStatus != 0) {
+        // AksResult::Ok here only means the mailbox round-trip completed —
+        // Client::LoadKeybag returns Ok even when SEP itself rejected the
+        // request (bad session, malformed bag, etc.), leaving outHandle
+        // untouched (still 0 from the init above). Printing "OK,
+        // handle=0" in that case would be a fabricated success, not a
+        // real one — report the real SEP status instead.
+        std::wcout << L"load-keybag: SEP rejected the request, sep_status="
+                   << static_cast<int>(sepStatus) << L"\n";
+        return 1;
+    }
 
     std::wcout << L"load-keybag: OK, handle=" << handle << L"\n";
     return 0;
 }
 
 static int CmdSetSystemKeybag(Client& client, int32_t handle, int32_t specialUserBag) {
-    AksResult r = client.MakeSystemKeybag(handle, specialUserBag);
+    int8_t sepStatus = 0;
+    AksResult r = client.MakeSystemKeybag(handle, specialUserBag, 1, &sepStatus);
     if (r == AksResult::NotReady) {
         std::wcout << L"set-system-keybag failed: DMA / OOL is not registered; run register-ool first\n";
         return 1;
     }
     if (r != AksResult::Ok) {
         std::wcout << L"set-system-keybag failed\n";
+        return 1;
+    }
+    if (sepStatus != 0) {
+        // Same pattern as load-keybag: Ok only means the exchange
+        // completed, not that SEP accepted the handle/session — check
+        // the real status before declaring success.
+        std::wcout << L"set-system-keybag: SEP rejected the request, sep_status="
+                   << static_cast<int>(sepStatus) << L"\n";
         return 1;
     }
 
@@ -176,9 +205,19 @@ static int CmdUnlock(Client& client, int32_t handle) {
         std::wcout << L"no password entered\n";
         return 1;
     }
-    AksResult r = client.Unlock(handle, secret); // zeroes `secret` internally
+    int8_t sepStatus = 0;
+    AksResult r = client.Unlock(handle, secret, 1, &sepStatus); // zeroes `secret` internally
     if (r != AksResult::Ok) {
         std::wcout << L"unlock failed\n";
+        return 1;
+    }
+    if (sepStatus != 0) {
+        // Client::Unlock's own comment: SepStatus != 0 on this opcode IS
+        // the wrong-password signal — it must never be reported as a
+        // bare "unlock: OK". Without this check the CLI previously
+        // printed success on a WRONG password.
+        std::wcout << L"unlock: SEP rejected the request (wrong password or bad handle), "
+                      L"sep_status=" << static_cast<int>(sepStatus) << L"\n";
         return 1;
     }
     std::wcout << L"unlock: OK\n";
@@ -208,6 +247,146 @@ static int CmdDeviceState(Client& client, int64_t handle, uint32_t selector) {
     std::wcout << L"\n";
     return 0;
 }
+
+
+
+static int CmdNetwork(int argc, wchar_t* argv[]) {
+    using namespace t2::discovery;
+
+    unsigned long ifIndexOverride = 0;
+    bool doScan = true;
+    std::string hostOverride; // peer IPv6 without zone
+
+    for (int i = 2; i < argc; ++i) {
+        std::wstring a = argv[i];
+        if (a == L"--no-scan") {
+            doScan = false;
+        } else if (a == L"--ifindex" && i + 1 < argc) {
+            ifIndexOverride = static_cast<unsigned long>(_wtoi(argv[++i]));
+        } else if (a == L"--host" && i + 1 < argc) {
+            // Narrow wide arg to UTF-8-ish for InetPton
+            std::wstring w = argv[++i];
+            hostOverride.clear();
+            for (wchar_t c : w) hostOverride.push_back(static_cast<char>(c & 0xFF));
+        } else if (a[0] >= L'0' && a[0] <= L'9') {
+            ifIndexOverride = static_cast<unsigned long>(_wtoi(a.c_str()));
+        }
+    }
+
+    std::vector<NcmEndpoint> endpoints;
+    if (ifIndexOverride != 0) {
+        NcmEndpoint ep;
+        if (!GetEndpointByIfIndex(ifIndexOverride, &ep)) {
+            std::wcout << L"no Preferred IPv6 link-local on ifIndex " << ifIndexOverride << L"\n";
+            return 1;
+        }
+        endpoints.push_back(ep);
+    } else {
+        endpoints = FindT2NcmEndpoints();
+        if (endpoints.empty()) {
+            std::wcout << L"no T2 NCM adapter found.\n";
+            std::wcout << L"hint: t2touchid.exe network <ifIndex> [--host fe80::...]\n";
+            return 1;
+        }
+    }
+
+    for (auto& ep : endpoints) {
+        if (!hostOverride.empty()) {
+            in6_addr parsed{};
+            if (!ParseIpv6(hostOverride.c_str(), &parsed)) {
+                std::wcout << L"invalid --host IPv6\n";
+                return 1;
+            }
+            ep.peerLinkLocal = parsed;
+            ep.peerDerivedFromMac = false;
+        }
+
+        std::string local = FormatLinkLocal(ep.localLinkLocal, ep.ifIndex);
+        std::string peer = FormatLinkLocal(ep.peerLinkLocal, ep.ifIndex);
+        std::wcout << L"adapter:  " << ep.friendlyName << L"\n";
+        std::wcout << L"desc:     " << ep.description << L"\n";
+        std::wcout << L"ifIndex:  " << ep.ifIndex << L"\n";
+        if (ep.hasMac) {
+            std::wcout << L"mac:      ";
+            for (int i = 0; i < 6; ++i) {
+                wchar_t b[4];
+                swprintf(b, 4, L"%02X%s", ep.mac[i], i < 5 ? L"-" : L"");
+                std::wcout << b;
+            }
+            std::wcout << L"\n";
+        }
+        std::wcout << L"local:    ";
+        for (char c : local) std::wcout << static_cast<wchar_t>(c);
+        std::wcout << L"  (Windows - do NOT scan this)\n";
+        std::wcout << L"peer:     ";
+        for (char c : peer) std::wcout << static_cast<wchar_t>(c);
+        if (ep.peerDerivedFromMac)
+            std::wcout << L"  (EUI-64 from MAC - scan target)\n";
+        else
+            std::wcout << L"  (--host override - scan target)\n";
+    }
+
+    if (!doScan) {
+        std::wcout << L"scan skipped (--no-scan).\n";
+        return 0;
+    }
+
+    const auto& ep = endpoints.front();
+    ScanOptions opt;
+    opt.concurrency = 64;
+    opt.connectTimeoutMs = 150;
+    opt.includeTcpOnly = true;
+    opt.onProgress = [](unsigned tried, unsigned total, unsigned tcp, unsigned http2) {
+        std::wcout << L"  scanned " << tried << L"/" << total
+                   << L"  tcp=" << tcp << L"  http2=" << http2 << L"\r" << std::flush;
+    };
+
+    std::wcout << L"scanning PEER ports " << opt.portBegin << L"-" << opt.portEnd
+               << L" (concurrency " << opt.concurrency
+               << L", timeout " << opt.connectTimeoutMs << L"ms)...\n";
+    auto hits = ScanHttp2Preface(ep, opt);
+    std::wcout << L"\n";
+
+    unsigned nTcp = 0, nHttp2 = 0;
+    for (const auto& h : hits) {
+        if (h.tcpOpen) ++nTcp;
+        if (h.http2PrefaceOk) ++nHttp2;
+    }
+
+    if (hits.empty()) {
+        std::wcout << L"no TCP listeners on peer in " << opt.portBegin << L"-"
+                   << opt.portEnd << L".\n";
+        std::wcout << L"try: t2touchid.exe network 4 --host fe80::aede:48ff:fe00:1122\n";
+        return 2;
+    }
+
+    std::wcout << L"candidates: tcp_open=" << nTcp << L"  http2_settings=" << nHttp2 << L"\n";
+    for (const auto& h : hits) {
+        std::wcout << L"  port " << h.port;
+        if (h.http2PrefaceOk) std::wcout << L"  [HTTP/2 SETTINGS]";
+        else std::wcout << L"  [TCP only]";
+        std::wcout << L"  recv=" << h.recvLen << L"B";
+        if (h.recvLen > 0) {
+            std::wcout << L"  hex=";
+            int show = h.recvLen < 12 ? h.recvLen : 12;
+            for (int i = 0; i < show; ++i) {
+                wchar_t tmp[4];
+                swprintf(tmp, 4, L"%02x", h.recvHead[i]);
+                std::wcout << tmp;
+            }
+        } else {
+            std::wcout << L"  (no data)";
+        }
+        std::wcout << L"\n";
+    }
+    if (nHttp2 == 0) {
+        std::wcout << L"note: no HTTP/2 SETTINGS yet. Confirm peer address matches Linux T2_TOUCHID_HOST.\n";
+    } else {
+        std::wcout << L"next: RemoteXPC handshake for Services[com.apple.eos.BiometricKit].Port\n";
+    }
+    return 0;
+}
+
 
 int wmain(int argc, wchar_t* argv[]) {
     if (argc < 2) {
@@ -250,13 +429,13 @@ int wmain(int argc, wchar_t* argv[]) {
         if (argc < 3) { std::wcout << L"usage: unlock <handle>\n"; return 1; }
         return CmdUnlock(client, _wtoi(argv[2]));
     }
-    if (cmd == L"network" || cmd == L"identities" || cmd == L"verify") {
-        // These require the BridgeXpc/BiometricKit protocol layer wired
-        // against a discovered port (see protocol/BridgeXpc,
-        // protocol/BiometricKit). Left as an explicit next-step rather
-        // than a fake "OK" — see docs/milestone-2-hardware-results.md.
-        std::wcout << L"not yet wired in this PoC skeleton - requires RemoteXPC "
-                      L"discovery + a live BridgeXpc connection on real hardware\n";
+    if (cmd == L"network") {
+        // Does not need the transport device handle — pure user-mode IPv6 scan.
+        return CmdNetwork(argc, argv);
+    }
+    if (cmd == L"identities" || cmd == L"verify") {
+        std::wcout << L"not yet wired - requires RemoteXPC BiometricKit port "
+                      L"+ live BridgeXpc connection (Gate 6 phase 2 / Gate 7)\n";
         return 2;
     }
 
