@@ -117,6 +117,12 @@
 #include <ndis.h>
 #pragma warning(pop)
 
+// WdfDeviceMiniportCreate and WdfDriverMiniportUnload (used by Device.c,
+// Driver.c and NdisMiniport.c) are declared here, not in wdf.h. This is
+// the "KMDF-as-USB-client-library-under-an-NDIS-miniport" mode Driver.h
+// describes above.
+#include <wdfminiport.h>
+
 #include "public.h"
 
 // ---- Logging ----

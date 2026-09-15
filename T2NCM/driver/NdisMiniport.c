@@ -1293,7 +1293,7 @@ T2NcmMiniportDevicePnPEventNotify(
 
     switch (NetDevicePnPEvent->DevicePnPEvent)
     {
-    case NdisDevicePnPEventSurpriseRemoval:
+    case NdisDevicePnPEventSurpriseRemoved:
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
             "T2Ncm: surprise removal\n"));
 
@@ -1384,7 +1384,7 @@ T2NcmMiniportShutdownEx(
 // Driver registration / unload
 // ---------------------------------------------------------------------
 
-MINIPORT_DRIVER_UNLOAD T2NcmMiniportDriverUnload;
+MINIPORT_UNLOAD T2NcmMiniportDriverUnload;
 
 VOID
 T2NcmMiniportDriverUnload(
