@@ -1,12 +1,15 @@
 ; ============================================================================
 ; apple-t2-ncm-ctrl-stub.inf  ("Variant 1" stub half)
 ;
-; Minimal stub binding for MI_00 (Apple T2 NCM Control interface). Ships
-; the SAME T2Ncm.sys binary as apple-t2-ncm.inf (which binds MI_01, the
-; real NCM function), but registers it under a DIFFERENT service name
-; ("T2NcmCtrlStub" vs "T2Ncm"). T2Ncm.sys's DriverEntry reads its own
-; RegistryPath to tell which service — and therefore which role — it was
-; loaded as (see Driver.c/g_T2NcmStubRole).
+; Minimal stub binding for MI_00 (Apple T2 NCM Control interface).
+;
+; CHANGED: this now ships its OWN binary, T2NcmCtrl.sys (built from
+; driver/CtrlStub.c by driver/T2NcmCtrl.vcxproj), instead of a second
+; service name over the same T2Ncm.sys image. T2Ncm.sys became an NDIS
+; miniport whose DriverEntry hands the driver object to NDIS and must not
+; own its dispatch table; this stub is a classic KMDF function driver and
+; must. One image cannot do both, and picking by RegistryPath inside a
+; single shared image was never a sound arrangement to begin with.
 ;
 ; Why this exists: real hardware showed MI_00 and MI_01 enumerate as two
 ; INDEPENDENT PDOs under usbccgp (no IAD grouping them), so the driver
@@ -17,6 +20,10 @@
 ; nothing but claim the PDO and handle PnP/power cleanly (D0Entry/D0Exit
 ; both return STATUS_SUCCESS immediately, no blocking, no I/O), so
 ; Windows treats MI_00 as a normal, working, sleep-friendly device.
+;
+; Note that this driver IS a normal power policy owner for MI_00, unlike
+; T2Ncm.sys where NDIS owns the power policy. That asymmetry is correct:
+; MI_00 is a plain USB interface, not a network adapter.
 ;
 ; Deliberately Class=System, not Net — this is not a network adapter and
 ; must not register an NDIS miniport or appear as a NIC. (Class is a
@@ -39,7 +46,7 @@ Signature   = "$WINDOWS NT$"
 Class       = System
 ClassGUID   = {4d36e97d-e325-11ce-bfc1-08002be10318}
 Provider    = %ManufacturerName%
-DriverVer   = 09/01/2026,2.0.0.0
+DriverVer   = 09/15/2026,2.1.0.0
 CatalogFile = apple-t2-ncm-ctrl-stub.cat
 PnpLockdown = 1
 
@@ -51,7 +58,7 @@ T2NcmCtrlStub.CopyDriverFiles = 12
 1 = %DiskName%,,,""
 
 [SourceDisksFiles]
-T2Ncm.sys = 1
+T2NcmCtrl.sys = 1
 
 [Manufacturer]
 %ManufacturerName% = Standard,NTamd64
@@ -74,13 +81,11 @@ T2Ncm.sys = 1
 CopyFiles = T2NcmCtrlStub.CopyDriverFiles
 
 [T2NcmCtrlStub.CopyDriverFiles]
-T2Ncm.sys
+T2NcmCtrl.sys
 
 
 ; ============================================================================
-; T2NcmCtrlStub service — SAME T2Ncm.sys binary as apple-t2-ncm.inf,
-; different service name. This is what lets one .sys tell the two roles
-; apart via RegistryPath in DriverEntry.
+; T2NcmCtrlStub service — its own binary, unrelated to T2Ncm.sys.
 ; ============================================================================
 
 [AppleT2NcmCtrlStub_Install.Services]
@@ -91,16 +96,14 @@ DisplayName   = %T2NcmCtrlStub.SVCDESC%
 ServiceType   = 1               ; SERVICE_KERNEL_DRIVER
 StartType     = 3               ; SERVICE_DEMAND_START
 ErrorControl  = 1               ; SERVICE_ERROR_NORMAL
-ServiceBinary = %12%\T2Ncm.sys
+ServiceBinary = %12%\T2NcmCtrl.sys
 
 [AppleT2NcmCtrlStub_Install.Wdf]
 KmdfService = T2NcmCtrlStub, T2NcmCtrlStub_wdfsect
 
 [T2NcmCtrlStub_wdfsect]
-; Must track T2Ncm.vcxproj's KMDF_VERSION_MAJOR/MINOR (currently 1.15,
-; pinned for Windows 10 compatibility — see that file's comment). Same
-; binary as apple-t2-ncm.inf, so this must always match that file's
-; T2Ncm_wdfsect value.
+; Must track T2NcmCtrl.vcxproj's KMDF_VERSION_MAJOR/MINOR (currently
+; 1.15, pinned for Windows 10 compatibility — see that file's comment).
 KmdfLibraryVersion = 1.15
 
 

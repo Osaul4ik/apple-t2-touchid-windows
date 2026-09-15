@@ -1,4 +1,13 @@
-# T2Ncm.sys — Architecture (Task 1 deliverable)
+# T2Ncm.sys — Architecture
+
+> **Revised.** This document originally described a KMDF function driver
+> that owned PnP and power for MI_01 and was going to attach an NDIS
+> miniport to the side of it. That is no longer the design. T2Ncm.sys is
+> now an **NDIS 6.30 miniport driver**, NDIS owns PnP and the power
+> policy, and KMDF is used only as a USB client library. The reasoning
+> and the full callback mapping live in
+> [T2Ncm-Power-Inversion.md](T2Ncm-Power-Inversion.md); this file has
+> been updated to match, but that one is the authority on the lifecycle.
 
 ## 1. Repo audit (Osaul4ik/apple-t2-touchid-windows @ Dev_lifecycle)
 
@@ -15,23 +24,39 @@
 ## 2. Where T2Ncm.sys lives
 
 ```
-driver/
-    T2TouchIdTransport/   (existing, untouched — PCI/SEP, unrelated bus)
-    T2Ncm/                (new)
-        T2Ncm.vcxproj
-        Driver.h / Driver.c        DriverEntry, WDF driver object
-        Device.h / Device.c        PnP/Power callbacks + lifecycle state machine
-        UsbTransport.h / .c        USB target/pipe/descriptor layer (Tasks 5-6)
-        NcmProtocol.h / .c         GET_NTB_PARAMETERS / format negotiation (Tasks 7-11)
-        NcmRx.h / .c                NTB16 RX parser + bulk-IN engine (Tasks 14-15)
-        NcmTx.h / .c                NTB16 TX builder + bulk-OUT engine (Tasks 13,16)
-        NdisMiniport.h / .c        NDIS 6 miniport glue (Tasks 18-20)
-        Power.h / .c                D0Entry/D0Exit orchestration (Task 21)
-inf/
-    apple-t2-ncm.inf            new — binds T2Ncm.sys directly, no UsbNcm.sys
+T2NCM/
+    apple-t2-composite.inf          parent (usbccgp.sys), ships no binary
+    apple-t2-ncm.inf                MI_01 — Net class, ships T2Ncm.sys
+    apple-t2-ncm-ctrl-stub.inf      MI_00 — ships T2NcmCtrl.sys
+    driver/
+        T2Ncm.vcxproj               -> T2Ncm.sys      (NDIS 6.30 miniport)
+        T2NcmCtrl.vcxproj           -> T2NcmCtrl.sys  (KMDF claim stub)
+
+        Driver.h / Driver.c         DriverEntry: WDF in miniport mode, then
+                                     NdisMRegisterMiniportDriver
+        NdisMiniport.h / .c         ALL NDIS entry points — Initialize/Halt,
+                                     Pause/Restart, Send/Return, OIDs, PnP
+                                     events, and the diagnostic control device
+        Device.h / Device.c         WdfDeviceMiniportCreate + lifecycle state
+                                     machine + status snapshot
+        Power.h / .c                OID_PNP_SET_POWER / QUERY_POWER handling
+        UsbTransport.h / .c         USB target/pipe/descriptor layer
+        NcmProtocol.h / .c          GET_NTB_PARAMETERS / format negotiation
+        NcmRx.h / .c                NTB16 RX parser + bulk-IN engine + NDIS
+                                     receive indication
+        NcmTx.h / .c                NTB16 TX builder + bulk-OUT engine + the
+                                     asynchronous NBL send path
+        CtrlStub.c                  SEPARATE BINARY — MI_00 claim only
 ```
 
-`T2NCM/apple-t2-composite.inf` (parent, owned by `usbccgp.sys`) is untouched. `T2NCM/apple-t2-ncm.inf` is superseded by `inf/apple-t2-ncm.inf` below — recommend deleting the old one in the same PR that adds `driver/T2Ncm/` so there is never a moment where both compete for `MI_00`.
+**Two binaries, not one.** MI_00 and MI_01 enumerate as independent PDOs,
+so they always needed two driver bindings; they now also need two
+*images*. T2Ncm.sys's `DriverEntry` creates its WDF driver with
+`WdfDriverInitNoDispatchOverride` and hands the driver object to NDIS,
+while the MI_00 stub has to own its dispatch table to receive PnP and
+power IRPs. One `DriverEntry` cannot do both, so the stub moved to
+`CtrlStub.c` / `T2NcmCtrl.sys` and the old `g_T2NcmStubRole`
+role-selection global is gone.
 
 ## 3. Topology (unchanged from your spec, confirmed against the descriptor dump)
 
@@ -48,11 +73,13 @@ MI_00 NCM Control                MI_01 NCM Data
 Class 02 SubClass 0D Prot 00     Class 0A, EP 0x82 IN / 0x01 OUT (alt 1)
 EP 0x81 IN interrupt                    ^
         |                               |
-        +-------- T2Ncm.sys -----------+
+        v                               |
+  T2NcmCtrl.sys                     T2Ncm.sys
+  (claim only)                          |
                      |
                      v
-              NDIS 6 Miniport (KMDF/NDIS hybrid — NDIS_WDF_PNP_POWER_EVENT_CALLBACKS,
-              same model Microsoft's own mobile-broadband/RNDIS miniports use)
+              NDIS 6.30 Miniport — NDIS owns PnP and the power policy;
+              KMDF is a USB client library below it (WdfDeviceMiniportCreate)
                      |
                      v
              ONE Ethernet NIC  (IF_TYPE_ETHERNET_CSMACD / NdisMedium802_3)
@@ -61,6 +88,24 @@ EP 0x81 IN interrupt                    ^
               Windows TCP/IP → existing BridgeXPC/T2 user-mode client (Task 27, untouched)
 ```
 
-## 4. Sequencing (per your incremental-milestone rule)
+## 4. Current state
 
-This turn ships **Task 1–3**: audit (above), project skeleton with the module boundaries and a real PnP lifecycle state machine (Task 4), and the corrected INF (Task 3) + CI build workflow. Descriptor parsing (Task 5) and USB pipe/config setup (Task 6) are stubbed with explicit `T2NCM_STATUS_NOT_IMPLEMENTED`-style TODOs tied to task numbers — filled in the next pass so Task 25's diagnostic milestone can be reached before any NDIS/NCM wire code is written, per your Task 30/31 constraint against implementing USB+NCM+NDIS in one change.
+Implemented: USB configuration and pipe discovery, the CDC-NCM control
+plane (GET_NTB_PARAMETERS / SET_NTB_FORMAT / SET_NTB_INPUT_SIZE / MAC),
+the NTB16 RX parser and TX builder, the full NDIS 6.30 miniport
+(initialize, halt, pause, restart, send, receive, OID handling, PnP
+events, reset, shutdown), and the inverted power model.
+
+Diagnostics moved with the rewrite. A `WdfDeviceMiniportCreate` device
+never sees an IRP, so `IOCTL_T2NCM_GET_STATUS` and
+`IOCTL_T2NCM_SEND_TEST_FRAME` are now served by a control device created
+with `NdisMRegisterDeviceEx` and reached through `\\.\T2Ncm` instead of a
+device interface GUID. `T2NCM_STATUS` gained the fields that make the
+inverted model observable from user mode — `PowerState` next to
+`DataPathRunning`, plus the two drain counters — and the new fields were
+appended so an older tool still reads every offset it knows.
+
+**Not yet validated on hardware.** None of this has been built with a
+real WDK or run against a MacBook — there is no WDK and no T2 device in
+the environment this was written in. Expect the first hardware session to
+be about NDIS registration and TCP/IP binding, in that order.

@@ -29,11 +29,13 @@
     <TargetVersion>Windows10</TargetVersion>
     <UseDebugLibraries>true</UseDebugLibraries>
     <DriverTargetPlatform>Universal</DriverTargetPlatform>
-    <!-- KMDF for PnP/USB, with an NDIS 6 miniport registered from within
-         it (NdisMiniport.c) — the same hybrid model Microsoft's own
-         mobile-broadband/RNDIS-class miniports use
-         (NDIS_WDF_PNP_POWER_EVENT_CALLBACKS), not a plain NDIS-only
-         driver. DriverType stays KMDF; Ndis.lib is added explicitly below. -->
+    <!-- NDIS 6.30 miniport. KMDF is still linked in and DriverType stays
+         KMDF (the INF therefore still needs its KmdfService/wdfsect
+         entries), but the framework is used ONLY as a USB client
+         library: DriverEntry creates the WDF driver with
+         WdfDriverInitNoDispatchOverride, so WDF never owns the dispatch
+         table, never gets an AddDevice, and is never a power policy
+         owner. NDIS owns PnP and power — see Driver.h. -->
     <DriverType>KMDF</DriverType>
     <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
     <ConfigurationType>Driver</ConfigurationType>
@@ -66,17 +68,17 @@
       <TreatWarningAsError>true</TreatWarningAsError>
       <ExceptionHandling>
       </ExceptionHandling>
-      <PreprocessorDefinitions>%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <!-- Pins the NDIS contract this driver is compiled against. Must
+           match the #define guard at the top of Driver.h, which sets the
+           same value defensively in case the project file is bypassed. -->
+      <PreprocessorDefinitions>NDIS630_MINIPORT=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
-      <!-- Ndis.lib for the NDIS 6 miniport entry points (Tasks 18-20);
-           needed even though NdisMiniport.c is currently a stub, so the
-           driver links cleanly once it's filled in without a project
-           file change.
-           Usbd.lib for USBD_ParseConfigurationDescriptorEx (NcmProtocol.c,
-           Task 8's Ethernet Functional Descriptor lookup) — this WDK's
-           usbdlib.h declares it __declspec(dllimport) rather than
-           inlining it, so it needs a real import library. -->
+      <!-- Ndis.lib for the NDIS 6 miniport entry points (NdisMiniport.c).
+           Usbd.lib for USBD_ParseConfigurationDescriptorEx
+           (NcmProtocol.c) — this WDK's usbdlib.h declares it
+           __declspec(dllimport) rather than inlining it, so it needs a
+           real import library. -->
       <AdditionalDependencies>Ndis.lib;Usbd.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <DriverSign>
@@ -92,6 +94,10 @@
     <ClCompile Include="NcmTx.c" />
     <ClCompile Include="NdisMiniport.c" />
     <ClCompile Include="Power.c" />
+    <!-- CtrlStub.c is deliberately NOT here: it builds into a separate
+         binary (T2NcmCtrl.sys, T2NcmCtrl.vcxproj) because it needs a
+         DriverEntry that owns its dispatch table, which is incompatible
+         with this driver's. See the comment block in CtrlStub.c. -->
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Driver.h" />
@@ -102,7 +108,7 @@
     <ClInclude Include="NcmTx.h" />
     <ClInclude Include="NdisMiniport.h" />
     <ClInclude Include="Power.h" />
-    <ClInclude Include="public.h" />
+    <ClInclude Include="Public.h" />
   </ItemGroup>
   <ItemGroup>
     <!-- No <Inf> item here — same reason as T2TouchIdTransport.vcxproj:

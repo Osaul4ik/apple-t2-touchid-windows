@@ -125,52 +125,6 @@ T2NcmUsbPrepareHardware(
     return STATUS_SUCCESS;
 }
 
-NTSTATUS
-T2NcmUsbPrepareHardwareStub(
-    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
-    )
-{
-    NTSTATUS status;
-    WDF_USB_DEVICE_CREATE_CONFIG createConfig;
-    WDF_USB_DEVICE_SELECT_CONFIG_PARAMS configParams;
-
-    WDF_USB_DEVICE_CREATE_CONFIG_INIT(&createConfig, USBD_CLIENT_CONTRACT_VERSION_602);
-
-    status = WdfUsbTargetDeviceCreateWithParameters(
-        DeviceContext->WdfDevice,
-        &createConfig,
-        WDF_NO_OBJECT_ATTRIBUTES,
-        &DeviceContext->UsbDevice);
-
-    if (!NT_SUCCESS(status))
-    {
-        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2Ncm(stub): WdfUsbTargetDeviceCreateWithParameters failed 0x%08X\n", status));
-        return status;
-    }
-
-    // MI_00 has exactly one interface, one alt setting — claim it and
-    // stop. No pipe discovery, no control-plane use: this instance exists
-    // solely so MI_00 has a working driver bound to it.
-    WDF_USB_DEVICE_SELECT_CONFIG_PARAMS_INIT_SINGLE_INTERFACE(&configParams);
-
-    status = WdfUsbTargetDeviceSelectConfig(
-        DeviceContext->UsbDevice, WDF_NO_OBJECT_ATTRIBUTES, &configParams);
-
-    if (!NT_SUCCESS(status))
-    {
-        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2Ncm(stub): WdfUsbTargetDeviceSelectConfig failed 0x%08X\n", status));
-        return status;
-    }
-
-    T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
-        "T2Ncm(stub): MI_00 claimed and idle — NCM function lives on the "
-        "MI_01 instance\n"));
-
-    return STATUS_SUCCESS;
-}
-
 VOID
 T2NcmUsbReleaseHardware(
     _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
@@ -305,4 +259,42 @@ Unwind:
     DeviceContext->BulkOutPipe = NULL;
 
     return status;
+}
+VOID
+T2NcmUsbDeactivateDataInterface(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
+    )
+{
+    NTSTATUS status;
+
+    // Drop the cached pipe handles FIRST. The pipe objects belong to the
+    // alt-1 setting and stop being valid targets the moment alt 0 is
+    // selected; clearing them before the SET_INTERFACE means the send
+    // path can never observe a window where BulkOutPipe is non-NULL but
+    // the interface underneath it has already been torn down.
+    DeviceContext->BulkInPipe = NULL;
+    DeviceContext->BulkOutPipe = NULL;
+
+    if (DeviceContext->DataInterface == NULL)
+    {
+        return; // never activated, or already released
+    }
+
+    status = T2NcmUsbSelectDataAltSetting(DeviceContext, T2NCM_DATA_ALT_IDLE);
+    if (!NT_SUCCESS(status))
+    {
+        // Not fatal, and deliberately not escalated: the caller is on a
+        // power-down or halt path where there is nothing useful to do
+        // with a failure, and refusing to proceed would be worse than
+        // leaving the device on alt 1. Logged because a device that
+        // cannot be parked on alt 0 is a real finding for the next
+        // hardware session.
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
+            "T2Ncm: parking MI_01 on alt %u failed 0x%08X — continuing\n",
+            T2NCM_DATA_ALT_IDLE, status));
+        return;
+    }
+
+    T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_TRACE_LEVEL,
+        "T2Ncm: MI_01 parked on alt %u\n", T2NCM_DATA_ALT_IDLE));
 }

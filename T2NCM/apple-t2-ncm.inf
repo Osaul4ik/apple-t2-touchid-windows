@@ -1,8 +1,14 @@
 ; ============================================================================
-; apple-t2-ncm.inf  (Task 3, revised for "Variant 1")
+;  apple-t2-ncm.inf
 ;
 ; Apple T2 USB CDC-NCM function driver binding. Installs T2Ncm.sys — no
 ; UsbNcm.sys, usbncm.inf, or usb.inf involved.
+;
+; T2Ncm.sys is an NDIS 6.30 miniport driver. KMDF is still linked in and
+; the .Wdf section below is still required, but the framework is used
+; ONLY as a USB client library (DriverEntry creates it with
+; WdfDriverInitNoDispatchOverride): NDIS — not KMDF — owns PnP and the
+; power policy for this adapter. See driver/Driver.h.
 ;
 ; ARCHITECTURE CHANGE from the original design: real hardware showed
 ; MI_00 and MI_01 enumerate as TWO INDEPENDENT PDOs under usbccgp (no IAD
@@ -12,9 +18,12 @@
 ; binds directly to MI_01 (NCM Data) instead of MI_00. Control-plane
 ; requests (GET_NTB_PARAMETERS etc., addressed by wIndex over the shared
 ; EP0) still work fine from here — they don't need MI_00's own interface
-; object. MI_00 gets its own separate binding, same T2Ncm.sys binary but
-; a different service name, in apple-t2-ncm-ctrl-stub.inf — a minimal
-; stub so MI_00 doesn't sit as an unclaimed Code-28/31 device.
+; object. MI_00 gets its own separate binding — and, as of this revision,
+; its own separate binary (T2NcmCtrl.sys) — in
+; apple-t2-ncm-ctrl-stub.inf, a minimal stub so MI_00 doesn't sit as an
+; unclaimed Code-28/31 device. The two drivers no longer share an image:
+; an NDIS miniport and a classic KMDF function driver need incompatible
+; DriverEntry bodies.
 ;
 ; Parent:
 ;   USB\VID_05AC&PID_8233
@@ -43,7 +52,7 @@ Signature   = "$WINDOWS NT$"
 Class       = Net
 ClassGUID   = {4d36e972-e325-11ce-bfc1-08002be10318}
 Provider    = %ManufacturerName%
-DriverVer   = 09/01/2026,2.0.0.0
+DriverVer   = 09/15/2026,2.1.0.0
 CatalogFile = apple-t2-ncm.cat
 PnpLockdown = 1
 
@@ -97,7 +106,7 @@ T2Ncm.sys
 
 
 ; ============================================================================
-; T2Ncm.sys service — our own KMDF+NDIS driver, NOT UsbNcm.
+; T2Ncm.sys service — our own NDIS 6.30 miniport, NOT UsbNcm.
 ; ============================================================================
 
 [AppleT2Ncm_Install.Services]
@@ -124,7 +133,16 @@ KmdfLibraryVersion = 1.15
 ; ============================================================================
 
 [AppleT2Ncm_AddReg]
-HKR, Ndi, Service, 0, "T2Ncm"
+HKR, Ndi,            Service,    0, "T2Ncm"
+
+; UpperRange/LowerRange are what actually let the TCP/IP stack bind to
+; this adapter — without them the miniport initializes and then sits
+; there with nothing bound above it. "ethernet" has to agree with the
+; NdisMedium802_3 / IF_TYPE_ETHERNET_CSMACD the miniport reports in its
+; general attributes (NdisMiniport.c).
+HKR, Ndi\Interfaces, UpperRange, 0, "ndis5"
+HKR, Ndi\Interfaces, LowerRange, 0, "ethernet"
+
 HKR, Ndi\params\NetworkAddress, Optional, 0, "1"
 
 
