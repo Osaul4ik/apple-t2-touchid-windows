@@ -298,7 +298,7 @@ static int CmdNetwork(int argc, wchar_t* argv[]) {
                 return 1;
             }
             ep.peerLinkLocal = parsed;
-            ep.peerDerivedFromMac = false;
+            ep.peerSource = PeerSource::ManualOverride;
         }
 
         std::string local = FormatLinkLocal(ep.localLinkLocal, ep.ifIndex);
@@ -318,12 +318,20 @@ static int CmdNetwork(int argc, wchar_t* argv[]) {
         std::wcout << L"local:    ";
         for (char c : local) std::wcout << static_cast<wchar_t>(c);
         std::wcout << L"  (Windows - do NOT scan this)\n";
-        std::wcout << L"peer:     ";
-        for (char c : peer) std::wcout << static_cast<wchar_t>(c);
-        if (ep.peerDerivedFromMac)
-            std::wcout << L"  (EUI-64 from MAC - scan target)\n";
-        else
-            std::wcout << L"  (--host override - scan target)\n";
+        if (ep.peerSource == PeerSource::None) {
+            std::wcout << L"peer:     (none found)\n";
+            std::wcout << L"  no Reachable/Stale/Delay/Probe IPv6 neighbor "
+                          L"on ifIndex " << ep.ifIndex << L" yet.\n";
+            std::wcout << L"  try pinging ff02::1%" << ep.ifIndex
+                       << L" to prompt the T2 to answer, or pass --host fe80::...\n";
+        } else {
+            std::wcout << L"peer:     ";
+            for (char c : peer) std::wcout << static_cast<wchar_t>(c);
+            if (ep.peerSource == PeerSource::NeighborTable)
+                std::wcout << L"  (IPv6 neighbor table - scan target)\n";
+            else
+                std::wcout << L"  (--host override - scan target)\n";
+        }
     }
 
     if (!doScan) {
@@ -332,6 +340,10 @@ static int CmdNetwork(int argc, wchar_t* argv[]) {
     }
 
     const auto& ep = endpoints.front();
+    if (ep.peerSource == PeerSource::None) {
+        std::wcout << L"no peer to scan - see above.\n";
+        return 1;
+    }
     ScanOptions opt;
     opt.concurrency = 64;
     opt.connectTimeoutMs = 150;
@@ -356,7 +368,7 @@ static int CmdNetwork(int argc, wchar_t* argv[]) {
     if (hits.empty()) {
         std::wcout << L"no TCP listeners on peer in " << opt.portBegin << L"-"
                    << opt.portEnd << L".\n";
-        std::wcout << L"try: t2touchid.exe network 4 --host fe80::aede:48ff:fe00:1122\n";
+        std::wcout << L"try: --host fe80::... to override the discovered peer.\n";
         return 2;
     }
 

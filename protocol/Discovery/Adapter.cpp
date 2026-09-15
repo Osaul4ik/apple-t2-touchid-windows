@@ -2,6 +2,7 @@
 #include "Adapter.h"
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
+#include <netioapi.h>
 #include <cstring>
 
 #pragma comment(lib, "Ws2_32.lib")
@@ -35,6 +36,33 @@ bool IsLinkLocal(const in6_addr& a) {
     return a.u.Byte[0] == 0xFE && (a.u.Byte[1] & 0xC0) == 0x80;
 }
 
+// IPv6 multicast addresses (ff00::/8) always start with 0xFF. Windows
+// keeps solicited-node and well-known multicast entries in the same
+// neighbor table as real neighbors (see the ff02::... rows netsh
+// prints as "Permanent"), so this is checked independently of the
+// State filter below rather than relying solely on Permanent meaning
+// "multicast" — the two happen to coincide today but nothing pins that.
+bool IsMulticast(const in6_addr& a) {
+    return a.u.Byte[0] == 0xFF;
+}
+
+// Higher is more confirmed. Anything not listed here (Incomplete,
+// Unreachable, Permanent, Media, and any future state) returns 0 and is
+// excluded by IsAcceptableNeighborState below.
+int NeighborStatePriority(NL_NEIGHBOR_STATE state) {
+    switch (state) {
+        case NlnsReachable: return 4;
+        case NlnsStale:     return 3;
+        case NlnsDelay:     return 2;
+        case NlnsProbe:     return 1;
+        default:            return 0;
+    }
+}
+
+bool IsAcceptableNeighborState(NL_NEIGHBOR_STATE state) {
+    return NeighborStatePriority(state) > 0;
+}
+
 bool FillFromAdapter(IP_ADAPTER_ADDRESSES* a, NcmEndpoint* out) {
     out->ifIndex = a->Ipv6IfIndex ? a->Ipv6IfIndex : a->IfIndex;
     out->friendlyName = a->FriendlyName ? a->FriendlyName : L"";
@@ -44,8 +72,6 @@ bool FillFromAdapter(IP_ADAPTER_ADDRESSES* a, NcmEndpoint* out) {
     if (a->PhysicalAddressLength >= 6) {
         std::memcpy(out->mac, a->PhysicalAddress, 6);
         out->hasMac = true;
-        out->peerLinkLocal = LinkLocalFromMac(out->mac);
-        out->peerDerivedFromMac = true;
     }
 
     bool gotLocal = false;
@@ -59,10 +85,63 @@ bool FillFromAdapter(IP_ADAPTER_ADDRESSES* a, NcmEndpoint* out) {
         gotLocal = true;
         break;
     }
+
+    // Real discovery, not derivation: look up whatever the Windows IPv6
+    // neighbor table actually confirmed on this interface. Left as
+    // PeerSource::None (peerLinkLocal stays zeroed) if nothing qualifies
+    // yet — the caller decides what to do about that (prompt for
+    // traffic, suggest --host), this function does not guess.
+    if (gotLocal) {
+        in6_addr peer{};
+        if (FindNeighborPeer(out->ifIndex, &peer)) {
+            out->peerLinkLocal = peer;
+            out->peerSource = PeerSource::NeighborTable;
+        }
+    }
+
     return gotLocal && out->hasMac;
 }
 
 } // namespace
+
+bool FindNeighborPeer(unsigned long ifIndex, in6_addr* out) {
+    if (!out || ifIndex == 0) return false;
+
+    PMIB_IPNET_TABLE2 table = nullptr;
+    if (GetIpNetTable2(AF_INET6, &table) != NO_ERROR || table == nullptr) {
+        return false;
+    }
+
+    bool found = false;
+    int bestPriority = 0;
+    in6_addr best{};
+
+    for (ULONG i = 0; i < table->NumEntries; ++i) {
+        const MIB_IPNET_ROW2& row = table->Table[i];
+
+        if (row.InterfaceIndex != ifIndex) continue;
+        if (row.Address.si_family != AF_INET6) continue;
+
+        const in6_addr& addr = row.Address.Ipv6.sin6_addr;
+        if (!IsLinkLocal(addr)) continue;
+        if (IsMulticast(addr)) continue;
+        if (!IsAcceptableNeighborState(row.State)) continue;
+
+        int priority = NeighborStatePriority(row.State);
+        if (!found || priority > bestPriority) {
+            found = true;
+            bestPriority = priority;
+            best = addr;
+        }
+    }
+
+    FreeMibTable(table);
+
+    if (found) {
+        *out = best;
+    }
+    return found;
+}
 
 in6_addr LinkLocalFromMac(const unsigned char mac[6]) {
     in6_addr a{};
