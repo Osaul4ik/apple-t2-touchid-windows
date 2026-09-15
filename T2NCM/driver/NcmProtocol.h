@@ -89,3 +89,56 @@ NTSTATUS
 T2NcmEnsureMacAddress(
     _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
     );
+
+// ---------------------------------------------------------------------
+// SET_ETHERNET_PACKET_FILTER (CDC ECM 1.2 6.2.4, inherited by NCM 1.0)
+//
+// The device forwards NOTHING to the host until the host sets a filter,
+// and it resets the filter to zero on every SET_CONFIGURATION and
+// SET_INTERFACE. Missing this request is what left the adapter
+// transmitting normally while receiving exactly zero bytes.
+// ---------------------------------------------------------------------
+#define T2NCM_CDC_PACKET_TYPE_PROMISCUOUS    0x0001u
+#define T2NCM_CDC_PACKET_TYPE_ALL_MULTICAST  0x0002u
+#define T2NCM_CDC_PACKET_TYPE_DIRECTED       0x0004u
+#define T2NCM_CDC_PACKET_TYPE_BROADCAST      0x0008u
+#define T2NCM_CDC_PACKET_TYPE_MULTICAST      0x0010u
+
+// Maps an NDIS packet filter onto the CDC bitmap. DIRECTED|BROADCAST
+// are always included (without broadcast there is no ARP and no IPv6
+// neighbour discovery, so the one peer on the link can never be
+// resolved). PROMISCUOUS is added when NDIS asks for it, and also when
+// the station address was NOT read from the device - see the comment on
+// the implementation for why that case needs it.
+USHORT
+T2NcmNdisFilterToCdcFilter(
+    _In_ ULONG NdisFilter,
+    _In_ BOOLEAN StationAddressIsFromDevice
+    );
+
+// Issues the request. PASSIVE_LEVEL only. Must be called AFTER the data
+// interface has been switched to alt 1, because SET_INTERFACE clears the
+// filter the device is holding.
+NTSTATUS
+T2NcmSetEthernetPacketFilter(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext,
+    _In_ USHORT CdcFilter
+    );
+
+// Computes the filter from the device context's current NDIS filter and
+// station-address provenance, then sends it. PASSIVE_LEVEL only.
+NTSTATUS
+T2NcmApplyPacketFilter(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
+    );
+
+// Work-item callback used by T2NcmRequestPacketFilterUpdate below.
+// Declared here because Device.c is what creates the work item.
+EVT_WDF_WORKITEM T2NcmEvtPacketFilterWorkItem;
+
+// IRQL-safe entry point for the OID path: applies inline at
+// PASSIVE_LEVEL, defers to the device's work item otherwise.
+VOID
+T2NcmRequestPacketFilterUpdate(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
+    );

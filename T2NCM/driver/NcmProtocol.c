@@ -29,6 +29,34 @@ DEFINE_DEVPROPKEY(T2Ncm_DEVPKEY_Device_ContainerId,
 #define T2NCM_REQ_SET_NTB_FORMAT        0x84u
 #define T2NCM_REQ_SET_NTB_INPUT_SIZE    0x86u
 
+// SET_ETHERNET_PACKET_FILTER — CDC ECM 1.2 section 6.2.4, reused
+// unchanged by NCM 1.0 (NCM defines no filter request of its own; it
+// inherits the ECM one). bmRequestType 0x21 (class, interface,
+// host-to-device), wValue = the filter bitmap, wIndex = the CONTROL
+// interface number, no data stage.
+//
+// THIS IS WHY NOTHING WAS EVER RECEIVED. The device resets its packet
+// filter to zero - forward nothing - on every SET_CONFIGURATION and
+// SET_INTERFACE, so an NCM function that is never told a filter sends
+// the host exactly nothing, forever, while still happily accepting
+// everything the host transmits. That is precisely the observed
+// symptom: SentBroadcastPackets/SentMulticastPackets climbing,
+// ReceivedBytes stuck at 0, and the BridgeOS peer permanently
+// "Unreachable" in the neighbour table because not one neighbour
+// advertisement ever came back.
+//
+// Linux does not have this problem because usbnet issues
+// USB_CDC_SET_ETHERNET_PACKET_FILTER from its ndo_set_rx_mode as soon
+// as the interface goes up (drivers/net/usb/cdc_ether.c,
+// usbnet_cdc_update_filter, wired up by cdc_ncm via .set_rx_mode) -
+// which is exactly what the reference setup in
+// jmurth1234/t2-touchid-linux relies on, since it uses the stock
+// cdc_ncm driver.
+//
+// Ordering matters: SET_INTERFACE(alt 1) clears the filter, so this
+// must be sent AFTER T2NcmUsbActivateDataInterface, never before.
+#define T2NCM_REQ_SET_ETHERNET_PACKET_FILTER 0x43u
+
 #define T2NCM_NTB_FORMAT_16             0x0000u
 #define T2NCM_BM_NTB16_SUPPORTED_BIT    0x0001u
 
@@ -956,4 +984,168 @@ T2NcmEnsureMacAddress(
         usedContainerId ? "ContainerID" : "VID/PID/REV (weak, may collide)"));
 
     return STATUS_SUCCESS;
+}
+// ---------------------------------------------------------------------
+// SET_ETHERNET_PACKET_FILTER
+//
+// See the T2NCM_REQ_SET_ETHERNET_PACKET_FILTER comment at the top of
+// this file for why the absence of this request is what kept RX at
+// exactly zero bytes.
+// ---------------------------------------------------------------------
+
+USHORT
+T2NcmNdisFilterToCdcFilter(
+    _In_ ULONG NdisFilter,
+    _In_ BOOLEAN StationAddressIsFromDevice
+    )
+{
+    // DIRECTED and BROADCAST unconditionally. Linux does the same and
+    // for the same reason: a link that cannot carry broadcast cannot
+    // carry ARP or IPv6 neighbour discovery, so the adapter would come
+    // up and then be unable to resolve the only peer on it. NDIS is
+    // free to ask for less, but there is nothing useful below this.
+    USHORT cdcFilter = T2NCM_CDC_PACKET_TYPE_DIRECTED |
+                       T2NCM_CDC_PACKET_TYPE_BROADCAST;
+
+    // Device-side multicast filtering is optional in CDC and the T2
+    // gives no way to program a list, so any multicast interest at all
+    // becomes ALL_MULTICAST and the precise list is applied in software
+    // by T2NcmRxAcceptsFrame. Same simplification Linux makes.
+    if (NdisFilter & (NDIS_PACKET_TYPE_MULTICAST |
+                      NDIS_PACKET_TYPE_ALL_MULTICAST))
+    {
+        cdcFilter |= T2NCM_CDC_PACKET_TYPE_ALL_MULTICAST;
+    }
+
+    if (NdisFilter & (NDIS_PACKET_TYPE_PROMISCUOUS | NDIS_PACKET_TYPE_ALL_LOCAL))
+    {
+        cdcFilter |= T2NCM_CDC_PACKET_TYPE_PROMISCUOUS;
+    }
+
+    // Safety net for the station-address situation this hardware
+    // actually presents. Real REV_0201 units report an empty string
+    // table, so there is no iMACAddress to read and the adapter runs on
+    // a generated locally-administered address (see
+    // T2NcmEnsureMacAddress). The device therefore has no way to know
+    // which unicast address belongs to the host, and a DIRECTED-only
+    // filter is a filter against an address the device was never told.
+    // Asking for PROMISCUOUS in that case costs nothing on a
+    // point-to-point USB link with exactly one peer, and removes a
+    // whole class of "the adapter is up but silent" failure.
+    if (!StationAddressIsFromDevice)
+    {
+        cdcFilter |= T2NCM_CDC_PACKET_TYPE_PROMISCUOUS;
+    }
+
+    return cdcFilter;
+}
+
+NTSTATUS
+T2NcmSetEthernetPacketFilter(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext,
+    _In_ USHORT CdcFilter
+    )
+{
+    NTSTATUS status;
+    WDF_USB_CONTROL_SETUP_PACKET setupPacket;
+
+    if (DeviceContext->UsbDevice == NULL)
+    {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
+    // wIndex is the CONTROL interface number, not the data one - the
+    // filter is a property of the CDC function, and the function's
+    // management element lives on MI_00. Same addressing as every other
+    // class request in this file.
+    WDF_USB_CONTROL_SETUP_PACKET_INIT_CLASS(
+        &setupPacket,
+        BmRequestHostToDevice,
+        BmRequestToInterface,
+        (UCHAR)T2NCM_REQ_SET_ETHERNET_PACKET_FILTER,
+        CdcFilter,
+        (USHORT)T2NCM_CONTROL_IFACE_NUM);
+
+    status = WdfUsbTargetDeviceSendControlTransferSynchronously(
+        DeviceContext->UsbDevice,
+        WDF_NO_HANDLE,
+        NULL,
+        &setupPacket,
+        NULL,   // no data stage
+        NULL);
+
+    if (!NT_SUCCESS(status))
+    {
+        // Logged loudly rather than swallowed: if this fails the adapter
+        // will look completely healthy and receive nothing, which is the
+        // single most confusing failure mode this driver has.
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+            "T2Ncm: SET_ETHERNET_PACKET_FILTER(0x%04X) failed 0x%08X - the "
+            "device will forward NO frames to the host\n",
+            CdcFilter, status));
+        return status;
+    }
+
+    DeviceContext->CdcPacketFilter = CdcFilter;
+    DeviceContext->CdcPacketFilterApplied = TRUE;
+
+    T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
+        "T2Ncm: SET_ETHERNET_PACKET_FILTER(0x%04X) OK\n", CdcFilter));
+
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS
+T2NcmApplyPacketFilter(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
+    )
+{
+    USHORT desired = T2NcmNdisFilterToCdcFilter(
+        DeviceContext->PacketFilter,
+        DeviceContext->MacAddressIsPermanent);
+
+    return T2NcmSetEthernetPacketFilter(DeviceContext, desired);
+}
+
+EVT_WDF_WORKITEM T2NcmEvtPacketFilterWorkItem;
+
+VOID
+T2NcmEvtPacketFilterWorkItem(
+    _In_ WDFWORKITEM WorkItem
+    )
+{
+    PT2NCM_DEVICE_CONTEXT deviceContext =
+        T2NcmGetDeviceContext(WdfWorkItemGetParentObject(WorkItem));
+
+    (VOID)T2NcmApplyPacketFilter(deviceContext);
+}
+
+VOID
+T2NcmRequestPacketFilterUpdate(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
+    )
+{
+    // MiniportOidRequest is documented as IRQL <= DISPATCH_LEVEL, and
+    // WdfUsbTargetDeviceSendControlTransferSynchronously is PASSIVE_LEVEL
+    // only. Sending inline when we happen to be at PASSIVE keeps the
+    // common case synchronous (so the filter is in effect before the OID
+    // completes); anything higher is deferred to the work item rather
+    // than dropped, because a filter update that silently never reaches
+    // the device is the exact bug this whole path exists to fix.
+    if (KeGetCurrentIrql() == PASSIVE_LEVEL)
+    {
+        (VOID)T2NcmApplyPacketFilter(DeviceContext);
+        return;
+    }
+
+    if (DeviceContext->PacketFilterWorkItem != NULL)
+    {
+        WdfWorkItemEnqueue(DeviceContext->PacketFilterWorkItem);
+        return;
+    }
+
+    T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+        "T2Ncm: packet-filter update requested at IRQL %u with no work "
+        "item available - filter NOT updated\n",
+        (ULONG)KeGetCurrentIrql()));
 }

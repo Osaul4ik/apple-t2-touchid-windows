@@ -138,6 +138,28 @@ typedef struct _T2NCM_STATUS
     // is FALSE; a non-zero value there means a drain did not complete.
     UINT32  OutstandingRxNbls;
     UINT32  OutstandingTxRequests;
+
+    // ---- Added with the SET_ETHERNET_PACKET_FILTER fix ----
+    // Appended, like the block above, so an older tool keeps every
+    // offset it already knows.
+
+    // The CDC-level filter (ECM 1.2 6.2.4 bitmap: 0x01 PROMISCUOUS,
+    // 0x02 ALL_MULTICAST, 0x04 DIRECTED, 0x08 BROADCAST, 0x10
+    // MULTICAST) last accepted by the device, and whether the device is
+    // currently holding it. This is the one that decides whether the T2
+    // sends anything to the host at all; a zero here with the adapter
+    // otherwise healthy means RX will be exactly zero bytes.
+    UINT16  CdcPacketFilter;
+    BOOLEAN CdcPacketFilterApplied;
+    UINT8   Reserved5;
+
+    // Frames the NTB parser accepted and the driver's software filter
+    // then discarded. Reading this next to RxFramesParsed and
+    // RxFramesIndicated says which of the three possible silences you
+    // have: nothing arriving (all three zero), arriving and dropped by
+    // us (Parsed high, Filtered high), or arriving and delivered
+    // (Indicated high).
+    UINT64  RxFramesFiltered;
 } T2NCM_STATUS, *PT2NCM_STATUS;
 #pragma pack(pop)
 

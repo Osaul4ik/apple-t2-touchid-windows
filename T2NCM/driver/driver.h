@@ -232,6 +232,19 @@ typedef struct _T2NCM_DEVICE_CONTEXT
     PDEVICE_OBJECT       ControlDeviceObject;
 
     ULONG                PacketFilter;
+
+    // The CDC-side filter last successfully pushed to the device with
+    // SET_ETHERNET_PACKET_FILTER, and whether that has ever succeeded
+    // for the current alt-1 activation. The device forwards nothing
+    // until this is set, and resets it on every SET_INTERFACE, so
+    // CdcPacketFilterApplied is cleared whenever the data interface is
+    // deactivated - see UsbTransport.c.
+    USHORT               CdcPacketFilter;
+    BOOLEAN              CdcPacketFilterApplied;
+
+    // Applies a pending filter change when the OID path lands above
+    // PASSIVE_LEVEL (control transfers are PASSIVE-only).
+    WDFWORKITEM          PacketFilterWorkItem;
     ULONG                CurrentLookahead;
     ULONG                MulticastAddressCount;
     UCHAR                MulticastList[T2NCM_MAX_MULTICAST_LIST][T2NCM_MAC_LENGTH];
@@ -271,6 +284,12 @@ typedef struct _T2NCM_DEVICE_CONTEXT
     LONG64               RxFramesParsed;
     LONG64               RxFramesRejected;
     LONG64               RxFramesIndicated;
+
+    // Frames the parser accepted but the software packet filter
+    // discarded. Distinguishes "the device sends nothing" from "the
+    // device sends frames we then throw away" - the two look identical
+    // from Get-NetAdapterStatistics.
+    LONG64               RxFramesFiltered;
     UCHAR                RxLastFrameDest[6];
     UCHAR                RxLastFrameSrc[6];
     USHORT               RxLastFrameEtherType;

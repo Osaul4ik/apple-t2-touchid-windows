@@ -3,6 +3,7 @@
 // diagnostic status snapshot. See Device.h for what left this file.
 
 #include "Device.h"
+#include "NcmProtocol.h"
 
 static const char* T2NcmStateName(T2NCM_LIFECYCLE_STATE s)
 {
@@ -132,6 +133,31 @@ T2NcmDeviceCreate(
         return status;
     }
 
+    // Work item for pushing SET_ETHERNET_PACKET_FILTER to the device
+    // when the OID path runs above PASSIVE_LEVEL. Non-fatal if it
+    // cannot be created: T2NcmRequestPacketFilterUpdate still applies
+    // inline whenever it is called at PASSIVE_LEVEL, which is the
+    // common case, and logs when it cannot.
+    {
+        WDF_WORKITEM_CONFIG workItemConfig;
+        WDF_OBJECT_ATTRIBUTES workItemAttributes;
+
+        WDF_WORKITEM_CONFIG_INIT(&workItemConfig, T2NcmEvtPacketFilterWorkItem);
+        WDF_OBJECT_ATTRIBUTES_INIT(&workItemAttributes);
+        workItemAttributes.ParentObject = device;
+
+        status = WdfWorkItemCreate(&workItemConfig, &workItemAttributes,
+            &context->PacketFilterWorkItem);
+        if (!NT_SUCCESS(status))
+        {
+            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
+                "T2Ncm: WdfWorkItemCreate (packet filter) failed 0x%08X - "
+                "filter updates raised above PASSIVE_LEVEL will be skipped\n",
+                status));
+            context->PacketFilterWorkItem = NULL;
+        }
+    }
+
     *Device = device;
     *DeviceContext = context;
 
@@ -222,6 +248,9 @@ T2NcmDeviceFillStatus(
     Status->RxFramesParsed    = (UINT64)DeviceContext->RxFramesParsed;
     Status->RxFramesRejected  = (UINT64)DeviceContext->RxFramesRejected;
     Status->RxFramesIndicated = (UINT64)DeviceContext->RxFramesIndicated;
+    Status->RxFramesFiltered  = (UINT64)DeviceContext->RxFramesFiltered;
+    Status->CdcPacketFilter        = DeviceContext->CdcPacketFilter;
+    Status->CdcPacketFilterApplied = DeviceContext->CdcPacketFilterApplied;
     RtlCopyMemory(Status->RxLastFrameDest, DeviceContext->RxLastFrameDest,
         sizeof(Status->RxLastFrameDest));
     RtlCopyMemory(Status->RxLastFrameSrc, DeviceContext->RxLastFrameSrc,

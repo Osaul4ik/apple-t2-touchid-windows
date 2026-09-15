@@ -791,6 +791,17 @@ T2NcmMiniportRestart(
     // traffic.
     InterlockedExchange(&context->DataPathRunning, 1);
 
+    // Re-assert the device-side packet filter. T2NcmPowerArmHardware
+    // already sent it after the alt-1 switch, but a restart can also
+    // follow paths where the interface was re-selected in between, and
+    // the device silently drops back to "forward nothing" every time
+    // that happens. Cheap control transfer, removes a whole class of
+    // silent-RX failure.
+    if (!context->CdcPacketFilterApplied)
+    {
+        (VOID)T2NcmApplyPacketFilter(context);
+    }
+
     status = T2NcmRxStart(context);
     if (!NT_SUCCESS(status))
     {
@@ -1141,6 +1152,13 @@ T2NcmOidSet(
 
         DeviceContext->PacketFilter = filter;
         Request->DATA.SET_INFORMATION.BytesRead = sizeof(ULONG);
+
+        // Push it to the device as well. The NDIS-level filter only
+        // decides what this driver indicates upward; the CDC-level one
+        // decides whether the device sends anything at all, and until
+        // it is set the answer is nothing.
+        T2NcmRequestPacketFilterUpdate(DeviceContext);
+
         return NDIS_STATUS_SUCCESS;
     }
 
@@ -1193,6 +1211,12 @@ T2NcmOidSet(
         DeviceContext->MulticastAddressCount = count;
 
         Request->DATA.SET_INFORMATION.BytesRead = length;
+
+        // Going from an empty to a non-empty list (or back) changes
+        // whether ALL_MULTICAST belongs in the CDC filter, so the device
+        // has to be told again.
+        T2NcmRequestPacketFilterUpdate(DeviceContext);
+
         return NDIS_STATUS_SUCCESS;
     }
 

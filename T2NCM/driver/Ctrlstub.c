@@ -41,6 +41,8 @@
 typedef struct _T2NCMCTRL_CONTEXT
 {
     WDFUSBDEVICE UsbDevice;
+    WDFUSBINTERFACE ControlInterface;
+    WDFUSBPIPE   NotificationPipe;   // EP 0x81, interrupt IN
 } T2NCMCTRL_CONTEXT, *PT2NCMCTRL_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(T2NCMCTRL_CONTEXT, T2NcmCtrlGetContext)
@@ -50,6 +52,165 @@ EVT_WDF_DRIVER_DEVICE_ADD T2NcmCtrlEvtDeviceAdd;
 EVT_WDF_DEVICE_PREPARE_HARDWARE T2NcmCtrlEvtDevicePrepareHardware;
 EVT_WDF_DEVICE_D0_ENTRY T2NcmCtrlEvtDeviceD0Entry;
 EVT_WDF_DEVICE_D0_EXIT T2NcmCtrlEvtDeviceD0Exit;
+
+
+// ---------------------------------------------------------------------
+// Notification endpoint (EP 0x81, interrupt IN)
+//
+// CHANGED: this used to be left alone on the grounds that nothing
+// consumes NCM notifications. That reasoning was wrong in one important
+// way - the device does not know nobody is listening. A CDC function
+// that has a NETWORK_CONNECTION or CONNECTION_SPEED_CHANGE notification
+// queued and no host reading its interrupt endpoint can sit on it, and
+// some implementations gate the data path behind having delivered it.
+// Draining the endpoint costs one standing read and removes that as a
+// possible reason for a silent receive path.
+//
+// The notifications themselves are still not acted on: link state for
+// this adapter is "the USB interface is configured" (see the
+// MediaConnectState comment in T2Ncm.sys's NdisMiniport.c), and
+// inventing a link-state policy from notifications this driver has
+// never actually observed would be guessing. They are logged and
+// discarded.
+// ---------------------------------------------------------------------
+#define T2NCMCTRL_NOTIFY_BUFFER_SIZE 64u
+
+EVT_WDF_USB_READER_COMPLETION_ROUTINE T2NcmCtrlEvtNotificationRead;
+
+VOID
+T2NcmCtrlEvtNotificationRead(
+    _In_ WDFUSBPIPE Pipe,
+    _In_ WDFMEMORY  Buffer,
+    _In_ size_t     NumBytesTransferred,
+    _In_ WDFCONTEXT Context
+    )
+{
+    const UCHAR* bytes;
+
+    UNREFERENCED_PARAMETER(Pipe);
+    UNREFERENCED_PARAMETER(Context);
+
+    if (NumBytesTransferred < 2)
+    {
+        return;
+    }
+
+    bytes = (const UCHAR*)WdfMemoryGetBuffer(Buffer, NULL);
+    if (bytes == NULL)
+    {
+        return;
+    }
+
+    // bmRequestType, bNotificationCode - enough to identify which
+    // notification arrived without pretending to decode a payload this
+    // driver has no confirmed layout for.
+    T2NCMCTRL_LOG((T2NCMCTRL_DPFLTR_ID, DPFLTR_INFO_LEVEL,
+        "T2NcmCtrl: notification bmRequestType=0x%02X code=0x%02X len=%Iu "
+        "(drained, not acted on)\n",
+        bytes[0], bytes[1], NumBytesTransferred));
+}
+
+EVT_WDF_USB_READERS_FAILED T2NcmCtrlEvtNotificationFailed;
+
+BOOLEAN
+T2NcmCtrlEvtNotificationFailed(
+    _In_ WDFUSBPIPE  Pipe,
+    _In_ NTSTATUS    Status,
+    _In_ USBD_STATUS UsbdStatus
+    )
+{
+    UNREFERENCED_PARAMETER(Pipe);
+
+    T2NCMCTRL_LOG((T2NCMCTRL_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
+        "T2NcmCtrl: notification reader stopped (status=0x%08X usbd=0x%08X)\n",
+        Status, UsbdStatus));
+
+    // FALSE: do not let the framework reset the pipe and retry forever
+    // on a device that has gone away. Same reasoning as T2Ncm.sys's
+    // bulk-IN reader.
+    return FALSE;
+}
+
+static
+VOID
+T2NcmCtrlStartNotificationReader(
+    _In_ WDFDEVICE Device
+    )
+{
+    PT2NCMCTRL_CONTEXT context = T2NcmCtrlGetContext(Device);
+    WDF_USB_CONTINUOUS_READER_CONFIG readerConfig;
+    UCHAR count;
+    UCHAR i;
+    NTSTATUS status;
+
+    if (context->ControlInterface == NULL)
+    {
+        return;
+    }
+
+    count = WdfUsbInterfaceGetNumConfiguredPipes(context->ControlInterface);
+
+    for (i = 0; i < count; i++)
+    {
+        WDF_USB_PIPE_INFORMATION pipeInfo;
+        WDFUSBPIPE pipe;
+
+        WDF_USB_PIPE_INFORMATION_INIT(&pipeInfo);
+        pipe = WdfUsbInterfaceGetConfiguredPipe(context->ControlInterface, i, &pipeInfo);
+        if (pipe == NULL)
+        {
+            continue;
+        }
+
+        if (WdfUsbPipeTypeInterrupt == pipeInfo.PipeType &&
+            WdfUsbTargetPipeIsInEndpoint(pipe))
+        {
+            context->NotificationPipe = pipe;
+            break;
+        }
+    }
+
+    if (context->NotificationPipe == NULL)
+    {
+        // Not an error worth failing start over - MI_00 without an
+        // interrupt endpoint just means there is nothing to drain.
+        T2NCMCTRL_LOG((T2NCMCTRL_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
+            "T2NcmCtrl: no interrupt IN endpoint on MI_00\n"));
+        return;
+    }
+
+    WDF_USB_CONTINUOUS_READER_CONFIG_INIT(
+        &readerConfig,
+        T2NcmCtrlEvtNotificationRead,
+        context,
+        T2NCMCTRL_NOTIFY_BUFFER_SIZE);
+    readerConfig.EvtUsbTargetPipeReadersFailed = T2NcmCtrlEvtNotificationFailed;
+    readerConfig.NumPendingReads = 2;
+
+    status = WdfUsbTargetPipeConfigContinuousReader(
+        context->NotificationPipe, &readerConfig);
+    if (!NT_SUCCESS(status))
+    {
+        T2NCMCTRL_LOG((T2NCMCTRL_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
+            "T2NcmCtrl: WdfUsbTargetPipeConfigContinuousReader failed 0x%08X\n",
+            status));
+        context->NotificationPipe = NULL;
+        return;
+    }
+
+    status = WdfIoTargetStart(
+        WdfUsbTargetPipeGetIoTarget(context->NotificationPipe));
+    if (!NT_SUCCESS(status))
+    {
+        T2NCMCTRL_LOG((T2NCMCTRL_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
+            "T2NcmCtrl: WdfIoTargetStart (notification) failed 0x%08X\n",
+            status));
+        return;
+    }
+
+    T2NCMCTRL_LOG((T2NCMCTRL_DPFLTR_ID, DPFLTR_INFO_LEVEL,
+        "T2NcmCtrl: notification reader started on MI_00\n"));
+}
 
 NTSTATUS
 T2NcmCtrlEvtDevicePrepareHardware(
@@ -78,11 +239,7 @@ T2NcmCtrlEvtDevicePrepareHardware(
         return status;
     }
 
-    // MI_00 has exactly one interface with one alt setting — claim it and
-    // stop. The interrupt notification endpoint (0x81) is deliberately
-    // not read: nothing consumes NCM notifications yet, and opening a
-    // pipe this driver would never service would be worse than leaving
-    // it alone.
+    // MI_00 has exactly one interface with one alt setting.
     WDF_USB_DEVICE_SELECT_CONFIG_PARAMS_INIT_SINGLE_INTERFACE(&configParams);
 
     status = WdfUsbTargetDeviceSelectConfig(
@@ -94,8 +251,13 @@ T2NcmCtrlEvtDevicePrepareHardware(
         return status;
     }
 
+    context->ControlInterface = configParams.Types.SingleInterface.ConfiguredUsbInterface;
+
+    // Drain the notification endpoint - see the comment block above.
+    T2NcmCtrlStartNotificationReader(Device);
+
     T2NCMCTRL_LOG((T2NCMCTRL_DPFLTR_ID, DPFLTR_INFO_LEVEL,
-        "T2NcmCtrl: MI_00 claimed and idle\n"));
+        "T2NcmCtrl: MI_00 claimed\n"));
 
     return STATUS_SUCCESS;
 }
@@ -106,8 +268,27 @@ T2NcmCtrlEvtDeviceD0Entry(
     _In_ WDF_POWER_DEVICE_STATE PreviousState
     )
 {
-    UNREFERENCED_PARAMETER(Device);
+    PT2NCMCTRL_CONTEXT context = T2NcmCtrlGetContext(Device);
+
     UNREFERENCED_PARAMETER(PreviousState);
+
+    // WDF stops power-managed USB pipe targets on D0Exit, so the
+    // notification reader has to be restarted here. Deliberately never
+    // fails the power transition over it: draining notifications is a
+    // precaution, not a requirement, and blocking a resume for it would
+    // be a worse bug than the one it guards against.
+    if (context->NotificationPipe != NULL)
+    {
+        NTSTATUS status = WdfIoTargetStart(
+            WdfUsbTargetPipeGetIoTarget(context->NotificationPipe));
+        if (!NT_SUCCESS(status))
+        {
+            T2NCMCTRL_LOG((T2NCMCTRL_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
+                "T2NcmCtrl: restarting notification reader failed 0x%08X\n",
+                status));
+        }
+    }
+
     return STATUS_SUCCESS;
 }
 
@@ -117,8 +298,17 @@ T2NcmCtrlEvtDeviceD0Exit(
     _In_ WDF_POWER_DEVICE_STATE TargetState
     )
 {
-    UNREFERENCED_PARAMETER(Device);
+    PT2NCMCTRL_CONTEXT context = T2NcmCtrlGetContext(Device);
+
     UNREFERENCED_PARAMETER(TargetState);
+
+    if (context->NotificationPipe != NULL)
+    {
+        WdfIoTargetStop(
+            WdfUsbTargetPipeGetIoTarget(context->NotificationPipe),
+            WdfIoTargetCancelSentIo);
+    }
+
     return STATUS_SUCCESS;
 }
 

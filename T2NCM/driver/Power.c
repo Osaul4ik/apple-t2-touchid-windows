@@ -81,6 +81,16 @@ T2NcmPowerArmHardware(
         return status;
     }
 
+    // MUST come after the alt-1 switch: SET_INTERFACE resets the
+    // device's packet filter to zero, i.e. "forward nothing to the
+    // host". Without this the adapter transmits fine and receives
+    // literally zero bytes - which is exactly what it did before this
+    // call existed. Not fatal on failure: the control plane is
+    // otherwise up, the failure is logged loudly by
+    // T2NcmSetEthernetPacketFilter, and the NDIS packet-filter OID will
+    // retry it as soon as the stack sets a filter.
+    (VOID)T2NcmApplyPacketFilter(DeviceContext);
+
     T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
         "T2Ncm: hardware armed — ntbIn=%lu ntbOut=%lu, MI_01 on alt %u\n",
         DeviceContext->NtbInMaxSize, DeviceContext->NtbOutMaxSize,

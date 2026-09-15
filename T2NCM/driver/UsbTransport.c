@@ -275,6 +275,12 @@ T2NcmUsbDeactivateDataInterface(
     DeviceContext->BulkInPipe = NULL;
     DeviceContext->BulkOutPipe = NULL;
 
+    // The device clears its Ethernet packet filter on SET_INTERFACE, so
+    // whatever was pushed for the previous alt-1 activation is gone the
+    // moment this runs. Record that, so nothing later mistakes a stale
+    // CdcPacketFilter value for a filter the device is actually holding.
+    DeviceContext->CdcPacketFilterApplied = FALSE;
+
     if (DeviceContext->DataInterface == NULL)
     {
         return; // never activated, or already released

@@ -193,8 +193,24 @@ T2NcmRxAcceptsFrame(
     {
         return FALSE;
     }
-    return RtlCompareMemory(DeviceContext->CurrentMacAddress, Destination,
-               T2NCM_MAC_LENGTH) == T2NCM_MAC_LENGTH;
+
+    if (RtlCompareMemory(DeviceContext->CurrentMacAddress, Destination,
+            T2NCM_MAC_LENGTH) == T2NCM_MAC_LENGTH)
+    {
+        return TRUE;
+    }
+
+    // Accept unicast addressed to somebody else ONLY when the station
+    // address was not read from the device. On real REV_0201 hardware
+    // the string table is empty, so there is no iMACAddress and the
+    // adapter runs on a generated locally-administered address that the
+    // T2 was never told about - it can and does address frames to a
+    // different unicast address, and matching on ours would silently
+    // drop every one of them. The link is point to point with exactly
+    // one peer, so there is no other station whose traffic this could
+    // be. When the address IS the device's own (MacAddressIsPermanent),
+    // this relaxation is off and normal directed filtering applies.
+    return !DeviceContext->MacAddressIsPermanent;
 }
 
 // Copies one datagram into a fresh NBL. Returns NULL on any allocation
@@ -470,6 +486,7 @@ T2NcmRxParseNtb(
 
             if (!T2NcmRxAcceptsFrame(DeviceContext, frame))
             {
+                InterlockedIncrement64(&DeviceContext->RxFramesFiltered);
                 // Filtered out by OID_GEN_CURRENT_PACKET_FILTER. Not an
                 // error and not a discard in the NDIS statistics sense —
                 // the frame was never ours to deliver.
