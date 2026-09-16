@@ -563,19 +563,14 @@ static bool DiscoverBiometricKitBridge(int argc, wchar_t* argv[], int firstArgIn
     return true;
 }
 
-// Gate 8 phase 1: read the enrolled identity list. Runs the verified setup
-// sequence (getBridgeVersion -> setClientVersion -> reset -> cancel ->
-// FDR calibration -> identity-list) but does NOT start a match - this is a
-// read-only probe. NOT YET RUN ON REAL HARDWARE past the BridgeXPC
-// handshake step; the handshake itself (Connect/HELO/getBridgeVersion) is
-// hardware-confirmed (see docs/gate6-discovery.md), the biometric commands
-// below are implemented per docs/linux-reference-analysis.md but await a
-// real hardware run before they can be called verified.
+// Gate 8 phase 1: read the enrolled identity list. Exact Linux ready
+// sequence (t2-biometric-ready.sh): initialize, reset-sensor, cancel,
+// load-calibration, identity-list. Does NOT start a match.
 static int CmdIdentities(int argc, wchar_t* argv[]) {
     using namespace t2::bridgexpc;
     using namespace t2::biometrickit;
 
-    uint32_t macosUserId = 501; // convention default, NOT a protocol requirement (Milestone 1 §6)
+    uint32_t macosUserId = 501;
     for (int i = 2; i < argc; ++i) {
         std::wstring a = argv[i];
         if (a == L"--uid" && i + 1 < argc) {
@@ -588,70 +583,62 @@ static int CmdIdentities(int argc, wchar_t* argv[]) {
         return 1;
     }
 
-    int64_t bridgeVersion = 0;
-    if (!bridge.GetBridgeVersion(&bridgeVersion, std::chrono::milliseconds(2000))) {
-        std::wcout << L"getBridgeVersion failed after connect. " << kSeeVerboseHint;
-        return 1;
-    }
-    int64_t clientVersion = (bridgeVersion < 2) ? bridgeVersion : 2; // min(api_version,2), VERIFIED FROM SOURCE
-    if (!bridge.SetClientVersion(clientVersion, std::chrono::milliseconds(2000))) {
-        std::wcout << L"setClientVersion failed. " << kSeeVerboseHint;
-        return 1;
-    }
-
-    std::vector<uint8_t> reply;
-    // VERIFIED FROM SOURCE: bridge-xpc-probe.py's biometric_command()
-    // defaults version=1 for every inner BM command, not just LoadCalibration.
-    auto resetCmd = EncodeBmCommand(Command::ResetSensor, 1, 2);
-    if (!bridge.SendBiometricCommand(resetCmd, 64, &reply, std::chrono::milliseconds(5000))) {
-        std::wcout << L"reset-sensor command failed. " << kSeeVerboseHint;
-        return 1;
-    }
-    auto cancelCmd = EncodeBmCommand(Command::Cancel, 1, 0);
-    bridge.SendBiometricCommand(cancelCmd, 64, &reply, std::chrono::milliseconds(5000)); // best-effort
-
-    std::vector<uint8_t> fdrBlob;
-    if (!bridge.GetFdrCalibration(&fdrBlob, std::chrono::milliseconds(5000))) {
-        std::wcout << L"read FDR calibration failed - bridgeOS returned no usable data. "
-                   << kSeeVerboseHint;
-        return 1;
-    }
-    auto loadCalibrationCmd = EncodeBmCommand(Command::LoadCalibration, /*version=*/1, /*value=*/3, fdrBlob);
-    if (!bridge.SendBiometricCommand(loadCalibrationCmd, 64, &reply, std::chrono::milliseconds(5000))) {
-        std::wcout << L"load-calibration command failed. " << kSeeVerboseHint;
-        return 1;
-    }
-
-    std::vector<uint8_t> idReq(4);
-    std::memcpy(idReq.data(), &macosUserId, 4);
-    auto idCmd = EncodeBmCommand(Command::IdentityList, 1, 0, idReq);
-    if (!bridge.SendBiometricCommand(idCmd, 4096, &reply, std::chrono::milliseconds(5000))) {
-        std::wcout << L"identity-list command failed. " << kSeeVerboseHint;
-        return 1;
-    }
+    VerifyConfig cfg;
+    cfg.macosUserId = macosUserId;
+    VerificationEngine engine(cfg);
     std::vector<IdentityRecordV1> identities;
-    if (!ParseIdentityList(reply, &identities)) {
-        std::wcout << L"identity-list reply malformed (not a whole number of 20-byte records).\n";
+    if (!engine.WarmUp(&bridge, &identities)) {
+        std::wcout << L"linux warm-up / identity-list failed. " << kSeeVerboseHint;
         return 1;
     }
 
     std::wcout << L"macOS user id: " << macosUserId << L"\n";
     std::wcout << L"enrolled identities: " << identities.size() << L"\n";
     for (size_t i = 0; i < identities.size(); ++i) {
-        // UUID itself is opaque and never logged, per Milestone 1 §7/§14 -
-        // only the record index and its embedded user_id are shown.
         std::wcout << L"  [" << i << L"] user_id=" << identities[i].userId << L"\n";
     }
     return 0;
 }
 
-// Gate 8 phase 2: full verify cycle via VerificationEngine (identity list ->
-// start match -> event loop -> verdict -> cancel). Runs live sensor
-// hardware and needs a finger on the touchpad's sensor during the match
-// window. Same hardware-verification caveat as CmdIdentities above: the
-// BridgeXPC transport is hardware-confirmed, the match sequence itself is
-// implemented per docs/linux-reference-analysis.md but is NOT YET RUN ON
-// REAL HARDWARE.
+// Exact port of t2-biometric-ready.sh: non-matching initialize /
+// reset-sensor / cancel / load-calibration / identity-list, then
+// disconnect. No StartMatch, no cmd 0x53.
+static int CmdWarmup(int argc, wchar_t* argv[]) {
+    using namespace t2::bridgexpc;
+    using namespace t2::biometrickit;
+
+    uint32_t macosUserId = 501;
+    for (int i = 2; i < argc; ++i) {
+        std::wstring a = argv[i];
+        if (a == L"--uid" && i + 1 < argc) {
+            macosUserId = static_cast<uint32_t>(_wtoi(argv[++i]));
+        }
+    }
+
+    Connection bridge;
+    if (!DiscoverBiometricKitBridge(argc, argv, 2, &bridge)) {
+        return 1;
+    }
+
+    VerifyConfig cfg;
+    cfg.macosUserId = macosUserId;
+    VerificationEngine engine(cfg);
+    std::vector<IdentityRecordV1> identities;
+    if (!engine.WarmUp(&bridge, &identities)) {
+        std::wcout << L"linux warm-up failed. " << kSeeVerboseHint;
+        return 1;
+    }
+    std::wcout << L"linux warm-up OK, identities=" << identities.size() << L"\n";
+    return 0;
+}
+
+// Gate 8 phase 2: Linux-shaped verify.
+//
+// t2-biometric-ready.sh runs the non-matching ready sequence on its own
+// connection and exits. fprintd then opens a NEW connection and runs
+// _run_probe() which repeats the same prefix plus StartMatch. This CLI
+// has no systemd unit, so `verify` does both: warm-up, disconnect,
+// reconnect, then Verify().
 static int CmdVerify(int argc, wchar_t* argv[]) {
     using namespace t2::bridgexpc;
     using namespace t2::biometrickit;
@@ -663,12 +650,9 @@ static int CmdVerify(int argc, wchar_t* argv[]) {
             cfg.macosUserId = static_cast<uint32_t>(_wtoi(argv[++i]));
         } else if (a == L"--seconds" && i + 1 < argc) {
             cfg.matchWindow = std::chrono::seconds(_wtoi(argv[++i]));
-        } else if (a == L"--reset-sensor") {
-            // Opt back in to the pre-16.09.2026 behaviour (cmd 2 before match).
-            cfg.resetSensor = true;
-        } else if (a == L"--load-calibration") {
-            // Opt back in to the pre-16.09.2026 behaviour (cmd 0x20 before match).
-            cfg.loadCalibration = true;
+        } else if (a == L"--reset-sensor" || a == L"--load-calibration") {
+            // Unconditional in the Linux ready sequence. Accepted so old
+            // command lines keep parsing; they no longer gate anything.
         } else if (a == L"--match-layout" && i + 1 < argc) {
             std::wstring layout = argv[++i];
             if (layout == L"inline") {
@@ -685,59 +669,26 @@ static int CmdVerify(int argc, wchar_t* argv[]) {
         }
     }
 
+    {
+        Connection warmup;
+        if (!DiscoverBiometricKitBridge(argc, argv, 2, &warmup)) {
+            return 1;
+        }
+        VerificationEngine ready(cfg);
+        std::vector<IdentityRecordV1> identities;
+        if (!ready.WarmUp(&warmup, &identities)) {
+            std::wcout << L"linux warm-up (non-matching ready sequence) failed. "
+                       << kSeeVerboseHint;
+            return 1;
+        }
+        std::wcout << L"linux warm-up OK, identities=" << identities.size()
+                   << L" (disconnecting, then verify on a new connection)\n";
+        warmup.Close();
+    }
+
     Connection bridge;
     if (!DiscoverBiometricKitBridge(argc, argv, 2, &bridge)) {
         return 1;
-    }
-
-    // Diagnostic-only pre-check. Correction from an earlier version of this
-    // block: "keybag" and "Catacomb" are two DIFFERENT SEP-side subsystems,
-    // not two names for the same thing. The `unlock` command (AKS endpoint 7,
-    // load_keybag/set-system-keybag/change_lock_state) only touches the
-    // AppleKeyStore keybag - the FileVault-style data-protection keybag - and
-    // is a completely separate protocol path from BiometricKit verification
-    // (docs/linux-reference-analysis.md §6.6-6.7). Doing that unlock does not
-    // necessarily arm the Catacomb (BiometricKit's own SEP-side store of
-    // enrolled identity records - the name and its 0x38/0x3a/0x3c query
-    // opcodes come from Apple's own BiometricSupport.framework, per the
-    // decompiled-source references in the Linux project's FINDINGS.md).
-    // Since IdentityList (0x42) above already returns real records, the
-    // Catacomb clearly has data - so what actually needs checking here is
-    // its *state* at match time, not whether AKS-side unlock happened.
-    // Byte-level meaning of these replies is NOT verified from source, so -
-    // same as before - this only prints raw bytes rather than guessing a
-    // ready/not-ready threshold.
-    {
-        std::vector<uint8_t> uidData(4);
-        std::memcpy(uidData.data(), &cfg.macosUserId, 4);
-        auto printRaw = [](const wchar_t* label, const std::vector<uint8_t>& data) {
-            std::wcout << label << L" (raw, meaning not yet verified from source): ";
-            for (uint8_t b : data) {
-                wchar_t tmp[4];
-                swprintf(tmp, 4, L"%02x", b);
-                std::wcout << tmp;
-            }
-            std::wcout << L"\n";
-        };
-        std::vector<uint8_t> reply;
-        auto sksCmd = EncodeBmCommand(Command::SksLockState, 1, 0, uidData);
-        if (bridge.SendBiometricCommand(sksCmd, 64, &reply, std::chrono::milliseconds(5000))) {
-            printRaw(L"sks lock state (0x27)", reply);
-        }
-        auto uuidCmd = EncodeBmCommand(Command::CatacombUuid, 1, 0, uidData);
-        if (bridge.SendBiometricCommand(uuidCmd, 16, &reply, std::chrono::milliseconds(5000))) {
-            printRaw(L"catacomb uuid (0x38)", reply);
-        }
-        auto hashCmd = EncodeBmCommand(Command::CatacombHash, 1, 0, uidData);
-        if (bridge.SendBiometricCommand(hashCmd, 33, &reply, std::chrono::milliseconds(5000))) {
-            printRaw(L"catacomb hash (0x3a)", reply);
-        }
-        auto stateCmd = EncodeBmCommand(Command::CatacombState, 1, 0);
-        if (bridge.SendBiometricCommand(stateCmd, 4096, &reply, std::chrono::milliseconds(5000))) {
-            printRaw(L"catacomb state (0x3c)", reply);
-        }
-        // Every query above is best-effort - a missing reply must not block
-        // verify itself, since none of this is required protocol-wise.
     }
 
     std::wcout << L"place finger on sensor...\n";
@@ -770,21 +721,8 @@ static int CmdVerify(int argc, wchar_t* argv[]) {
         case VerifyOutcome::NoImageCaptured:
             std::wcout << L"verify-no-image: sensor reported the finger (FingerOn/FingerOff) but never\n"
                           L"                 reported ImageCaptured/ImageForProcessing/ImageWasAccepted.\n"
-                          L"                 The match never got as far as comparing anything.\n";
-            if (!cfg.loadCalibration) {
-                // 16.09.2026: a hardware A/B (legacy 132B vs corrected 68B
-                // StartMatch payload, otherwise identical run) produced
-                // bit-identical failing wire traffic either way - the
-                // payload layout is not what's gating image capture. Lead
-                // with the one flag not yet tried on this exact machine.
-                std::wcout << L"                 Payload layout changes alone did not affect this on a\n"
-                              L"                 hardware A/B test. Try --load-calibration next, then\n"
-                              L"                 --match-layout padded. ";
-            } else {
-                std::wcout << L"                 --load-calibration was already on for this run and still\n"
-                              L"                 no image. Try --match-layout padded next. ";
-            }
-            std::wcout << kSeeVerboseHint;
+                          L"                 The match never got as far as comparing anything. "
+                       << kSeeVerboseHint;
             return 1;
     }
     return 1;
@@ -817,10 +755,11 @@ int wmain(int argc, wchar_t* argv[]) {
     }
 
     if (argc < 2) {
-        std::wcout << L"usage: t2touchid.exe [--verbose|-v] <status|register-ool|capabilities|device-state|load-keybag|set-system-keybag|unlock|network|identities|verify>\n";
+        std::wcout << L"usage: t2touchid.exe [--verbose|-v] <status|register-ool|capabilities|device-state|load-keybag|set-system-keybag|unlock|network|identities|warmup|verify>\n";
         std::wcout << L"  identities [ifIndex] [--host fe80::...] [--uid N]\n";
+        std::wcout << L"  warmup     [ifIndex] [--host fe80::...] [--uid N]\n";
         std::wcout << L"  verify     [ifIndex] [--host fe80::...] [--uid N] [--seconds N]\n"
-                      L"             [--match-layout inline|padded|legacy] [--reset-sensor] [--load-calibration]\n";
+                      L"             [--match-layout inline|padded|legacy]\n";
         std::wcout << L"  --verbose/-v (or env T2TOUCHID_VERBOSE=1): print step-by-step\n";
         std::wcout << L"    BridgeXPC diagnostics to the console. Always available in\n";
         std::wcout << L"    DebugView (run as Administrator, Capture Global Win32) even\n";
@@ -868,11 +807,12 @@ int wmain(int argc, wchar_t* argv[]) {
         return CmdNetwork(argc, argv);
     }
     if (cmd == L"identities") {
-        // Gate 8 phase 1 - see CmdIdentities for hardware-verification status.
         return CmdIdentities(argc, argv);
     }
+    if (cmd == L"warmup") {
+        return CmdWarmup(argc, argv);
+    }
     if (cmd == L"verify") {
-        // Gate 8 phase 2 - see CmdVerify for hardware-verification status.
         return CmdVerify(argc, argv);
     }
 

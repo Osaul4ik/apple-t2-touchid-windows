@@ -5,6 +5,7 @@
 #include "MatchResult.h"
 #include "../BridgeXpc/Connection.h"
 #include <chrono>
+#include <vector>
 
 namespace t2::biometrickit {
 
@@ -43,21 +44,10 @@ struct VerifyConfig {
     std::chrono::seconds matchWindow{20};
     std::chrono::milliseconds ioTimeout{5000};
 
-    // 16.09.2026 macOS reference capture: across four minutes of live
-    // Touch ID activity (including two successful unlocks) biometrickitd
-    // issues commands 4, 12, 39, 40, 44, 46, 48, 56, 61, 62, 63, 74, 80
-    // and 84 — and NEVER command 2 (ResetSensor) or command 0x20
-    // (LoadCalibration). Both were being sent by this project before every
-    // match on the strength of the Linux reference alone, whose firmware
-    // the project's own README notes is not the same. On the failing
-    // Windows capture the SEP answers the calibration load with an
-    // unnamed status_code=94 and then rejects every subsequent capture, so
-    // these two are now opt-in rather than unconditional. Turn them back
-    // on to A/B the old behaviour, not because the protocol needs them.
-    bool resetSensor = false;
-    bool loadCalibration = false;
-
     // Wire format of the start-match payload. See MatchIdentityLayout.
+    // Warm-up / verify prefix no longer consults resetSensor or
+    // loadCalibration flags: both commands are unconditional in the Linux
+    // reference (t2-biometric-ready.sh and t2-fprintd.py _run_probe).
     MatchIdentityLayout matchLayout = MatchIdentityLayout::InlineIdentities;
 };
 
@@ -70,7 +60,17 @@ public:
 
     bool IsBusy() const { return busy_; }
 
-    // Full sequence per Milestone 1 §2 / Milestone 2 §19:
+    // Exact port of t2-biometric-ready.sh warm_up() / bridge-xpc-probe.py
+    // argv `--initialize --reset-sensor --cancel-operation
+    // --load-calibration --identity-list`. No StartMatch (cmd 4), no
+    // sensor-readiness (cmd 0x53). Linux runs this on its own TCP
+    // connection and then disconnects, BEFORE fprintd's first verify.
+    // outIdentities is optional (CmdIdentities); WarmUp itself does not
+    // require a non-empty list — the Linux ready script doesn't either.
+    bool WarmUp(bridgexpc::Connection* conn,
+                std::vector<IdentityRecordV1>* outIdentities = nullptr);
+
+    // Full sequence per t2-fprintd.py T2Backend._run_probe():
     // connect -> HELO -> getBridgeVersion -> setClientVersion -> reset ->
     // cancel -> load FDR calibration -> load calibration into sensor ->
     // identity list -> start match -> event loop -> verdict -> cancel/stop
@@ -80,6 +80,15 @@ public:
                           std::optional<std::array<uint8_t, 16>>* outMatchedUuid);
 
 private:
+    // Shared prefix of WarmUp and Verify. Byte-identical to the Linux
+    // flag sequence above. Returns false on any transport/parse failure.
+    // outIdentityListRaw, if non-null, receives the unparsed cmd 0x42
+    // blob so Verify can byte-compare it against the repeated 0x42 that
+    // Linux sends before StartMatch.
+    bool RunLinuxReadySequence(bridgexpc::Connection* conn,
+                               std::vector<IdentityRecordV1>* outIdentities,
+                               std::vector<uint8_t>* outIdentityListRaw = nullptr);
+
     VerifyConfig config_;
     bool busy_ = false;
 };

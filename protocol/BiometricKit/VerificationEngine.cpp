@@ -3,6 +3,7 @@
 #include "VerificationEngine.h"
 #include "../BridgeXpc/PlistPayload.h"
 #include "../BridgeXpc/Log.h"
+#include <algorithm>
 #include <cstring>
 #include <string>
 
@@ -14,40 +15,154 @@ using namespace std::chrono;
 
 namespace {
 
-// Read-only diagnostic: biometric command 0x53, one-byte sensor-ready
-// state. VERIFIED FROM SOURCE (jmurth1234/t2-touchid-linux,
-// bridge-xpc-probe.py's --sensor-readiness: biometric_command(sock, 0x53,
-// version=1, value=0, output_capacity=1), reply blob's single byte treated
-// as bool sensor_ready). This project never called command 0x53 before
-// 16.09.2026. It is read-only and safe to call unconditionally, regardless
-// of the resetSensor/loadCalibration config - unlike those two, sending it
-// cannot itself change sensor state.
-//
-// Purpose (16.09.2026 A/B, see project notes): find out whether the sensor
-// is already "ready" before this project does anything, and whether
-// LoadCalibration is what flips that bit. A false->true transition
-// straddling LoadCalibration would localize the missing-image-pipeline
-// problem to sensor init/calibration state rather than the match payload,
-// layout, or status 81/78 (both already ruled out by prior captures).
-std::optional<bool> QuerySensorReadiness(bridgexpc::Connection* conn,
-                                          std::chrono::milliseconds timeout) {
-    auto cmd = EncodeBmCommand(Command::SensorReadiness, /*version=*/1, /*value=*/0);
-    std::vector<uint8_t> reply;
-    if (!conn->SendBiometricCommand(cmd, /*outputCapacity=*/1, &reply, timeout)) {
-        return std::nullopt;
+bool Uuid16IsZero(const uint8_t* p) {
+    for (int i = 0; i < 16; i++) {
+        if (p[i] != 0) return false;
     }
-    if (reply.size() != 1) {
-        return std::nullopt;
-    }
-    return reply[0] != 0;
+    return true;
 }
 
-const wchar_t* ReadinessLabel(const std::optional<bool>& r) {
-    if (!r) return L"query failed";
-    return *r ? L"1 (ready)" : L"0 (not ready)";
+// Port of t2_fprint_match_gate._global_records: walk 40-byte
+// global_identity_record_v1_t values, reject zero-UUID / duplicates /
+// non-built-in group on the configured user, collect the leading 20-byte
+// identity_record_v1_t of each configured entry.
+bool ConfiguredGlobalIdentities(const std::vector<uint8_t>& globalRaw,
+                                uint32_t appleUserId,
+                                std::vector<std::array<uint8_t, 20>>* outConfigured) {
+    outConfigured->clear();
+    if (globalRaw.size() % 40 != 0) return false;
+    std::vector<std::array<uint8_t, 20>> seen;
+    for (size_t off = 0; off < globalRaw.size(); off += 40) {
+        std::array<uint8_t, 20> identity{};
+        std::memcpy(identity.data(), globalRaw.data() + off, 20);
+        if (Uuid16IsZero(identity.data() + 4)) return false;
+        for (const auto& s : seen) {
+            if (s == identity) return false;
+        }
+        seen.push_back(identity);
+        uint32_t userId = 0;
+        std::memcpy(&userId, identity.data(), 4);
+        if (userId != appleUserId) continue;
+        uint32_t groupType = 0;
+        std::memcpy(&groupType, globalRaw.data() + off + 20, 4);
+        if (groupType != 0 && groupType != 1) return false;
+        if (!Uuid16IsZero(globalRaw.data() + off + 24)) return false;
+        outConfigured->push_back(identity);
+    }
+    return true;
+}
+
+bool SamePerUserSet(std::vector<std::array<uint8_t, 20>> configured,
+                    const std::vector<IdentityRecordV1>& perUser) {
+    std::vector<std::array<uint8_t, 20>> live;
+    live.reserve(perUser.size());
+    for (const auto& rec : perUser) {
+        std::array<uint8_t, 20> raw{};
+        std::memcpy(raw.data(), &rec, 20);
+        live.push_back(raw);
+    }
+    std::sort(configured.begin(), configured.end());
+    std::sort(live.begin(), live.end());
+    return configured == live;
 }
 
 } // namespace
+
+// Exact port of jmurth1234/t2-touchid-linux:
+//   src/t2-biometric-ready.sh warm_up()
+//   src/t2-fprintd.py T2Backend._run_probe() prefix
+//   src/bridge-xpc-probe.py flags:
+//     --initialize --reset-sensor --cancel-operation
+//     --load-calibration --identity-list
+//
+// Wire, in order, with biometric_command() defaults (version=1, value=0
+// unless noted, output_capacity=0 unless noted):
+//   request([0])                         getBridgeVersion
+//   request([10, min(api_version, 2)])   setClientVersion
+//   biometric_command(2, value=2)        ResetSensor
+//   biometric_command(12)                Cancel
+//   request_with_events([11])            FDR blob
+//   biometric_command(0x20, value=3, data=fdr)
+//   biometric_command(0x42, data=uid:u32le, output_capacity=20*10)
+//
+// No cmd 0x53. No StartMatch. Payloads are the Linux ones, not invented.
+bool VerificationEngine::RunLinuxReadySequence(
+    bridgexpc::Connection* conn,
+    std::vector<IdentityRecordV1>* outIdentities,
+    std::vector<uint8_t>* outIdentityListRaw) {
+    int64_t bridgeVersion = 0;
+    if (!conn->GetBridgeVersion(&bridgeVersion, config_.ioTimeout)) {
+        return false;
+    }
+    int64_t clientVersion = (bridgeVersion < 2) ? bridgeVersion : 2; // min(api_version, 2)
+    if (!conn->SetClientVersion(clientVersion, config_.ioTimeout)) {
+        return false;
+    }
+
+    std::vector<uint8_t> reply;
+
+    auto resetCmd = EncodeBmCommand(Command::ResetSensor, /*version=*/1, /*value=*/2);
+    if (!conn->SendBiometricCommand(resetCmd, /*outputCapacity=*/0, &reply, config_.ioTimeout)) {
+        T2_LOG("warmup", L"ResetSensor (cmd 2, value=2, capacity=0) failed");
+        return false;
+    }
+    T2_LOG("warmup", L"ResetSensor OK");
+
+    auto cancelCmd = EncodeBmCommand(Command::Cancel, /*version=*/1, /*value=*/0);
+    conn->SendBiometricCommand(cancelCmd, /*outputCapacity=*/0, &reply, config_.ioTimeout); // best-effort
+    T2_LOG("warmup", L"Cancel (cmd 0x0c) issued");
+
+    std::vector<uint8_t> fdrBlob;
+    if (!conn->GetFdrCalibration(&fdrBlob, config_.ioTimeout)) {
+        T2_LOG("warmup", L"GetFdrCalibration (bridge method 11) failed");
+        return false;
+    }
+    auto loadCalibrationCmd = EncodeBmCommand(Command::LoadCalibration, /*version=*/1, /*value=*/3, fdrBlob);
+    if (!conn->SendBiometricCommand(loadCalibrationCmd, /*outputCapacity=*/0, &reply, config_.ioTimeout)) {
+        T2_LOG("warmup", L"LoadCalibration (cmd 0x20, value=3, capacity=0, fdr=%zuB) failed",
+               fdrBlob.size());
+        return false;
+    }
+    T2_LOG("warmup", L"LoadCalibration OK, fdr=%zuB", fdrBlob.size());
+
+    std::vector<uint8_t> idReq(4);
+    std::memcpy(idReq.data(), &config_.macosUserId, 4);
+    auto idCmd = EncodeBmCommand(Command::IdentityList, /*version=*/1, /*value=*/0, idReq);
+    if (!conn->SendBiometricCommand(idCmd, kIdentityListOutputCapacity, &reply, config_.ioTimeout)) {
+        T2_LOG("warmup", L"IdentityList (cmd 0x42, capacity=%u) failed",
+               kIdentityListOutputCapacity);
+        return false;
+    }
+    std::vector<IdentityRecordV1> identities;
+    if (!ParseIdentityList(reply, &identities)) {
+        T2_LOG("warmup", L"IdentityList reply malformed (reply=%zuB, not a multiple of 20)",
+               reply.size());
+        return false;
+    }
+    T2_LOG("warmup", L"identity list parsed: %zu identities (reply=%zuB)",
+           identities.size(), reply.size());
+    if (outIdentityListRaw) {
+        *outIdentityListRaw = reply;
+    }
+    if (outIdentities) {
+        *outIdentities = std::move(identities);
+    }
+    return true;
+}
+
+bool VerificationEngine::WarmUp(bridgexpc::Connection* conn,
+                                std::vector<IdentityRecordV1>* outIdentities) {
+    if (busy_) {
+        return false;
+    }
+    busy_ = true;
+    struct BusyGuard { bool* b; ~BusyGuard() { *b = false; } } guard{&busy_};
+
+    T2_LOG("warmup",
+           L"linux ready sequence (non-matching): initialize, reset-sensor, "
+           L"cancel-operation, load-calibration, identity-list");
+    return RunLinuxReadySequence(conn, outIdentities);
+}
 
 VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
                                           std::optional<std::array<uint8_t, 16>>* outMatchedUuid) {
@@ -57,111 +172,86 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     busy_ = true;
     struct BusyGuard { bool* b; ~BusyGuard() { *b = false; } } guard{&busy_};
 
-    int64_t bridgeVersion = 0;
-    if (!conn->GetBridgeVersion(&bridgeVersion, config_.ioTimeout)) {
-        return VerifyOutcome::TransportError;
-    }
-    int64_t clientVersion = (bridgeVersion < 2) ? bridgeVersion : 2; // min(api_version, 2), VERIFIED FROM SOURCE
-    if (!conn->SetClientVersion(clientVersion, config_.ioTimeout)) {
-        return VerifyOutcome::TransportError;
-    }
-
-    std::vector<uint8_t> reply;
-
-    // 16.09.2026: sensor-readiness A/B instrumentation. Queried here,
-    // before ResetSensor/Cancel/LoadCalibration touch anything, so this is
-    // the session's true "at rest" readiness - the other half of the pair
-    // is queried after LoadCalibration below, only when that step actually
-    // ran (there is nothing meaningful to compare it against otherwise).
-    std::optional<bool> readinessAtStartup = QuerySensorReadiness(conn, config_.ioTimeout);
-    std::optional<bool> readinessAfterCalibration; // stays empty unless loadCalibration ran
-    T2_LOG("verify", L"sensor readiness (cmd 0x53, at startup): %s",
-           ReadinessLabel(readinessAtStartup));
-
-    // reset sensor (cmd 2, value=2). VERIFIED FROM SOURCE: bridge-xpc-probe.py's
-    // biometric_command() defaults version=1 for every inner BM command -
-    // LoadCalibration below was already given version=1 explicitly, but
-    // reset/cancel/identity-list/start-match were left at version=0, which
-    // does not match the reference for any of them.
-    //
-    // outputCapacity: VERIFIED FROM SOURCE - biometric_command() defaults
-    // output_capacity=0, and reset/cancel/load-calibration/start-match
-    // never pass an explicit value, so all four go out as capacity=0 on
-    // the wire (outer envelope [3, 0, innerBmBytes, output_capacity]).
-    // Only calls that actually return data (identity-list, catacomb
-    // queries) get a nonzero capacity. This file previously used 64 for
-    // every call on the theory that 0 was unsafe to send; that is not
-    // what the reference does, so it no longer matches the verified byte
-    // stream for these four fire-and-forget commands.
-    //
-    // 16.09.2026: gated behind VerifyConfig::resetSensor (default off).
-    // The macOS reference capture never issues command 2 on a live
-    // connection, and a sensor reset immediately before arming a match is
-    // a plausible way to lose the sensor-side calibration state bridgeOS
-    // set up at boot.
-    if (config_.resetSensor) {
-        auto resetCmd = EncodeBmCommand(Command::ResetSensor, 1, 2);
-        if (!conn->SendBiometricCommand(resetCmd, 0, &reply, config_.ioTimeout)) {
-            return VerifyOutcome::TransportError;
-        }
-    } else {
-        T2_LOG("verify", L"skipping ResetSensor (cmd 2) - not issued by macOS reference capture");
-    }
-
-    // cancel any outstanding operation (cmd 12)
-    auto cancelCmd = EncodeBmCommand(Command::Cancel, 1, 0);
-    conn->SendBiometricCommand(cancelCmd, 0, &reply, config_.ioTimeout); // best-effort, ignore failure here
-
-    // FDR calibration (Milestone 2 §6 / bridge-xpc-probe.py
-    // --load-calibration): bridge-level method 11 fetches the calibration
-    // blob, which is then loaded into the sensor via biometric command
-    // 0x20 with value=3 ("source 3 is remote/bridgeOS FDR" — VERIFIED FROM
-    // SOURCE; source 5 is local-macOS-filesystem-only and not applicable
-    // here). This must run before every match attempt, matching the Linux
-    // reference — it is not optional/skippable.
-    //
-    // 16.09.2026 CORRECTION: "must run before every match attempt" was an
-    // inference from the Linux reference, not an observation. The macOS
-    // capture on this exact machine shows zero calibration commands across
-    // two successful unlocks - bridgeOS calibrates the sensor during its
-    // own boot and macOS never re-pushes an FDR blob per match. Meanwhile
-    // the failing Windows capture shows the SEP emitting an unnamed
-    // status_code=94 while this 61407-byte blob is being loaded, and then
-    // rejecting every image the sensor produces. Now opt-in.
-    if (config_.loadCalibration) {
-        std::vector<uint8_t> fdrBlob;
-        if (!conn->GetFdrCalibration(&fdrBlob, config_.ioTimeout)) {
-            return VerifyOutcome::TransportError;
-        }
-        auto loadCalibrationCmd = EncodeBmCommand(Command::LoadCalibration, /*version=*/1, /*value=*/3, fdrBlob);
-        if (!conn->SendBiometricCommand(loadCalibrationCmd, 0, &reply, config_.ioTimeout)) {
-            return VerifyOutcome::TransportError;
-        }
-        readinessAfterCalibration = QuerySensorReadiness(conn, config_.ioTimeout);
-        T2_LOG("verify", L"sensor readiness (cmd 0x53, after LoadCalibration): %s",
-               ReadinessLabel(readinessAfterCalibration));
-    } else {
-        T2_LOG("verify", L"skipping LoadCalibration (cmd 0x20) - not issued by macOS reference capture");
-    }
-
-    // identity list (cmd 0x42)
-    std::vector<uint8_t> idReq(4);
-    std::memcpy(idReq.data(), &config_.macosUserId, 4);
-    auto idCmd = EncodeBmCommand(Command::IdentityList, 1, 0, idReq);
-    if (!conn->SendBiometricCommand(idCmd, 4096, &reply, config_.ioTimeout)) {
-        return VerifyOutcome::TransportError;
-    }
+    // Same prefix Linux fprintd sends on the verify connection
+    // (--initialize --reset-sensor --cancel-operation --load-calibration
+    // --identity-list) AFTER t2-biometric-ready already did it once on a
+    // previous connection. Empty identity list is a hard fail here because
+    // bridge-xpc-probe.py: "--match-seconds requires a non-empty --identity-list result".
     std::vector<IdentityRecordV1> identities;
-    if (!ParseIdentityList(reply, &identities)) {
+    std::vector<uint8_t> firstUserRaw;
+    if (!RunLinuxReadySequence(conn, &identities, &firstUserRaw)) {
+        return VerifyOutcome::TransportError;
+    }
+    if (identities.empty()) {
+        T2_LOG("verify", L"identity list empty - refusing StartMatch (Linux requires non-empty)");
         return VerifyOutcome::Malformed;
     }
-    // Never logged before: a hardware capture that timed out with no
-    // match_result event left no way to tell "SEP had nothing enrolled to
-    // compare against" apart from "SEP just never finalized a verdict" -
-    // those are very different problems and this was the missing signal
-    // to tell them apart. Count only, never any UUID (Milestone 1 §7/§14).
-    T2_LOG("verify", L"identity list parsed: %zu identities (reply=%zuB)",
-           identities.size(), reply.size());
+
+    // Non-matching identity warm-up immediately before StartMatch.
+    // VERIFIED FROM SOURCE: bridge-xpc-probe.py match-seconds branch with
+    // --resolve-any-finger-name (t2-fprintd.py verify_fprint() for requested
+    // finger == "any" AND a complete projection). After the first 0x42 from
+    // --identity-list it sends:
+    //   biometric_command(sock, 0x51, output_capacity=40*10)
+    //   biometric_command(sock, 0x42, data=uid, output_capacity=20*10)
+    //   biometric_command(sock, 0x51, output_capacity=40*10)
+    // then t2_fprint_match_gate.prepare_all fail-closes unless first==repeat
+    // for both views AND the configured 0x51 slice equals the first 0x42
+    // set. StartMatch still uses the FIRST 0x42 records, never the repeat.
+    std::vector<uint8_t> firstGlobalRaw;
+    auto globalCmd = EncodeBmCommand(Command::GlobalIdentityList, /*version=*/1, /*value=*/0);
+    if (!conn->SendBiometricCommand(globalCmd, kGlobalIdentityListOutputCapacity,
+                                    &firstGlobalRaw, config_.ioTimeout)) {
+        T2_LOG("verify", L"GlobalIdentityList (cmd 0x51, capacity=%u) failed",
+               kGlobalIdentityListOutputCapacity);
+        return VerifyOutcome::TransportError;
+    }
+    if (firstGlobalRaw.size() % 40 != 0) {
+        T2_LOG("verify", L"GlobalIdentityList reply malformed (reply=%zuB, not a multiple of 40)",
+               firstGlobalRaw.size());
+        return VerifyOutcome::Malformed;
+    }
+
+    std::vector<uint8_t> idReq(4);
+    std::memcpy(idReq.data(), &config_.macosUserId, 4);
+    auto idCmd = EncodeBmCommand(Command::IdentityList, /*version=*/1, /*value=*/0, idReq);
+    std::vector<uint8_t> repeatedUserRaw;
+    if (!conn->SendBiometricCommand(idCmd, kIdentityListOutputCapacity,
+                                    &repeatedUserRaw, config_.ioTimeout)) {
+        T2_LOG("verify", L"repeated IdentityList (cmd 0x42) failed");
+        return VerifyOutcome::TransportError;
+    }
+
+    std::vector<uint8_t> repeatedGlobalRaw;
+    if (!conn->SendBiometricCommand(globalCmd, kGlobalIdentityListOutputCapacity,
+                                    &repeatedGlobalRaw, config_.ioTimeout)) {
+        T2_LOG("verify", L"repeated GlobalIdentityList (cmd 0x51) failed");
+        return VerifyOutcome::TransportError;
+    }
+
+    if (firstUserRaw != repeatedUserRaw || firstGlobalRaw != repeatedGlobalRaw) {
+        T2_LOG("verify",
+               L"live identity inventory is unstable "
+               L"(user %zuB vs %zuB, global %zuB vs %zuB)",
+               firstUserRaw.size(), repeatedUserRaw.size(),
+               firstGlobalRaw.size(), repeatedGlobalRaw.size());
+        return VerifyOutcome::Malformed;
+    }
+
+    std::vector<std::array<uint8_t, 20>> configured;
+    if (!ConfiguredGlobalIdentities(firstGlobalRaw, config_.macosUserId, &configured) ||
+        !SamePerUserSet(configured, identities)) {
+        T2_LOG("verify",
+               L"global and per-user identity inventories disagree "
+               L"(configured=%zu per-user=%zu global=%zuB)",
+               configured.size(), identities.size(), firstGlobalRaw.size());
+        return VerifyOutcome::Malformed;
+    }
+    T2_LOG("verify",
+           L"identity warm-up OK: 0x42/0x51/0x42/0x51 user=%zuB global=%zuB identities=%zu (StartMatch uses first 0x42)",
+           firstUserRaw.size(), firstGlobalRaw.size(), identities.size());
+
+    auto cancelCmd = EncodeBmCommand(Command::Cancel, 1, 0);
 
     // start match (cmd 4)
     //
@@ -170,31 +260,20 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     // capture shows biometrickitd sending inSize=68 for the same command on
     // the same machine with the same 3 identities. 68 == 8 + 3*20, so the
     // identity records go inline after an 8-byte header with no count word.
-    // Sending 132 bytes means the SEP parsed garbage where it expected the
-    // identity array, which is consistent with a match session that arms
-    // the sensor (status 90) and detects the finger (status 63) but never
-    // reaches the image/matching stage.
     auto matchInitData = EncodeMatchInitData(0, config_.macosUserId, identities,
                                               config_.matchLayout);
     T2_LOG("verify", L"start match: layout=%s payload=%zuB (macOS reference for %zu identities = %zuB)",
            MatchIdentityLayoutName(config_.matchLayout), matchInitData.size(),
            identities.size(), sizeof(MatchOptionsV1) + identities.size() * sizeof(IdentityRecordV1));
     auto startCmd = EncodeBmCommand(Command::StartMatch, 1, 0, matchInitData);
+    std::vector<uint8_t> reply;
     if (!conn->SendBiometricCommand(startCmd, 0, &reply, config_.ioTimeout)) {
         return VerifyOutcome::TransportError;
     }
 
     // Milestone 2B §11: from here on the StartMatch IPC itself succeeded,
     // so a match session may now be live on the device regardless of what
-    // happens next - a malformed/unparseable reply, an explicit device
-    // rejection, a later transport error, a timeout, or normal completion.
-    // CancelMatch must be attempted on every one of those exit paths, not
-    // just the "we got all the way through the event loop" one. A
-    // scope-exit guard (the same pattern as BusyGuard above) makes this
-    // hold regardless of which `return` below actually fires, without
-    // duplicating the cancel call at every one of them; it replaces the
-    // single unconditional cancel that previously ran only after the event
-    // loop and so was skipped by the two early returns below.
+    // happens next. CancelMatch must be attempted on every exit path.
     struct CancelGuard {
         bridgexpc::Connection* conn;
         const std::vector<uint8_t>* cancelCmd;
@@ -205,66 +284,28 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
         }
     } cancelGuard{conn, &cancelCmd, config_.ioTimeout};
 
-    // "match_reply[0] != 0 -> match_rejected -> ERROR (never a silent
-    // success)" (VERIFIED FROM SOURCE) refers to the OUTER bridgexpc
-    // [status, blob] status word for this command - not to any content of
-    // the blob itself. That outer status is already enforced above: this
-    // point in the function is only reached when SendBiometricCommand
-    // returned true, which itself requires statusBlob->status == 0 (see
-    // Connection.cpp). The reference never inspects match_reply[1] (the
-    // blob) for start-match at all, and now that this command is correctly
-    // sent with outputCapacity=0 (matching the reference), the blob is
-    // legitimately empty on every successful call - a size check here
-    // would reject every accepted start-match as Malformed. Previously
-    // this "worked" only by accident, because outputCapacity=64 made the
-    // blob 64 zero bytes whose first 4 happened to read as 0.
-
     auto deadline = steady_clock::now() + config_.matchWindow;
     VerifyOutcome outcome = VerifyOutcome::Timeout; // default if loop exits via deadline
 
-    // Session-level evidence, used only to turn an otherwise opaque
-    // "verify-timeout" into a statement about WHERE the pipeline stopped.
-    // Never feeds the match/no-match decision.
     bool sawFingerOn = false;
     size_t imagePipelineEvents = 0;
     size_t unnamedStatusEvents = 0;
-    size_t fingerTouchCycles = 0; // count of status_code==63 (FingerOn) events
-    // 16.09.2026: two back-to-back hardware captures (132B legacy payload,
-    // then the corrected 68B inline payload) produced BIT-IDENTICAL status
-    // sequences - same 81/63/91/78/64 cycle, same statistics types
-    // (4/35/25 then 30), same total absence of 55/72/95 and of statistics
-    // types 0/1/2. Fixing the StartMatch payload size to match the macOS
-    // capture changed nothing observable on the wire. That is strong
-    // evidence the payload content is not what gates image capture -
-    // whatever decides "does the sensor hand a captured image to the
-    // matcher" happens upstream of this command entirely. See
-    // docs/macos-verified-status-map.md section 7 ("second hardware
-    // capture"). LoadCalibration (still opt-in, disabled by default because
-    // the macOS *live* capture never re-issues it) is now the leading
-    // remaining candidate specifically because Boot Camp Windows may skip
-    // whatever step macOS's own boot performs to arm the sensor for a given
-    // power cycle - something biometrickitd's own IPC traffic would never
-    // show, since on macOS it already happened before biometrickitd ran.
+    size_t fingerTouchCycles = 0;
 
     while (steady_clock::now() < deadline) {
         std::vector<uint8_t> eventPayload;
         if (!conn->WaitForEvent(&eventPayload, deadline)) {
-            break; // timeout or malformed frame -> fall through to Cancel + Timeout/Malformed below
+            break;
         }
 
-        // VERIFIED FROM SOURCE (bridge-xpc-probe.py summarize_event): the
-        // event payload is [9, bridge_status, data, x, x]; `data` begins
-        // with a 24-byte header whose embedded_type field is the real
-        // discriminator — this replaces the previous hardcoded
-        // "assume every event is match_result" placeholder.
         auto statusData = bridgexpc::DecodeStatusEventData(eventPayload);
         if (!statusData) {
-            continue; // not a recognizable status-callback shape; keep waiting
+            continue;
         }
         uint32_t embeddedType = 0;
         std::vector<uint8_t> eventData;
         if (!ParseStatusEventHeader(*statusData, &embeddedType, &eventData)) {
-            continue; // header too short; keep waiting rather than guessing
+            continue;
         }
         if (embeddedType != kEmbeddedTypeMatchResult) {
             const wchar_t* kind = EmbeddedTypeName(embeddedType);
@@ -336,17 +377,9 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     }
     T2_LOG("verify",
            L"session summary: finger_touch_cycles=%zu image_pipeline_events=%zu unnamed_status_events=%zu "
-           L"layout=%s reset_sensor=%d load_calibration=%d readiness_startup=%s readiness_after_calibration=%s outcome=%d",
+           L"layout=%s linux_ready=1 (reset+cal+idlist) outcome=%d",
            fingerTouchCycles, imagePipelineEvents, unnamedStatusEvents,
-           MatchIdentityLayoutName(config_.matchLayout), config_.resetSensor ? 1 : 0,
-           config_.loadCalibration ? 1 : 0, ReadinessLabel(readinessAtStartup),
-           ReadinessLabel(readinessAfterCalibration), static_cast<int>(outcome));
-    if (fingerTouchCycles >= 2 && imagePipelineEvents == 0 && !config_.loadCalibration) {
-        T2_LOG("verify",
-               L"%zu consecutive no-image touch cycles with LoadCalibration disabled - "
-               L"strongly consider retrying with loadCalibration=true (--load-calibration)",
-               fingerTouchCycles);
-    }
+           MatchIdentityLayoutName(config_.matchLayout), static_cast<int>(outcome));
 
     return outcome;
 }

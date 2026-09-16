@@ -100,8 +100,20 @@ enum class Command : uint16_t {
     CatacombHash      = 0x3a,
     CatacombState     = 0x3c,
     IdentityList      = 0x42,
+    GlobalIdentityList = 0x51,
     SensorReadiness   = 0x53,
 };
+
+// VERIFIED FROM SOURCE (jmurth1234/t2-touchid-linux,
+// src/bridge-xpc-probe.py --identity-list):
+//   biometric_command(sock, 0x42, data=pack("<I", uid), output_capacity=20 * 10)
+// Ten identity_record_v1_t slots. t2-biometric-ready.sh uses this exact
+// capacity; do not substitute 4096.
+constexpr uint32_t kIdentityListOutputCapacity = 20 * 10;
+
+// VERIFIED FROM SOURCE (bridge-xpc-probe.py resolve-any / --global-identity-list):
+//   biometric_command(sock, 0x51, output_capacity=40 * 10)
+constexpr uint32_t kGlobalIdentityListOutputCapacity = 40 * 10;
 
 constexpr uint32_t kEmbeddedTypeStatus      = 0xE3FF8001;
 constexpr uint32_t kEmbeddedTypeMatchResult = 0xE3FF8002;

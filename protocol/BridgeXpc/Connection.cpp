@@ -380,40 +380,79 @@ bool Connection::GetFdrCalibration(std::vector<uint8_t>* outBlob, std::chrono::m
         return false;
     }
 
-    RawFrame reply;
-    if (!ReadFrame(&reply, timeout) || reply.type != FrameType::Message) {
-        T2_LOG("getFdrCalibration", L"ReadFrame failed/wrong type (reqId=%s, timeout=%lldms)",
-               Widen(reqId).c_str(), static_cast<long long>(timeout.count()));
-        return false;
-    }
+    // VERIFIED FROM SOURCE: bridge-xpc-probe.py --load-calibration uses
+    // request_with_events(sock, [11]), which acks async callbacks until
+    // the matching reply arrives. A single ReadFrame here used to treat
+    // the first frame as the reply and fail if bkremoted pushed a
+    // serviceStatus event first — the same bug SendBiometricCommand
+    // already fixed for BM commands.
+    auto deadline = std::chrono::steady_clock::now() + timeout;
+    for (;;) {
+        auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            T2_LOG("getFdrCalibration", L"deadline reached waiting for reply "
+                   "(reqId=%s, timeout=%lldms)", Widen(reqId).c_str(),
+                   static_cast<long long>(timeout.count()));
+            return false;
+        }
+        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
 
-    auto env = ParseMessageBody(reply.body);
-    if (!env) {
-        T2_LOG("getFdrCalibration", L"ParseMessageBody failed, body=%zuB %s",
-               reply.body.size(), HexDump(reply.body).c_str());
-        return false;
-    }
-    if (env->requestId != reqId) {
-        T2_LOG("getFdrCalibration", L"requestId mismatch: sent=%s got=%s isReply=%d",
-               Widen(reqId).c_str(), Widen(env->requestId).c_str(), env->isReply ? 1 : 0);
-        return false;
-    }
+        RawFrame reply;
+        if (!ReadFrame(&reply, remaining)) {
+            T2_LOG("getFdrCalibration", L"ReadFrame failed/timed out (reqId=%s, "
+                   "%lldms remained) - WSAGetLastError=%d",
+                   Widen(reqId).c_str(), static_cast<long long>(remaining.count()),
+                   WSAGetLastError());
+            return false;
+        }
+        if (reply.type != FrameType::Message) {
+            T2_LOG("getFdrCalibration", L"unexpected frame type %u (reqId=%s) - ignoring",
+                   static_cast<unsigned>(reply.type), Widen(reqId).c_str());
+            continue;
+        }
 
-    auto blob = DecodeSingleBlobPayload(env->payloadPlist);
-    // VERIFIED FROM SOURCE: "--load-calibration requires bridgeOS returned
-    // no usable FDR calibration data" is treated as a hard failure, not an
-    // empty-but-ok result — do not skip calibration on a missing blob.
-    if (!blob || blob->empty()) {
-        T2_LOG("getFdrCalibration", L"bridgeOS returned no usable FDR blob "
-               "(decoded=%d, size=%zu) - payload was %zuB %s",
-               blob.has_value() ? 1 : 0, blob ? blob->size() : 0,
-               env->payloadPlist.size(), HexDump(env->payloadPlist).c_str());
-        return false;
-    }
+        auto env = ParseMessageBody(reply.body);
+        if (!env) {
+            T2_LOG("getFdrCalibration", L"ParseMessageBody failed, body=%zuB %s",
+                   reply.body.size(), HexDump(reply.body).c_str());
+            return false;
+        }
 
-    *outBlob = std::move(*blob);
-    T2_LOG("getFdrCalibration", L"OK, blob=%zuB", outBlob->size());
-    return true;
+        if (!env->isReply) {
+            T2_LOG("getFdrCalibration", L"async event while waiting for reply "
+                   "(reqId=%s), event reqId=%s payload=%zuB - acking and continuing",
+                   Widen(reqId).c_str(), Widen(env->requestId).c_str(),
+                   env->payloadPlist.size());
+            if (!AcknowledgeEvent(env->requestId)) {
+                T2_LOG("getFdrCalibration", L"AcknowledgeEvent failed for event reqId=%s",
+                       Widen(env->requestId).c_str());
+                return false;
+            }
+            continue;
+        }
+
+        if (env->requestId != reqId) {
+            T2_LOG("getFdrCalibration", L"ignoring stray reply, sent=%s got=%s",
+                   Widen(reqId).c_str(), Widen(env->requestId).c_str());
+            continue;
+        }
+
+        auto blob = DecodeSingleBlobPayload(env->payloadPlist);
+        // VERIFIED FROM SOURCE: "--load-calibration requires bridgeOS returned
+        // no usable FDR calibration data" is treated as a hard failure, not an
+        // empty-but-ok result — do not skip calibration on a missing blob.
+        if (!blob || blob->empty()) {
+            T2_LOG("getFdrCalibration", L"bridgeOS returned no usable FDR blob "
+                   "(decoded=%d, size=%zu) - payload was %zuB %s",
+                   blob.has_value() ? 1 : 0, blob ? blob->size() : 0,
+                   env->payloadPlist.size(), HexDump(env->payloadPlist).c_str());
+            return false;
+        }
+
+        *outBlob = std::move(*blob);
+        T2_LOG("getFdrCalibration", L"OK, blob=%zuB", outBlob->size());
+        return true;
+    }
 }
 
 bool Connection::WaitForEvent(std::vector<uint8_t>* outEventPayload,

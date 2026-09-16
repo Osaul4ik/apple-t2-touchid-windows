@@ -270,7 +270,22 @@ static void TestStatusCodeNames_FromMacOsCapture() {
     CHECK(!biometrickit::StatusCodeIsImagePipeline(90));
 }
 
-static void TestStatisticsEventBody_DecodesTypeAndValue() {
+static void TestLinuxIdentityCapacitiesAndGlobalCommand() {
+    CHECK(biometrickit::kIdentityListOutputCapacity == 200);
+    CHECK(biometrickit::kGlobalIdentityListOutputCapacity == 400);
+    auto cmd = biometrickit::EncodeBmCommand(
+        biometrickit::Command::GlobalIdentityList, 1, 0);
+    CHECK(cmd.size() == 8);
+    uint16_t magic = 0, command = 0, version = 0, value = 0xffff;
+    std::memcpy(&magic, cmd.data(), 2);
+    std::memcpy(&command, cmd.data() + 2, 2);
+    std::memcpy(&version, cmd.data() + 4, 2);
+    std::memcpy(&value, cmd.data() + 6, 2);
+    CHECK(magic == 0x4D42);
+    CHECK(command == 0x51);
+    CHECK(version == 1);
+    CHECK(value == 0);
+}
     // Bytes taken verbatim from the failing Windows capture:
     // ordinal=0, length=12, type=4, value=1
     std::vector<uint8_t> body(28, 0);
@@ -309,6 +324,7 @@ int wmain() {
     TestMatchPayload_LegacyIsTheOldOneHundredThirtyTwo();
     TestStatusCodeNames_FromMacOsCapture();
     TestStatisticsEventBody_DecodesTypeAndValue();
+    TestLinuxIdentityCapacitiesAndGlobalCommand();
 
     if (g_failures == 0) {
         std::wcout << L"All tests passed.\n";
