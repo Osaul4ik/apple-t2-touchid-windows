@@ -184,11 +184,28 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
                                  : L"unknown";
             if (embeddedType == kEmbeddedTypeStatus) {
                 StatusEventBody body = ParseStatusEventBody(eventData);
+                // ParseStatusEventBody only decodes eventData[0:4) and
+                // [8:16) (VERIFIED FROM SOURCE - that is genuinely the
+                // reference's entire decode). Whatever status_data_length
+                // describes (eventData[16:...)) has never been logged by
+                // this project in any form, on any capture to date - every
+                // status_code=81/63/78/64 event (the ones bracketing the
+                // status_code=91 no-payload event, i.e. the actual
+                // per-touch capture cycle) has been a total blind spot.
+                // Dumping it is the same "raw bytes, well under
+                // kMinMatchResultEventBytes" reasoning already applied to
+                // statistics events below - these bodies are 52B, nowhere
+                // near the 0xC70B match_result floor, so this cannot be
+                // printing anything UUID-shaped.
                 T2_LOG("verify",
-                       L"event_type=%s embedded_type=0x%08X body=%zuB status_code=%s status_data_length=%s",
+                       L"event_type=%s embedded_type=0x%08X body=%zuB status_code=%s status_data_length=%s status_data=%s",
                        kind, embeddedType, eventData.size(),
                        body.statusCode ? std::to_wstring(*body.statusCode).c_str() : L"(n/a)",
-                       body.statusDataLength ? std::to_wstring(*body.statusDataLength).c_str() : L"(n/a)");
+                       body.statusDataLength ? std::to_wstring(*body.statusDataLength).c_str() : L"(n/a)",
+                       eventData.size() > kStatusEventBodyFixedFieldsBytes
+                           ? HexDump(std::vector<uint8_t>(eventData.begin() + kStatusEventBodyFixedFieldsBytes, eventData.end()),
+                                     eventData.size() - kStatusEventBodyFixedFieldsBytes).c_str()
+                           : L"(none)");
             } else if (embeddedType == kEmbeddedTypeStatistics) {
                 // Raw dump, not just size: statistics events are ~28B and
                 // this project has never decoded their fields (see the

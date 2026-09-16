@@ -31,6 +31,14 @@ constexpr size_t kMinMatchResultEventBytes = 0xC70;
 // version:u32le, ordinal:u64le — followed by the event-type-specific body.
 constexpr size_t kStatusEventHeaderBytes = 24;
 
+// VERIFIED FROM SOURCE (ParseStatusEventBody below): the reference only
+// ever reads eventData[0:4) (status_code) and eventData[8:16)
+// (status_data_length). Nothing in [4:8) or beyond [16:...) is decoded by
+// the reference, but status_data_length itself asserts that a body
+// exists starting at this offset - this constant is that offset, used
+// only for raw hex-dumping what's there, never for parsing it.
+constexpr size_t kStatusEventBodyFixedFieldsBytes = 16;
+
 // Splits raw status-event `data` bytes (as extracted by
 // bridgexpc::DecodeStatusEventData) into embedded_type and the remaining
 // event body. Returns false if data is shorter than the fixed 24-byte
