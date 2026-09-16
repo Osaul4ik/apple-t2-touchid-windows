@@ -36,14 +36,24 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     // LoadCalibration below was already given version=1 explicitly, but
     // reset/cancel/identity-list/start-match were left at version=0, which
     // does not match the reference for any of them.
+    //
+    // outputCapacity: VERIFIED FROM SOURCE - biometric_command() defaults
+    // output_capacity=0, and reset/cancel/load-calibration/start-match
+    // never pass an explicit value, so all four go out as capacity=0 on
+    // the wire (outer envelope [3, 0, innerBmBytes, output_capacity]).
+    // Only calls that actually return data (identity-list, catacomb
+    // queries) get a nonzero capacity. This file previously used 64 for
+    // every call on the theory that 0 was unsafe to send; that is not
+    // what the reference does, so it no longer matches the verified byte
+    // stream for these four fire-and-forget commands.
     auto resetCmd = EncodeBmCommand(Command::ResetSensor, 1, 2);
-    if (!conn->SendBiometricCommand(resetCmd, 64, &reply, config_.ioTimeout)) {
+    if (!conn->SendBiometricCommand(resetCmd, 0, &reply, config_.ioTimeout)) {
         return VerifyOutcome::TransportError;
     }
 
     // cancel any outstanding operation (cmd 12)
     auto cancelCmd = EncodeBmCommand(Command::Cancel, 1, 0);
-    conn->SendBiometricCommand(cancelCmd, 64, &reply, config_.ioTimeout); // best-effort, ignore failure here
+    conn->SendBiometricCommand(cancelCmd, 0, &reply, config_.ioTimeout); // best-effort, ignore failure here
 
     // FDR calibration (Milestone 2 §6 / bridge-xpc-probe.py
     // --load-calibration): bridge-level method 11 fetches the calibration
@@ -57,7 +67,7 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
         return VerifyOutcome::TransportError;
     }
     auto loadCalibrationCmd = EncodeBmCommand(Command::LoadCalibration, /*version=*/1, /*value=*/3, fdrBlob);
-    if (!conn->SendBiometricCommand(loadCalibrationCmd, 64, &reply, config_.ioTimeout)) {
+    if (!conn->SendBiometricCommand(loadCalibrationCmd, 0, &reply, config_.ioTimeout)) {
         return VerifyOutcome::TransportError;
     }
 
@@ -83,7 +93,7 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     // start match (cmd 4)
     auto matchInitData = EncodeMatchInitData(0, config_.macosUserId, identities);
     auto startCmd = EncodeBmCommand(Command::StartMatch, 1, 0, matchInitData);
-    if (!conn->SendBiometricCommand(startCmd, 64, &reply, config_.ioTimeout)) {
+    if (!conn->SendBiometricCommand(startCmd, 0, &reply, config_.ioTimeout)) {
         return VerifyOutcome::TransportError;
     }
 
@@ -104,7 +114,7 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
         std::chrono::milliseconds ioTimeout;
         ~CancelGuard() {
             std::vector<uint8_t> discard;
-            conn->SendBiometricCommand(*cancelCmd, 64, &discard, ioTimeout); // best-effort
+            conn->SendBiometricCommand(*cancelCmd, 0, &discard, ioTimeout); // best-effort
         }
     } cancelGuard{conn, &cancelCmd, config_.ioTimeout};
 
