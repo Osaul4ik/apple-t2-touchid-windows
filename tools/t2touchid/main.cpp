@@ -574,12 +574,14 @@ static int CmdIdentities(int argc, wchar_t* argv[]) {
     }
 
     std::vector<uint8_t> reply;
-    auto resetCmd = EncodeBmCommand(Command::ResetSensor, 0, 2);
+    // VERIFIED FROM SOURCE: bridge-xpc-probe.py's biometric_command()
+    // defaults version=1 for every inner BM command, not just LoadCalibration.
+    auto resetCmd = EncodeBmCommand(Command::ResetSensor, 1, 2);
     if (!bridge.SendBiometricCommand(resetCmd, 64, &reply, std::chrono::milliseconds(5000))) {
         std::wcout << L"reset-sensor command failed.\n";
         return 1;
     }
-    auto cancelCmd = EncodeBmCommand(Command::Cancel, 0, 0);
+    auto cancelCmd = EncodeBmCommand(Command::Cancel, 1, 0);
     bridge.SendBiometricCommand(cancelCmd, 64, &reply, std::chrono::milliseconds(5000)); // best-effort
 
     std::vector<uint8_t> fdrBlob;
@@ -595,7 +597,7 @@ static int CmdIdentities(int argc, wchar_t* argv[]) {
 
     std::vector<uint8_t> idReq(4);
     std::memcpy(idReq.data(), &macosUserId, 4);
-    auto idCmd = EncodeBmCommand(Command::IdentityList, 0, 0, idReq);
+    auto idCmd = EncodeBmCommand(Command::IdentityList, 1, 0, idReq);
     if (!bridge.SendBiometricCommand(idCmd, 4096, &reply, std::chrono::milliseconds(5000))) {
         std::wcout << L"identity-list command failed.\n";
         return 1;

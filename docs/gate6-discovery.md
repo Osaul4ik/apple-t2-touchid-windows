@@ -165,3 +165,45 @@ fresh side-by-side capture (peer address, ifIndex, and full candidate
 list) of two consecutive unqualified `network` runs to tell whether the
 IPv6 neighbor-table peer address is unstable across runs, independent of
 the `ifIndex` instability already documented above.
+## Gate 8 — root cause of "load-calibration command failed" / verify transport error (analysis, 16.09.2026)
+
+Hardware run: `network` correctly landed on port 59602 → BiometricKit
+BridgeXPC port 49252, HELO/getBridgeVersion/setClientVersion all OK, `identities`
+got through `reset-sensor` and `cancel` (both tiny payloads) and through
+`GetFdrCalibration` (bridge-level method 11, a large *read*), then failed
+at `load-calibration command failed.` `verify` fails the same way
+(`verify-failed: transport error`) because `VerificationEngine::Verify` runs
+the identical sequence.
+
+Two real bugs found by diffing this port against
+`src/bridge-xpc-probe.py` + `src/t2_bridge_wire.py` in the Linux reference:
+
+1. **`Connection::WriteFrame` didn't loop on short `send()`s.** Every prior
+   frame this session sent (HELO echo, `getBridgeVersion`, `setClientVersion`,
+   `reset`, `cancel`) is a few bytes and happened to go out in one `send()`
+   call, masking this. The load-calibration command's body is the FDR
+   calibration blob read back a moment earlier — large enough that a single
+   blocking `send()` over the T2's virtual USB-NCM link isn't guaranteed to
+   write it all at once. `WriteFrame` treated any `send()` returning fewer
+   bytes than requested as a hard failure instead of continuing the write,
+   which is exactly the "gets through everything with a tiny payload, fails
+   on the first big one" pattern observed. `RemoteXpcConnection::WriteRaw` in
+   `protocol/Discovery/RemoteXpc.cpp` already loops correctly — `WriteFrame`
+   just never matched it. Fixed by adding the same loop (`WriteAll`) and using
+   it for both the frame header and body writes.
+
+2. **Inner BM-command header used `version=0` instead of `version=1` for
+   `reset`, `cancel`, `identity-list`, and `start-match`.** Only
+   `LoadCalibration` was given `version=1` explicitly. The reference's
+   `biometric_command()` (`t2_bridge_wire.py`) defaults `version=1` for
+   *every* inner command — there is no documented case where `bkremoted`
+   expects `version=0`. This didn't manifest as a hard transport failure on
+   its own (the device still replied), but it's a genuine protocol mismatch
+   against the verified source and is now fixed to `version=1` everywhere,
+   matching the reference exactly.
+
+Both fixes applied in `protocol/BridgeXpc/Connection.cpp`,
+`protocol/BiometricKit/VerificationEngine.cpp`, and the CLI's own copy of
+the sequence in `tools/t2touchid/main.cpp`. **Not yet re-verified on real
+hardware** — next `identities`/`verify` run should confirm load-calibration
+now succeeds and identities/match proceed past it.

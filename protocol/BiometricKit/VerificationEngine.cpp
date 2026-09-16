@@ -27,14 +27,18 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
 
     std::vector<uint8_t> reply;
 
-    // reset sensor (cmd 2, value=2)
-    auto resetCmd = EncodeBmCommand(Command::ResetSensor, 0, 2);
+    // reset sensor (cmd 2, value=2). VERIFIED FROM SOURCE: bridge-xpc-probe.py's
+    // biometric_command() defaults version=1 for every inner BM command -
+    // LoadCalibration below was already given version=1 explicitly, but
+    // reset/cancel/identity-list/start-match were left at version=0, which
+    // does not match the reference for any of them.
+    auto resetCmd = EncodeBmCommand(Command::ResetSensor, 1, 2);
     if (!conn->SendBiometricCommand(resetCmd, 64, &reply, config_.ioTimeout)) {
         return VerifyOutcome::TransportError;
     }
 
     // cancel any outstanding operation (cmd 12)
-    auto cancelCmd = EncodeBmCommand(Command::Cancel, 0, 0);
+    auto cancelCmd = EncodeBmCommand(Command::Cancel, 1, 0);
     conn->SendBiometricCommand(cancelCmd, 64, &reply, config_.ioTimeout); // best-effort, ignore failure here
 
     // FDR calibration (Milestone 2 §6 / bridge-xpc-probe.py
@@ -56,7 +60,7 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     // identity list (cmd 0x42)
     std::vector<uint8_t> idReq(4);
     std::memcpy(idReq.data(), &config_.macosUserId, 4);
-    auto idCmd = EncodeBmCommand(Command::IdentityList, 0, 0, idReq);
+    auto idCmd = EncodeBmCommand(Command::IdentityList, 1, 0, idReq);
     if (!conn->SendBiometricCommand(idCmd, 4096, &reply, config_.ioTimeout)) {
         return VerifyOutcome::TransportError;
     }
@@ -67,7 +71,7 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
 
     // start match (cmd 4)
     auto matchInitData = EncodeMatchInitData(0, config_.macosUserId, identities);
-    auto startCmd = EncodeBmCommand(Command::StartMatch, 0, 0, matchInitData);
+    auto startCmd = EncodeBmCommand(Command::StartMatch, 1, 0, matchInitData);
     if (!conn->SendBiometricCommand(startCmd, 64, &reply, config_.ioTimeout)) {
         return VerifyOutcome::TransportError;
     }

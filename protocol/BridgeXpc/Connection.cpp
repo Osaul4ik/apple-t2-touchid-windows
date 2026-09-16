@@ -226,6 +226,30 @@ bool Connection::ReadFrame(RawFrame* out, std::chrono::milliseconds timeout) {
     return true;
 }
 
+// Sends every byte of [data, data+len), looping on short writes. A single
+// send() call is NOT guaranteed to transmit the whole buffer even on a
+// blocking TCP socket - it can return early once its own send buffer is
+// full. This matters here because bodies can be several KB (e.g. the FDR
+// calibration blob echoed back in the load-calibration command), unlike the
+// few-byte HELO/getBridgeVersion/setClientVersion bodies that happened to
+// always fit in one send() and masked this bug during earlier hardware
+// runs. Mirrors RemoteXpcConnection::WriteRaw in
+// protocol/Discovery/RemoteXpc.cpp, which already gets this right.
+static bool WriteAll(SOCKET s, const uint8_t* data, size_t len) {
+    size_t sent = 0;
+    while (sent < len) {
+        int n = send(s, reinterpret_cast<const char*>(data + sent),
+                     static_cast<int>(len - sent), 0);
+        if (n <= 0) {
+            int e = WSAGetLastError();
+            if (n < 0 && e == WSAEWOULDBLOCK) continue;
+            return false; // hard error or peer closed: fail closed
+        }
+        sent += static_cast<size_t>(n);
+    }
+    return true;
+}
+
 bool Connection::WriteFrame(FrameType type, const std::vector<uint8_t>& body) {
     uint8_t header[16];
     uint16_t magic = kFrameMagic;
@@ -238,12 +262,10 @@ bool Connection::WriteFrame(FrameType type, const std::vector<uint8_t>& body) {
     std::memcpy(header + 4, &frameType, 4);
     std::memcpy(header + 8, &bodyLength, 8);
 
-    if (send(socket_, reinterpret_cast<const char*>(header), sizeof(header), 0) != sizeof(header)) {
+    if (!WriteAll(socket_, header, sizeof(header))) {
         return false;
     }
-    if (!body.empty() &&
-        send(socket_, reinterpret_cast<const char*>(body.data()), static_cast<int>(body.size()), 0)
-            != static_cast<int>(body.size())) {
+    if (!body.empty() && !WriteAll(socket_, body.data(), body.size())) {
         return false;
     }
     return true;
