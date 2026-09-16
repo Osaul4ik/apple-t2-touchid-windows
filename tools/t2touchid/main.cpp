@@ -19,6 +19,7 @@
 #include "../../protocol/Discovery/Adapter.h"
 #include "../../protocol/Discovery/PortScan.h"
 #include "../../protocol/Discovery/RemoteXpc.h"
+#include "../../protocol/BridgeXpc/Log.h"
 #include <iostream>
 #include <string>
 #include <fstream>
@@ -31,6 +32,14 @@
 #include <cstring>
 
 using namespace t2::applekeystore;
+
+// Shared tail for terse failure lines throughout this file: every
+// BridgeXPC-layer failure ("... command failed") now has a matching
+// detailed reason logged from protocol/BridgeXpc/Connection.cpp — this
+// just points the operator at where to look instead of leaving them with
+// nothing but the one-line summary.
+static const wchar_t* kSeeVerboseHint =
+    L"(re-run with --verbose, or attach DebugView, for the detailed reason)\n";
 
 static std::vector<uint8_t> ReadPasswordInteractive() {
     std::wcout << L"Password: ";
@@ -574,12 +583,12 @@ static int CmdIdentities(int argc, wchar_t* argv[]) {
 
     int64_t bridgeVersion = 0;
     if (!bridge.GetBridgeVersion(&bridgeVersion, std::chrono::milliseconds(2000))) {
-        std::wcout << L"getBridgeVersion failed after connect.\n";
+        std::wcout << L"getBridgeVersion failed after connect. " << kSeeVerboseHint;
         return 1;
     }
     int64_t clientVersion = (bridgeVersion < 2) ? bridgeVersion : 2; // min(api_version,2), VERIFIED FROM SOURCE
     if (!bridge.SetClientVersion(clientVersion, std::chrono::milliseconds(2000))) {
-        std::wcout << L"setClientVersion failed.\n";
+        std::wcout << L"setClientVersion failed. " << kSeeVerboseHint;
         return 1;
     }
 
@@ -588,7 +597,7 @@ static int CmdIdentities(int argc, wchar_t* argv[]) {
     // defaults version=1 for every inner BM command, not just LoadCalibration.
     auto resetCmd = EncodeBmCommand(Command::ResetSensor, 1, 2);
     if (!bridge.SendBiometricCommand(resetCmd, 64, &reply, std::chrono::milliseconds(5000))) {
-        std::wcout << L"reset-sensor command failed.\n";
+        std::wcout << L"reset-sensor command failed. " << kSeeVerboseHint;
         return 1;
     }
     auto cancelCmd = EncodeBmCommand(Command::Cancel, 1, 0);
@@ -596,12 +605,13 @@ static int CmdIdentities(int argc, wchar_t* argv[]) {
 
     std::vector<uint8_t> fdrBlob;
     if (!bridge.GetFdrCalibration(&fdrBlob, std::chrono::milliseconds(5000))) {
-        std::wcout << L"read FDR calibration failed - bridgeOS returned no usable data.\n";
+        std::wcout << L"read FDR calibration failed - bridgeOS returned no usable data. "
+                   << kSeeVerboseHint;
         return 1;
     }
     auto loadCalibrationCmd = EncodeBmCommand(Command::LoadCalibration, /*version=*/1, /*value=*/3, fdrBlob);
     if (!bridge.SendBiometricCommand(loadCalibrationCmd, 64, &reply, std::chrono::milliseconds(5000))) {
-        std::wcout << L"load-calibration command failed.\n";
+        std::wcout << L"load-calibration command failed. " << kSeeVerboseHint;
         return 1;
     }
 
@@ -609,7 +619,7 @@ static int CmdIdentities(int argc, wchar_t* argv[]) {
     std::memcpy(idReq.data(), &macosUserId, 4);
     auto idCmd = EncodeBmCommand(Command::IdentityList, 1, 0, idReq);
     if (!bridge.SendBiometricCommand(idCmd, 4096, &reply, std::chrono::milliseconds(5000))) {
-        std::wcout << L"identity-list command failed.\n";
+        std::wcout << L"identity-list command failed. " << kSeeVerboseHint;
         return 1;
     }
     std::vector<IdentityRecordV1> identities;
@@ -670,13 +680,13 @@ static int CmdVerify(int argc, wchar_t* argv[]) {
             std::wcout << L"verify-timeout (no match_result event within window)\n";
             return 1;
         case VerifyOutcome::TransportError:
-            std::wcout << L"verify-failed: transport error\n";
+            std::wcout << L"verify-failed: transport error " << kSeeVerboseHint;
             return 1;
         case VerifyOutcome::RejectedByDevice:
             std::wcout << L"verify-failed: device rejected start-match\n";
             return 1;
         case VerifyOutcome::Malformed:
-            std::wcout << L"verify-failed: malformed reply from device\n";
+            std::wcout << L"verify-failed: malformed reply from device " << kSeeVerboseHint;
             return 1;
         case VerifyOutcome::Busy:
             std::wcout << L"verify-failed: engine busy (should not happen on a one-shot CLI call)\n";
@@ -687,10 +697,38 @@ static int CmdVerify(int argc, wchar_t* argv[]) {
 
 
 int wmain(int argc, wchar_t* argv[]) {
+    // Pull --verbose/-v out of argv before any command sees it, so it
+    // doesn't get misread as an ifIndex/host/uid value by commands that
+    // scan their own argv slice positionally (CmdNetwork, CmdIdentities,
+    // CmdVerify). T2TOUCHID_VERBOSE=1 works the same way without a flag,
+    // for scripting or when you don't want to retype it every run.
+    std::vector<wchar_t*> filtered;
+    filtered.push_back(argv[0]);
+    bool verbose = false;
+    for (int i = 1; i < argc; ++i) {
+        std::wstring a = argv[i];
+        if (a == L"--verbose" || a == L"-v") {
+            verbose = true;
+            continue;
+        }
+        filtered.push_back(argv[i]);
+    }
+    argv = filtered.data();
+    argc = static_cast<int>(filtered.size());
+
+    t2::log::InitFromEnvironment(verbose);
+    if (t2::log::ConsoleEnabled()) {
+        std::wcout << L"[verbose logging on - also mirrored to DebugView]\n";
+    }
+
     if (argc < 2) {
-        std::wcout << L"usage: t2touchid.exe <status|register-ool|capabilities|device-state|load-keybag|set-system-keybag|unlock|network|identities|verify>\n";
+        std::wcout << L"usage: t2touchid.exe [--verbose|-v] <status|register-ool|capabilities|device-state|load-keybag|set-system-keybag|unlock|network|identities|verify>\n";
         std::wcout << L"  identities [ifIndex] [--host fe80::...] [--uid N]\n";
         std::wcout << L"  verify     [ifIndex] [--host fe80::...] [--uid N] [--seconds N]\n";
+        std::wcout << L"  --verbose/-v (or env T2TOUCHID_VERBOSE=1): print step-by-step\n";
+        std::wcout << L"    BridgeXPC diagnostics to the console. Always available in\n";
+        std::wcout << L"    DebugView (run as Administrator, Capture Global Win32) even\n";
+        std::wcout << L"    without this flag.\n";
         return 1;
     }
 

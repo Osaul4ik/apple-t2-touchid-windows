@@ -74,6 +74,7 @@
     <ClInclude Include="BiometricKit\VerificationEngine.h" />
     <ClInclude Include="BridgeXpc\Connection.h" />
     <ClInclude Include="BridgeXpc\Frame.h" />
+    <ClInclude Include="BridgeXpc\Log.h" />
     <ClInclude Include="BridgeXpc\PlistPayload.h" />
     <ClInclude Include="Discovery\Adapter.h" />
     <ClInclude Include="Discovery\PortScan.h" />
