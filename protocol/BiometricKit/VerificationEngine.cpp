@@ -72,6 +72,13 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     if (!ParseIdentityList(reply, &identities)) {
         return VerifyOutcome::Malformed;
     }
+    // Never logged before: a hardware capture that timed out with no
+    // match_result event left no way to tell "SEP had nothing enrolled to
+    // compare against" apart from "SEP just never finalized a verdict" -
+    // those are very different problems and this was the missing signal
+    // to tell them apart. Count only, never any UUID (Milestone 1 §7/§14).
+    T2_LOG("verify", L"identity list parsed: %zu identities (reply=%zuB)",
+           identities.size(), reply.size());
 
     // start match (cmd 4)
     auto matchInitData = EncodeMatchInitData(0, config_.macosUserId, identities);
