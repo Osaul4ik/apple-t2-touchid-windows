@@ -329,8 +329,32 @@ bool Connection::SendBiometricCommand(const std::vector<uint8_t>& innerBmMessage
             continue;
         }
 
-        *outReply = env->payloadPlist;
-        T2_LOG("sendBiometricCommand", L"OK, reqId=%s reply=%zuB %s",
+        // env->payloadPlist is still one level wrapped: every BM command
+        // reply's outer payload is [status, blob] (VERIFIED LIVE — see
+        // PlistPayload.h's DecodeStatusBlobPayload comment). Callers
+        // (ParseIdentityList, VerificationEngine's raw int32 startResult
+        // read) expect the unwrapped blob, not this bplist-encoded array —
+        // that mismatch, not the async-event issue above, is why
+        // identity-list kept failing "not a whole number of 20-byte
+        // records" even after the reply itself arrived successfully.
+        auto statusBlob = DecodeStatusBlobPayload(env->payloadPlist);
+        if (!statusBlob) {
+            T2_LOG("sendBiometricCommand", L"payload isn't the expected "
+                   "[status, blob] shape (reqId=%s), %zuB %s",
+                   Widen(reqId).c_str(), env->payloadPlist.size(),
+                   HexDump(env->payloadPlist).c_str());
+            return false;
+        }
+        if (statusBlob->status != 0) {
+            T2_LOG("sendBiometricCommand", L"non-zero status=%lld (reqId=%s), "
+                   "blob=%zuB %s - treating as failure",
+                   static_cast<long long>(statusBlob->status), Widen(reqId).c_str(),
+                   statusBlob->blob.size(), HexDump(statusBlob->blob).c_str());
+            return false;
+        }
+
+        *outReply = std::move(statusBlob->blob);
+        T2_LOG("sendBiometricCommand", L"OK, reqId=%s blob=%zuB %s",
                Widen(reqId).c_str(), outReply->size(), HexDump(*outReply).c_str());
         return true;
     }

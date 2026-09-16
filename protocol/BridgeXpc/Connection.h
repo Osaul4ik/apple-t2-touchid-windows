@@ -47,8 +47,12 @@ public:
     // "bridgeOS returned no usable FDR calibration data" fail-closed check.
     bool GetFdrCalibration(std::vector<uint8_t>* outBlob, std::chrono::milliseconds timeout);
 
-    // Sends [3,0,innerBmBytes,outputCapacity] and returns the raw reply
-    // payload bytes (BiometricKit.cpp interprets the "BM" wrapper).
+    // Sends [3,0,innerBmBytes,outputCapacity]. The bridgexpc-level reply is
+    // itself [status, blob] (see PlistPayload.h's DecodeStatusBlobPayload);
+    // this unwraps that automatically, fails closed on a non-zero status,
+    // and returns the raw blob bytes in *outReply — callers (identity-list
+    // parsing, VerificationEngine's raw int32 startResult read) do not
+    // need to decode anything further themselves.
     // bkremoted can push async, non-reply events (e.g. a serviceStatus
     // callback) ahead of the actual reply — confirmed live for
     // load-calibration — so this loops, acknowledging and discarding

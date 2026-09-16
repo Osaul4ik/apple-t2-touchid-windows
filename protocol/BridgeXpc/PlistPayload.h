@@ -76,6 +76,22 @@ std::optional<std::vector<int64_t>> DecodeIntArrayPayload(const std::vector<uint
 // check.
 std::optional<std::vector<uint8_t>> DecodeSingleBlobPayload(const std::vector<uint8_t>& payloadPlist);
 
+// Decodes a payload that is a 2-element array [status, blob] — the shape
+// every BM command reply's outer bridgexpc envelope uses (VERIFIED LIVE:
+// e.g. reset-sensor's reply is [0, <64-byte data>], identity-list's is
+// [0, <60-byte data>] — 60 bytes being exactly 3 * sizeof(IdentityRecordV1),
+// confirming `blob` is the raw BM-layer reply data with no further
+// wrapping, so callers like ParseIdentityList and VerificationEngine's
+// raw int32 startResult read must receive this blob, not the still-wrapped
+// bytes ParseMessageBody hands back). std::nullopt if the shape doesn't
+// match (wrong element count/types); an empty blob is still returned, not
+// treated as nullopt, matching DecodeSingleBlobPayload's convention.
+struct StatusBlobPayload {
+    int64_t status = 0;
+    std::vector<uint8_t> blob;
+};
+std::optional<StatusBlobPayload> DecodeStatusBlobPayload(const std::vector<uint8_t>& payloadPlist);
+
 // Decodes the async bridge-event payload shape used for serviceStatus
 // callbacks: a 5-element array [9, bridge_status, data, x, x] (VERIFIED
 // FROM SOURCE: bridge-xpc-probe.py's summarize_event). Returns the raw

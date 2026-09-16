@@ -184,6 +184,31 @@ std::optional<std::vector<uint8_t>> DecodeSingleBlobPayload(const std::vector<ui
     return out;
 }
 
+std::optional<StatusBlobPayload> DecodeStatusBlobPayload(const std::vector<uint8_t>& payloadPlist) {
+    plist_t root = ParseRootArray(payloadPlist, 2);
+    if (!root) return std::nullopt;
+    PlistGuard guard{root};
+
+    plist_t statusNode = plist_array_get_item(root, 0);
+    plist_t blobNode = plist_array_get_item(root, 1);
+    if (!statusNode || plist_get_node_type(statusNode) != PLIST_UINT) return std::nullopt;
+    if (!blobNode || plist_get_node_type(blobNode) != PLIST_DATA) return std::nullopt;
+
+    StatusBlobPayload out;
+    uint64_t statusVal = 0;
+    plist_get_uint_val(statusNode, &statusVal);
+    out.status = static_cast<int64_t>(statusVal);
+
+    char* data = nullptr;
+    uint64_t length = 0;
+    plist_get_data_val(blobNode, &data, &length);
+    if (data && length) {
+        out.blob.assign(reinterpret_cast<uint8_t*>(data), reinterpret_cast<uint8_t*>(data) + length);
+    }
+    if (data) free(data);
+    return out;
+}
+
 std::optional<std::vector<uint8_t>> DecodeStatusEventData(const std::vector<uint8_t>& payloadPlist) {
     // VERIFIED FROM SOURCE (bridge-xpc-probe.py summarize_event):
     // isinstance(payload, list) and len(payload) == 5 and payload[0] == 9.
