@@ -32,9 +32,12 @@ struct MatchInitDataV1 {
     uint32_t flags;
     uint32_t macosUserId;
     std::array<uint8_t, 60> reserved{};
-    uint32_t identityCount;
-    // followed by identityCount * IdentityRecordV1
 };
+static_assert(sizeof(MatchInitDataV1) == 68, "match_init_data_v1_t must be 68 bytes");
+
+// The selected-identities blob appended after MatchInitDataV1 starts with
+// its own uint32 record count, followed by count * IdentityRecordV1 records.
+// This is distinct from the 68-byte match options structure itself.
 #pragma pack(pop)
 
 constexpr uint16_t kBmMagic = 0x4D42;

@@ -32,12 +32,24 @@ std::vector<uint8_t> EncodeMatchInitData(uint32_t flags, uint32_t macosUserId,
     MatchInitDataV1 header{};
     header.flags = flags;
     header.macosUserId = macosUserId;
-    header.identityCount = static_cast<uint32_t>(count);
 
-    std::vector<uint8_t> out(sizeof(header) + count * sizeof(IdentityRecordV1));
+    // Linux reference (bridge-xpc-probe.py, identity_blob_format="counted")
+    // serializes the 68-byte match options structure first, then appends a
+    // separate uint32 record count followed by the selected identity records.
+    // Do not put the count inside MatchInitDataV1: doing so shifts the identity
+    // blob by four bytes and produces a different wire format.
+    constexpr size_t kIdentityCountBytes = sizeof(uint32_t);
+    std::vector<uint8_t> out(
+        sizeof(header) + kIdentityCountBytes + count * sizeof(IdentityRecordV1));
+
     std::memcpy(out.data(), &header, sizeof(header));
+
+    const uint32_t selectedCount = static_cast<uint32_t>(count);
+    std::memcpy(out.data() + sizeof(header), &selectedCount, sizeof(selectedCount));
+
     for (size_t i = 0; i < count; i++) {
-        std::memcpy(out.data() + sizeof(header) + i * sizeof(IdentityRecordV1),
+        std::memcpy(out.data() + sizeof(header) + kIdentityCountBytes +
+                        i * sizeof(IdentityRecordV1),
                     &identities[i], sizeof(IdentityRecordV1));
     }
     return out;
