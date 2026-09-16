@@ -334,17 +334,71 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
                L"expect async SensorOperationModeIdle");
     }
 
-    // LINUX PARITY: warm-up events must NOT enter the match event stream.
-    // Placed after the macOS pre-match sequence above so any events those
-    // five commands provoke are discarded too, not just the identity-gate
-    // ones.
+    // WAIT FOR CONFIRMED 89 Idle — 16.09.2026 finding: a real hardware
+    // capture (t2touchid verify -v) showed the blind DiscardPendingEvents()
+    // this replaces threw away exactly 0 pre-StartMatch events, and the
+    // second Cancel's own async completion (expected: 80 MatchingCancelled
+    // -> 89 Idle, per the macOS reference order in MatchResult.cpp) did NOT
+    // arrive before StartMatch was sent at all — 80 showed up as the FIRST
+    // event of the *match* stream instead, and 89 never appeared anywhere
+    // in the whole session. So the previous "send second Cancel, discard
+    // whatever's queued, immediately send StartMatch" was a race: on real
+    // macOS, StartMatch is issued only after the sensor has actually
+    // reached Idle, not merely after the Cancel command's own reply.
+    // This block now blocks on WaitForEvent (same primitive the post-
+    // StartMatch match loop already uses) until either a status event with
+    // statusCode==89 is observed, or a bounded deadline elapses. Every
+    // other event seen along the way (80 MatchingCancelled, statistics,
+    // etc.) is still discarded from the match stream, same as before —
+    // only 89 is treated as the release condition. If the deadline is hit
+    // without 89, this fails OPEN (logs and proceeds to StartMatch
+    // anyway): downgrading a still-unverified wait condition into a hard
+    // fail-closed gate is not justified by a single capture, and every
+    // other best-effort step in this pre-match sequence (48/39/46/40, all
+    // of which returned non-zero status=258 on the same capture) already
+    // follows that same non-blocking convention.
     {
-        size_t dropped = conn->DiscardPendingEvents();
-        if (dropped > 0) {
+        auto idleDeadline = steady_clock::now() + config_.ioTimeout;
+        size_t discardedBeforeIdle = 0;
+        bool sawIdle = false;
+        while (steady_clock::now() < idleDeadline) {
+            std::vector<uint8_t> eventPayload;
+            if (!conn->WaitForEvent(&eventPayload, idleDeadline)) {
+                break;
+            }
+            discardedBeforeIdle++;
+
+            auto statusData = bridgexpc::DecodeStatusEventData(eventPayload);
+            if (!statusData) continue;
+            uint32_t embeddedType = 0;
+            std::vector<uint8_t> eventData;
+            if (!ParseStatusEventHeader(*statusData, &embeddedType, &eventData)) continue;
+            if (embeddedType != kEmbeddedTypeStatus) continue;
+
+            StatusEventBody body = ParseStatusEventBody(eventData);
             T2_LOG("verify",
-                   L"discarded %zu pre-StartMatch event(s) so match loop sees "
-                   L"only post-StartMatch traffic",
-                   dropped);
+                   L"pre-StartMatch event: status_code=%s status_name=%s",
+                   body.statusCode ? std::to_wstring(*body.statusCode).c_str() : L"(n/a)",
+                   body.statusCode
+                       ? (StatusCodeName(*body.statusCode) ? StatusCodeName(*body.statusCode)
+                                                            : L"(not seen in macOS reference capture)")
+                       : L"(n/a)");
+            if (body.statusCode && *body.statusCode == 89) {
+                sawIdle = true;
+                break;
+            }
+        }
+        if (sawIdle) {
+            T2_LOG("verify",
+                   L"confirmed 89 SensorOperationModeIdle after %zu discarded "
+                   L"pre-StartMatch event(s) - proceeding to StartMatch",
+                   discardedBeforeIdle - 1);
+        } else {
+            T2_LOG("verify",
+                   L"89 Idle NOT observed before deadline (%zu event(s) discarded "
+                   L"instead) - proceeding to StartMatch anyway (best-effort, not "
+                   L"yet fail-closed)",
+                   discardedBeforeIdle);
         }
     }
 
