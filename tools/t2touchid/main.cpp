@@ -13,6 +13,7 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include "../../protocol/AppleKeyStore/Client.h"
+#include "../../protocol/BridgeXpc/Connection.h"
 #include "../../protocol/Discovery/Adapter.h"
 #include "../../protocol/Discovery/PortScan.h"
 #include "../../protocol/Discovery/RemoteXpc.h"
@@ -416,6 +417,28 @@ static int CmdNetwork(int argc, wchar_t* argv[]) {
         std::chrono::milliseconds(2000));
     if (discovered.found) {
         std::wcout << L"BiometricKit BridgeXPC port: " << discovered.port << L"\n";
+
+        // Gate 7 phase 1: prove the discovered port is a live BridgeXpc
+        // endpoint, not just a plausible-looking number — open a real
+        // connection (HELO handshake, Milestone 1 section 7) and read the
+        // bridge's own version, rather than declaring victory on the port
+        // number alone.
+        using namespace t2::bridgexpc;
+        Connection bridge;
+        ConnectResult cr = bridge.Connect(ep.peerLinkLocal, ep.ifIndex, discovered.port,
+                                           std::chrono::milliseconds(2000));
+        if (cr != ConnectResult::Ok) {
+            std::wcout << L"BridgeXPC connect/HELO failed on port " << discovered.port
+                       << L" - discovered port did not answer as BridgeXpc.\n";
+            return 1;
+        }
+        int64_t bridgeVersion = 0;
+        if (!bridge.GetBridgeVersion(&bridgeVersion, std::chrono::milliseconds(2000))) {
+            std::wcout << L"BridgeXPC HELO OK, but getBridgeVersion failed "
+                          L"(unexpected reply shape).\n";
+            return 1;
+        }
+        std::wcout << L"BridgeXPC verified: HELO OK, bridge version=" << bridgeVersion << L"\n";
     } else {
         std::wcout << L"BiometricKit service not advertised by any candidate "
                       L"(all decoys, or T2 is not currently offering it).\n";
