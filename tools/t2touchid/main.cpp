@@ -632,15 +632,15 @@ static int CmdWarmup(int argc, wchar_t* argv[]) {
     return 0;
 }
 
-// Gate 8 phase 2: single-session lifecycle A/B.
+// Gate 8 phase 2: single-session verification A/B.
 //
-// The verify test deliberately uses ONE BridgeXPC connection from HELO
-// through StartMatch, event processing, and final Cancel. This isolates the
-// session-lifecycle variable without adding a warm-up connection,
-// disconnect, or reconnect before the real match session.
-//
-// VerificationEngine::Verify() itself performs the Linux-shaped ready prefix
-// on this same connection before StartMatch.
+// The production Linux fprintd path runs _run_probe() on one BridgeXPC
+// connection: version negotiation, reset/cancel, FDR calibration, identity
+// inventory, StartMatch, event loop, and cancel all share that connection.
+// The separate t2-biometric-ready systemd warm-up is a boot/readiness step,
+// not part of the verify transaction itself. This CLI intentionally removes
+// its old warm-up/disconnect/reconnect pair so the hardware test isolates
+// session lifecycle without changing the packet format or BM command order.
 static int CmdVerify(int argc, wchar_t* argv[]) {
     using namespace t2::bridgexpc;
     using namespace t2::biometrickit;

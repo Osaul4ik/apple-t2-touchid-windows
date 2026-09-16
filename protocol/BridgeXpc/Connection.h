@@ -7,6 +7,7 @@
 #include <ws2ipdef.h>
 #include <string>
 #include <chrono>
+#include <deque>
 
 namespace t2::bridgexpc {
 
@@ -53,11 +54,11 @@ public:
     // and returns the raw blob bytes in *outReply — callers (identity-list
     // parsing, VerificationEngine's raw int32 startResult read) do not
     // need to decode anything further themselves.
-    // bkremoted can push async, non-reply events (e.g. a serviceStatus
-    // callback) ahead of the actual reply — confirmed live for
-    // load-calibration — so this loops, acknowledging and discarding
-    // anything that isn't the matching reply, until it arrives or
-    // `timeout` elapses (same contract as WaitForEvent, just inline).
+    // bkremoted can push async, non-reply events ahead of the actual reply.
+    // Acknowledge them while waiting for the matching reply, but RETAIN them
+    // in the connection's pending-event queue so WaitForEvent() can deliver
+    // them later. This mirrors Linux biometric_command(), which returns the
+    // events observed while waiting for a command reply to the caller.
     bool SendBiometricCommand(const std::vector<uint8_t>& innerBmMessage,
                                uint32_t outputCapacity,
                                std::vector<uint8_t>* outReply,
@@ -81,6 +82,7 @@ private:
     bool ReadFrame(RawFrame* out, std::chrono::milliseconds timeout);
     bool WriteFrame(FrameType type, const std::vector<uint8_t>& body);
     bool AcknowledgeEvent(const std::string& requestId);
+    std::deque<std::vector<uint8_t>> pendingEvents_;
 };
 
 } // namespace t2::bridgexpc
