@@ -175,7 +175,7 @@ bool Connection::ReadUntilMatchingReply(const std::string& expectedReqId,
     for (;;) {
         auto now = std::chrono::steady_clock::now();
         if (now >= deadline) {
-            T2_LOG(logTag, L"deadline reached waiting for reply (reqId=%s, timeout=%lldms)",
+            ::t2::log::Logf(logTag, L"deadline reached waiting for reply (reqId=%s, timeout=%lldms)",
                    Widen(expectedReqId).c_str(), static_cast<long long>(timeout.count()));
             return false;
         }
@@ -183,7 +183,7 @@ bool Connection::ReadUntilMatchingReply(const std::string& expectedReqId,
 
         RawFrame frame;
         if (!ReadFrame(&frame, remaining)) {
-            T2_LOG(logTag, L"ReadFrame failed/timed out (reqId=%s, %lldms remained)",
+            ::t2::log::Logf(logTag, L"ReadFrame failed/timed out (reqId=%s, %lldms remained)",
                    Widen(expectedReqId).c_str(), static_cast<long long>(remaining.count()));
             return false;
         }
@@ -193,18 +193,18 @@ bool Connection::ReadUntilMatchingReply(const std::string& expectedReqId,
 
         auto env = ParseMessageBody(frame.body);
         if (!env) {
-            T2_LOG(logTag, L"ParseMessageBody failed, body=%zuB %s",
+            ::t2::log::Logf(logTag, L"ParseMessageBody failed, body=%zuB %s",
                    frame.body.size(), HexDump(frame.body).c_str());
             return false;
         }
 
         if (!env->isReply) {
-            T2_LOG(logTag, L"async event while waiting for reply (reqId=%s), event reqId=%s "
+            ::t2::log::Logf(logTag, L"async event while waiting for reply (reqId=%s), event reqId=%s "
                    L"payload=%zuB - acking and queuing",
                    Widen(expectedReqId).c_str(), Widen(env->requestId).c_str(),
                    env->payloadPlist.size());
             if (!AcknowledgeEvent(env->requestId)) {
-                T2_LOG(logTag, L"AcknowledgeEvent failed for event reqId=%s",
+                ::t2::log::Logf(logTag, L"AcknowledgeEvent failed for event reqId=%s",
                        Widen(env->requestId).c_str());
                 return false;
             }
@@ -213,7 +213,7 @@ bool Connection::ReadUntilMatchingReply(const std::string& expectedReqId,
         }
 
         if (env->requestId != expectedReqId) {
-            T2_LOG(logTag, L"ignoring stray reply (expected=%s got=%s)",
+            ::t2::log::Logf(logTag, L"ignoring stray reply (expected=%s got=%s)",
                    Widen(expectedReqId).c_str(), Widen(env->requestId).c_str());
             continue;
         }
