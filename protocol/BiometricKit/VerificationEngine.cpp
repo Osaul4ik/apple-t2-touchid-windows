@@ -267,43 +267,71 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     auto cancelCmd = EncodeBmCommand(Command::Cancel, 1, 0);
     std::vector<uint8_t> reply;
 
-    // macOS live-unlock pre-match sequence (docs/ macos-verified.md §4,
-    // 16.09.2026 capture, same machine/firmware as this driver targets):
-    // "Across the whole capture: 4, 12, 39, 40, 44, 46, 48, ...". Every
-    // real unlock issues these four informational reads plus a Cancel
-    // immediately before StartMatch (cmd 4). Windows previously skipped
-    // straight from identity-list to StartMatch (Commands.h's own comment
-    // ties that gap directly to "the sensor then never emitted 89 Idle or
-    // 55 ImageCaptured" — exactly this session's symptom). Only the
-    // request sizes are documented (48/40: inSize=0; 39/46: inSize=4,
-    // macosUserId) — no reply format is documented for any of the four, so
-    // none is parsed; outputCapacity=0 matches the existing convention for
-    // commands whose reply body this project does not read (ResetSensor,
-    // Cancel, LoadCalibration, StartMatch above/below). Best-effort, like
-    // the existing warm-up Cancel: a failure here does not by itself justify
-    // aborting a verify that has a stable, non-empty identity list.
+    // macOS live-unlock pre-match sequence — VERIFIED FROM SOURCE, a real
+    // macOS unified-log capture of biometrickitd on this exact machine/
+    // firmware (16.09.2026, /mnt/user-data/uploads/touchid-unlock.log),
+    // not the earlier docs/ macos-verified.md §4 command SET alone — that
+    // gave the commands issued but not their order. The full ordered trace
+    // for a successful unlock, exact timestamps:
+    //   48 GetEnabledForUnlock
+    //   39 GetSksLockStateMac(uid)
+    //   46 GetProtectedConfig(uid)
+    //   12 Cancel                        -> async status 80 MatchingCancelled
+    //   39 GetSksLockStateMac(uid)        (repeat)
+    //   40 GetBiometrickitdInfo
+    //   46 GetProtectedConfig(uid)        (repeat)
+    //   [cmd 84, inSize=20, undocumented - fires from an unrelated periodic
+    //    statistics(type 29) callback, not part of this gate; not ported,
+    //    no verified request/reply format exists for it]
+    //   12 Cancel (again)                -> async status 89 SensorOperationModeIdle
+    //   4 StartMatch (68B)               -> 90 Capture -> ... -> 55 ImageCaptured
+    // StartMatch is issued ONLY after the SECOND Cancel, and that second
+    // Cancel is the last thing sent before it - nothing else comes between.
+    // The resulting 89 Idle transition is exactly the status this project's
+    // own Windows captures have never once observed (docs/ macos-verified.md
+    // §2's "failing Windows session" trace has no 80 and no 89 either).
+    // Windows previously went straight from identity-list to StartMatch with
+    // no Cancel adjacent to it at all. Only request sizes are documented
+    // (48/40: inSize=0; 39/46: inSize=4, macosUserId) - no reply format is
+    // documented for any of them, so none is parsed; outputCapacity=0
+    // matches the existing convention for commands whose reply body this
+    // project does not read (ResetSensor, Cancel, LoadCalibration, StartMatch
+    // above/below). Best-effort, like the existing warm-up Cancel: a failure
+    // here does not by itself justify aborting a verify that has a stable,
+    // non-empty identity list.
     {
         std::vector<uint8_t> uidReq(4);
         std::memcpy(uidReq.data(), &config_.macosUserId, 4);
 
         auto enabledForUnlockCmd = EncodeBmCommand(Command::GetEnabledForUnlock, 1, 0);
+        auto sksLockStateCmd = EncodeBmCommand(Command::GetSksLockStateMac, 1, 0, uidReq);
+        auto protectedConfigCmd = EncodeBmCommand(Command::GetProtectedConfig, 1, 0, uidReq);
+        auto biometrickitdInfoCmd = EncodeBmCommand(Command::GetBiometrickitdInfo, 1, 0);
+
         conn->SendBiometricCommand(enabledForUnlockCmd, 0, &reply, config_.ioTimeout);
         T2_LOG("verify", L"macOS pre-match: GetEnabledForUnlock (cmd 48) issued");
 
-        auto sksLockStateCmd = EncodeBmCommand(Command::GetSksLockStateMac, 1, 0, uidReq);
         conn->SendBiometricCommand(sksLockStateCmd, 0, &reply, config_.ioTimeout);
         T2_LOG("verify", L"macOS pre-match: GetSksLockStateMac (cmd 39) issued");
 
-        auto protectedConfigCmd = EncodeBmCommand(Command::GetProtectedConfig, 1, 0, uidReq);
         conn->SendBiometricCommand(protectedConfigCmd, 0, &reply, config_.ioTimeout);
         T2_LOG("verify", L"macOS pre-match: GetProtectedConfig (cmd 46) issued");
 
         conn->SendBiometricCommand(cancelCmd, 0, &reply, config_.ioTimeout);
-        T2_LOG("verify", L"macOS pre-match: Cancel (cmd 12) issued");
+        T2_LOG("verify", L"macOS pre-match: Cancel (cmd 12), first - expect async MatchingCancelled");
 
-        auto biometrickitdInfoCmd = EncodeBmCommand(Command::GetBiometrickitdInfo, 1, 0);
+        conn->SendBiometricCommand(sksLockStateCmd, 0, &reply, config_.ioTimeout);
+        T2_LOG("verify", L"macOS pre-match: GetSksLockStateMac (cmd 39), repeat");
+
         conn->SendBiometricCommand(biometrickitdInfoCmd, 0, &reply, config_.ioTimeout);
         T2_LOG("verify", L"macOS pre-match: GetBiometrickitdInfo (cmd 40) issued");
+
+        conn->SendBiometricCommand(protectedConfigCmd, 0, &reply, config_.ioTimeout);
+        T2_LOG("verify", L"macOS pre-match: GetProtectedConfig (cmd 46), repeat");
+
+        conn->SendBiometricCommand(cancelCmd, 0, &reply, config_.ioTimeout);
+        T2_LOG("verify", L"macOS pre-match: Cancel (cmd 12), second (last before StartMatch) - "
+               L"expect async SensorOperationModeIdle");
     }
 
     // LINUX PARITY: warm-up events must NOT enter the match event stream.
