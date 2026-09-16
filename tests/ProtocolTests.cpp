@@ -286,6 +286,8 @@ static void TestLinuxIdentityCapacitiesAndGlobalCommand() {
     CHECK(version == 1);
     CHECK(value == 0);
 }
+
+static void TestStatisticsEventBody_DecodesTypeAndValue() {
     // Bytes taken verbatim from the failing Windows capture:
     // ordinal=0, length=12, type=4, value=1
     std::vector<uint8_t> body(28, 0);
