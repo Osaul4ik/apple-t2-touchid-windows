@@ -197,7 +197,8 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     //   biometric_command(sock, 0x51, output_capacity=40*10)
     // then t2_fprint_match_gate.prepare_all fail-closes unless first==repeat
     // for both views AND the configured 0x51 slice equals the first 0x42
-    // set. StartMatch still uses the FIRST 0x42 records, never the repeat.
+    // set. StartMatch uses the full parsed identity vector from the 0x42
+    // response; the repeated 0x42 is only used for byte-stability validation.
     std::vector<uint8_t> firstGlobalRaw;
     auto globalCmd = EncodeBmCommand(Command::GlobalIdentityList, /*version=*/1, /*value=*/0);
     if (!conn->SendBiometricCommand(globalCmd, kGlobalIdentityListOutputCapacity,
@@ -248,7 +249,7 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
         return VerifyOutcome::Malformed;
     }
     T2_LOG("verify",
-           L"identity warm-up OK: 0x42/0x51/0x42/0x51 user=%zuB global=%zuB identities=%zu (StartMatch uses first 0x42)",
+           L"identity warm-up OK: 0x42/0x51/0x42/0x51 user=%zuB global=%zuB identities=%zu (StartMatch uses all identities from 0x42)",
            firstUserRaw.size(), firstGlobalRaw.size(), identities.size());
 
     auto cancelCmd = EncodeBmCommand(Command::Cancel, 1, 0);

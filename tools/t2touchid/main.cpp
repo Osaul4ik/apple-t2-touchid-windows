@@ -632,13 +632,15 @@ static int CmdWarmup(int argc, wchar_t* argv[]) {
     return 0;
 }
 
-// Gate 8 phase 2: Linux-shaped verify.
+// Gate 8 phase 2: single-session lifecycle A/B.
 //
-// t2-biometric-ready.sh runs the non-matching ready sequence on its own
-// connection and exits. fprintd then opens a NEW connection and runs
-// _run_probe() which repeats the same prefix plus StartMatch. This CLI
-// has no systemd unit, so `verify` does both: warm-up, disconnect,
-// reconnect, then Verify().
+// The verify test deliberately uses ONE BridgeXPC connection from HELO
+// through StartMatch, event processing, and final Cancel. This isolates the
+// session-lifecycle variable without adding a warm-up connection,
+// disconnect, or reconnect before the real match session.
+//
+// VerificationEngine::Verify() itself performs the Linux-shaped ready prefix
+// on this same connection before StartMatch.
 static int CmdVerify(int argc, wchar_t* argv[]) {
     using namespace t2::bridgexpc;
     using namespace t2::biometrickit;
@@ -667,23 +669,6 @@ static int CmdVerify(int argc, wchar_t* argv[]) {
                 return 1;
             }
         }
-    }
-
-    {
-        Connection warmup;
-        if (!DiscoverBiometricKitBridge(argc, argv, 2, &warmup)) {
-            return 1;
-        }
-        VerificationEngine ready(cfg);
-        std::vector<IdentityRecordV1> identities;
-        if (!ready.WarmUp(&warmup, &identities)) {
-            std::wcout << L"linux warm-up (non-matching ready sequence) failed. "
-                       << kSeeVerboseHint;
-            return 1;
-        }
-        std::wcout << L"linux warm-up OK, identities=" << identities.size()
-                   << L" (disconnecting, then verify on a new connection)\n";
-        warmup.Close();
     }
 
     Connection bridge;
