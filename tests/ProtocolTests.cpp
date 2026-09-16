@@ -271,8 +271,14 @@ static void TestStatusCodeNames_FromMacOsCapture() {
 }
 
 static void TestLinuxIdentityCapacitiesAndGlobalCommand() {
+    // These two CHECKs compare compile-time constants, so MSVC folds the
+    // condition and flags C4127 ("conditional expression is constant"),
+    // which this project builds with /WX. Suppress just for these lines.
+#pragma warning(push)
+#pragma warning(disable : 4127)
     CHECK(biometrickit::kIdentityListOutputCapacity == 200);
     CHECK(biometrickit::kGlobalIdentityListOutputCapacity == 400);
+#pragma warning(pop)
     auto cmd = biometrickit::EncodeBmCommand(
         biometrickit::Command::GlobalIdentityList, 1, 0);
     CHECK(cmd.size() == 8);
