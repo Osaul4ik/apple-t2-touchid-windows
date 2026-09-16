@@ -44,11 +44,20 @@ struct VerifyConfig {
     std::chrono::seconds matchWindow{20};
     std::chrono::milliseconds ioTimeout{5000};
 
-    // Wire format of the start-match payload. See MatchIdentityLayout.
-    // Warm-up / verify prefix no longer consults resetSensor or
-    // loadCalibration flags: both commands are unconditional in the Linux
-    // reference (t2-biometric-ready.sh and t2-fprintd.py _run_probe).
-    MatchIdentityLayout matchLayout = MatchIdentityLayout::InlineIdentities;
+    // Wire format of the start-match payload. The Linux reference
+    // currently defaults its selected identity blob to "counted":
+    //   68-byte MatchOptionsV1
+    //   + uint32 selected-record count
+    //   + N * 20-byte IdentityRecordV1
+    // For three identities this is 132 bytes of biometric-command data
+    // (140 bytes including the 8-byte BM header).
+    //
+    // IMPORTANT: a separate macOS capture on the Windows test machine showed
+    // a 68-byte start-match payload, so the 68-byte InlineIdentities and
+    // PaddedNoIdentities variants remain available explicitly for A/B tests.
+    // The default is deliberately switched to Linux parity so the next run
+    // tests the one known wire-visible difference that has not yet been tried.
+    MatchIdentityLayout matchLayout = MatchIdentityLayout::LegacyCounted;
 };
 
 // One VerificationEngine instance == one in-flight session (Milestone 2
@@ -70,14 +79,14 @@ public:
     bool WarmUp(bridgexpc::Connection* conn,
                 std::vector<IdentityRecordV1>* outIdentities = nullptr);
 
-    // Full sequence per t2-fprintd.py T2Backend._run_probe():
+    // Full sequence per t2-fprintd.py T2Backend::_run_probe():
     // connect -> HELO -> getBridgeVersion -> setClientVersion -> reset ->
     // cancel -> load FDR calibration -> load calibration into sensor ->
     // identity list -> start match -> event loop -> verdict -> cancel/stop
     // -> disconnect. Every step's failure maps to a fail-closed outcome;
     // nothing here ever converts a transport success into an implicit MATCH.
     VerifyOutcome Verify(bridgexpc::Connection* conn,
-                          std::optional<std::array<uint8_t, 16>>* outMatchedUuid);
+                         std::optional<std::array<uint8_t, 16>>* outMatchedUuid);
 
 private:
     // Shared prefix of WarmUp and Verify. Byte-identical to the Linux

@@ -30,11 +30,10 @@ std::vector<uint8_t> EncodeMatchInitData(uint32_t flags, uint32_t macosUserId,
         count = kMaxLocalIdentities; // never send more than sane local cap
     }
 
-    // VERIFIED (16.09.2026 macOS unified-log capture, same machine, same
-    // bridgeOS 23P5067, same 3 identities as the failing Windows run):
-    // biometrickitd's start-match inner payload is 68 bytes TOTAL. The
-    // LegacyCounted layout below produces 132 bytes for the same machine,
-    // so it cannot be what the SEP expects. See docs/macos-verified-status-map.md.
+    // The 68-byte macOS-captured payload and the Linux counted payload are
+    // both retained as explicit A/B variants. The default VerifyConfig now
+    // selects LegacyCounted so the next hardware run exercises the Linux
+    // reference's current default representation.
     if (layout == MatchIdentityLayout::InlineIdentities) {
         MatchOptionsV1 header{};
         header.flags = flags;
@@ -61,12 +60,12 @@ std::vector<uint8_t> EncodeMatchInitData(uint32_t flags, uint32_t macosUserId,
         return out;
     }
 
-    // MatchIdentityLayout::LegacyCounted - pre-16.09.2026 behaviour.
+    // MatchIdentityLayout::LegacyCounted.
     // Linux reference (bridge-xpc-probe.py, identity_blob_format="counted")
     // serializes the 68-byte match options structure first, then appends a
     // separate uint32 record count followed by the selected identity records.
-    // Do not put the count inside MatchInitDataV1: doing so shifts the identity
-    // blob by four bytes and produces a different wire format.
+    // For 3 identities this produces 132 bytes of match data:
+    //   68-byte options + 4-byte count + 3 * 20-byte records.
     constexpr size_t kIdentityCountBytes = sizeof(uint32_t);
     std::vector<uint8_t> out(
         sizeof(header) + kIdentityCountBytes + count * sizeof(IdentityRecordV1));
