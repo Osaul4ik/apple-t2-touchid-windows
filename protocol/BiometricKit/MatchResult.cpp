@@ -16,6 +16,17 @@
 //   IdentityRecordV1 below);
 // - the first signed word of the event is NOT a reliable success signal
 //   (VERIFIED, this file never reads it).
+//
+// 16.09.2026 native macOS reference refinement:
+// a successful match on the same MacBookPro T2 / bridgeOS 23P5067 shows the
+// status sequence around a real capture as:
+//   63 FingerOn -> 55 ImageCaptured -> 72 ImageForProcessing ->
+//   95 ImageWasAccepted -> 91 SensorOperationModePause.
+// Status 55/72/95 are therefore the only statuses used here as the
+// definitive "image reached the matcher pipeline" indicators. 53
+// (ImageQueueIsEmpty) and 73 (TemplateListUpdated) occur later in the
+// lifecycle and are not evidence that a new image was captured for the
+// current finger-on event.
 
 #include "MatchResult.h"
 #include <cstring>
@@ -41,7 +52,7 @@ bool ParseStatusEventHeader(const std::vector<uint8_t>& data,
 StatusEventBody ParseStatusEventBody(const std::vector<uint8_t>& eventData) {
     // VERIFIED FROM SOURCE: struct.unpack_from("<I", event_data) for the
     // first field (gated on len >= 4), struct.unpack_from("<Q", event_data, 8)
-    // for the second (gated on len >= 16). Bytes [4:8) of event_data are not
+    // for the second (gated on len >= 16). Bytes [4:8) of eventData are not
     // read by the reference either - not an oversight here, it simply isn't
     // part of what the reference decodes.
     StatusEventBody body;
@@ -124,11 +135,19 @@ const wchar_t* StatusCodeName(uint32_t statusCode) {
 }
 
 bool StatusCodeIsImagePipeline(uint32_t statusCode) {
+    // VERIFIED FROM THE NATIVE MATCH CAPTURE ON 16.09.2026:
+    // 55 == ImageCaptured
+    // 72 == ImageForProcessing
+    // 95 == ImageWasAccepted
+    //
+    // These three statuses form the actual capture/processing chain for the
+    // current finger presentation. 53 (ImageQueueIsEmpty) and 73
+    // (TemplateListUpdated) are post-match lifecycle events in the same
+    // reference sequence, so they are deliberately NOT counted as evidence
+    // that an image was captured for the current attempt.
     switch (statusCode) {
-        case 53: // ImageQueueIsEmpty
         case 55: // ImageCaptured
         case 72: // ImageForProcessing
-        case 73: // TemplateListUpdated
         case 95: // ImageWasAccepted
             return true;
         default:
@@ -180,6 +199,13 @@ const wchar_t* StatusOrdinalHypothesis(uint32_t ordinal) {
     // MatchResult.cpp's fail-closed UUID scan remains the only outcome
     // source. Returns nullptr for ordinals with no enrollment-side meaning
     // to hypothesize from at all.
+    //
+    // 16.09.2026 refinement: the native macOS verify capture emits 55/72/95
+    // for the real image pipeline, while the failing Windows capture emits
+    // 78 and 81 but never emits 55/72/95. There is therefore no basis in the
+    // native verify capture to call 78 "rejected capture". Until a native
+    // verify capture actually shows 78, leave it unlabeled here rather than
+    // presenting the enrollment-derived guess as if it were confirmed.
     switch (ordinal) {
         case 63: return L"HYPOTHESIS(enrollment-sourced): finger-present feedback";
         case 64: return L"HYPOTHESIS(enrollment-sourced): finger-removed/waiting feedback";
@@ -188,7 +214,9 @@ const wchar_t* StatusOrdinalHypothesis(uint32_t ordinal) {
         case 68: return L"HYPOTHESIS(enrollment-sourced): timeout-terminal";
         case 70: return L"HYPOTHESIS(enrollment-sourced): continue-without-new-progress";
         case 74: return L"HYPOTHESIS(enrollment-sourced): waiting-for-finger-removal";
-        case 78: case 85: case 87: case 88: case 98:
+        case 78:
+            return nullptr; // unverified on the native verify path
+        case 85: case 87: case 88: case 98:
             return L"HYPOTHESIS(enrollment-sourced): rejected-capture feedback (retry)";
         case 86: return L"HYPOTHESIS(enrollment-sourced): rejected-small-coverage feedback";
         case 93: return L"HYPOTHESIS(enrollment-sourced): dirty-sensor advisory";
