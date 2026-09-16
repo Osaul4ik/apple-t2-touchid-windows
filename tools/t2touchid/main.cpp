@@ -476,20 +476,31 @@ static bool DiscoverBiometricKitBridge(int argc, wchar_t* argv[], int firstArgIn
 
     unsigned long ifIndexOverride = 0;
     std::string hostOverride;
+    // Flags whose *following* argv token is a value owned by CmdVerify /
+    // CmdIdentities / etc. Must be skipped here or e.g. "--match-flags 1"
+    // makes "1" look like a positional ifIndex and discovery dies with
+    // "no Preferred IPv6 link-local on ifIndex 1".
+    auto isValueFlag = [](const std::wstring& a) {
+        return a == L"--uid" || a == L"--seconds" || a == L"--match-layout" ||
+               a == L"--match-flags" || a == L"--host";
+    };
+    auto isBoolFlag = [](const std::wstring& a) {
+        return a == L"--no-reset-sensor" || a == L"--no-load-calibration" ||
+               a == L"--reset-sensor" || a == L"--load-calibration" ||
+               a == L"--verbose" || a == L"-v";
+    };
     for (int i = firstArgIndex; i < argc; ++i) {
         std::wstring a = argv[i];
         if (a == L"--host" && i + 1 < argc) {
             std::wstring w = argv[++i];
             hostOverride.clear();
             for (wchar_t c : w) hostOverride.push_back(static_cast<char>(c & 0xFF));
-        } else if ((a == L"--uid" || a == L"--seconds") && i + 1 < argc) {
-            // Not this function's flag - CmdVerify/CmdIdentities parse the
-            // value themselves - but it still must be skipped here, or the
-            // digit that follows (e.g. "20" in "--seconds 20") falls through
-            // to the bare-digit branch below and gets misread as a
-            // positional ifIndex override.
-            ++i;
-        } else if (!a.empty() && a[0] >= L'0' && a[0] <= L'9') {
+        } else if (isValueFlag(a) && i + 1 < argc) {
+            ++i; // skip the value token
+        } else if (isBoolFlag(a) || (!a.empty() && a[0] == L'-')) {
+            // Boolean flag or unknown dashed option: ignore (do not treat as ifIndex).
+        } else if (!a.empty() && a.find_first_not_of(L"0123456789") == std::wstring::npos) {
+            // Pure decimal token only → positional ifIndex override.
             ifIndexOverride = static_cast<unsigned long>(_wtoi(a.c_str()));
         }
     }
@@ -652,9 +663,6 @@ static int CmdVerify(int argc, wchar_t* argv[]) {
             cfg.macosUserId = static_cast<uint32_t>(_wtoi(argv[++i]));
         } else if (a == L"--seconds" && i + 1 < argc) {
             cfg.matchWindow = std::chrono::seconds(_wtoi(argv[++i]));
-        } else if (a == L"--reset-sensor" || a == L"--load-calibration") {
-            // Unconditional in the Linux ready sequence. Accepted so old
-            // command lines keep parsing; they no longer gate anything.
         } else if (a == L"--match-layout" && i + 1 < argc) {
             std::wstring layout = argv[++i];
             if (layout == L"inline") {
@@ -671,6 +679,16 @@ static int CmdVerify(int argc, wchar_t* argv[]) {
         } else if (a == L"--match-flags" && i + 1 < argc) {
             // Linux: --match-processed-flags (default 0; "use 1 for an unlock match")
             cfg.matchFlags = static_cast<uint32_t>(_wtoi(argv[++i]));
+        } else if (a == L"--no-reset-sensor") {
+            // macOS live unlock never issues cmd 2 on the match connection
+            cfg.skipResetSensor = true;
+        } else if (a == L"--no-load-calibration") {
+            // macOS live unlock never issues cmd 0x20; bridgeOS calibrates at boot
+            cfg.skipLoadCalibration = true;
+        } else if (a == L"--reset-sensor") {
+            cfg.skipResetSensor = false; // explicit opt-in (default already does it)
+        } else if (a == L"--load-calibration") {
+            cfg.skipLoadCalibration = false;
         }
     }
 
@@ -748,7 +766,9 @@ int wmain(int argc, wchar_t* argv[]) {
         std::wcout << L"  warmup     [ifIndex] [--host fe80::...] [--uid N]\n";
         std::wcout << L"  verify     [ifIndex] [--host fe80::...] [--uid N] [--seconds N]\n"
                       L"             [--match-layout inline|padded|legacy]\n"
-                      L"             [--match-flags N]  (0=default, 1=unlock match per Linux)\n";
+                      L"             [--match-flags N]  (0=default, 1=unlock match per Linux)\n"
+                      L"             [--no-reset-sensor] [--no-load-calibration]\n"
+                      L"               (macOS live path never issues cmd 2 / 0x20)\n";
         std::wcout << L"  --verbose/-v (or env T2TOUCHID_VERBOSE=1): print step-by-step\n";
         std::wcout << L"    BridgeXPC diagnostics to the console. Always available in\n";
         std::wcout << L"    DebugView (run as Administrator, Capture Global Win32) even\n";

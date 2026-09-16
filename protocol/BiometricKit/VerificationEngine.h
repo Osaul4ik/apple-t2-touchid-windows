@@ -68,6 +68,14 @@ struct VerifyConfig {
     // its help text notes "use 1 for an unlock match". Keep 0 as default to
     // match both Linux fprintd and the macOS capture; expose via CLI for A/B.
     uint32_t matchFlags = 0;
+
+    // macOS live unlock on this machine never issues ResetSensor (cmd 2) or
+    // LoadCalibration (cmd 0x20) on the match connection — bridgeOS calibrates
+    // once at its own boot. Linux always does both. Defaults stay Linux-parity
+    // (false = do the command); set true to A/B the macOS-style path that
+    // skips them. Identity list + StartMatch still always run.
+    bool skipResetSensor = false;
+    bool skipLoadCalibration = false;
 };
 
 // One VerificationEngine instance == one in-flight session (Milestone 2

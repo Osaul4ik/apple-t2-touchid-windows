@@ -101,29 +101,39 @@ bool VerificationEngine::RunLinuxReadySequence(
 
     std::vector<uint8_t> reply;
 
-    auto resetCmd = EncodeBmCommand(Command::ResetSensor, /*version=*/1, /*value=*/2);
-    if (!conn->SendBiometricCommand(resetCmd, /*outputCapacity=*/0, &reply, config_.ioTimeout)) {
-        T2_LOG("warmup", L"ResetSensor (cmd 2, value=2, capacity=0) failed");
-        return false;
+    if (config_.skipResetSensor) {
+        T2_LOG("warmup", L"skipping ResetSensor (macOS live path never issues cmd 2)");
+    } else {
+        auto resetCmd = EncodeBmCommand(Command::ResetSensor, /*version=*/1, /*value=*/2);
+        if (!conn->SendBiometricCommand(resetCmd, /*outputCapacity=*/0, &reply, config_.ioTimeout)) {
+            T2_LOG("warmup", L"ResetSensor (cmd 2, value=2, capacity=0) failed");
+            return false;
+        }
+        T2_LOG("warmup", L"ResetSensor OK");
     }
-    T2_LOG("warmup", L"ResetSensor OK");
 
     auto cancelCmd = EncodeBmCommand(Command::Cancel, /*version=*/1, /*value=*/0);
     conn->SendBiometricCommand(cancelCmd, /*outputCapacity=*/0, &reply, config_.ioTimeout); // best-effort
     T2_LOG("warmup", L"Cancel (cmd 0x0c) issued");
 
-    std::vector<uint8_t> fdrBlob;
-    if (!conn->GetFdrCalibration(&fdrBlob, config_.ioTimeout)) {
-        T2_LOG("warmup", L"GetFdrCalibration (bridge method 11) failed");
-        return false;
+    if (config_.skipLoadCalibration) {
+        T2_LOG("warmup",
+               L"skipping LoadCalibration (macOS live path never issues cmd 0x20; "
+               L"bridgeOS calibrates at its own boot)");
+    } else {
+        std::vector<uint8_t> fdrBlob;
+        if (!conn->GetFdrCalibration(&fdrBlob, config_.ioTimeout)) {
+            T2_LOG("warmup", L"GetFdrCalibration (bridge method 11) failed");
+            return false;
+        }
+        auto loadCalibrationCmd = EncodeBmCommand(Command::LoadCalibration, /*version=*/1, /*value=*/3, fdrBlob);
+        if (!conn->SendBiometricCommand(loadCalibrationCmd, /*outputCapacity=*/0, &reply, config_.ioTimeout)) {
+            T2_LOG("warmup", L"LoadCalibration (cmd 0x20, value=3, capacity=0, fdr=%zuB) failed",
+                   fdrBlob.size());
+            return false;
+        }
+        T2_LOG("warmup", L"LoadCalibration OK, fdr=%zuB", fdrBlob.size());
     }
-    auto loadCalibrationCmd = EncodeBmCommand(Command::LoadCalibration, /*version=*/1, /*value=*/3, fdrBlob);
-    if (!conn->SendBiometricCommand(loadCalibrationCmd, /*outputCapacity=*/0, &reply, config_.ioTimeout)) {
-        T2_LOG("warmup", L"LoadCalibration (cmd 0x20, value=3, capacity=0, fdr=%zuB) failed",
-               fdrBlob.size());
-        return false;
-    }
-    T2_LOG("warmup", L"LoadCalibration OK, fdr=%zuB", fdrBlob.size());
 
     std::vector<uint8_t> idReq(4);
     std::memcpy(idReq.data(), &config_.macosUserId, 4);
@@ -395,9 +405,12 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     }
     T2_LOG("verify",
            L"session summary: finger_touch_cycles=%zu image_pipeline_events=%zu unnamed_status_events=%zu "
-           L"layout=%s linux_ready=1 (reset+cal+idlist) outcome=%d",
+           L"layout=%s flags=%u reset=%s cal=%s outcome=%d",
            fingerTouchCycles, imagePipelineEvents, unnamedStatusEvents,
-           MatchIdentityLayoutName(config_.matchLayout), static_cast<int>(outcome));
+           MatchIdentityLayoutName(config_.matchLayout), config_.matchFlags,
+           config_.skipResetSensor ? L"skip" : L"yes",
+           config_.skipLoadCalibration ? L"skip" : L"yes",
+           static_cast<int>(outcome));
 
     return outcome;
 }
