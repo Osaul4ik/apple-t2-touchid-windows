@@ -12,6 +12,43 @@ namespace t2::biometrickit {
 
 using namespace std::chrono;
 
+namespace {
+
+// Read-only diagnostic: biometric command 0x53, one-byte sensor-ready
+// state. VERIFIED FROM SOURCE (jmurth1234/t2-touchid-linux,
+// bridge-xpc-probe.py's --sensor-readiness: biometric_command(sock, 0x53,
+// version=1, value=0, output_capacity=1), reply blob's single byte treated
+// as bool sensor_ready). This project never called command 0x53 before
+// 16.09.2026. It is read-only and safe to call unconditionally, regardless
+// of the resetSensor/loadCalibration config - unlike those two, sending it
+// cannot itself change sensor state.
+//
+// Purpose (16.09.2026 A/B, see project notes): find out whether the sensor
+// is already "ready" before this project does anything, and whether
+// LoadCalibration is what flips that bit. A false->true transition
+// straddling LoadCalibration would localize the missing-image-pipeline
+// problem to sensor init/calibration state rather than the match payload,
+// layout, or status 81/78 (both already ruled out by prior captures).
+std::optional<bool> QuerySensorReadiness(bridgexpc::Connection* conn,
+                                          std::chrono::milliseconds timeout) {
+    auto cmd = EncodeBmCommand(Command::SensorReadiness, /*version=*/1, /*value=*/0);
+    std::vector<uint8_t> reply;
+    if (!conn->SendBiometricCommand(cmd, /*outputCapacity=*/1, &reply, timeout)) {
+        return std::nullopt;
+    }
+    if (reply.size() != 1) {
+        return std::nullopt;
+    }
+    return reply[0] != 0;
+}
+
+const wchar_t* ReadinessLabel(const std::optional<bool>& r) {
+    if (!r) return L"query failed";
+    return *r ? L"1 (ready)" : L"0 (not ready)";
+}
+
+} // namespace
+
 VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
                                           std::optional<std::array<uint8_t, 16>>* outMatchedUuid) {
     if (busy_) {
@@ -30,6 +67,16 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     }
 
     std::vector<uint8_t> reply;
+
+    // 16.09.2026: sensor-readiness A/B instrumentation. Queried here,
+    // before ResetSensor/Cancel/LoadCalibration touch anything, so this is
+    // the session's true "at rest" readiness - the other half of the pair
+    // is queried after LoadCalibration below, only when that step actually
+    // ran (there is nothing meaningful to compare it against otherwise).
+    std::optional<bool> readinessAtStartup = QuerySensorReadiness(conn, config_.ioTimeout);
+    std::optional<bool> readinessAfterCalibration; // stays empty unless loadCalibration ran
+    T2_LOG("verify", L"sensor readiness (cmd 0x53, at startup): %s",
+           ReadinessLabel(readinessAtStartup));
 
     // reset sensor (cmd 2, value=2). VERIFIED FROM SOURCE: bridge-xpc-probe.py's
     // biometric_command() defaults version=1 for every inner BM command -
@@ -90,6 +137,9 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
         if (!conn->SendBiometricCommand(loadCalibrationCmd, 0, &reply, config_.ioTimeout)) {
             return VerifyOutcome::TransportError;
         }
+        readinessAfterCalibration = QuerySensorReadiness(conn, config_.ioTimeout);
+        T2_LOG("verify", L"sensor readiness (cmd 0x53, after LoadCalibration): %s",
+               ReadinessLabel(readinessAfterCalibration));
     } else {
         T2_LOG("verify", L"skipping LoadCalibration (cmd 0x20) - not issued by macOS reference capture");
     }
@@ -217,32 +267,6 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
             continue; // header too short; keep waiting rather than guessing
         }
         if (embeddedType != kEmbeddedTypeMatchResult) {
-            // status (0xE3FF8001) / statistics (0xE3FF8004) / other — not
-            // yet a verdict, keep waiting up to the deadline. This is the
-            // only place that decodes embedded_type, so without logging it
-            // here a hardware session is an opaque wall of "event acked"
-            // lines with no way to tell a genuine finger-presence/idle
-            // status stream apart from something actually going wrong -
-            // that ambiguity is exactly what made a real capture (3
-            // back-to-back verify runs, all timing out on nothing but
-            // <200B status/statistics events) unreadable after the fact.
-            //
-            // event_type=status also gets its body's two VERIFIED FROM
-            // SOURCE fields (ParseStatusEventBody / MatchResult.h) logged
-            // structured, matching what bridge-xpc-probe.py itself decodes
-            // for this event kind - status_code and status_data_length.
-            // As of 16.09.2026 status_code (== the "ordinal" field
-            // FINDINGS.md's enrollment-flow table keys off) also gets a
-            // HYPOTHESIS-only label from StatusOrdinalHypothesis when one
-            // exists - explicitly NOT verified for this (verify, not
-            // enrollment) operation, see that function's own comment.
-            // There is deliberately no INVENTED finger/progress field
-            // beyond what that hypothesis table itself provides: the
-            // reference's own summarize_event() does not decode any
-            // further signal from this event kind either, so adding one
-            // here would be inventing a field this project has no source
-            // for at all, which is exactly what Milestone 2's "no guessing
-            // undocumented protocol details" rule forbids.
             const wchar_t* kind = EmbeddedTypeName(embeddedType);
             if (embeddedType == kEmbeddedTypeStatus) {
                 StatusEventBody body = ParseStatusEventBody(eventData);
@@ -252,19 +276,6 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
                     if (StatusCodeIsImagePipeline(code)) imagePipelineEvents++;
                     if (!StatusCodeName(code)) unnamedStatusEvents++;
                 }
-                // ParseStatusEventBody only decodes eventData[0:4) and
-                // [8:16) (VERIFIED FROM SOURCE - that is genuinely the
-                // reference's entire decode). Whatever status_data_length
-                // describes (eventData[16:...)) has never been logged by
-                // this project in any form, on any capture to date - every
-                // status_code=81/63/78/64 event (the ones bracketing the
-                // status_code=91 no-payload event, i.e. the actual
-                // per-touch capture cycle) has been a total blind spot.
-                // Dumping it is the same "raw bytes, well under
-                // kMinMatchResultEventBytes" reasoning already applied to
-                // statistics events below - these bodies are 52B, nowhere
-                // near the 0xC70B match_result floor, so this cannot be
-                // printing anything UUID-shaped.
                 T2_LOG("verify",
                        L"event_type=%s embedded_type=0x%08X body=%zuB status_code=%s status_name=%s status_data_length=%s ordinal_hypothesis=%s status_data=%s",
                        kind, embeddedType, eventData.size(),
@@ -283,23 +294,6 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
                                      eventData.size() - kStatusEventBodyFixedFieldsBytes).c_str()
                            : L"(none)");
             } else if (embeddedType == kEmbeddedTypeStatistics) {
-                // Raw dump, not just size: statistics events are ~28B and
-                // this project has never decoded their fields (see the
-                // comment above — "statistics ... content not parsed in
-                // detail"). Dumping the whole body (well under
-                // kMinMatchResultEventBytes, so never risks printing
-                // anything UUID-shaped) is meant to let a hardware capture
-                // of several finger presentations in a row show whether any
-                // byte in here tracks something like a per-attempt quality
-                // score around a `status_code=78` (retry) moment — still no
-                // meaning assigned here, just the bytes for comparison.
-                // 16.09.2026: decoded rather than raw-dumped. The macOS
-                // capture shows types 0/1/2 (IEEE-754 doubles, image
-                // quality scores ~0.02-0.14) only ever appearing once an
-                // image has actually been processed; the failing Windows
-                // capture contains types 4/25/30/35 and none of 0/1/2,
-                // which is independent confirmation that no image ever
-                // reached the matcher. Raw bytes kept alongside.
                 StatisticsEventBody stats = ParseStatisticsEventBody(eventData);
                 T2_LOG("verify",
                        L"event_type=%s embedded_type=0x%08X body=%zuB stat_type=%s stat_value=%s stat_double=%s raw=%s",
@@ -309,17 +303,6 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
                        stats.asDouble ? std::to_wstring(*stats.asDouble).c_str() : L"(n/a)",
                        HexDump(eventData, eventData.size()).c_str());
             } else {
-                // New as of 16.09.2026: previously any envelope other than
-                // status/statistics logged size-only under the generic
-                // name "unknown". Now that EmbeddedTypeName covers the
-                // reference's full "Raw service-envelope map" (see
-                // Commands.h), this also hex-dumps the body when it is
-                // safely under kMinMatchResultEventBytes - the same bound
-                // already relied on above to guarantee a statistics dump
-                // can never be UUID-shaped. A body at or above that bound
-                // is left undumped even if the type isn't kEmbeddedTypeMatchResult,
-                // since nothing here has verified what such a body can
-                // contain for these newly-named types.
                 T2_LOG("verify", L"event_type=%s embedded_type=0x%08X body=%zuB%s",
                        kind, embeddedType, eventData.size(),
                        eventData.size() < kMinMatchResultEventBytes
@@ -329,16 +312,6 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
             continue;
         }
 
-        // Previously this branch called ParseMatchResult with no logging at
-        // all, so a genuine 0xE3FF8002 event arriving on the wire was
-        // invisible in the log — every earlier capture that ended in
-        // "verify-timeout" left no way to tell whether SEP simply never
-        // sent this event, or sent it and something afterward went wrong.
-        // Log arrival unconditionally (size only — never the raw bytes,
-        // since eventData at this point may embed the identity UUID this
-        // project's own logging policy forbids printing), then log the
-        // parsed outcome. Never logs the matched UUID itself, only that a
-        // match occurred (MatchResult.h's contract for MatchResult::outcome).
         T2_LOG("verify", L"event_type=match_result embedded_type=0x%08X body=%zuB",
                embeddedType, eventData.size());
 
@@ -353,46 +326,28 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
             outcome = VerifyOutcome::NoMatch;
             break;
         }
-        // Malformed match_result (e.g. under 0xC70 bytes): keep waiting up
-        // to the deadline rather than immediately failing — Milestone 2
-        // §20 requires malformed MATCH-RESULT parsing to never become
-        // NoMatch, but does not require aborting the whole session.
         T2_LOG("verify", L"match_result outcome=MALFORMED body=%zuB (min required=%zuB) — "
                L"still waiting, not treated as NO_MATCH",
                eventData.size(), kMinMatchResultEventBytes);
     }
 
-    // 16.09.2026: a bare "Timeout" hid the single most informative fact a
-    // failing session has. If the SEP told us a finger was on the sensor
-    // but never once reported ImageCaptured / ImageForProcessing /
-    // ImageWasAccepted, the failure is upstream of matching entirely and
-    // no amount of waiting longer will help.
     if (outcome == VerifyOutcome::Timeout && sawFingerOn && imagePipelineEvents == 0) {
         outcome = VerifyOutcome::NoImageCaptured;
     }
     T2_LOG("verify",
            L"session summary: finger_touch_cycles=%zu image_pipeline_events=%zu unnamed_status_events=%zu "
-           L"layout=%s reset_sensor=%d load_calibration=%d outcome=%d",
+           L"layout=%s reset_sensor=%d load_calibration=%d readiness_startup=%s readiness_after_calibration=%s outcome=%d",
            fingerTouchCycles, imagePipelineEvents, unnamedStatusEvents,
            MatchIdentityLayoutName(config_.matchLayout), config_.resetSensor ? 1 : 0,
-           config_.loadCalibration ? 1 : 0, static_cast<int>(outcome));
+           config_.loadCalibration ? 1 : 0, ReadinessLabel(readinessAtStartup),
+           ReadinessLabel(readinessAfterCalibration), static_cast<int>(outcome));
     if (fingerTouchCycles >= 2 && imagePipelineEvents == 0 && !config_.loadCalibration) {
-        // Two full touch cycles is enough to say this isn't a one-off missed
-        // placement: the sensor consistently detects the finger and never
-        // reaches ImageCaptured. Flagged here (not just left to the CLI's
-        // one-shot hint) because a caller driving several verify() calls in
-        // a row from a script would otherwise see the same generic
-        // NoImageCaptured every time with no escalation signal.
         T2_LOG("verify",
                L"%zu consecutive no-image touch cycles with LoadCalibration disabled - "
                L"strongly consider retrying with loadCalibration=true (--load-calibration)",
                fingerTouchCycles);
     }
 
-    // Cancel runs unconditionally via cancelGuard's destructor as this
-    // function returns, matching Linux reference behavior (Milestone 1 §2)
-    // - see the CancelGuard comment above for why it now covers every exit
-    // path, not just this one.
     return outcome;
 }
 
