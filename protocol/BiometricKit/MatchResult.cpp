@@ -117,6 +117,13 @@ const wchar_t* StatusCodeName(uint32_t statusCode) {
     //   [0xE3FF8002 match_result] -> 74 RequestFingerOff ->
     //   53 ImageQueueIsEmpty -> 91 Pause -> 73 TemplateListUpdated ->
     //   80 MatchingCancelled -> 64 FingerOff
+    //
+    // Current Windows investigation has now reproduced two independent
+    // 20-second sessions with both 68-byte match layouts, plus a 61407-byte
+    // FDR calibration load, and all still stop at 63 -> 91 with no 55/72/95.
+    // Therefore this map deliberately treats 55/72/95 as the diagnostic
+    // image-pipeline boundary; later statuses 53/73 are not evidence that
+    // image acquisition succeeded.
     switch (statusCode) {
         case 53: return L"ImageQueueIsEmpty";
         case 55: return L"ImageCaptured";
@@ -207,8 +214,11 @@ const wchar_t* StatusOrdinalHypothesis(uint32_t ordinal) {
     // verify capture actually shows 78, leave it unlabeled here rather than
     // presenting the enrollment-derived guess as if it were confirmed.
     switch (ordinal) {
-        case 63: return L"HYPOTHESIS(enrollment-sourced): finger-present feedback";
-        case 64: return L"HYPOTHESIS(enrollment-sourced): finger-removed/waiting feedback";
+        // 63/64 are directly named by the successful macOS verify capture;
+        // do not duplicate them with an enrollment-derived hypothesis.
+        case 63:
+        case 64:
+            return nullptr;
         case 66: return L"HYPOTHESIS(enrollment-sourced): cancelled-terminal";
         case 67: return L"HYPOTHESIS(enrollment-sourced): generic-failure-terminal";
         case 68: return L"HYPOTHESIS(enrollment-sourced): timeout-terminal";
