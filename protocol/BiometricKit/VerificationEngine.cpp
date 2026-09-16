@@ -174,12 +174,27 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
             continue;
         }
 
+        // Previously this branch called ParseMatchResult with no logging at
+        // all, so a genuine 0xE3FF8002 event arriving on the wire was
+        // invisible in the log — every earlier capture that ended in
+        // "verify-timeout" left no way to tell whether SEP simply never
+        // sent this event, or sent it and something afterward went wrong.
+        // Log arrival unconditionally (size only — never the raw bytes,
+        // since eventData at this point may embed the identity UUID this
+        // project's own logging policy forbids printing), then log the
+        // parsed outcome. Never logs the matched UUID itself, only that a
+        // match occurred (MatchResult.h's contract for MatchResult::outcome).
+        T2_LOG("verify", L"event_type=match_result embedded_type=0x%08X body=%zuB",
+               embeddedType, eventData.size());
+
         MatchResult mr = ParseMatchResult(embeddedType, eventData, identities);
         if (mr.outcome == MatchOutcome::Match) {
+            T2_LOG("verify", L"match_result outcome=MATCH (identity matched, UUID not logged)");
             outcome = VerifyOutcome::Match;
             *outMatchedUuid = mr.matchedIdentityUuid;
             break;
         } else if (mr.outcome == MatchOutcome::NoMatch) {
+            T2_LOG("verify", L"match_result outcome=NO_MATCH (no enrolled UUID found in event)");
             outcome = VerifyOutcome::NoMatch;
             break;
         }
@@ -187,6 +202,9 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
         // to the deadline rather than immediately failing — Milestone 2
         // §20 requires malformed MATCH-RESULT parsing to never become
         // NoMatch, but does not require aborting the whole session.
+        T2_LOG("verify", L"match_result outcome=MALFORMED body=%zuB (min required=%zuB) — "
+               L"still waiting, not treated as NO_MATCH",
+               eventData.size(), kMinMatchResultEventBytes);
     }
 
     // Cancel runs unconditionally via cancelGuard's destructor as this
