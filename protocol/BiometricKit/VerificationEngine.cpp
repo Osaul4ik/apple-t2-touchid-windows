@@ -2,6 +2,7 @@
 // VerificationEngine.cpp
 #include "VerificationEngine.h"
 #include "../BridgeXpc/PlistPayload.h"
+#include "../BridgeXpc/Log.h"
 #include <cstring>
 
 namespace t2::biometrickit {
@@ -133,7 +134,19 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
         }
         if (embeddedType != kEmbeddedTypeMatchResult) {
             // status (0xE3FF8001) / statistics (0xE3FF8004) / other — not
-            // yet a verdict, keep waiting up to the deadline.
+            // yet a verdict, keep waiting up to the deadline. This is the
+            // only place that decodes embedded_type, so without logging it
+            // here a hardware session is an opaque wall of "event acked"
+            // lines with no way to tell a genuine finger-presence/idle
+            // status stream apart from something actually going wrong -
+            // that ambiguity is exactly what made a real capture (3
+            // back-to-back verify runs, all timing out on nothing but
+            // <200B status/statistics events) unreadable after the fact.
+            const wchar_t* kind = (embeddedType == kEmbeddedTypeStatus) ? L"status"
+                                 : (embeddedType == kEmbeddedTypeStatistics) ? L"statistics"
+                                 : L"unknown";
+            T2_LOG("verify", L"non-match event: embedded_type=0x%08X (%s) body=%zuB",
+                   embeddedType, kind, eventData.size());
             continue;
         }
 

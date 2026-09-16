@@ -664,7 +664,34 @@ static int CmdVerify(int argc, wchar_t* argv[]) {
         return 1;
     }
 
-    std::wcout << L"place finger on sensor...\n";
+    // Diagnostic-only pre-check (docs/linux-reference-analysis.md §6.6):
+    // verification cannot produce a real match_result while the
+    // keybag/catacomb is unavailable, and that dependency is documented
+    // but its byte-level encoding in the 0x27 SKS-lock-state reply is
+    // NOT verified from source - so this prints the raw bytes for the
+    // person running the test to eyeball, rather than guessing a
+    // locked/unlocked threshold. A run that ends in nothing but
+    // status/statistics events for the whole match window (visible with
+    // --verbose) and never a match_result is the symptom this is meant
+    // to help diagnose; if that happens, try `unlock` first.
+    {
+        std::vector<uint8_t> lockStateReply;
+        std::vector<uint8_t> uidData(4);
+        std::memcpy(uidData.data(), &cfg.macosUserId, 4);
+        auto lockStateCmd = EncodeBmCommand(Command::SksLockState, 1, 0, uidData);
+        if (bridge.SendBiometricCommand(lockStateCmd, 64, &lockStateReply, std::chrono::milliseconds(5000))) {
+            std::wcout << L"sks lock state (raw, meaning not yet verified from source): ";
+            for (uint8_t b : lockStateReply) {
+                wchar_t tmp[4];
+                swprintf(tmp, 4, L"%02x", b);
+                std::wcout << tmp;
+            }
+            std::wcout << L"\n";
+        } // best-effort - absence of this reply must not block verify itself
+    }
+
+    std::wcout << L"place finger on sensor (keybag/catacomb must already be unlocked - "
+               << L"run `unlock` first if this is the first verify since boot)...\n";
     VerificationEngine engine(cfg);
     std::optional<std::array<uint8_t, 16>> matchedUuid;
     VerifyOutcome outcome = engine.Verify(&bridge, &matchedUuid);

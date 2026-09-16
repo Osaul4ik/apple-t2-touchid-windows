@@ -94,3 +94,11 @@ have NOT been run; they require an actual WDK toolchain.
   cancel call entirely, since it only ran unconditionally after the event
   loop.
 
+### Real-hardware verify session, 16.09.2026
+- Captured a `--verbose` log of three back-to-back `verify` runs: connect/HELO/version negotiation, reset+cancel, FDR calibration load, identity list (3 enrolled identities returned), start-match accepted (status=0), then a ~10s event loop that received nothing but small (131-167B) async events, timed out every time, and reconnected for the next run - never a single match_result event (which needs >= 0xC70B).
+- `docs/linux-reference-analysis.md` \xc2\xa76.6 documents (per the Linux README, not independently verified on this hardware) that BiometricKit verification cannot yield a real matching identity while the keybag/catacomb is unavailable - a dependency the CLI never surfaced before now.
+- Changes made in response, all diagnostic-only (no guessed protocol semantics):
+  - `protocol/BiometricKit/Commands.h`: added `SksLockState = 0x27` (shape already VERIFIED FROM SOURCE in the analysis doc; semantics of the returned bytes are NOT verified, so nothing interprets them).
+  - `protocol/BiometricKit/VerificationEngine.cpp`: the event loop now `T2_LOG`s every non-match event it discards, naming it status/statistics/unknown by `embedded_type` and its body size, so a `--verbose` hardware run is legible instead of an opaque wall of \xe2\x80\x9cevent acked\xe2\x80\x9d lines.
+  - `tools/t2touchid/main.cpp` (`CmdVerify`): queries SKS lock state (cmd 0x27) before the match window and prints the raw reply bytes unconditionally, labeled as unverified-meaning; the \xe2\x80\x9cplace finger on sensor\xe2\x80\x9d prompt now also names the keybag/catacomb-unlock prerequisite and points at `unlock`.
+- Not yet done: actually confirming on real hardware whether running `unlock` before `verify` changes the outcome, and (if so) formally verifying the 0x27 reply encoding from a captured before/after pair so it can move from raw hex dump to an interpreted status.

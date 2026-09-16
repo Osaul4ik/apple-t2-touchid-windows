@@ -45,6 +45,7 @@ enum class Command : uint16_t {
     StartMatch        = 4,
     Cancel            = 0x0c,
     LoadCalibration   = 0x20,
+    SksLockState      = 0x27,
     SensorInfo        = 0x35,
     CatacombState     = 0x3c,
     IdentityList      = 0x42,
