@@ -227,7 +227,46 @@ offset  size  field
 | 0x40 | load catacomb archive component | data=LTFC-wrapped secure blob | status |
 | 0x42 | identity list | data=macos_user_id:u32le | N × 20-byte `identity_record_v1_t` |
 | 0x4b | load bio-lockout record | data=HRLB-wrapped blob | status |
+| 0x51 | global identity list | — | N × 40-byte `global_identity_record_v1_t` |
 | 0x53 | sensor readiness | — | 1 byte bool |
+
+### `global_identity_record_v1_t` (40 bytes) — VERIFIED FROM SOURCE
+```
+offset  size  field
+0x00    20    identity_record_v1_t (record[:20] — same layout as cmd 0x42)
+0x14    20    reserved (never parsed by the reference beyond the leading 20 bytes)
+```
+
+### 16.09.2026 — non-matching warm-up before StartMatch (cmd 4) — VERIFIED FROM SOURCE
+`bridge-xpc-probe.py`'s резолюючий шлях (`--match-finger-name` / `--resolve-any-finger-name` /
+`--resolve-any-identity-slot` — усі три ведуть в одну гілку коду, рядки ~1298-1392) виконує
+**чотири** непозначаючі (non-matching) читання ідентичностей ПЕРЕД відправкою cmd 4, а не одне:
+
+```
+biometric_command(sock, 0x42, data=uid)          # перший identity-list читання (вже було в Windows)
+biometric_command(sock, 0x51)                    # перший global-identity-list читання (НОВЕ)
+biometric_command(sock, 0x42, data=uid)          # повторне identity-list читання (НОВЕ)
+biometric_command(sock, 0x51)                    # повторне global-identity-list читання (НОВЕ)
+ ↓ (t2_fprint_match_gate.prepare_slots/_all: fail-closed, якщо перший ≠ повторний зріз)
+biometric_command(sock, 4, data=match_init_data_v1)   # START MATCH — незмінно, дані з ПЕРШОГО identity-list
+```
+
+`t2-fprintd.py`'s `verify_fprint()` (реальний production-шлях для звичайного "будь-який палець"
+розблокування) передає `resolve_any_finger=True`, коли `requested_finger == "any"` — тобто для
+типового unlock-кейсу ця гілка **завжди** виконується, а не лише в bootstrap-скрипті
+`t2-touchid-identify-finger.py`. Це не software-only перевірка: команди 0x42/0x51 фізично йдуть
+по дроту до SEP двічі кожна перед стартом матчу. `t2_fprint_match_gate.py` (`prepare_slots`,
+`prepare_all`) підтверджує, що:
+- ідентичності, які реально йдуть у `match_init_data_v1`, беруться з **першого** 0x42-читання
+  (не з повторного) — повторні читання й 0x51 служать лише stability-гейтом;
+- якщо перший і повторний 0x42-зріз (або перший і повторний 0x51-зріз) не збігаються побайтово,
+  Linux-довідник відмовляє (`FprintMatchGateError("live identity inventory is unstable")`) —
+  fail-closed, а не silent-continue.
+
+Windows-порт (`VerificationEngine::Verify`) не мав жодного виклику 0x51 і жодного повторного 0x42
+до 16.09.2026 — сесія йшла прямо з одного identity-list в start-match. Це задокументована,
+джерело-верифікована розбіжність з тим самим шляхом коду, який реальний `verify_fprint()`
+використовує для звичайного unlock.
 
 ### `identity_record_v1_t` (20 bytes) — VERIFIED FROM SOURCE
 ```
