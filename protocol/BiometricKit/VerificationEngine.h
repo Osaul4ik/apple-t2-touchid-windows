@@ -17,6 +17,9 @@ enum class VerifyOutcome {
     RejectedByDevice,     // start-match command itself was rejected (word[0]!=0) — never silent success
     Malformed,
     Busy,                 // Milestone 2 §23: only one active session allowed
+    UnstableIdentityInventory, // port of Linux FprintMatchGateError("live identity
+                          // inventory is unstable"): first/repeat 0x42 or 0x51 snapshot
+                          // disagreed — fail-closed, StartMatch never sent
     NoImageCaptured,      // finger was detected (FingerOn/FingerOff) but the SEP never
                           // reported ImageCaptured/ImageForProcessing/ImageWasAccepted —
                           // the sensor sees the finger and never scans it. Distinct from

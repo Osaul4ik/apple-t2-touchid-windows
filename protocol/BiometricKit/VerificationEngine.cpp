@@ -197,15 +197,72 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
         return VerifyOutcome::Malformed;
     }
 
-    // LINUX 1:1 minimal match path (bridge-xpc-probe.py --match-seconds):
-    // after --identity-list (single 0x42 from RunLinuxReadySequence) go
-    // straight to StartMatch. No 0x51/0x42/0x51 gate (that is only the
-    // --resolve-any-finger-name / fprintd projection path). No macOS
-    // pre-match cmds 48/39/46/40.
+    // LINUX PARITY (docs/linux-reference-analysis.md §7, 16.09.2026 entry):
+    // t2-fprintd.py's verify_fprint() — the real path every normal "any
+    // finger" unlock takes (resolve_any_finger=True whenever
+    // requested_finger == "any") — always runs 0x42 → 0x51 → 0x42 → 0x51
+    // (t2_fprint_match_gate.prepare_slots/prepare_all) before StartMatch,
+    // and fails closed if the first/repeat snapshot of either command
+    // disagrees. The bare bridge-xpc-probe.py --match-seconds CLI (no
+    // --resolve-any-finger-name) skips this gate, but that is not the
+    // code path fprintd's production unlock uses, so it is not the one
+    // this driver should imitate. Identities sent to StartMatch are the
+    // FIRST 0x42 read, never the repeat — the repeat and both 0x51 reads
+    // exist only to prove the live inventory is stable.
     T2_LOG("verify",
-           L"LINUX minimal path: single 0x42 identity-list (%zu identities, %zuB raw) — "
-           L"no 0x51 gate, no macOS pre-match 48/39/46/40",
+           L"LINUX unlock-parity gate: verifying identity inventory is stable "
+           L"(0x42 done, now 0x51 → 0x42 → 0x51) before StartMatch (%zu identities, %zuB raw)",
            identities.size(), firstUserRaw.size());
+
+    auto readGlobalIdentityList = [&](std::vector<uint8_t>* outRaw) -> bool {
+        auto globalCmd = EncodeBmCommand(Command::GlobalIdentityList, /*version=*/1, /*value=*/0);
+        return conn->SendBiometricCommand(globalCmd, kGlobalIdentityListOutputCapacity, outRaw,
+                                           config_.ioTimeout);
+    };
+    auto readUserIdentityList = [&](std::vector<uint8_t>* outRaw) -> bool {
+        std::vector<uint8_t> idReq(4);
+        std::memcpy(idReq.data(), &config_.macosUserId, 4);
+        auto idCmd = EncodeBmCommand(Command::IdentityList, /*version=*/1, /*value=*/0, idReq);
+        return conn->SendBiometricCommand(idCmd, kIdentityListOutputCapacity, outRaw, config_.ioTimeout);
+    };
+
+    std::vector<uint8_t> firstGlobalRaw, repeatUserRaw, repeatGlobalRaw;
+    if (!readGlobalIdentityList(&firstGlobalRaw)) {
+        T2_LOG("verify", L"GlobalIdentityList (cmd 0x51, first read) failed");
+        return VerifyOutcome::TransportError;
+    }
+    if (!readUserIdentityList(&repeatUserRaw)) {
+        T2_LOG("verify", L"IdentityList (cmd 0x42, repeat read) failed");
+        return VerifyOutcome::TransportError;
+    }
+    if (!readGlobalIdentityList(&repeatGlobalRaw)) {
+        T2_LOG("verify", L"GlobalIdentityList (cmd 0x51, repeat read) failed");
+        return VerifyOutcome::TransportError;
+    }
+
+    std::vector<std::array<uint8_t, 20>> configuredFirst, configuredRepeat;
+    if (!ConfiguredGlobalIdentities(firstGlobalRaw, config_.macosUserId, &configuredFirst) ||
+        !ConfiguredGlobalIdentities(repeatGlobalRaw, config_.macosUserId, &configuredRepeat)) {
+        T2_LOG("verify", L"global identity-list malformed (zero-UUID, duplicate, or "
+               L"non-built-in group entry) — fail-closed, refusing StartMatch");
+        return VerifyOutcome::UnstableIdentityInventory;
+    }
+    std::vector<IdentityRecordV1> repeatIdentities;
+    if (!ParseIdentityList(repeatUserRaw, &repeatIdentities)) {
+        T2_LOG("verify", L"repeat IdentityList reply malformed (%zuB, not a multiple of 20) — "
+               L"fail-closed, refusing StartMatch", repeatUserRaw.size());
+        return VerifyOutcome::UnstableIdentityInventory;
+    }
+    std::sort(configuredFirst.begin(), configuredFirst.end());
+    std::sort(configuredRepeat.begin(), configuredRepeat.end());
+    if (configuredFirst != configuredRepeat || !SamePerUserSet(configuredFirst, identities) ||
+        !SamePerUserSet(configuredRepeat, repeatIdentities)) {
+        T2_LOG("verify", L"live identity inventory is unstable (first/repeat 0x42 or 0x51 "
+               L"snapshot disagreed) — fail-closed, refusing StartMatch");
+        return VerifyOutcome::UnstableIdentityInventory;
+    }
+    T2_LOG("verify", L"identity inventory stable across 0x42→0x51→0x42→0x51 (%zu configured)",
+           configuredFirst.size());
 
     // LINUX PARITY: warm-up events must NOT enter the match event stream.
     {
