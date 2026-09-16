@@ -184,6 +184,16 @@ std::optional<std::vector<uint8_t>> DecodeSingleBlobPayload(const std::vector<ui
     return out;
 }
 
+// VERIFIED FROM SOURCE (t2_bridge_wire.py, BIOMETRIC_NIL_OUTPUT_SENTINEL /
+// is_biometric_nil_output()): bkremoted uses this fixed CFString as the
+// second element of a [status, blob] reply whenever
+// performCommand:input:output:capacity: returns a nil Objective-C output —
+// which is exactly what happens for a command sent with outputCapacity=0
+// (reset/cancel/load-calibration/start-match, per VerificationEngine.cpp).
+// It is a protocol sentinel, not a request/connection/identity/service
+// UUID, and must never be treated as one.
+constexpr const char* kBiometricNilOutputSentinel = "d4161201-daf5-4bbd-ae4f-9bf319fabbe0";
+
 std::optional<StatusBlobPayload> DecodeStatusBlobPayload(const std::vector<uint8_t>& payloadPlist) {
     plist_t root = ParseRootArray(payloadPlist, 2);
     if (!root) return std::nullopt;
@@ -192,12 +202,30 @@ std::optional<StatusBlobPayload> DecodeStatusBlobPayload(const std::vector<uint8
     plist_t statusNode = plist_array_get_item(root, 0);
     plist_t blobNode = plist_array_get_item(root, 1);
     if (!statusNode || plist_get_node_type(statusNode) != PLIST_UINT) return std::nullopt;
-    if (!blobNode || plist_get_node_type(blobNode) != PLIST_DATA) return std::nullopt;
+    if (!blobNode) return std::nullopt;
 
     StatusBlobPayload out;
     uint64_t statusVal = 0;
     plist_get_uint_val(statusNode, &statusVal);
     out.status = static_cast<int64_t>(statusVal);
+
+    auto blobType = plist_get_node_type(blobNode);
+    if (blobType == PLIST_STRING) {
+        // Nil output (expected whenever the caller sent outputCapacity=0):
+        // only the exact sentinel string is accepted here — anything else
+        // typed as a string is an unrecognized shape, not a nil output,
+        // and must still fail closed.
+        char* str = nullptr;
+        plist_get_string_val(blobNode, &str);
+        bool isNilSentinel = str && std::string(str) == kBiometricNilOutputSentinel;
+        if (str) free(str);
+        if (!isNilSentinel) return std::nullopt;
+        // out.blob stays empty - matches DecodeSingleBlobPayload's/this
+        // struct's own convention that "no data" is an empty blob, not
+        // nullopt.
+        return out;
+    }
+    if (blobType != PLIST_DATA) return std::nullopt;
 
     char* data = nullptr;
     uint64_t length = 0;

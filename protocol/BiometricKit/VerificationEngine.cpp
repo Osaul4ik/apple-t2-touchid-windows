@@ -118,16 +118,19 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
         }
     } cancelGuard{conn, &cancelCmd, config_.ioTimeout};
 
-    if (reply.size() < 4) {
-        return VerifyOutcome::Malformed;
-    }
-    int32_t startResult;
-    std::memcpy(&startResult, reply.data(), 4);
-    if (startResult != 0) {
-        // VERIFIED FROM SOURCE: "match_reply[0] != 0 -> match_rejected ->
-        // ERROR (never a silent success)".
-        return VerifyOutcome::RejectedByDevice;
-    }
+    // "match_reply[0] != 0 -> match_rejected -> ERROR (never a silent
+    // success)" (VERIFIED FROM SOURCE) refers to the OUTER bridgexpc
+    // [status, blob] status word for this command - not to any content of
+    // the blob itself. That outer status is already enforced above: this
+    // point in the function is only reached when SendBiometricCommand
+    // returned true, which itself requires statusBlob->status == 0 (see
+    // Connection.cpp). The reference never inspects match_reply[1] (the
+    // blob) for start-match at all, and now that this command is correctly
+    // sent with outputCapacity=0 (matching the reference), the blob is
+    // legitimately empty on every successful call - a size check here
+    // would reject every accepted start-match as Malformed. Previously
+    // this "worked" only by accident, because outputCapacity=64 made the
+    // blob 64 zero bytes whose first 4 happened to read as 0.
 
     auto deadline = steady_clock::now() + config_.matchWindow;
     VerifyOutcome outcome = VerifyOutcome::Timeout; // default if loop exits via deadline
