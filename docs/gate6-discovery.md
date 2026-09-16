@@ -135,3 +135,33 @@ BiometricKit-related to begin with.
 First real-hardware confirmation of both Phase 2 (RemoteXPC service
 discovery) and Gate 7 phase 1 (live BridgeXpc HELO + getBridgeVersion) —
 see the sections above.
+
+### Fourth run (16.09.2026) — 49197 turned out to be a decoy; walk order reversed
+
+Follow-up `t2touchid.exe identities` against the port found above (49197)
+got all the way through `getBridgeVersion` / `setClientVersion` / reset /
+cancel, then failed at FDR calibration (bridge-level method 11) — a
+BiometricKit-specific step, not a generic BridgeXPC one. Separately, a
+scan targeted directly at the peer (`network 3 --host fe80::aede:48ff:fe33:4455`)
+found exactly one HTTP/2 candidate on this hardware: port **59602**, at
+the very top of the 49152–65535 range — which the project owner also
+identifies as the known-correct BiometricKit port from the Linux
+reference driver on this same T2.
+
+`DiscoverServicePort`'s candidate walk was ascending (lowest port first)
+and returned on the first candidate whose peer record advertised
+`Services["com.apple.eos.BiometricKit"]`, which was apparently a
+low-numbered decoy reporting 49197 rather than the real channel. Changed
+the walk to go from the end of the candidate list backward (highest port
+first), so 59602-like high-numbered candidates are tried before any
+low-numbered ones. **Not yet re-verified on hardware** — next `network`/
+`identities` run should confirm the walk now lands on 59602 and that
+`identities` gets past FDR calibration this time.
+
+A separate, still-open question: an unqualified `t2touchid.exe network`
+(no `--host`) reportedly produced different output on a later run than
+the one captured above, without the actual output captured. Needs a
+fresh side-by-side capture (peer address, ifIndex, and full candidate
+list) of two consecutive unqualified `network` runs to tell whether the
+IPv6 neighbor-table peer address is unstable across runs, independent of
+the `ifIndex` instability already documented above.

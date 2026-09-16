@@ -670,7 +670,28 @@ DiscoveredService DiscoverServicePort(const NcmEndpoint& endpoint,
                                        const std::string& serviceName,
                                        std::chrono::milliseconds perPortTimeout) {
     DiscoveredService result;
-    for (uint16_t port : candidatePorts) {
+    // Real-hardware finding (16.09.2026, reported by project owner): walking
+    // candidatePorts ascending (its natural sorted order - see
+    // ScanHttp2Preface) matched Services["com.apple.eos.BiometricKit"] on a
+    // low-numbered candidate and returned port 49197; a follow-up
+    // `identities` run against that port got through getBridgeVersion/
+    // setClientVersion/reset/cancel but failed at FDR calibration (a
+    // BiometricKit-specific bridge method), suggesting 49197 answers as a
+    // generic BridgeXPC-family service but is not actually BiometricKit's
+    // channel. A separate scan targeted directly at the peer link-local
+    // found exactly one HTTP/2 candidate on this hardware: port 59602, at
+    // the top of the range - which the reporter also identifies as the
+    // known-correct port on the Linux reference driver for this same T2.
+    // Walking candidatePorts from the end (highest port first) prefers
+    // 59602-like high-numbered candidates over low-numbered ones before
+    // accepting a match, on the working theory that the low-numbered
+    // decoys are answering with a stale/shared Services entry rather than
+    // BiometricKit's own. This is a user-observation-driven ordering
+    // change, not re-derived from source - it needs re-running `network`/
+    // `identities` on real hardware to confirm the walk now lands on
+    // 59602 and that `identities` gets past FDR calibration.
+    for (auto it = candidatePorts.rbegin(); it != candidatePorts.rend(); ++it) {
+        uint16_t port = *it;
         RemoteXpcConnection conn;
         if (conn.Connect(endpoint, port, perPortTimeout) != RemoteXpcResult::Ok) {
             continue; // couldn't even open this candidate — try the next one
@@ -704,5 +725,6 @@ DiscoveredService DiscoverServicePort(const NcmEndpoint& endpoint,
     }
     return result;
 }
+
 
 } // namespace t2::discovery
