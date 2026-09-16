@@ -47,38 +47,39 @@ struct VerifyConfig {
     std::chrono::seconds matchWindow{20};
     std::chrono::milliseconds ioTimeout{5000};
 
-    // Wire format of the start-match payload.
-    //
-    // macOS capture on this exact machine (bridgeOS 23P5067, uid 501,
-    // 3 enrolled identities) shows:
-    //   performCommand:version:inValue:inData:inSize: 4 1 0 <ptr> 68
-    // i.e. the whole inner payload of cmd 4 is 68 bytes =
-    //   MatchOptionsV1 (8 B) + N * IdentityRecordV1 (20 B each).
-    //
-    // Linux (bridge-xpc-probe.py default "counted") appends an extra
-    // uint32 count + records after a 68-byte MatchInitDataV1, producing
-    // 132 B for N=3. That form is kept as MatchIdentityLayout::LegacyCounted
-    // for regression / A/B only.
-    //
-    // Hardware A/B on Windows already showed that switching 132→68 alone
-    // does not unlock the image pipeline (still no 55/72/95). The default
-    // is therefore the Linux default LegacyCounted form (II60x+count+records) so the
-    // next run starts from the wire format that the SEP actually accepts
-    // on this firmware, not the Linux-derived counted blob.
-    MatchIdentityLayout matchLayout = MatchIdentityLayout::LegacyCounted; // Linux --identity-blob-format=counted
+    // docs/ macos-verified.md §3, §7 (16.09.2026, same physical machine/
+    // firmware): macOS itself puts exactly 68 bytes on the wire for
+    // StartMatch with 3 identities (MatchOptionsV1 8B + N*IdentityRecordV1
+    // 20B, no count field) — InlineIdentities reproduces that byte-for-byte.
+    // A second hardware capture with this layout landed correctly on the
+    // wire (confirmed: "inner=76B" = 8B BM header + 68B payload) but showed
+    // a bit-identical failure shape to the 132-byte LegacyCounted form —
+    // §7's own conclusion is explicit: "the StartMatch payload content/size
+    // is not what gates image capture... the fix in section 3 is still
+    // correct... and stays in place". LegacyCounted (132B, count+records) is
+    // the pre-macOS-capture Linux-derived form, verified WRONG for this
+    // firmware — kept only as an explicit A/B variant, never the default.
+    MatchIdentityLayout matchLayout = MatchIdentityLayout::InlineIdentities; // macOS-verified default
 
     // MatchInitDataV1 / MatchOptionsV1 flags field. Linux probe default is 0;
     // its help text notes "use 1 for an unlock match". Keep 0 as default to
     // match both Linux fprintd and the macOS capture; expose via CLI for A/B.
     uint32_t matchFlags = 0;
 
-    // macOS live unlock on this machine never issues ResetSensor (cmd 2) or
-    // LoadCalibration (cmd 0x20) on the match connection — bridgeOS calibrates
-    // once at its own boot. Linux always does both. Defaults stay Linux-parity
-    // (false = do the command); set true to A/B the macOS-style path that
-    // skips them. Identity list + StartMatch still always run.
-    bool skipResetSensor = false;
-    bool skipLoadCalibration = false;
+    // docs/ macos-verified.md §4 (16.09.2026 macOS live-unlock capture,
+    // same machine): "Across the whole capture: 4, 12, 39, 40, 44, 46, 48,
+    // 56, 61, 62, 63, 74, 80, 84. Never 2 (ResetSensor) and never 0x20
+    // (LoadCalibration)... Both are now opt-in." So the macOS-verified
+    // default is to skip both; Linux always sends both, which is why the
+    // Linux-parity path (skip=false) existed, but this project talks to
+    // real bridgeOS firmware, not the Linux reference target, and the two
+    // disagree here — the hardware capture wins. §7's "Next diagnostic
+    // step" explicitly re-enables LoadCalibration via CLI on top of this
+    // default (--load-calibration) as the next A/B to try, precisely
+    // because this default is skip=true, not skip=false. Identity list +
+    // StartMatch still always run.
+    bool skipResetSensor = true;
+    bool skipLoadCalibration = true;
 };
 
 // One VerificationEngine instance == one in-flight session (Milestone 2

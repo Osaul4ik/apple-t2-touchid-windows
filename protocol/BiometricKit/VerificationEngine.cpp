@@ -200,7 +200,7 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     // LINUX PARITY (docs/linux-reference-analysis.md §7, 16.09.2026 entry):
     // t2-fprintd.py's verify_fprint() — the real path every normal "any
     // finger" unlock takes (resolve_any_finger=True whenever
-    // requested_finger == "any") — always runs 0x42 → 0x51 → 0x42 → 0x51
+    // requested_finger == "any") — always runs 0x42 -> 0x51 -> 0x42 -> 0x51
     // (t2_fprint_match_gate.prepare_slots/prepare_all) before StartMatch,
     // and fails closed if the first/repeat snapshot of either command
     // disagrees. The bare bridge-xpc-probe.py --match-seconds CLI (no
@@ -211,7 +211,7 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     // exist only to prove the live inventory is stable.
     T2_LOG("verify",
            L"LINUX unlock-parity gate: verifying identity inventory is stable "
-           L"(0x42 done, now 0x51 → 0x42 → 0x51) before StartMatch (%zu identities, %zuB raw)",
+           L"(0x42 done, now 0x51 -> 0x42 -> 0x51) before StartMatch (%zu identities, %zuB raw)",
            identities.size(), firstUserRaw.size());
 
     auto readGlobalIdentityList = [&](std::vector<uint8_t>* outRaw) -> bool {
@@ -261,10 +261,55 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
                L"snapshot disagreed) — fail-closed, refusing StartMatch");
         return VerifyOutcome::UnstableIdentityInventory;
     }
-    T2_LOG("verify", L"identity inventory stable across 0x42→0x51→0x42→0x51 (%zu configured)",
+    T2_LOG("verify", L"identity inventory stable across 0x42->0x51->0x42->0x51 (%zu configured)",
            configuredFirst.size());
 
+    auto cancelCmd = EncodeBmCommand(Command::Cancel, 1, 0);
+    std::vector<uint8_t> reply;
+
+    // macOS live-unlock pre-match sequence (docs/ macos-verified.md §4,
+    // 16.09.2026 capture, same machine/firmware as this driver targets):
+    // "Across the whole capture: 4, 12, 39, 40, 44, 46, 48, ...". Every
+    // real unlock issues these four informational reads plus a Cancel
+    // immediately before StartMatch (cmd 4). Windows previously skipped
+    // straight from identity-list to StartMatch (Commands.h's own comment
+    // ties that gap directly to "the sensor then never emitted 89 Idle or
+    // 55 ImageCaptured" — exactly this session's symptom). Only the
+    // request sizes are documented (48/40: inSize=0; 39/46: inSize=4,
+    // macosUserId) — no reply format is documented for any of the four, so
+    // none is parsed; outputCapacity=0 matches the existing convention for
+    // commands whose reply body this project does not read (ResetSensor,
+    // Cancel, LoadCalibration, StartMatch above/below). Best-effort, like
+    // the existing warm-up Cancel: a failure here does not by itself justify
+    // aborting a verify that has a stable, non-empty identity list.
+    {
+        std::vector<uint8_t> uidReq(4);
+        std::memcpy(uidReq.data(), &config_.macosUserId, 4);
+
+        auto enabledForUnlockCmd = EncodeBmCommand(Command::GetEnabledForUnlock, 1, 0);
+        conn->SendBiometricCommand(enabledForUnlockCmd, 0, &reply, config_.ioTimeout);
+        T2_LOG("verify", L"macOS pre-match: GetEnabledForUnlock (cmd 48) issued");
+
+        auto sksLockStateCmd = EncodeBmCommand(Command::GetSksLockStateMac, 1, 0, uidReq);
+        conn->SendBiometricCommand(sksLockStateCmd, 0, &reply, config_.ioTimeout);
+        T2_LOG("verify", L"macOS pre-match: GetSksLockStateMac (cmd 39) issued");
+
+        auto protectedConfigCmd = EncodeBmCommand(Command::GetProtectedConfig, 1, 0, uidReq);
+        conn->SendBiometricCommand(protectedConfigCmd, 0, &reply, config_.ioTimeout);
+        T2_LOG("verify", L"macOS pre-match: GetProtectedConfig (cmd 46) issued");
+
+        conn->SendBiometricCommand(cancelCmd, 0, &reply, config_.ioTimeout);
+        T2_LOG("verify", L"macOS pre-match: Cancel (cmd 12) issued");
+
+        auto biometrickitdInfoCmd = EncodeBmCommand(Command::GetBiometrickitdInfo, 1, 0);
+        conn->SendBiometricCommand(biometrickitdInfoCmd, 0, &reply, config_.ioTimeout);
+        T2_LOG("verify", L"macOS pre-match: GetBiometrickitdInfo (cmd 40) issued");
+    }
+
     // LINUX PARITY: warm-up events must NOT enter the match event stream.
+    // Placed after the macOS pre-match sequence above so any events those
+    // five commands provoke are discarded too, not just the identity-gate
+    // ones.
     {
         size_t dropped = conn->DiscardPendingEvents();
         if (dropped > 0) {
@@ -274,9 +319,6 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
                    dropped);
         }
     }
-
-    auto cancelCmd = EncodeBmCommand(Command::Cancel, 1, 0);
-    std::vector<uint8_t> reply;
 
     // start match (cmd 4) — Linux counted default: II60x + count + records
     // (132 B for 3 identities). Override with --match-layout inline|padded.
