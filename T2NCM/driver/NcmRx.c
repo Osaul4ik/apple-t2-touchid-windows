@@ -558,9 +558,13 @@ T2NcmRxParseNtb(
             indicateFlags);
     }
 
-    T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_TRACE_LEVEL,
-        "T2Ncm: RX NTB seq=%u block=%u frames=%lu\n",
-        nth.wSequence, blockLength, framesThisNtb));
+    // Per-NTB success trace deliberately removed (16.09.2026) - this ran on
+    // every received NTB, i.e. continuously during any active traffic, and
+    // flooded the debug output ("T2Ncm: RX NTB seq=... block=... frames=...").
+    // RxNtbsReceived/RxFramesIndicated (incremented above/below) already give
+    // the same information for diagnostics without per-packet spam; the
+    // drop/error paths above keep their own T2NCM_LOG calls since those are
+    // rare by construction.
 }
 
 EVT_WDF_USB_READER_COMPLETION_ROUTINE T2NcmEvtRxReadComplete;
