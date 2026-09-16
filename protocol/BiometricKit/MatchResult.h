@@ -68,6 +68,18 @@ struct StatusEventBody {
 // the whole event.
 StatusEventBody ParseStatusEventBody(const std::vector<uint8_t>& eventData);
 
+// Human-readable name for any embedded_type this connection can receive
+// (VERIFIED FROM SOURCE — see .cpp). Never affects parsing/outcome logic,
+// diagnostic-only.
+const wchar_t* EmbeddedTypeName(uint32_t embeddedType);
+
+// Best-effort human-readable label for a status event's ordinal
+// (statusCode). NOT VERIFIED FROM SOURCE for the verify/match path — see
+// the "HYPOTHESIS" note in the .cpp. Returns nullptr when there is no
+// enrollment-sourced meaning to hypothesize. Diagnostic-only; never used
+// for any match/no-match decision.
+const wchar_t* StatusOrdinalHypothesis(uint32_t ordinal);
+
 struct MatchResult {
     MatchOutcome outcome;
     // Populated only when outcome == Match; the caller (verify engine) may

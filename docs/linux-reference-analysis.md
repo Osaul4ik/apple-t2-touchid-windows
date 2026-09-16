@@ -241,6 +241,71 @@ offset  size  field
 
 Інші типи подій: `0xE3FF8001` = "status" (4-байт status_code + 8-байт status_data_length за офсетом 8), `0xE3FF8004` = "statistics" (вміст не парситься детально в цьому коді).
 
+### Повна карта envelope-типів — VERIFIED FROM SOURCE (16.09.2026)
+`enrollment_research/FINDINGS.md` реконструює повну 16-записну jump-таблицю
+диспетчера matching-демона (це карта РІВНЯ ПРОТОКОЛУ, не прив'язана лише до
+enrollment):
+
+| Envelope | Назва |
+|---|---|
+| `0xE3FF8001` | Generic status message (ordinal у тілі) |
+| `0xE3FF8002` | Match result |
+| `0xE3FF8003` | Enrollment result |
+| `0xE3FF8004` | Statistics message |
+| `0xE3FF8005` | Sensor-status message |
+| `0xE3FF8006`, `0xE3FF8007` | Home/Touch ID button state transitions |
+| `0xE3FF8008` | Kernel log message |
+| `0xE3FF8009` | Sensor-recovery reason |
+| `0xE3FF800A` | Secure Key Store lock-state update |
+| `0xE3FF800B` | Match-event message |
+| `0xE3FF800C` | Accessory-list change/cache refresh |
+| `0xE3FF800D` | Sensor initialization and template-list synchronization |
+| `0xE3FF800E` | Device/accessory authorization required |
+| `0xE3FF800F` | Accessory image-information message |
+| `0xE3FF8010` | Mesa hardware-pass report |
+
+Усі 16 тепер названі в `Commands.h`/`EmbeddedTypeName()` (раніше лише 3 з 16
+мали ім'я, решта логувались як `unknown`). **В обох апаратних захопленнях
+16.09.2026 (10s і пізніше 20-30s вікна) реально прийшли тільки `0xE3FF8001`
+і `0xE3FF8004` — жоден з інших 14 типів (включно з `0xE3FF8002` match_result,
+`0xE3FF800B` match_event, `0xE3FF800F` accessory_image_info) не з'явився на
+дроті жодного разу.** Це означає: проблема не в тому, що Windows-клієнт
+неправильно інтерпретує подію, яка приходить — жодна відповідна подія за цей
+час не прийшла взагалі.
+
+### Ordinal-семантика `0xE3FF8001` — ГІПОТЕЗА, НЕ VERIFIED FOR VERIFY PATH
+`enrollment_research/FINDINGS.md`, розділ "Enrollment event-flow conformance
+matrix", декомпілює ordinal-семантику (перші 4 байти тіла status-події) саме
+для класу `BKEnrollOperation` (enrollment), а не `BKMatchOperation`
+(verification). Застосування цієї таблиці до ordinal-ів, що спостерігаються
+під час `verify`, — це гіпотеза (низькорівневий sensor-feedback шар, ймовірно,
+спільний для обох операцій, але це не підтверджено окремо), не факт:
+
+| Ordinal | Гіпотетичне значення (з enrollment) |
+|---|---|
+| 63 | finger-present feedback |
+| 64 | finger-removed/waiting feedback |
+| 66 | cancelled-terminal |
+| 67 | generic-failure-terminal |
+| 68 | timeout-terminal |
+| 74 | waiting-for-finger-removal |
+| 78, 85, 87, 88, 98 | **rejected-capture feedback (retry)** |
+| 86 | rejected-small-coverage feedback |
+| 93 | dirty-sensor advisory |
+| 100..355 | enrollment progress |
+| решта (0..50, 52..57, 59, 69, 71..73, 75..77, 79, 81..84, 89..92, 94..97, 356..500, 503..UINT32_MAX) | no-op / ignored |
+
+Реалізовано як `StatusOrdinalHypothesis()` (`MatchResult.cpp`), явно позначено
+в коді й логах як `HYPOTHESIS(enrollment-sourced)` — ніколи не впливає на
+match/no-match рішення (це й далі виключно fail-closed UUID-скан у
+`MatchResult.cpp`). **Якщо гіпотеза вірна й для verify:** ordinal-и в обох
+захопленнях (90, 91, 81, 63, 78, 64) читаються як no-op(90/91/81) →
+finger-present(63) → **rejected-capture(78)** → finger-removed(64), по колу —
+тобто SEP бачить дотик пальця, але відхиляє кожну спробу захоплення ще ДО
+того, як міг би відправити match_event/image-info/match_result. Це
+переорієнтовує пошук причини з "match_result не приходить" на "чому кожна
+спроба захоплення відхиляється (ordinal 78) ще до цього".
+
 ---
 
 ## 8. Dynamic port discovery (`discover-biometric-port.py`) — VERIFIED FROM SOURCE
@@ -308,6 +373,21 @@ verdict_from_result(): only "verify-match" if BOTH matched==True AND
     test_missing_or_explicit_no_match_fails_closed,
     test_unenrolled_identity_fails_closed)
 ```
+
+**`--match-seconds` default — VERIFIED FROM SOURCE:** `t2-fprintd.py`'s own
+argparse default (`main()`, `"--match-seconds", type=float, default=20.0`)
+is **20.0 seconds**, and `T2Backend._run_probe()` never overrides it for a
+normal `verify()` call — every real verification on the reference
+implementation therefore runs with a 20s window. The Windows
+`VerifyConfig::matchWindow` default had been `10` with no cited source;
+fixed to `20` (`protocol/BiometricKit/VerificationEngine.h`) on 16.09.2026
+after a hardware capture (3 back-to-back `verify` runs, all ending in
+"verify-timeout" with only status/statistics events) showed every run's
+transport-level timeout landing at almost exactly 10s elapsed — consistent
+with the client cutting the window, and sending its own Cancel (cmd 0x0c),
+before SEP's normal per-session poll cycle would have finished on real
+macOS. This does not rule out "no finger was on the sensor during the
+capture" as an independent or additional cause of that specific capture.
 
 **Транспортний успіх ≠ біометричний успіх:** `match_reply[0]==0` (SEP accepted the *start match* command) is only a "match session began" signal — не результат. Єдиний шлях до `verify-match` — конкретний `match_result` event із збігом UUID. Це відповідає на пряме питання Milestone 0/1: **fail-closed модель формально безумовна** — жодного коду, який трактує "command succeeded" як autoматичний match, не знайдено.
 

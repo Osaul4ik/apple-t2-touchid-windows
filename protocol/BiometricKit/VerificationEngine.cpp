@@ -170,18 +170,19 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
             // SOURCE fields (ParseStatusEventBody / MatchResult.h) logged
             // structured, matching what bridge-xpc-probe.py itself decodes
             // for this event kind - status_code and status_data_length.
-            // There is deliberately no finger=/progress= field here: the
-            // reference implementation does not decode any such signal from
-            // this event kind either, so adding one here would be inventing
-            // a field this project has no source for, which is exactly what
-            // Milestone 2's "no guessing undocumented protocol details"
-            // rule forbids. If a finger-presence signal exists on the wire
-            // at all, it is not part of what has been reverse-engineered so
-            // far — see docs/linux-reference-analysis.md and the reference
-            // project's own bridge-xpc-probe.py::summarize_event.
-            const wchar_t* kind = (embeddedType == kEmbeddedTypeStatus) ? L"status"
-                                 : (embeddedType == kEmbeddedTypeStatistics) ? L"statistics"
-                                 : L"unknown";
+            // As of 16.09.2026 status_code (== the "ordinal" field
+            // FINDINGS.md's enrollment-flow table keys off) also gets a
+            // HYPOTHESIS-only label from StatusOrdinalHypothesis when one
+            // exists - explicitly NOT verified for this (verify, not
+            // enrollment) operation, see that function's own comment.
+            // There is deliberately no INVENTED finger/progress field
+            // beyond what that hypothesis table itself provides: the
+            // reference's own summarize_event() does not decode any
+            // further signal from this event kind either, so adding one
+            // here would be inventing a field this project has no source
+            // for at all, which is exactly what Milestone 2's "no guessing
+            // undocumented protocol details" rule forbids.
+            const wchar_t* kind = EmbeddedTypeName(embeddedType);
             if (embeddedType == kEmbeddedTypeStatus) {
                 StatusEventBody body = ParseStatusEventBody(eventData);
                 // ParseStatusEventBody only decodes eventData[0:4) and
@@ -198,10 +199,13 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
                 // near the 0xC70B match_result floor, so this cannot be
                 // printing anything UUID-shaped.
                 T2_LOG("verify",
-                       L"event_type=%s embedded_type=0x%08X body=%zuB status_code=%s status_data_length=%s status_data=%s",
+                       L"event_type=%s embedded_type=0x%08X body=%zuB status_code=%s status_data_length=%s ordinal_hypothesis=%s status_data=%s",
                        kind, embeddedType, eventData.size(),
                        body.statusCode ? std::to_wstring(*body.statusCode).c_str() : L"(n/a)",
                        body.statusDataLength ? std::to_wstring(*body.statusDataLength).c_str() : L"(n/a)",
+                       body.statusCode
+                           ? (StatusOrdinalHypothesis(*body.statusCode) ? StatusOrdinalHypothesis(*body.statusCode) : L"(no hypothesis)")
+                           : L"(n/a)",
                        eventData.size() > kStatusEventBodyFixedFieldsBytes
                            ? HexDump(std::vector<uint8_t>(eventData.begin() + kStatusEventBodyFixedFieldsBytes, eventData.end()),
                                      eventData.size() - kStatusEventBodyFixedFieldsBytes).c_str()
@@ -220,8 +224,22 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
                 T2_LOG("verify", L"event_type=%s embedded_type=0x%08X body=%zuB %s",
                        kind, embeddedType, eventData.size(), HexDump(eventData, eventData.size()).c_str());
             } else {
-                T2_LOG("verify", L"event_type=%s embedded_type=0x%08X body=%zuB",
-                       kind, embeddedType, eventData.size());
+                // New as of 16.09.2026: previously any envelope other than
+                // status/statistics logged size-only under the generic
+                // name "unknown". Now that EmbeddedTypeName covers the
+                // reference's full "Raw service-envelope map" (see
+                // Commands.h), this also hex-dumps the body when it is
+                // safely under kMinMatchResultEventBytes - the same bound
+                // already relied on above to guarantee a statistics dump
+                // can never be UUID-shaped. A body at or above that bound
+                // is left undumped even if the type isn't kEmbeddedTypeMatchResult,
+                // since nothing here has verified what such a body can
+                // contain for these newly-named types.
+                T2_LOG("verify", L"event_type=%s embedded_type=0x%08X body=%zuB%s",
+                       kind, embeddedType, eventData.size(),
+                       eventData.size() < kMinMatchResultEventBytes
+                           ? (L" " + HexDump(eventData, eventData.size())).c_str()
+                           : L" (body withheld: size >= kMinMatchResultEventBytes, unverified content)");
             }
             continue;
         }

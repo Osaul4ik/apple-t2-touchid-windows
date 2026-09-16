@@ -61,6 +61,28 @@ constexpr uint32_t kEmbeddedTypeStatus      = 0xE3FF8001;
 constexpr uint32_t kEmbeddedTypeMatchResult = 0xE3FF8002;
 constexpr uint32_t kEmbeddedTypeStatistics  = 0xE3FF8004;
 
+// VERIFIED FROM SOURCE (jmurth1234/t2-touchid-linux,
+// enrollment_research/FINDINGS.md, "Raw service-envelope map" — recovered
+// from the matching daemon's 16-entry jump table, NOT scoped to
+// enrollment specifically; this is the complete envelope-type space, only
+// three of which (8001/8002/8004 above) this project previously named).
+// Added so a hardware capture can show a real name instead of "unknown"
+// if one of these ever arrives — no byte-level body of any of these is
+// parsed or assumed here, only the type is named.
+constexpr uint32_t kEmbeddedTypeEnrollmentResult      = 0xE3FF8003;
+constexpr uint32_t kEmbeddedTypeSensorStatus          = 0xE3FF8005;
+constexpr uint32_t kEmbeddedTypeButtonState1          = 0xE3FF8006;
+constexpr uint32_t kEmbeddedTypeButtonState2          = 0xE3FF8007;
+constexpr uint32_t kEmbeddedTypeKernelLog             = 0xE3FF8008;
+constexpr uint32_t kEmbeddedTypeSensorRecoveryReason  = 0xE3FF8009;
+constexpr uint32_t kEmbeddedTypeSksLockStateUpdate    = 0xE3FF800A;
+constexpr uint32_t kEmbeddedTypeMatchEvent            = 0xE3FF800B;
+constexpr uint32_t kEmbeddedTypeAccessoryListChange   = 0xE3FF800C;
+constexpr uint32_t kEmbeddedTypeSensorInitTemplateSync = 0xE3FF800D;
+constexpr uint32_t kEmbeddedTypeDeviceAuthRequired    = 0xE3FF800E;
+constexpr uint32_t kEmbeddedTypeAccessoryImageInfo    = 0xE3FF800F;
+constexpr uint32_t kEmbeddedTypeMesaHardwarePassReport = 0xE3FF8010;
+
 // Serializes a BM-wrapped command: magic|command|version|value|data.
 std::vector<uint8_t> EncodeBmCommand(Command command, uint16_t version, uint16_t value,
                                       const std::vector<uint8_t>& data = {});

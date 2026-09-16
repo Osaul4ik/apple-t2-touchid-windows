@@ -58,6 +58,74 @@ StatusEventBody ParseStatusEventBody(const std::vector<uint8_t>& eventData) {
     return body;
 }
 
+const wchar_t* EmbeddedTypeName(uint32_t embeddedType) {
+    // VERIFIED FROM SOURCE (t2-touchid-linux, enrollment_research/
+    // FINDINGS.md, "Raw service-envelope map"): this table is recovered
+    // from the matching daemon's own dispatch jump table, i.e. it names
+    // every envelope type the daemon can receive on this connection, not
+    // just the ones observed on a specific operation - so it is valid to
+    // name any of these regardless of whether the current session is a
+    // verify or enrollment. Naming a type here does NOT mean this project
+    // parses its body; kEmbeddedTypeMatchResult (0x8002) is the only one
+    // with a body parser (MatchResult.cpp).
+    switch (embeddedType) {
+        case kEmbeddedTypeStatus:                return L"status";
+        case kEmbeddedTypeMatchResult:            return L"match_result";
+        case kEmbeddedTypeEnrollmentResult:       return L"enrollment_result";
+        case kEmbeddedTypeStatistics:             return L"statistics";
+        case kEmbeddedTypeSensorStatus:           return L"sensor_status";
+        case kEmbeddedTypeButtonState1:           return L"button_state_1";
+        case kEmbeddedTypeButtonState2:           return L"button_state_2";
+        case kEmbeddedTypeKernelLog:              return L"kernel_log";
+        case kEmbeddedTypeSensorRecoveryReason:   return L"sensor_recovery_reason";
+        case kEmbeddedTypeSksLockStateUpdate:     return L"sks_lock_state_update";
+        case kEmbeddedTypeMatchEvent:             return L"match_event";
+        case kEmbeddedTypeAccessoryListChange:    return L"accessory_list_change";
+        case kEmbeddedTypeSensorInitTemplateSync: return L"sensor_init_template_sync";
+        case kEmbeddedTypeDeviceAuthRequired:     return L"device_auth_required";
+        case kEmbeddedTypeAccessoryImageInfo:     return L"accessory_image_info";
+        case kEmbeddedTypeMesaHardwarePassReport: return L"mesa_hardware_pass_report";
+        default:                                  return L"unknown";
+    }
+}
+
+const wchar_t* StatusOrdinalHypothesis(uint32_t ordinal) {
+    // NOT VERIFIED FROM SOURCE FOR THIS PATH - HYPOTHESIS ONLY. This table
+    // comes from t2-touchid-linux's "Enrollment event-flow conformance
+    // matrix" (enrollment_research/FINDINGS.md), which is explicitly
+    // decompiled from BKEnrollOperation - the ENROLLMENT class - not from
+    // BKMatchOperation/verification. It is being applied here to a verify
+    // session's 0xE3FF8001 ordinals only because the two operations
+    // appear to share the same low-level envelope/ordinal wire format for
+    // sensor-level feedback (finger presence, capture rejection) - that
+    // sharing itself is NOT independently confirmed. Treat every string
+    // this returns as a labeled guess for a human reading the log, never
+    // as a value this project's own match/no-match decision depends on -
+    // MatchResult.cpp's fail-closed UUID scan remains the only outcome
+    // source. Returns nullptr for ordinals with no enrollment-side meaning
+    // to hypothesize from at all.
+    switch (ordinal) {
+        case 63: return L"HYPOTHESIS(enrollment-sourced): finger-present feedback";
+        case 64: return L"HYPOTHESIS(enrollment-sourced): finger-removed/waiting feedback";
+        case 66: return L"HYPOTHESIS(enrollment-sourced): cancelled-terminal";
+        case 67: return L"HYPOTHESIS(enrollment-sourced): generic-failure-terminal";
+        case 68: return L"HYPOTHESIS(enrollment-sourced): timeout-terminal";
+        case 70: return L"HYPOTHESIS(enrollment-sourced): continue-without-new-progress";
+        case 74: return L"HYPOTHESIS(enrollment-sourced): waiting-for-finger-removal";
+        case 78: case 85: case 87: case 88: case 98:
+            return L"HYPOTHESIS(enrollment-sourced): rejected-capture feedback (retry)";
+        case 86: return L"HYPOTHESIS(enrollment-sourced): rejected-small-coverage feedback";
+        case 93: return L"HYPOTHESIS(enrollment-sourced): dirty-sensor advisory";
+        default:
+            if (ordinal >= 100 && ordinal <= 355) {
+                return L"HYPOTHESIS(enrollment-sourced): progress ordinal (100..355 range)";
+            }
+            return nullptr; // no enrollment-side meaning to hypothesize (includes the
+                             // documented no-op ranges 0..50/52..57/59/69/71..73/75..77/
+                             // 79/81..84/89..92/94..97/356..500/503..UINT32_MAX)
+    }
+}
+
 // Constant-time compare: always touches all 16 bytes regardless of where
 // (or whether) a mismatch occurs, so timing does not leak which byte of a
 // candidate UUID differed from the enrolled UUID.

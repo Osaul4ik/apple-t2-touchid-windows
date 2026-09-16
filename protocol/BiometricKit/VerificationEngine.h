@@ -20,7 +20,22 @@ enum class VerifyOutcome {
 
 struct VerifyConfig {
     uint32_t macosUserId = 501;              // configurable, NOT hardcoded per Milestone 1 §6 finding
-    std::chrono::seconds matchWindow{10};
+    // VERIFIED FROM SOURCE: t2-fprintd.py's own argparse default for
+    // --match-seconds is 20.0 (main(), "--match-seconds", type=float,
+    // default=20.0), and _run_probe() never overrides it for a normal
+    // verify() call - so every real verification on the reference
+    // implementation runs with a 20s window, not 10s. This value was
+    // previously an unverified placeholder (nothing in docs/ ever cited a
+    // source for "10"). A 16.09.2026 hardware capture (3 back-to-back
+    // `verify` runs, all timing out with only status/statistics events)
+    // cut off at almost exactly 10s elapsed in every run - consistent with
+    // this mismatch ending the match window, and the client's own Cancel
+    // (cmd 0x0c), before SEP's normal idle/poll cycle for that session
+    // would have run its course on real macOS. Still cannot rule out "no
+    // finger was on the sensor during the window" as an independent or
+    // additional cause - this fix addresses a real, source-verified
+    // discrepancy, not a confirmed root cause.
+    std::chrono::seconds matchWindow{20};
     std::chrono::milliseconds ioTimeout{5000};
 };
 
