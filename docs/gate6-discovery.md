@@ -136,7 +136,7 @@ First real-hardware confirmation of both Phase 2 (RemoteXPC service
 discovery) and Gate 7 phase 1 (live BridgeXpc HELO + getBridgeVersion) —
 see the sections above.
 
-### Fourth run (16.09.2026) — 49197 turned out to be a decoy; walk order reversed
+### Fourth run (16.09.2026) — 49197 turned out to be a decoy; walk order reversed, then FALSIFIED and reverted
 
 Follow-up `t2touchid.exe identities` against the port found above (49197)
 got all the way through `getBridgeVersion` / `setClientVersion` / reset /
@@ -153,10 +153,21 @@ and returned on the first candidate whose peer record advertised
 `Services["com.apple.eos.BiometricKit"]`, which was apparently a
 low-numbered decoy reporting 49197 rather than the real channel. Changed
 the walk to go from the end of the candidate list backward (highest port
-first), so 59602-like high-numbered candidates are tried before any
-low-numbered ones. **Not yet re-verified on hardware** — next `network`/
-`identities` run should confirm the walk now lands on 59602 and that
-`identities` gets past FDR calibration this time.
+first), on the theory that 59602-like high-numbered candidates should be
+tried before low-numbered ones.
+
+**Re-verified and FALSIFIED.** A follow-up capture reported the same
+BiometricKit port (49252) both when 59602 was the sole scanned candidate
+and when the full 21-candidate scan ran — i.e. the advertised port is a
+boot-scoped dynamic/ephemeral value, unrelated to scan order or which
+candidate is highest-numbered. 59602 was just a control-channel candidate
+that happened to be the top of the range on that particular boot, not "the"
+BiometricKit port on any boot. `DiscoverServicePort` has been reverted to
+plain ascending order — first candidate whose peer record advertises the
+service wins — matching `discover-biometric-port.py`'s own
+`discover_rsd_ports()` exactly (VERIFIED FROM SOURCE). No port-ordering
+heuristic exists in the Linux reference.
+
 
 A separate, still-open question: an unqualified `t2touchid.exe network`
 (no `--host`) reportedly produced different output on a later run than

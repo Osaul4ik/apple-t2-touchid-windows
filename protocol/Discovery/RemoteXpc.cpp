@@ -670,27 +670,25 @@ DiscoveredService DiscoverServicePort(const NcmEndpoint& endpoint,
                                        const std::string& serviceName,
                                        std::chrono::milliseconds perPortTimeout) {
     DiscoveredService result;
-    // Real-hardware finding (16.09.2026, reported by project owner): walking
-    // candidatePorts ascending (its natural sorted order - see
-    // ScanHttp2Preface) matched Services["com.apple.eos.BiometricKit"] on a
-    // low-numbered candidate and returned port 49197; a follow-up
-    // `identities` run against that port got through getBridgeVersion/
-    // setClientVersion/reset/cancel but failed at FDR calibration (a
-    // BiometricKit-specific bridge method), suggesting 49197 answers as a
-    // generic BridgeXPC-family service but is not actually BiometricKit's
-    // channel. A separate scan targeted directly at the peer link-local
-    // found exactly one HTTP/2 candidate on this hardware: port 59602, at
-    // the top of the range - which the reporter also identifies as the
-    // known-correct port on the Linux reference driver for this same T2.
-    // Walking candidatePorts from the end (highest port first) prefers
-    // 59602-like high-numbered candidates over low-numbered ones before
-    // accepting a match, on the working theory that the low-numbered
-    // decoys are answering with a stale/shared Services entry rather than
-    // BiometricKit's own. This is a user-observation-driven ordering
-    // change, not re-derived from source - it needs re-running `network`/
-    // `identities` on real hardware to confirm the walk now lands on
-    // 59602 and that `identities` gets past FDR calibration.
-    for (auto it = candidatePorts.rbegin(); it != candidatePorts.rend(); ++it) {
+    // REVERTED (16.09.2026): the descending ("highest port first") walk
+    // below was a user-observation-driven heuristic, explicitly marked at
+    // the time as "not re-derived from source" and pending re-verification.
+    // That re-verification happened and falsified it: a follow-up capture
+    // showed the same BiometricKit port (49252) reported both when port
+    // 59602 was the sole scanned candidate AND when the full 21-candidate
+    // ascending scan ran — i.e. the port bridgeOS actually advertises in
+    // its peer record's Services dict is a boot-scoped dynamic value,
+    // independent of which candidate is probed first or in which order.
+    // 59602 was a control-channel candidate that happened to be highest on
+    // one specific boot, not "the" BiometricKit port on any boot. This walk
+    // is now plain ascending (ports.begin() -> ports.end(), first match
+    // wins), matching discover-biometric-port.py's own discover_rsd_ports()
+    // exactly (VERIFIED FROM SOURCE: `for port in
+    // range(FIRST_DYNAMIC_PORT, LAST_DYNAMIC_PORT + 1)`, returning on the
+    // first peer record whose Services dict contains the target service
+    // name) — no port-ordering heuristic exists in the Linux reference at
+    // all, so this driver should not carry one either.
+    for (auto it = candidatePorts.begin(); it != candidatePorts.end(); ++it) {
         uint16_t port = *it;
         RemoteXpcConnection conn;
         if (conn.Connect(endpoint, port, perPortTimeout) != RemoteXpcResult::Ok) {

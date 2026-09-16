@@ -47,19 +47,20 @@ struct VerifyConfig {
     std::chrono::seconds matchWindow{20};
     std::chrono::milliseconds ioTimeout{5000};
 
-    // docs/ macos-verified.md §3, §7 (16.09.2026, same physical machine/
-    // firmware): macOS itself puts exactly 68 bytes on the wire for
-    // StartMatch with 3 identities (MatchOptionsV1 8B + N*IdentityRecordV1
-    // 20B, no count field) — InlineIdentities reproduces that byte-for-byte.
-    // A second hardware capture with this layout landed correctly on the
-    // wire (confirmed: "inner=76B" = 8B BM header + 68B payload) but showed
-    // a bit-identical failure shape to the 132-byte LegacyCounted form —
-    // §7's own conclusion is explicit: "the StartMatch payload content/size
-    // is not what gates image capture... the fix in section 3 is still
-    // correct... and stays in place". LegacyCounted (132B, count+records) is
-    // the pre-macOS-capture Linux-derived form, verified WRONG for this
-    // firmware — kept only as an explicit A/B variant, never the default.
-    MatchIdentityLayout matchLayout = MatchIdentityLayout::InlineIdentities; // macOS-verified default
+    // REVERTED (16.09.2026): defaulted to InlineIdentities (68B, no count)
+    // on the strength of the same macOS unified-log capture already
+    // discredited above (the pre-match sequence and skipResetSensor/
+    // skipLoadCalibration derived from it). The comment this replaces
+    // already records that this WAS A/B tested on real hardware against
+    // LegacyCounted and the two produced "a bit-identical failure shape" —
+    // i.e. switching does not reopen a previously-ruled-out cause, it just
+    // stops preferring the macOS-shaped payload over Linux's own. Default
+    // is now LegacyCounted (132B: 68-byte options + uint32 count + N*20B
+    // records), matching bridge-xpc-probe.py's own default exactly
+    // (VERIFIED FROM SOURCE: `--identity-blob-format` argparse default is
+    // `"counted"`). InlineIdentities/PaddedNoIdentities remain available via
+    // --match-layout for explicit A/B, now as the non-default variants.
+    MatchIdentityLayout matchLayout = MatchIdentityLayout::LegacyCounted; // Linux-verified default
 
     // MatchInitDataV1 / MatchOptionsV1 flags field. Linux probe default is 0;
     // its help text notes "use 1 for an unlock match". Keep 0 as default to

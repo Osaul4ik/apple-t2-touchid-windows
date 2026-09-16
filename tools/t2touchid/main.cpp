@@ -772,10 +772,9 @@ int wmain(int argc, wchar_t* argv[]) {
         std::wcout << L"  identities [ifIndex] [--host fe80::...] [--uid N]\n";
         std::wcout << L"  warmup     [ifIndex] [--host fe80::...] [--uid N]\n";
         std::wcout << L"  verify     [ifIndex] [--host fe80::...] [--uid N] [--seconds N]\n"
-                      L"             [--match-layout inline|padded|legacy]\n"
+                      L"             [--match-layout inline|padded|legacy]  (default: legacy)\n"
                       L"             [--match-flags N]  (0=default, 1=unlock match per Linux)\n"
-                      L"             [--no-reset-sensor] [--no-load-calibration]\n"
-                      L"               (macOS live path never issues cmd 2 / 0x20)\n";
+                      L"             [--no-reset-sensor] [--no-load-calibration]  (both ON by default, Linux parity)\n";
         std::wcout << L"  --verbose/-v (or env T2TOUCHID_VERBOSE=1): print step-by-step\n";
         std::wcout << L"    BridgeXPC diagnostics to the console. Always available in\n";
         std::wcout << L"    DebugView (run as Administrator, Capture Global Win32) even\n";
