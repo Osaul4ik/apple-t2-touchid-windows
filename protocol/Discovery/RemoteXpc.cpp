@@ -248,8 +248,8 @@ std::vector<uint8_t> XpcObject::Encode() const {
                     break;
                 case Kind::Bool:
                     PutU32LE(out, kTypeBool);
-                    out.push_back(obj.boolValue ? 1 : 0);
-                    out.push_back(0); out.push_back(0); out.push_back(0);
+                    out.push_back(static_cast<uint8_t>(obj.boolValue ? 1 : 0));
+                    out.push_back(static_cast<uint8_t>(0)); out.push_back(static_cast<uint8_t>(0)); out.push_back(static_cast<uint8_t>(0));
                     break;
                 case Kind::Int64:
                     PutU32LE(out, kTypeInt64);
@@ -271,8 +271,8 @@ std::vector<uint8_t> XpcObject::Encode() const {
                     uint32_t l = static_cast<uint32_t>(obj.stringValue.size() + 1);
                     PutU32LE(out, l);
                     out.insert(out.end(), obj.stringValue.begin(), obj.stringValue.end());
-                    out.push_back(0);
-                    for (size_t i = 0; i < Padding(l); ++i) out.push_back(0);
+                    out.push_back(static_cast<uint8_t>(0));
+                    for (size_t i = 0; i < Padding(l); ++i) out.push_back(static_cast<uint8_t>(0));
                     break;
                 }
                 case Kind::Data: {
@@ -280,7 +280,7 @@ std::vector<uint8_t> XpcObject::Encode() const {
                     uint32_t l = static_cast<uint32_t>(obj.dataValue.size());
                     PutU32LE(out, l);
                     out.insert(out.end(), obj.dataValue.begin(), obj.dataValue.end());
-                    for (size_t i = 0; i < Padding(l); ++i) out.push_back(0);
+                    for (size_t i = 0; i < Padding(l); ++i) out.push_back(static_cast<uint8_t>(0));
                     break;
                 }
                 case Kind::Uuid:
@@ -303,8 +303,8 @@ std::vector<uint8_t> XpcObject::Encode() const {
                     for (const auto& kv : obj.dictValue) {
                         uint32_t klen = static_cast<uint32_t>(kv.first.size() + 1);
                         content.insert(content.end(), kv.first.begin(), kv.first.end());
-                        content.push_back(0);
-                        for (size_t i = 0; i < Padding(klen); ++i) content.push_back(0);
+                        content.push_back(static_cast<uint8_t>(0));
+                        for (size_t i = 0; i < Padding(klen); ++i) content.push_back(static_cast<uint8_t>(0));
                         Run(kv.second, content);
                     }
                     PutU32LE(out, static_cast<uint32_t>(content.size()));
@@ -580,7 +580,9 @@ RemoteXpcResult RemoteXpcConnection::FetchPeerRecord(std::chrono::milliseconds t
     auto deadline = std::chrono::steady_clock::now() + timeout;
 
     // --- do_handshake() ---------------------------------------------------
-    if (!SendSettings({{0x0003, 100}, {0x0004, 1048576}}, /*stream*/ 0, /*flags*/ 0x00)) {
+    if (!SendSettings({{static_cast<uint16_t>(0x0003), static_cast<uint32_t>(100)},
+                       {static_cast<uint16_t>(0x0004), static_cast<uint32_t>(1048576)}},
+                      /*stream*/ 0, /*flags*/ 0x00)) {
         return RemoteXpcResult::HandshakeIoFailed;
     }
     if (!SendWindowUpdate(983041, /*stream*/ 0)) {
