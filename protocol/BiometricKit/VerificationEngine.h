@@ -44,20 +44,25 @@ struct VerifyConfig {
     std::chrono::seconds matchWindow{20};
     std::chrono::milliseconds ioTimeout{5000};
 
-    // Wire format of the start-match payload. The Linux reference
-    // currently defaults its selected identity blob to "counted":
-    //   68-byte MatchOptionsV1
-    //   + uint32 selected-record count
-    //   + N * 20-byte IdentityRecordV1
-    // For three identities this is 132 bytes of biometric-command data
-    // (140 bytes including the 8-byte BM header).
+    // Wire format of the start-match payload.
     //
-    // IMPORTANT: a separate macOS capture on the Windows test machine showed
-    // a 68-byte start-match payload, so the 68-byte InlineIdentities and
-    // PaddedNoIdentities variants remain available explicitly for A/B tests.
-    // The default is deliberately switched to Linux parity so the next run
-    // tests the one known wire-visible difference that has not yet been tried.
-    MatchIdentityLayout matchLayout = MatchIdentityLayout::LegacyCounted;
+    // macOS capture on this exact machine (bridgeOS 23P5067, uid 501,
+    // 3 enrolled identities) shows:
+    //   performCommand:version:inValue:inData:inSize: 4 1 0 <ptr> 68
+    // i.e. the whole inner payload of cmd 4 is 68 bytes =
+    //   MatchOptionsV1 (8 B) + N * IdentityRecordV1 (20 B each).
+    //
+    // Linux (bridge-xpc-probe.py default "counted") appends an extra
+    // uint32 count + records after a 68-byte MatchInitDataV1, producing
+    // 132 B for N=3. That form is kept as MatchIdentityLayout::LegacyCounted
+    // for regression / A/B only.
+    //
+    // Hardware A/B on Windows already showed that switching 132→68 alone
+    // does not unlock the image pipeline (still no 55/72/95). The default
+    // is therefore the macOS-verified 68-byte InlineIdentities form so the
+    // next run starts from the wire format that the SEP actually accepts
+    // on this firmware, not the Linux-derived counted blob.
+    MatchIdentityLayout matchLayout = MatchIdentityLayout::InlineIdentities;
 };
 
 // One VerificationEngine instance == one in-flight session (Milestone 2
