@@ -46,8 +46,12 @@ driver/T2TouchIdTransport.sys — mailbox, DMA, AKS allow-list enforcement
    реальному білді, найімовірніше, зламає перше match-звернення (Linux
    reference виконує його щоразу).
 4. **RemoteXPC discovery** (`discover-biometric-port.py` еквівалент) —
-   не реалізовано в цьому Milestone; `t2touchid.exe network/verify` явно
-   повертають "not yet wired", а не фейковий OK.
+   Phase 2 реалізовано в `protocol/Discovery/RemoteXpc.{h,cpp}` і
+   під'єднано до `t2touchid.exe network` (докладніше —
+   `docs/gate6-discovery.md`), але **не перевірено на реальному
+   залізі**. `identities`/`verify` досі повертають "not yet wired" —
+   це окремий Gate 7 (жива `BridgeXpc::Connection` на знайдений порт),
+   а не фейковий OK.
 
 ## Чому так, а не "зробити вигляд, що готово"
 

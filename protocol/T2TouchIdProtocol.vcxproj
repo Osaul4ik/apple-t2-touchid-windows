@@ -65,6 +65,7 @@
     <ClCompile Include="BridgeXpc\PlistPayload.cpp" />
     <ClCompile Include="Discovery\Adapter.cpp" />
     <ClCompile Include="Discovery\PortScan.cpp" />
+    <ClCompile Include="Discovery\RemoteXpc.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="AppleKeyStore\Client.h" />
@@ -76,6 +77,7 @@
     <ClInclude Include="BridgeXpc\PlistPayload.h" />
     <ClInclude Include="Discovery\Adapter.h" />
     <ClInclude Include="Discovery\PortScan.h" />
+    <ClInclude Include="Discovery\RemoteXpc.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

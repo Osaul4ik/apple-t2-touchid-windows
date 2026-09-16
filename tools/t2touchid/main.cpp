@@ -15,11 +15,14 @@
 #include "../../protocol/AppleKeyStore/Client.h"
 #include "../../protocol/Discovery/Adapter.h"
 #include "../../protocol/Discovery/PortScan.h"
+#include "../../protocol/Discovery/RemoteXpc.h"
 #include <iostream>
 #include <string>
 #include <fstream>
 #include <limits>
 #include <conio.h>
+#include <chrono>
+#include <vector>
 
 using namespace t2::applekeystore;
 
@@ -393,8 +396,29 @@ static int CmdNetwork(int argc, wchar_t* argv[]) {
     }
     if (nHttp2 == 0) {
         std::wcout << L"note: no HTTP/2 SETTINGS yet. Confirm peer address matches Linux T2_TOUCHID_HOST.\n";
+        return 0;
+    }
+
+    // Gate 6 Phase 2 (docs/gate6-discovery.md): run the RemoteXPC handshake
+    // against each HTTP/2 candidate and look for
+    // Services["com.apple.eos.BiometricKit"]["Port"]. A candidate that
+    // completes RemoteXPC but doesn't advertise the service is a decoy,
+    // not a failure — DiscoverServicePort already treats it that way and
+    // moves on, matching discover-biometric-port.py's loop.
+    std::vector<uint16_t> candidatePorts;
+    for (const auto& h : hits) {
+        if (h.http2PrefaceOk) candidatePorts.push_back(h.port);
+    }
+    std::wcout << L"probing " << candidatePorts.size()
+               << L" RemoteXPC candidate(s) for com.apple.eos.BiometricKit...\n";
+    auto discovered = t2::discovery::DiscoverServicePort(
+        ep, candidatePorts, "com.apple.eos.BiometricKit",
+        std::chrono::milliseconds(2000));
+    if (discovered.found) {
+        std::wcout << L"BiometricKit BridgeXPC port: " << discovered.port << L"\n";
     } else {
-        std::wcout << L"next: RemoteXPC handshake for Services[com.apple.eos.BiometricKit].Port\n";
+        std::wcout << L"BiometricKit service not advertised by any candidate "
+                      L"(all decoys, or T2 is not currently offering it).\n";
     }
     return 0;
 }

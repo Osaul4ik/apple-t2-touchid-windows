@@ -31,7 +31,7 @@ hits — it does not confirm BiometricKit, and if it fires it means the
 "peer speaks first" assumption is wrong for this port range and Phase 1
 needs the active send made unconditional, not just a fallback.
 
-## Phase 2 (not implemented)
+## Phase 2 (implemented, not yet verified on hardware)
 
 Linux reference (`discover-biometric-port.py` + `pymobiledevice3`):
 
@@ -42,9 +42,36 @@ for each HTTP/2 candidate port:
     Services["com.apple.eos.BiometricKit"]["Port"]  → BridgeXPC port
 ```
 
-Decoy services accept HTTP/2 preface but reject RSD — must not be treated
-as BiometricKit. Until phase 2 exists, `network` reports HTTP/2 hits only
-and does **not** claim a BiometricKit port.
+`discover-biometric-port.py` only calls into `pymobiledevice3`'s
+`RemoteXPCConnection` — it does not itself define the wire format. Since
+`pymobiledevice3` isn't vendored in this repo, `protocol/Discovery/RemoteXpc.{h,cpp}`
+implements the wire format from a different verification source:
+jkcoxson/idevice's clean-room Rust reimplementation of the same client
+(`src/xpc/http2/{mod,frame}.rs`, `src/xpc/{mod,format}.rs`), which the
+crate's own comments describe as "ported from pymobiledevice3". See the
+header comment in `RemoteXpc.h` for exactly which pieces of that source
+map to which parts of this file.
+
+`RemoteXpcConnection` runs `do_handshake()` (SETTINGS + WINDOW_UPDATE +
+root/reply channel open) then `send_device_handshake()`, then reads one
+non-empty message off the root channel as the peer record.
+`DiscoverServicePort()` walks the HTTP/2 candidates from Phase 1/1.5 in
+order and treats any candidate that completes RemoteXPC but doesn't
+advertise `com.apple.eos.BiometricKit` as a decoy, not a failure — same
+as the Python reference's blanket `except Exception: continue`. Never
+claims a port without seeing it in a decoded `Services` dictionary.
+
+`t2touchid.exe network` now runs Phase 2 automatically against every
+Phase-1/1.5 HTTP/2 hit and prints the BiometricKit port if found.
+
+**Not yet verified on real T2 hardware** — the byte-level framing is
+implemented per the verification source above but has not been run
+against a live T2 `remoted`-equivalent yet. If it fails hardware
+verification, the two most likely culprits are (a) the non-HPACK HEADERS
+"channel open" frame not being accepted as-is by T2's HTTP/2
+implementation, or (b) `RemoteXPCVersionFlags`/`MessagingProtocolVersion`
+needing a value T2's older `remoted` build expects instead of the
+iOS-17-era one idevice sends.
 
 ## Hardware baseline (01.09.2026)
 
