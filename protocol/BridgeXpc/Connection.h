@@ -94,6 +94,12 @@ private:
     bool ReadFrame(RawFrame* out, std::chrono::milliseconds timeout);
     bool WriteFrame(FrameType type, const std::vector<uint8_t>& body);
     bool AcknowledgeEvent(const std::string& requestId);
+    // Same event-before-reply loop as SendBiometricCommand/GetFdr:
+    // ACK+queue async events, return only the matching reply envelope.
+    bool ReadUntilMatchingReply(const std::string& expectedReqId,
+                                MessageEnvelope* outEnv,
+                                std::chrono::milliseconds timeout,
+                                const wchar_t* logTag);
     std::deque<std::vector<uint8_t>> pendingEvents_;
 };
 

@@ -166,6 +166,63 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
     return ConnectResult::Ok;
 }
 
+
+bool Connection::ReadUntilMatchingReply(const std::string& expectedReqId,
+                                        MessageEnvelope* outEnv,
+                                        std::chrono::milliseconds timeout,
+                                        const wchar_t* logTag) {
+    auto deadline = std::chrono::steady_clock::now() + timeout;
+    for (;;) {
+        auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            T2_LOG(logTag, L"deadline reached waiting for reply (reqId=%s, timeout=%lldms)",
+                   Widen(expectedReqId).c_str(), static_cast<long long>(timeout.count()));
+            return false;
+        }
+        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+
+        RawFrame frame;
+        if (!ReadFrame(&frame, remaining)) {
+            T2_LOG(logTag, L"ReadFrame failed/timed out (reqId=%s, %lldms remained)",
+                   Widen(expectedReqId).c_str(), static_cast<long long>(remaining.count()));
+            return false;
+        }
+        if (frame.type != FrameType::Message) {
+            continue;
+        }
+
+        auto env = ParseMessageBody(frame.body);
+        if (!env) {
+            T2_LOG(logTag, L"ParseMessageBody failed, body=%zuB %s",
+                   frame.body.size(), HexDump(frame.body).c_str());
+            return false;
+        }
+
+        if (!env->isReply) {
+            T2_LOG(logTag, L"async event while waiting for reply (reqId=%s), event reqId=%s "
+                   L"payload=%zuB - acking and queuing",
+                   Widen(expectedReqId).c_str(), Widen(env->requestId).c_str(),
+                   env->payloadPlist.size());
+            if (!AcknowledgeEvent(env->requestId)) {
+                T2_LOG(logTag, L"AcknowledgeEvent failed for event reqId=%s",
+                       Widen(env->requestId).c_str());
+                return false;
+            }
+            pendingEvents_.push_back(std::move(env->payloadPlist));
+            continue;
+        }
+
+        if (env->requestId != expectedReqId) {
+            T2_LOG(logTag, L"ignoring stray reply (expected=%s got=%s)",
+                   Widen(expectedReqId).c_str(), Widen(env->requestId).c_str());
+            continue;
+        }
+
+        *outEnv = std::move(*env);
+        return true;
+    }
+}
+
 bool Connection::GetBridgeVersion(int64_t* outVersion, std::chrono::milliseconds timeout) {
     std::string reqId = NewRequestUuid();
     if (reqId.empty()) return false;
@@ -175,32 +232,19 @@ bool Connection::GetBridgeVersion(int64_t* outVersion, std::chrono::milliseconds
         return false;
     }
 
-    RawFrame reply;
-    if (!ReadFrame(&reply, timeout) || reply.type != FrameType::Message) {
-        T2_LOG("getBridgeVersion", L"ReadFrame failed/wrong type (reqId=%s, timeout=%lldms)",
-               Widen(reqId).c_str(), static_cast<long long>(timeout.count()));
-        return false;
-    }
-
-    auto env = ParseMessageBody(reply.body);
-    if (!env) {
-        T2_LOG("getBridgeVersion", L"ParseMessageBody failed, body=%zuB %s",
-               reply.body.size(), HexDump(reply.body).c_str());
-        return false;
-    }
-    if (env->requestId != reqId) {
-        T2_LOG("getBridgeVersion", L"requestId mismatch: sent=%s got=%s isReply=%d",
-               Widen(reqId).c_str(), Widen(env->requestId).c_str(), env->isReply ? 1 : 0);
+    // Same event-before-reply loop as SendBiometricCommand (ACK+queue).
+    MessageEnvelope env;
+    if (!ReadUntilMatchingReply(reqId, &env, timeout, L"getBridgeVersion")) {
         return false;
     }
 
     // VERIFIED FROM SOURCE: getBridgeVersion reply is [0, api_version];
     // Apple's own client rejects any other shape ("getBridgeVersion
     // failed") rather than guessing, and so do we.
-    auto ints = DecodeIntArrayPayload(env->payloadPlist);
+    auto ints = DecodeIntArrayPayload(env.payloadPlist);
     if (!ints || ints->size() != 2 || (*ints)[0] != 0) {
         T2_LOG("getBridgeVersion", L"unexpected payload shape, %zuB %s",
-               env->payloadPlist.size(), HexDump(env->payloadPlist).c_str());
+               env.payloadPlist.size(), HexDump(env.payloadPlist).c_str());
         return false;
     }
     *outVersion = (*ints)[1];
@@ -217,22 +261,8 @@ bool Connection::SetClientVersion(int64_t version, std::chrono::milliseconds tim
         return false;
     }
 
-    RawFrame reply;
-    if (!ReadFrame(&reply, timeout) || reply.type != FrameType::Message) {
-        T2_LOG("setClientVersion", L"ReadFrame failed/wrong type (reqId=%s, version=%lld)",
-               Widen(reqId).c_str(), static_cast<long long>(version));
-        return false;
-    }
-
-    auto env = ParseMessageBody(reply.body);
-    if (!env) {
-        T2_LOG("setClientVersion", L"ParseMessageBody failed, body=%zuB %s",
-               reply.body.size(), HexDump(reply.body).c_str());
-        return false;
-    }
-    if (env->requestId != reqId) {
-        T2_LOG("setClientVersion", L"requestId mismatch: sent=%s got=%s isReply=%d",
-               Widen(reqId).c_str(), Widen(env->requestId).c_str(), env->isReply ? 1 : 0);
+    MessageEnvelope env;
+    if (!ReadUntilMatchingReply(reqId, &env, timeout, L"setClientVersion")) {
         return false;
     }
 

@@ -365,7 +365,7 @@ static int CmdNetwork(int argc, wchar_t* argv[]) {
     }
     ScanOptions opt;
     opt.concurrency = 64;
-    opt.connectTimeoutMs = 10;  // ~1ms observed RTT; 150ms was overkill for this link
+    opt.connectTimeoutMs = 25;  // 10ms was flaky under concurrent scan load
     opt.includeTcpOnly = true;
     opt.onProgress = [](unsigned tried, unsigned total, unsigned tcp, unsigned http2) {
         std::wcout << L"  scanned " << tried << L"/" << total
@@ -534,26 +534,33 @@ static bool DiscoverBiometricKitBridge(int argc, wchar_t* argv[], int firstArgIn
         return false;
     }
 
+    // Discovery race: a single 10ms full-port scan is flaky under USB NCM
+    // jitter — `network` can find the port, then `identities` immediately
+    // after reports "no HTTP/2 candidates". Retry with longer timeouts.
     ScanOptions opt;
     opt.concurrency = 64;
-    // BUG FIX: this was 4ms, well under the 10ms that `network`'s own
-    // scan (CmdNetwork, same link, same probe) uses and has verified on
-    // real hardware. On a USB NCM link ~1ms RTT is typical but not
-    // guaranteed every probe — 4ms left too many of the 64 concurrent
-    // connect()s timing out before SETTINGS arrived, which is why
-    // `identities`/`verify` intermittently reported "no HTTP/2
-    // candidates" right after `network` had just found 7. Match the
-    // proven value instead of re-guessing a smaller one.
-    opt.connectTimeoutMs = 10;
     opt.includeTcpOnly = true;
-    auto hits = ScanHttp2Preface(ep, opt);
-
     std::vector<uint16_t> candidatePorts;
-    for (const auto& h : hits) {
-        if (h.http2PrefaceOk) candidatePorts.push_back(h.port);
+    const unsigned timeoutsMs[] = {25, 50, 100};
+    for (unsigned attempt = 0; attempt < 3; ++attempt) {
+        opt.connectTimeoutMs = timeoutsMs[attempt];
+        auto hits = ScanHttp2Preface(ep, opt);
+        candidatePorts.clear();
+        for (const auto& h : hits) {
+            if (h.http2PrefaceOk) candidatePorts.push_back(h.port);
+        }
+        if (!candidatePorts.empty()) {
+            if (attempt > 0) {
+                std::wcout << L"HTTP/2 candidates found on retry " << (attempt + 1)
+                           << L" (timeout " << opt.connectTimeoutMs << L"ms)\n";
+            }
+            break;
+        }
+        std::wcout << L"no HTTP/2 candidates (attempt " << (attempt + 1)
+                   << L", timeout " << opt.connectTimeoutMs << L"ms) — retrying...\n";
     }
     if (candidatePorts.empty()) {
-        std::wcout << L"no HTTP/2 candidates on peer - run 'network' for full diagnostics.\n";
+        std::wcout << L"no HTTP/2 candidates on peer after retries - run 'network' for full diagnostics.\n";
         return false;
     }
 
