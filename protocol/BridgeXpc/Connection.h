@@ -64,9 +64,12 @@ public:
                                std::vector<uint8_t>* outReply,
                                std::chrono::milliseconds timeout);
 
-    // Blocking receive loop used during an active match session: returns
-    // async bridge-side events (already acknowledged internally) until
-    // either a match_result-shaped event arrives or the deadline passes.
+    // Blocking receive loop used during an active match session. First
+    // drains any event already retained in pendingEvents_ (acked while
+    // GetFdrCalibration/SendBiometricCommand were waiting on an earlier
+    // command's reply, per the Linux-parity note above) before blocking on
+    // a fresh ReadFrame; either way the returned payload is already
+    // acknowledged and the caller decides whether it is match_result-shaped.
     // false on timeout, malformed frame, or connection loss — the caller
     // (BiometricKit verify engine) must treat false as fail-closed, never
     // as an implicit NO_MATCH signal by itself (see MatchResult.h).

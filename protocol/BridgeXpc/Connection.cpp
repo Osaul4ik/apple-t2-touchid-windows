@@ -41,6 +41,11 @@ void Connection::Close() {
         closesocket(socket_);
         socket_ = INVALID_SOCKET;
     }
+    // Defensive only: this class is one-connection-per-verification-attempt
+    // (see the class comment) and is expected to be discarded after Close(),
+    // never reused, so there should be no queued events left to leak into a
+    // next session. Clearing anyway costs nothing and removes any doubt.
+    pendingEvents_.clear();
 }
 
 static bool SetSocketTimeout(SOCKET s, int optname, std::chrono::milliseconds timeout) {
@@ -313,7 +318,7 @@ bool Connection::SendBiometricCommand(const std::vector<uint8_t>& innerBmMessage
             // ones seen here in practice, 131-167B) print in full instead
             // of "..."-truncated at a third of their length.
             T2_LOG("sendBiometricCommand", L"async event while waiting for reply "
-                   "(reqId=%s), event reqId=%s payload=%zuB %s - acking and continuing",
+                   "(reqId=%s), event reqId=%s payload=%zuB %s - acking and queuing",
                    Widen(reqId).c_str(), Widen(env->requestId).c_str(),
                    env->payloadPlist.size(), HexDump(env->payloadPlist, 512).c_str());
             if (!AcknowledgeEvent(env->requestId)) {
@@ -321,6 +326,20 @@ bool Connection::SendBiometricCommand(const std::vector<uint8_t>& innerBmMessage
                        "event reqId=%s", Widen(env->requestId).c_str());
                 return false;
             }
+            // LINUX PARITY FIX: the Linux reference (t2_bridge_wire.py's
+            // request_with_events(), which biometric_command() wraps
+            // directly) does not discard events seen while waiting for a
+            // command reply - it appends them to a list and hands that
+            // list back to the caller alongside the reply. Dropping them
+            // here (as this used to do) silently loses any status,
+            // statistics, or match_result event that happens to race a
+            // command's reply - e.g. StartMatch's own reply - which is
+            // exactly the failure mode WaitForEvent's caller
+            // (VerificationEngine::Verify) cannot see or recover from.
+            // Retain in pendingEvents_ (already acked, per protocol) so
+            // WaitForEvent() can still deliver it to the match-session
+            // loop in receipt order.
+            pendingEvents_.push_back(std::move(env->payloadPlist));
             continue;
         }
 
@@ -420,7 +439,7 @@ bool Connection::GetFdrCalibration(std::vector<uint8_t>* outBlob, std::chrono::m
 
         if (!env->isReply) {
             T2_LOG("getFdrCalibration", L"async event while waiting for reply "
-                   "(reqId=%s), event reqId=%s payload=%zuB - acking and continuing",
+                   "(reqId=%s), event reqId=%s payload=%zuB - acking and queuing",
                    Widen(reqId).c_str(), Widen(env->requestId).c_str(),
                    env->payloadPlist.size());
             if (!AcknowledgeEvent(env->requestId)) {
@@ -428,6 +447,15 @@ bool Connection::GetFdrCalibration(std::vector<uint8_t>* outBlob, std::chrono::m
                        Widen(env->requestId).c_str());
                 return false;
             }
+            // LINUX PARITY FIX (same rationale as SendBiometricCommand
+            // below): request_with_events(sock, [11]) - the exact call
+            // --load-calibration uses - returns events seen while waiting
+            // for method 11's reply to the caller instead of discarding
+            // them. LoadCalibration runs before StartMatch in every verify
+            // session (see VerificationEngine::Verify), so any event lost
+            // here is lost before the match-session event loop even
+            // starts. Retain (already acked) for WaitForEvent() to drain.
+            pendingEvents_.push_back(std::move(env->payloadPlist));
             continue;
         }
 
@@ -458,6 +486,23 @@ bool Connection::GetFdrCalibration(std::vector<uint8_t>* outBlob, std::chrono::m
 bool Connection::WaitForEvent(std::vector<uint8_t>* outEventPayload,
                                std::chrono::steady_clock::time_point deadline) {
     for (;;) {
+        // LINUX PARITY FIX: drain events already observed (and acked) by
+        // SendBiometricCommand/GetFdrCalibration before blocking on a new
+        // ReadFrame. This is what actually closes the parity gap with the
+        // Linux reference: request_with_events() hands its caller every
+        // event seen while waiting for a command reply, in receipt order,
+        // ahead of anything read afterward. Delivering a queued event
+        // costs no wire I/O, so it is not subject to the deadline check
+        // below - a StartMatch reply race should not let its own
+        // already-acked events be silently timed out by the caller.
+        if (!pendingEvents_.empty()) {
+            *outEventPayload = std::move(pendingEvents_.front());
+            pendingEvents_.pop_front();
+            T2_LOG("waitForEvent", L"delivering queued event, payload=%zuB, "
+                   "%zu still queued", outEventPayload->size(), pendingEvents_.size());
+            return true;
+        }
+
         auto now = std::chrono::steady_clock::now();
         if (now >= deadline) {
             T2_LOG("waitForEvent", L"deadline reached, giving up");
