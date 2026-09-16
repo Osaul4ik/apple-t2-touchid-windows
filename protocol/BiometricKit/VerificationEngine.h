@@ -16,6 +16,11 @@ enum class VerifyOutcome {
     RejectedByDevice,     // start-match command itself was rejected (word[0]!=0) — never silent success
     Malformed,
     Busy,                 // Milestone 2 §23: only one active session allowed
+    NoImageCaptured,      // finger was detected (FingerOn/FingerOff) but the SEP never
+                          // reported ImageCaptured/ImageForProcessing/ImageWasAccepted —
+                          // the sensor sees the finger and never scans it. Distinct from
+                          // Timeout (= nothing happened at all) on purpose: these two have
+                          // completely different causes and used to be indistinguishable.
 };
 
 struct VerifyConfig {
@@ -37,6 +42,23 @@ struct VerifyConfig {
     // discrepancy, not a confirmed root cause.
     std::chrono::seconds matchWindow{20};
     std::chrono::milliseconds ioTimeout{5000};
+
+    // 16.09.2026 macOS reference capture: across four minutes of live
+    // Touch ID activity (including two successful unlocks) biometrickitd
+    // issues commands 4, 12, 39, 40, 44, 46, 48, 56, 61, 62, 63, 74, 80
+    // and 84 — and NEVER command 2 (ResetSensor) or command 0x20
+    // (LoadCalibration). Both were being sent by this project before every
+    // match on the strength of the Linux reference alone, whose firmware
+    // the project's own README notes is not the same. On the failing
+    // Windows capture the SEP answers the calibration load with an
+    // unnamed status_code=94 and then rejects every subsequent capture, so
+    // these two are now opt-in rather than unconditional. Turn them back
+    // on to A/B the old behaviour, not because the protocol needs them.
+    bool resetSensor = false;
+    bool loadCalibration = false;
+
+    // Wire format of the start-match payload. See MatchIdentityLayout.
+    MatchIdentityLayout matchLayout = MatchIdentityLayout::InlineIdentities;
 };
 
 // One VerificationEngine instance == one in-flight session (Milestone 2

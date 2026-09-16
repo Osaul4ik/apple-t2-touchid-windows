@@ -10,8 +10,11 @@
 #include "../protocol/BridgeXpc/Frame.h"
 #include "../protocol/BridgeXpc/PlistPayload.h"
 #include "../protocol/BiometricKit/MatchResult.h"
+#include "../protocol/BiometricKit/Commands.h"
 #include <iostream>
 #include <cstring>
+#include <string>
+#include <vector>
 #include <cassert>
 
 using namespace t2;
@@ -209,6 +212,77 @@ static void TestPlistPayload_MalformedTopLevelRejected() {
     CHECK(!env.has_value());
 }
 
+// ---------------------------------------------------------------------------
+// start-match payload layout (16.09.2026 macOS-capture regression tests)
+// ---------------------------------------------------------------------------
+
+static std::vector<biometrickit::IdentityRecordV1> ThreeIdentities() {
+    std::vector<biometrickit::IdentityRecordV1> ids(3);
+    for (size_t i = 0; i < ids.size(); i++) {
+        ids[i].userId = 501;
+        ids[i].uuid.fill(static_cast<uint8_t>(0xA0 + i));
+    }
+    return ids;
+}
+
+static void TestMatchPayload_InlineMatchesMacOsSize() {
+    // macOS biometrickitd on the target machine (3 enrolled identities):
+    //   performCommand ... 4 1 0 <ptr> 68
+    auto payload = biometrickit::EncodeMatchInitData(
+        0, 501, ThreeIdentities(), biometrickit::MatchIdentityLayout::InlineIdentities);
+    CHECK(payload.size() == 68);
+
+    // header is flags|userId, then the records verbatim - no count word.
+    uint32_t flags = 0xFFFFFFFF, uid = 0;
+    std::memcpy(&flags, payload.data(), 4);
+    std::memcpy(&uid, payload.data() + 4, 4);
+    CHECK(flags == 0);
+    CHECK(uid == 501);
+    CHECK(payload[8 + 0] == 0xF5); // first record's userId (501) low byte
+    CHECK(payload[8 + 4] == 0xA0); // first record's uuid[0]
+    CHECK(payload[8 + 20 + 4] == 0xA1);
+}
+
+static void TestMatchPayload_PaddedIsAlsoSixtyEight() {
+    auto payload = biometrickit::EncodeMatchInitData(
+        0, 501, ThreeIdentities(), biometrickit::MatchIdentityLayout::PaddedNoIdentities);
+    CHECK(payload.size() == 68);
+}
+
+static void TestMatchPayload_LegacyIsTheOldOneHundredThirtyTwo() {
+    auto payload = biometrickit::EncodeMatchInitData(
+        0, 501, ThreeIdentities(), biometrickit::MatchIdentityLayout::LegacyCounted);
+    CHECK(payload.size() == 132); // what the failing hardware capture shows
+}
+
+static void TestStatusCodeNames_FromMacOsCapture() {
+    CHECK(std::wstring(biometrickit::StatusCodeName(55)) == L"ImageCaptured");
+    CHECK(std::wstring(biometrickit::StatusCodeName(63)) == L"FingerOn");
+    CHECK(std::wstring(biometrickit::StatusCodeName(95)) == L"ImageWasAccepted");
+    // 78 and 81 appear in the failing Windows capture and in NO successful
+    // macOS unlock - they must stay unnamed here.
+    CHECK(biometrickit::StatusCodeName(78) == nullptr);
+    CHECK(biometrickit::StatusCodeName(81) == nullptr);
+
+    CHECK(biometrickit::StatusCodeIsImagePipeline(55));
+    CHECK(biometrickit::StatusCodeIsImagePipeline(95));
+    CHECK(!biometrickit::StatusCodeIsImagePipeline(63));
+    CHECK(!biometrickit::StatusCodeIsImagePipeline(90));
+}
+
+static void TestStatisticsEventBody_DecodesTypeAndValue() {
+    // Bytes taken verbatim from the failing Windows capture:
+    // ordinal=0, length=12, type=4, value=1
+    std::vector<uint8_t> body(28, 0);
+    body[8] = 0x0c;           // payload length = 12
+    body[16] = 0x04;          // type = 4
+    body[20] = 0x01;          // value = 1
+    auto stats = biometrickit::ParseStatisticsEventBody(body);
+    CHECK(stats.type.has_value() && *stats.type == 4);
+    CHECK(stats.rawValue.has_value() && *stats.rawValue == 1);
+}
+
+
 int wmain() {
     TestFrameHeader_Valid();
     TestFrameHeader_Truncated();
@@ -229,6 +303,12 @@ int wmain() {
     TestPlistPayload_EnvelopeRoundTrip();
     TestPlistPayload_BiometricCommandShape();
     TestPlistPayload_MalformedTopLevelRejected();
+
+    TestMatchPayload_InlineMatchesMacOsSize();
+    TestMatchPayload_PaddedIsAlsoSixtyEight();
+    TestMatchPayload_LegacyIsTheOldOneHundredThirtyTwo();
+    TestStatusCodeNames_FromMacOsCapture();
+    TestStatisticsEventBody_DecodesTypeAndValue();
 
     if (g_failures == 0) {
         std::wcout << L"All tests passed.\n";

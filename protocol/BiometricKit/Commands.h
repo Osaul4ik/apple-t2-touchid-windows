@@ -28,6 +28,23 @@ struct IdentityRecordV1 {
 };
 static_assert(sizeof(uint32_t) + 16 == 20, "identity_record_v1_t must be 20 bytes");
 
+// LEGACY LAYOUT ONLY - see MatchIdentityLayout below and
+// docs/macos-verified-status-map.md section 3.
+//
+// This struct was derived from the Linux reference's "68-byte match
+// options structure". A 16.09.2026 macOS unified-log capture on the very
+// same machine (bridgeOS 23P5067, uid 501, 3 enrolled identities) shows
+// biometrickitd issuing start-match as:
+//
+//   performCommand:version:inValue:inData:inSize: 4 1 0 <ptr> 68
+//
+// i.e. the WHOLE inner payload of command 4 is 68 bytes - not 68 bytes of
+// options plus a counted identity blob (which is 68 + 4 + 3*20 = 132
+// bytes, exactly what this project was sending). 68 == 8 + 3*20 == a small
+// fixed header plus the three identity records verbatim, which also
+// explains why the Linux-derived struct appeared to carry "60 reserved
+// bytes": on a machine with three enrolled fingers those 60 bytes ARE the
+// identity array.
 struct MatchInitDataV1 {
     uint32_t flags;
     uint32_t macosUserId;
@@ -35,10 +52,39 @@ struct MatchInitDataV1 {
 };
 static_assert(sizeof(MatchInitDataV1) == 68, "match_init_data_v1_t must be 68 bytes");
 
+// Fixed header that precedes the inline identity records in the layout the
+// macOS capture shows on the wire.
+struct MatchOptionsV1 {
+    uint32_t flags;
+    uint32_t macosUserId;
+};
+static_assert(sizeof(MatchOptionsV1) == 8, "match_options_v1_t must be 8 bytes");
+
 // The selected-identities blob appended after MatchInitDataV1 starts with
 // its own uint32 record count, followed by count * IdentityRecordV1 records.
 // This is distinct from the 68-byte match options structure itself.
 #pragma pack(pop)
+
+// How the start-match (cmd 4) payload is serialized.
+//
+//  InlineIdentities    8-byte MatchOptionsV1 + N * IdentityRecordV1; no
+//                      count field, no padding. For N == 3 this is exactly
+//                      the 68-byte payload macOS sends. DEFAULT.
+//  PaddedNoIdentities  the 68-byte MatchInitDataV1 alone, identities not
+//                      sent at all. Also 68 bytes on the wire, so the
+//                      macOS capture cannot tell it apart from
+//                      InlineIdentities by size - kept as an explicitly
+//                      selectable A/B variant instead of pretending the
+//                      capture disambiguated the two.
+//  LegacyCounted       MatchInitDataV1 + uint32 count + N records. What
+//                      this project sent up to 16.09.2026 (132 bytes for
+//                      N == 3). Kept only so the regression can be
+//                      reproduced on demand.
+enum class MatchIdentityLayout {
+    InlineIdentities,
+    PaddedNoIdentities,
+    LegacyCounted,
+};
 
 constexpr uint16_t kBmMagic = 0x4D42;
 
@@ -91,7 +137,12 @@ std::vector<uint8_t> EncodeBmCommand(Command command, uint16_t version, uint16_t
 // at a sane local maximum (256) independent of any device-reported count,
 // per "never trust remote length before allocation".
 std::vector<uint8_t> EncodeMatchInitData(uint32_t flags, uint32_t macosUserId,
-                                          const std::vector<IdentityRecordV1>& identities);
+                                          const std::vector<IdentityRecordV1>& identities,
+                                          MatchIdentityLayout layout =
+                                              MatchIdentityLayout::InlineIdentities);
+
+// Diagnostic-only name for a layout, for logging the wire format actually used.
+const wchar_t* MatchIdentityLayoutName(MatchIdentityLayout layout);
 
 // Parses a raw identity-list reply body into 20-byte records. Returns false
 // (and an empty vector) on any length mismatch — never truncates silently.

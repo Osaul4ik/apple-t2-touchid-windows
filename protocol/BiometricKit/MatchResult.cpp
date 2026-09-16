@@ -89,6 +89,82 @@ const wchar_t* EmbeddedTypeName(uint32_t embeddedType) {
     }
 }
 
+const wchar_t* StatusCodeName(uint32_t statusCode) {
+    // VERIFIED (16.09.2026 macOS unified-log capture, MacBookPro T2,
+    // bridgeOS 23P5067 - the same machine and firmware the Windows client
+    // talks to). Source lines look like:
+    //   -[BiometricKitDStatistics statusMessage:]: 55 (ImageCaptured)
+    // i.e. Apple's own daemon printing the symbolic name for the ordinal
+    // carried in the 0xE3FF8001 body this project already decodes. Every
+    // entry below was observed at least twice in that capture during
+    // successful Touch ID unlocks.
+    //
+    // Reference order of a SUCCESSFUL unlock on that capture:
+    //   80 MatchingCancelled -> 89 Idle -> 90 Capture -> 63 FingerOn ->
+    //   55 ImageCaptured -> 72 ImageForProcessing -> 95 ImageWasAccepted ->
+    //   91 Pause -> 64 FingerOff -> 90 Capture -> 63 FingerOn ->
+    //   [0xE3FF8002 match_result] -> 74 RequestFingerOff ->
+    //   53 ImageQueueIsEmpty -> 91 Pause -> 73 TemplateListUpdated ->
+    //   80 MatchingCancelled -> 64 FingerOff
+    switch (statusCode) {
+        case 53: return L"ImageQueueIsEmpty";
+        case 55: return L"ImageCaptured";
+        case 63: return L"FingerOn";
+        case 64: return L"FingerOff";
+        case 72: return L"ImageForProcessing";
+        case 73: return L"TemplateListUpdated";
+        case 74: return L"RequestFingerOff";
+        case 80: return L"MatchingCancelled";
+        case 89: return L"SensorOperationModeIdle";
+        case 90: return L"SensorOperationModeCapture";
+        case 91: return L"SensorOperationModePause";
+        case 95: return L"ImageWasAccepted";
+        default: return nullptr; // ordinal not produced by the reference capture
+    }
+}
+
+bool StatusCodeIsImagePipeline(uint32_t statusCode) {
+    switch (statusCode) {
+        case 53: // ImageQueueIsEmpty
+        case 55: // ImageCaptured
+        case 72: // ImageForProcessing
+        case 73: // TemplateListUpdated
+        case 95: // ImageWasAccepted
+            return true;
+        default:
+            return false;
+    }
+}
+
+StatisticsEventBody ParseStatisticsEventBody(const std::vector<uint8_t>& eventData) {
+    // VERIFIED (same capture): biometrickitd reports a 0xE3FF8004 body of
+    // exactly 12 bytes ("MCDMExtractMessageData ... 12 ... 0xe3ff8004"),
+    // and prints it as `type` + one 8-byte value shown both as an integer
+    // and as a double. The 12 bytes start after the same
+    // kStatusEventBodyFixedFieldsBytes prefix the status body uses
+    // (ordinal:u64 + payload_length:u64), which the failing Windows
+    // capture independently confirms: its 28-byte statistics bodies decode
+    // as ordinal=0, length=12, then type/value - e.g. type 4 value 1,
+    // type 35 value 1, type 25 value 1215, type 30 value 2169, all of
+    // which fall inside the type range the macOS capture also shows.
+    StatisticsEventBody body;
+    if (eventData.size() >= kStatusEventBodyFixedFieldsBytes + 4) {
+        uint32_t type = 0;
+        std::memcpy(&type, eventData.data() + kStatusEventBodyFixedFieldsBytes, sizeof(type));
+        body.type = type;
+    }
+    if (eventData.size() >= kStatusEventBodyFixedFieldsBytes + 12) {
+        uint64_t raw = 0;
+        std::memcpy(&raw, eventData.data() + kStatusEventBodyFixedFieldsBytes + 4, sizeof(raw));
+        body.rawValue = raw;
+        double asDouble = 0.0;
+        static_assert(sizeof(double) == sizeof(uint64_t), "double must be 8 bytes");
+        std::memcpy(&asDouble, &raw, sizeof(asDouble));
+        body.asDouble = asDouble;
+    }
+    return body;
+}
+
 const wchar_t* StatusOrdinalHypothesis(uint32_t ordinal) {
     // NOT VERIFIED FROM SOURCE FOR THIS PATH - HYPOTHESIS ONLY. This table
     // comes from t2-touchid-linux's "Enrollment event-flow conformance
@@ -120,9 +196,15 @@ const wchar_t* StatusOrdinalHypothesis(uint32_t ordinal) {
             if (ordinal >= 100 && ordinal <= 355) {
                 return L"HYPOTHESIS(enrollment-sourced): progress ordinal (100..355 range)";
             }
-            return nullptr; // no enrollment-side meaning to hypothesize (includes the
-                             // documented no-op ranges 0..50/52..57/59/69/71..73/75..77/
-                             // 79/81..84/89..92/94..97/356..500/503..UINT32_MAX)
+            // No enrollment-side meaning to hypothesize. NOTE (16.09.2026):
+            // the enrollment table calls 81..84 and 94..97 "no-op" ranges,
+            // but the failing Windows capture shows the SEP emitting
+            // status_code=81 on every finger presentation, and 94 right
+            // after load-calibration - so that table's "no-op" claim does
+            // not hold for the verify path. StatusCodeName above (macOS
+            // sourced) is the authority; 78 and 81 are NOT named there,
+            // i.e. they never occur in a successful macOS unlock at all.
+            return nullptr;
     }
 }
 

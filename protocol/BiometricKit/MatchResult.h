@@ -73,6 +73,41 @@ StatusEventBody ParseStatusEventBody(const std::vector<uint8_t>& eventData);
 // diagnostic-only.
 const wchar_t* EmbeddedTypeName(uint32_t embeddedType);
 
+// VERIFIED (16.09.2026 macOS unified-log capture on the target machine:
+// `-[BiometricKitDStatistics statusMessage:]` prints Apple's own symbolic
+// name next to every ordinal biometrickitd receives on this exact wire
+// format). Unlike StatusOrdinalHypothesis below, this is NOT an
+// enrollment-sourced guess: it is the matching daemon's own naming, taken
+// from a successful Touch ID unlock on the same hardware and the same
+// bridgeOS build (23P5067) as the failing Windows session.
+// Returns nullptr for ordinals the capture never produced.
+const wchar_t* StatusCodeName(uint32_t statusCode);
+
+// True for the ordinals that only ever appear once the sensor has actually
+// produced an image and handed it to the matcher (ImageCaptured,
+// ImageForProcessing, ImageWasAccepted, ImageQueueIsEmpty,
+// TemplateListUpdated). A verify session that sees FingerOn/FingerOff but
+// none of these has a sensor that detects the finger and never scans it -
+// a materially different failure from "matcher ran and said no".
+bool StatusCodeIsImagePipeline(uint32_t statusCode);
+
+// VERIFIED (same capture): a 0xE3FF8004 statistics body is 12 bytes -
+// uint32 type followed by a uint64 value, where the value is either an
+// integer counter or the bit pattern of an IEEE-754 double, depending on
+// the type. biometrickitd logs both interpretations side by side
+// ("type 21 fixed: 4637863191261478912 floating: 116.000000"), so this
+// struct does the same rather than choosing one.
+struct StatisticsEventBody {
+    std::optional<uint32_t> type;
+    std::optional<uint64_t> rawValue;
+    std::optional<double> asDouble;
+};
+
+// eventData: the bytes AFTER the 24-byte header, for an event whose
+// embedded_type == kEmbeddedTypeStatistics. Degrades gracefully on a short
+// body, same contract as ParseStatusEventBody.
+StatisticsEventBody ParseStatisticsEventBody(const std::vector<uint8_t>& eventData);
+
 // Best-effort human-readable label for a status event's ordinal
 // (statusCode). NOT VERIFIED FROM SOURCE for the verify/match path — see
 // the "HYPOTHESIS" note in the .cpp. Returns nullptr when there is no

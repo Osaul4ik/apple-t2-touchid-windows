@@ -663,6 +663,25 @@ static int CmdVerify(int argc, wchar_t* argv[]) {
             cfg.macosUserId = static_cast<uint32_t>(_wtoi(argv[++i]));
         } else if (a == L"--seconds" && i + 1 < argc) {
             cfg.matchWindow = std::chrono::seconds(_wtoi(argv[++i]));
+        } else if (a == L"--reset-sensor") {
+            // Opt back in to the pre-16.09.2026 behaviour (cmd 2 before match).
+            cfg.resetSensor = true;
+        } else if (a == L"--load-calibration") {
+            // Opt back in to the pre-16.09.2026 behaviour (cmd 0x20 before match).
+            cfg.loadCalibration = true;
+        } else if (a == L"--match-layout" && i + 1 < argc) {
+            std::wstring layout = argv[++i];
+            if (layout == L"inline") {
+                cfg.matchLayout = MatchIdentityLayout::InlineIdentities;
+            } else if (layout == L"padded") {
+                cfg.matchLayout = MatchIdentityLayout::PaddedNoIdentities;
+            } else if (layout == L"legacy") {
+                cfg.matchLayout = MatchIdentityLayout::LegacyCounted;
+            } else {
+                std::wcout << L"unknown --match-layout '" << layout
+                           << L"' (expected inline|padded|legacy)\n";
+                return 1;
+            }
         }
     }
 
@@ -748,6 +767,13 @@ static int CmdVerify(int argc, wchar_t* argv[]) {
         case VerifyOutcome::Busy:
             std::wcout << L"verify-failed: engine busy (should not happen on a one-shot CLI call)\n";
             return 1;
+        case VerifyOutcome::NoImageCaptured:
+            std::wcout << L"verify-no-image: sensor reported the finger (FingerOn/FingerOff) but never\n"
+                          L"                 reported ImageCaptured/ImageForProcessing/ImageWasAccepted.\n"
+                          L"                 The match never got as far as comparing anything.\n"
+                          L"                 Try: --match-layout padded, then --load-calibration, "
+                       << kSeeVerboseHint;
+            return 1;
     }
     return 1;
 }
@@ -781,7 +807,8 @@ int wmain(int argc, wchar_t* argv[]) {
     if (argc < 2) {
         std::wcout << L"usage: t2touchid.exe [--verbose|-v] <status|register-ool|capabilities|device-state|load-keybag|set-system-keybag|unlock|network|identities|verify>\n";
         std::wcout << L"  identities [ifIndex] [--host fe80::...] [--uid N]\n";
-        std::wcout << L"  verify     [ifIndex] [--host fe80::...] [--uid N] [--seconds N]\n";
+        std::wcout << L"  verify     [ifIndex] [--host fe80::...] [--uid N] [--seconds N]\n"
+                      L"             [--match-layout inline|padded|legacy] [--reset-sensor] [--load-calibration]\n";
         std::wcout << L"  --verbose/-v (or env T2TOUCHID_VERBOSE=1): print step-by-step\n";
         std::wcout << L"    BridgeXPC diagnostics to the console. Always available in\n";
         std::wcout << L"    DebugView (run as Administrator, Capture Global Win32) even\n";

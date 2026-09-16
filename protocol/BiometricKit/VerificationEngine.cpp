@@ -46,9 +46,19 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     // every call on the theory that 0 was unsafe to send; that is not
     // what the reference does, so it no longer matches the verified byte
     // stream for these four fire-and-forget commands.
-    auto resetCmd = EncodeBmCommand(Command::ResetSensor, 1, 2);
-    if (!conn->SendBiometricCommand(resetCmd, 0, &reply, config_.ioTimeout)) {
-        return VerifyOutcome::TransportError;
+    //
+    // 16.09.2026: gated behind VerifyConfig::resetSensor (default off).
+    // The macOS reference capture never issues command 2 on a live
+    // connection, and a sensor reset immediately before arming a match is
+    // a plausible way to lose the sensor-side calibration state bridgeOS
+    // set up at boot.
+    if (config_.resetSensor) {
+        auto resetCmd = EncodeBmCommand(Command::ResetSensor, 1, 2);
+        if (!conn->SendBiometricCommand(resetCmd, 0, &reply, config_.ioTimeout)) {
+            return VerifyOutcome::TransportError;
+        }
+    } else {
+        T2_LOG("verify", L"skipping ResetSensor (cmd 2) - not issued by macOS reference capture");
     }
 
     // cancel any outstanding operation (cmd 12)
@@ -62,13 +72,26 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     // SOURCE; source 5 is local-macOS-filesystem-only and not applicable
     // here). This must run before every match attempt, matching the Linux
     // reference — it is not optional/skippable.
-    std::vector<uint8_t> fdrBlob;
-    if (!conn->GetFdrCalibration(&fdrBlob, config_.ioTimeout)) {
-        return VerifyOutcome::TransportError;
-    }
-    auto loadCalibrationCmd = EncodeBmCommand(Command::LoadCalibration, /*version=*/1, /*value=*/3, fdrBlob);
-    if (!conn->SendBiometricCommand(loadCalibrationCmd, 0, &reply, config_.ioTimeout)) {
-        return VerifyOutcome::TransportError;
+    //
+    // 16.09.2026 CORRECTION: "must run before every match attempt" was an
+    // inference from the Linux reference, not an observation. The macOS
+    // capture on this exact machine shows zero calibration commands across
+    // two successful unlocks - bridgeOS calibrates the sensor during its
+    // own boot and macOS never re-pushes an FDR blob per match. Meanwhile
+    // the failing Windows capture shows the SEP emitting an unnamed
+    // status_code=94 while this 61407-byte blob is being loaded, and then
+    // rejecting every image the sensor produces. Now opt-in.
+    if (config_.loadCalibration) {
+        std::vector<uint8_t> fdrBlob;
+        if (!conn->GetFdrCalibration(&fdrBlob, config_.ioTimeout)) {
+            return VerifyOutcome::TransportError;
+        }
+        auto loadCalibrationCmd = EncodeBmCommand(Command::LoadCalibration, /*version=*/1, /*value=*/3, fdrBlob);
+        if (!conn->SendBiometricCommand(loadCalibrationCmd, 0, &reply, config_.ioTimeout)) {
+            return VerifyOutcome::TransportError;
+        }
+    } else {
+        T2_LOG("verify", L"skipping LoadCalibration (cmd 0x20) - not issued by macOS reference capture");
     }
 
     // identity list (cmd 0x42)
@@ -91,7 +114,21 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
            identities.size(), reply.size());
 
     // start match (cmd 4)
-    auto matchInitData = EncodeMatchInitData(0, config_.macosUserId, identities);
+    //
+    // 16.09.2026 FIX: the payload used to be MatchInitDataV1 + uint32 count
+    // + records = 132 bytes for the 3 identities on this machine. The macOS
+    // capture shows biometrickitd sending inSize=68 for the same command on
+    // the same machine with the same 3 identities. 68 == 8 + 3*20, so the
+    // identity records go inline after an 8-byte header with no count word.
+    // Sending 132 bytes means the SEP parsed garbage where it expected the
+    // identity array, which is consistent with a match session that arms
+    // the sensor (status 90) and detects the finger (status 63) but never
+    // reaches the image/matching stage.
+    auto matchInitData = EncodeMatchInitData(0, config_.macosUserId, identities,
+                                              config_.matchLayout);
+    T2_LOG("verify", L"start match: layout=%s payload=%zuB (macOS reference for %zu identities = %zuB)",
+           MatchIdentityLayoutName(config_.matchLayout), matchInitData.size(),
+           identities.size(), sizeof(MatchOptionsV1) + identities.size() * sizeof(IdentityRecordV1));
     auto startCmd = EncodeBmCommand(Command::StartMatch, 1, 0, matchInitData);
     if (!conn->SendBiometricCommand(startCmd, 0, &reply, config_.ioTimeout)) {
         return VerifyOutcome::TransportError;
@@ -134,6 +171,13 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
 
     auto deadline = steady_clock::now() + config_.matchWindow;
     VerifyOutcome outcome = VerifyOutcome::Timeout; // default if loop exits via deadline
+
+    // Session-level evidence, used only to turn an otherwise opaque
+    // "verify-timeout" into a statement about WHERE the pipeline stopped.
+    // Never feeds the match/no-match decision.
+    bool sawFingerOn = false;
+    size_t imagePipelineEvents = 0;
+    size_t unnamedStatusEvents = 0;
 
     while (steady_clock::now() < deadline) {
         std::vector<uint8_t> eventPayload;
@@ -185,6 +229,12 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
             const wchar_t* kind = EmbeddedTypeName(embeddedType);
             if (embeddedType == kEmbeddedTypeStatus) {
                 StatusEventBody body = ParseStatusEventBody(eventData);
+                if (body.statusCode) {
+                    const uint32_t code = *body.statusCode;
+                    if (code == 63) sawFingerOn = true;
+                    if (StatusCodeIsImagePipeline(code)) imagePipelineEvents++;
+                    if (!StatusCodeName(code)) unnamedStatusEvents++;
+                }
                 // ParseStatusEventBody only decodes eventData[0:4) and
                 // [8:16) (VERIFIED FROM SOURCE - that is genuinely the
                 // reference's entire decode). Whatever status_data_length
@@ -199,9 +249,14 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
                 // near the 0xC70B match_result floor, so this cannot be
                 // printing anything UUID-shaped.
                 T2_LOG("verify",
-                       L"event_type=%s embedded_type=0x%08X body=%zuB status_code=%s status_data_length=%s ordinal_hypothesis=%s status_data=%s",
+                       L"event_type=%s embedded_type=0x%08X body=%zuB status_code=%s status_name=%s status_data_length=%s ordinal_hypothesis=%s status_data=%s",
                        kind, embeddedType, eventData.size(),
                        body.statusCode ? std::to_wstring(*body.statusCode).c_str() : L"(n/a)",
+                       body.statusCode
+                           ? (StatusCodeName(*body.statusCode)
+                                  ? StatusCodeName(*body.statusCode)
+                                  : L"(not seen in macOS reference capture)")
+                           : L"(n/a)",
                        body.statusDataLength ? std::to_wstring(*body.statusDataLength).c_str() : L"(n/a)",
                        body.statusCode
                            ? (StatusOrdinalHypothesis(*body.statusCode) ? StatusOrdinalHypothesis(*body.statusCode) : L"(no hypothesis)")
@@ -221,8 +276,21 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
                 // byte in here tracks something like a per-attempt quality
                 // score around a `status_code=78` (retry) moment — still no
                 // meaning assigned here, just the bytes for comparison.
-                T2_LOG("verify", L"event_type=%s embedded_type=0x%08X body=%zuB %s",
-                       kind, embeddedType, eventData.size(), HexDump(eventData, eventData.size()).c_str());
+                // 16.09.2026: decoded rather than raw-dumped. The macOS
+                // capture shows types 0/1/2 (IEEE-754 doubles, image
+                // quality scores ~0.02-0.14) only ever appearing once an
+                // image has actually been processed; the failing Windows
+                // capture contains types 4/25/30/35 and none of 0/1/2,
+                // which is independent confirmation that no image ever
+                // reached the matcher. Raw bytes kept alongside.
+                StatisticsEventBody stats = ParseStatisticsEventBody(eventData);
+                T2_LOG("verify",
+                       L"event_type=%s embedded_type=0x%08X body=%zuB stat_type=%s stat_value=%s stat_double=%s raw=%s",
+                       kind, embeddedType, eventData.size(),
+                       stats.type ? std::to_wstring(*stats.type).c_str() : L"(n/a)",
+                       stats.rawValue ? std::to_wstring(*stats.rawValue).c_str() : L"(n/a)",
+                       stats.asDouble ? std::to_wstring(*stats.asDouble).c_str() : L"(n/a)",
+                       HexDump(eventData, eventData.size()).c_str());
             } else {
                 // New as of 16.09.2026: previously any envelope other than
                 // status/statistics logged size-only under the generic
@@ -276,6 +344,19 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
                L"still waiting, not treated as NO_MATCH",
                eventData.size(), kMinMatchResultEventBytes);
     }
+
+    // 16.09.2026: a bare "Timeout" hid the single most informative fact a
+    // failing session has. If the SEP told us a finger was on the sensor
+    // but never once reported ImageCaptured / ImageForProcessing /
+    // ImageWasAccepted, the failure is upstream of matching entirely and
+    // no amount of waiting longer will help.
+    if (outcome == VerifyOutcome::Timeout && sawFingerOn && imagePipelineEvents == 0) {
+        outcome = VerifyOutcome::NoImageCaptured;
+    }
+    T2_LOG("verify",
+           L"session summary: finger_on=%d image_pipeline_events=%zu unnamed_status_events=%zu outcome=%d",
+           sawFingerOn ? 1 : 0, imagePipelineEvents, unnamedStatusEvents,
+           static_cast<int>(outcome));
 
     // Cancel runs unconditionally via cancelGuard's destructor as this
     // function returns, matching Linux reference behavior (Milestone 1 §2)

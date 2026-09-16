@@ -23,16 +23,45 @@ std::vector<uint8_t> EncodeBmCommand(Command command, uint16_t version, uint16_t
 }
 
 std::vector<uint8_t> EncodeMatchInitData(uint32_t flags, uint32_t macosUserId,
-                                          const std::vector<IdentityRecordV1>& identities) {
+                                          const std::vector<IdentityRecordV1>& identities,
+                                          MatchIdentityLayout layout) {
     size_t count = identities.size();
     if (count > kMaxLocalIdentities) {
         count = kMaxLocalIdentities; // never send more than sane local cap
+    }
+
+    // VERIFIED (16.09.2026 macOS unified-log capture, same machine, same
+    // bridgeOS 23P5067, same 3 identities as the failing Windows run):
+    // biometrickitd's start-match inner payload is 68 bytes TOTAL. The
+    // LegacyCounted layout below produces 132 bytes for the same machine,
+    // so it cannot be what the SEP expects. See docs/macos-verified-status-map.md.
+    if (layout == MatchIdentityLayout::InlineIdentities) {
+        MatchOptionsV1 header{};
+        header.flags = flags;
+        header.macosUserId = macosUserId;
+
+        std::vector<uint8_t> out(sizeof(header) + count * sizeof(IdentityRecordV1));
+        std::memcpy(out.data(), &header, sizeof(header));
+        for (size_t i = 0; i < count; i++) {
+            std::memcpy(out.data() + sizeof(header) + i * sizeof(IdentityRecordV1),
+                        &identities[i], sizeof(IdentityRecordV1));
+        }
+        return out;
     }
 
     MatchInitDataV1 header{};
     header.flags = flags;
     header.macosUserId = macosUserId;
 
+    if (layout == MatchIdentityLayout::PaddedNoIdentities) {
+        // 68 bytes, identities not transmitted. Same size as the macOS
+        // capture; a deliberate A/B alternative to InlineIdentities.
+        std::vector<uint8_t> out(sizeof(header));
+        std::memcpy(out.data(), &header, sizeof(header));
+        return out;
+    }
+
+    // MatchIdentityLayout::LegacyCounted - pre-16.09.2026 behaviour.
     // Linux reference (bridge-xpc-probe.py, identity_blob_format="counted")
     // serializes the 68-byte match options structure first, then appends a
     // separate uint32 record count followed by the selected identity records.
@@ -53,6 +82,15 @@ std::vector<uint8_t> EncodeMatchInitData(uint32_t flags, uint32_t macosUserId,
                     &identities[i], sizeof(IdentityRecordV1));
     }
     return out;
+}
+
+const wchar_t* MatchIdentityLayoutName(MatchIdentityLayout layout) {
+    switch (layout) {
+        case MatchIdentityLayout::InlineIdentities:   return L"inline";
+        case MatchIdentityLayout::PaddedNoIdentities: return L"padded";
+        case MatchIdentityLayout::LegacyCounted:      return L"legacy";
+    }
+    return L"unknown";
 }
 
 bool ParseIdentityList(const std::vector<uint8_t>& replyBody,
