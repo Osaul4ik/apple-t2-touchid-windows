@@ -482,6 +482,13 @@ static bool DiscoverBiometricKitBridge(int argc, wchar_t* argv[], int firstArgIn
             std::wstring w = argv[++i];
             hostOverride.clear();
             for (wchar_t c : w) hostOverride.push_back(static_cast<char>(c & 0xFF));
+        } else if ((a == L"--uid" || a == L"--seconds") && i + 1 < argc) {
+            // Not this function's flag - CmdVerify/CmdIdentities parse the
+            // value themselves - but it still must be skipped here, or the
+            // digit that follows (e.g. "20" in "--seconds 20") falls through
+            // to the bare-digit branch below and gets misread as a
+            // positional ifIndex override.
+            ++i;
         } else if (!a.empty() && a[0] >= L'0' && a[0] <= L'9') {
             ifIndexOverride = static_cast<unsigned long>(_wtoi(a.c_str()));
         }
