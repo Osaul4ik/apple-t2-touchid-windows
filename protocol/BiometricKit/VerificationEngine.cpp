@@ -178,6 +178,23 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     bool sawFingerOn = false;
     size_t imagePipelineEvents = 0;
     size_t unnamedStatusEvents = 0;
+    size_t fingerTouchCycles = 0; // count of status_code==63 (FingerOn) events
+    // 16.09.2026: two back-to-back hardware captures (132B legacy payload,
+    // then the corrected 68B inline payload) produced BIT-IDENTICAL status
+    // sequences - same 81/63/91/78/64 cycle, same statistics types
+    // (4/35/25 then 30), same total absence of 55/72/95 and of statistics
+    // types 0/1/2. Fixing the StartMatch payload size to match the macOS
+    // capture changed nothing observable on the wire. That is strong
+    // evidence the payload content is not what gates image capture -
+    // whatever decides "does the sensor hand a captured image to the
+    // matcher" happens upstream of this command entirely. See
+    // docs/macos-verified-status-map.md section 7 ("second hardware
+    // capture"). LoadCalibration (still opt-in, disabled by default because
+    // the macOS *live* capture never re-issues it) is now the leading
+    // remaining candidate specifically because Boot Camp Windows may skip
+    // whatever step macOS's own boot performs to arm the sensor for a given
+    // power cycle - something biometrickitd's own IPC traffic would never
+    // show, since on macOS it already happened before biometrickitd ran.
 
     while (steady_clock::now() < deadline) {
         std::vector<uint8_t> eventPayload;
@@ -231,7 +248,7 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
                 StatusEventBody body = ParseStatusEventBody(eventData);
                 if (body.statusCode) {
                     const uint32_t code = *body.statusCode;
-                    if (code == 63) sawFingerOn = true;
+                    if (code == 63) { sawFingerOn = true; fingerTouchCycles++; }
                     if (StatusCodeIsImagePipeline(code)) imagePipelineEvents++;
                     if (!StatusCodeName(code)) unnamedStatusEvents++;
                 }
@@ -354,9 +371,23 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
         outcome = VerifyOutcome::NoImageCaptured;
     }
     T2_LOG("verify",
-           L"session summary: finger_on=%d image_pipeline_events=%zu unnamed_status_events=%zu outcome=%d",
-           sawFingerOn ? 1 : 0, imagePipelineEvents, unnamedStatusEvents,
-           static_cast<int>(outcome));
+           L"session summary: finger_touch_cycles=%zu image_pipeline_events=%zu unnamed_status_events=%zu "
+           L"layout=%s reset_sensor=%d load_calibration=%d outcome=%d",
+           fingerTouchCycles, imagePipelineEvents, unnamedStatusEvents,
+           MatchIdentityLayoutName(config_.matchLayout), config_.resetSensor ? 1 : 0,
+           config_.loadCalibration ? 1 : 0, static_cast<int>(outcome));
+    if (fingerTouchCycles >= 2 && imagePipelineEvents == 0 && !config_.loadCalibration) {
+        // Two full touch cycles is enough to say this isn't a one-off missed
+        // placement: the sensor consistently detects the finger and never
+        // reaches ImageCaptured. Flagged here (not just left to the CLI's
+        // one-shot hint) because a caller driving several verify() calls in
+        // a row from a script would otherwise see the same generic
+        // NoImageCaptured every time with no escalation signal.
+        T2_LOG("verify",
+               L"%zu consecutive no-image touch cycles with LoadCalibration disabled - "
+               L"strongly consider retrying with loadCalibration=true (--load-calibration)",
+               fingerTouchCycles);
+    }
 
     // Cancel runs unconditionally via cancelGuard's destructor as this
     // function returns, matching Linux reference behavior (Milestone 1 §2)

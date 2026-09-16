@@ -186,3 +186,72 @@ The `0x42` reply is `N * 20` bytes of `uint32 userId + 16-byte uuid` — the
 Windows session parses 3 identities correctly, and the UUID macOS reports on a
 successful match (`D6AE7EAA-…`) is the second record in that same list. The
 identity path is **not** the problem: the templates are there and reachable.
+
+## 7. Second hardware capture — the payload-size fix, tested and ruled out as sole cause
+
+**16.09.2026, second capture.** Ran `t2touchid verify -v` again on the same
+Windows machine after shipping the section-3 fix (`MatchIdentityLayout::
+InlineIdentities`, 68-byte `StartMatch` payload) and disabling `ResetSensor`
+and `LoadCalibration` by default (both confirmed opt-in in the log:
+`skipping ResetSensor ... skipping LoadCalibration ...`). The command line
+itself confirms the fix landed correctly on the wire:
+
+```
+[verify] start match: layout=inline payload=68B (macOS reference for 3 identities = 68B)
+[sendBiometricCommand] -> ... inner=76B (424d040001000000...)   ; 8 header + 68 payload
+```
+
+**Result: bit-identical failure shape to the pre-fix capture.** Two full
+finger-touch cycles, same status-code sequence both times, same statistics
+types, zero image-pipeline events either time:
+
+```
+81 (unnamed)  -> 63 FingerOn -> 91 Pause -> [~1.5s] -> 78 (unnamed) -> 64 FingerOff -> stat(30)
+81 (unnamed)  -> 63 FingerOn -> 91 Pause -> [~1.5s] -> 78 (unnamed) -> 64 FingerOff -> stat(30)
+```
+
+Statistics observed per cycle, in order: `type=4 value=1`, `type=35 value=1`,
+`type=25 value=<growing>` (2646 then 7207 — tracks elapsed ms since session
+start, not a quality score), then after FingerOff `type=30 value=<growing>`
+(4477 then 8686). None of 0/1/2 (the quality-score types) ever appear, same
+as the first capture.
+
+**Conclusion: the StartMatch payload content/size is not what gates image
+capture.** The fix in section 3 is still correct (it matches what macOS puts
+on the wire) and stays in place, but it is not — by itself — the fix for this
+symptom. Whatever decides "does the sensor hand a captured image to the
+matcher" is evidently independent of what's inside the `StartMatch` blob.
+
+### Updated read of ordinals 81 and 78
+
+Both captures now agree: `81` fires once per cycle, consistently *before*
+`63 FingerOn` even arrives (at +3197ms here, finger touch logged at
++3280ms) — i.e. it is not a finger-presence-derived signal, it looks
+autonomous/sensor-initiated. `78` fires once per cycle, consistently *after*
+`91 Pause` and well before `64 FingerOff` (≈1.5s gap both times). Neither
+ordinal appears anywhere in the macOS reference capture's two successful
+unlocks. Still not naming these — no source for what they mean — but the
+consistency across two independent hardware runs makes "sensor-side
+retry/rejection loop, unrelated to which bytes we put in StartMatch" a much
+better-supported reading than before.
+
+### Why LoadCalibration is now the leading candidate
+
+The macOS *live* capture (section 4) never re-issues `LoadCalibration`
+per match — but that only proves biometrickitd doesn't need to. On macOS,
+whatever calibrates the sensor for TouchID plausibly happens once, earlier,
+as part of the OS's own boot sequence — a step this project has no unified-log
+visibility into, because by the time biometrickitd starts talking over
+BridgeXPC on macOS, that step (if it exists) has already run. A Boot Camp
+Windows boot that never boots macOS in the same power cycle may skip
+whatever that step is, leaving the sensor perpetually "armed but
+uncalibrated" — consistent with a sensor that reports finger presence
+(mechanical/capacitive detection, likely handled by hardware regardless of
+calibration) but never produces a usable image (which needs the calibration
+blob). This is a hypothesis, not a verified fact — recorded here as the
+reasoning behind reordering the CLI's suggested next step, not as a new
+"VERIFIED FROM SOURCE" claim.
+
+**Next diagnostic step:** `t2touchid verify -v --load-calibration`, then, if
+that also fails, `--match-layout padded` to rule out the other 68-byte
+reading of the StartMatch header.

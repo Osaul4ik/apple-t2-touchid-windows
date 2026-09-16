@@ -770,9 +770,21 @@ static int CmdVerify(int argc, wchar_t* argv[]) {
         case VerifyOutcome::NoImageCaptured:
             std::wcout << L"verify-no-image: sensor reported the finger (FingerOn/FingerOff) but never\n"
                           L"                 reported ImageCaptured/ImageForProcessing/ImageWasAccepted.\n"
-                          L"                 The match never got as far as comparing anything.\n"
-                          L"                 Try: --match-layout padded, then --load-calibration, "
-                       << kSeeVerboseHint;
+                          L"                 The match never got as far as comparing anything.\n";
+            if (!cfg.loadCalibration) {
+                // 16.09.2026: a hardware A/B (legacy 132B vs corrected 68B
+                // StartMatch payload, otherwise identical run) produced
+                // bit-identical failing wire traffic either way - the
+                // payload layout is not what's gating image capture. Lead
+                // with the one flag not yet tried on this exact machine.
+                std::wcout << L"                 Payload layout changes alone did not affect this on a\n"
+                              L"                 hardware A/B test. Try --load-calibration next, then\n"
+                              L"                 --match-layout padded. ";
+            } else {
+                std::wcout << L"                 --load-calibration was already on for this run and still\n"
+                              L"                 no image. Try --match-layout padded next. ";
+            }
+            std::wcout << kSeeVerboseHint;
             return 1;
     }
     return 1;
