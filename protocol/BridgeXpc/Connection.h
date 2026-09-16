@@ -49,6 +49,11 @@ public:
 
     // Sends [3,0,innerBmBytes,outputCapacity] and returns the raw reply
     // payload bytes (BiometricKit.cpp interprets the "BM" wrapper).
+    // bkremoted can push async, non-reply events (e.g. a serviceStatus
+    // callback) ahead of the actual reply — confirmed live for
+    // load-calibration — so this loops, acknowledging and discarding
+    // anything that isn't the matching reply, until it arrives or
+    // `timeout` elapses (same contract as WaitForEvent, just inline).
     bool SendBiometricCommand(const std::vector<uint8_t>& innerBmMessage,
                                uint32_t outputCapacity,
                                std::vector<uint8_t>* outReply,

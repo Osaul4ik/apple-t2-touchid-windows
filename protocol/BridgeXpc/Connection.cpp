@@ -260,53 +260,80 @@ bool Connection::SendBiometricCommand(const std::vector<uint8_t>& innerBmMessage
         return false;
     }
 
-    // A single ReadFrame here assumes the very next frame IS the reply to
-    // this request. That's true for the small synchronous commands
-    // (getBridgeVersion/setClientVersion/reset-sensor/cancel), but
-    // bkremoted can also push an async, non-reply event (isReply=false —
-    // the same shape Connection::WaitForEvent exists to handle during a
-    // match session) ahead of a command's real reply. If that happens
-    // here the log line below ("isReply=0") is the tell: the transport
-    // itself is fine, this function just isn't looping past the event to
-    // find the actual reply the way WaitForEvent does.
-    RawFrame reply;
-    if (!ReadFrame(&reply, timeout)) {
-        T2_LOG("sendBiometricCommand", L"ReadFrame failed/timed out (reqId=%s, "
-               "waited up to %lldms) - WSAGetLastError=%d",
-               Widen(reqId).c_str(), static_cast<long long>(timeout.count()),
-               WSAGetLastError());
-        return false;
-    }
-    if (reply.type != FrameType::Message) {
-        T2_LOG("sendBiometricCommand", L"unexpected frame type %u (reqId=%s), "
-               "expected Message(%u)", static_cast<unsigned>(reply.type),
-               Widen(reqId).c_str(), static_cast<unsigned>(FrameType::Message));
-        return false;
-    }
+    // bkremoted can push an async, non-reply event (isReply=false, e.g. a
+    // serviceStatus callback shaped [9, status, data, x, x] — see
+    // PlistPayload.h's DecodeStatusEventData) ahead of a command's real
+    // reply, exactly the way Connection::WaitForEvent already expects
+    // during a match session. A single ReadFrame here used to assume the
+    // very next frame WAS the reply and fail as soon as an event arrived
+    // first — confirmed live: load-calibration's real reply was preceded
+    // by one such event. Loop, acknowledging (and discarding, same as
+    // WaitForEvent) anything that isn't our reply, until either the
+    // matching reply arrives or the deadline passes.
+    auto deadline = std::chrono::steady_clock::now() + timeout;
+    for (;;) {
+        auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            T2_LOG("sendBiometricCommand", L"deadline reached waiting for reply "
+                   "(reqId=%s, timeout=%lldms)", Widen(reqId).c_str(),
+                   static_cast<long long>(timeout.count()));
+            return false;
+        }
+        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
 
-    auto env = ParseMessageBody(reply.body);
-    if (!env) {
-        T2_LOG("sendBiometricCommand", L"ParseMessageBody failed (reqId=%s), "
-               "body=%zuB %s", Widen(reqId).c_str(), reply.body.size(),
-               HexDump(reply.body).c_str());
-        return false;
-    }
-    if (env->requestId != reqId) {
-        T2_LOG("sendBiometricCommand",
-               L"requestId mismatch: sent=%s got=%s isReply=%d payload=%zuB %s%s",
-               Widen(reqId).c_str(), Widen(env->requestId).c_str(),
-               env->isReply ? 1 : 0, env->payloadPlist.size(),
-               HexDump(env->payloadPlist).c_str(),
-               env->isReply ? L"" :
-                   L"  <-- looks like an async bridge event, not our reply; "
-                   L"this frame was consumed and discarded instead of acked");
-        return false;
-    }
+        RawFrame reply;
+        if (!ReadFrame(&reply, remaining)) {
+            T2_LOG("sendBiometricCommand", L"ReadFrame failed/timed out (reqId=%s, "
+                   "%lldms remained) - WSAGetLastError=%d",
+                   Widen(reqId).c_str(), static_cast<long long>(remaining.count()),
+                   WSAGetLastError());
+            return false;
+        }
+        if (reply.type != FrameType::Message) {
+            T2_LOG("sendBiometricCommand", L"unexpected frame type %u (reqId=%s), "
+                   "expected Message(%u) - ignoring, keep waiting",
+                   static_cast<unsigned>(reply.type), Widen(reqId).c_str(),
+                   static_cast<unsigned>(FrameType::Message));
+            continue;
+        }
 
-    *outReply = env->payloadPlist;
-    T2_LOG("sendBiometricCommand", L"OK, reqId=%s reply=%zuB %s",
-           Widen(reqId).c_str(), outReply->size(), HexDump(*outReply).c_str());
-    return true;
+        auto env = ParseMessageBody(reply.body);
+        if (!env) {
+            T2_LOG("sendBiometricCommand", L"ParseMessageBody failed (reqId=%s), "
+                   "body=%zuB %s", Widen(reqId).c_str(), reply.body.size(),
+                   HexDump(reply.body).c_str());
+            return false; // malformed -> fail closed, do not keep guessing
+        }
+
+        if (!env->isReply) {
+            // Async bridge-side callback: ack it (same contract as
+            // WaitForEvent) and keep waiting for the actual reply.
+            T2_LOG("sendBiometricCommand", L"async event while waiting for reply "
+                   "(reqId=%s), event reqId=%s payload=%zuB %s - acking and continuing",
+                   Widen(reqId).c_str(), Widen(env->requestId).c_str(),
+                   env->payloadPlist.size(), HexDump(env->payloadPlist).c_str());
+            if (!AcknowledgeEvent(env->requestId)) {
+                T2_LOG("sendBiometricCommand", L"AcknowledgeEvent failed for "
+                       "event reqId=%s", Widen(env->requestId).c_str());
+                return false;
+            }
+            continue;
+        }
+
+        if (env->requestId != reqId) {
+            // A stray reply to something we're not waiting on (e.g. a
+            // best-effort command whose caller didn't read its reply):
+            // ignore, keep looping — same as WaitForEvent.
+            T2_LOG("sendBiometricCommand", L"ignoring stray reply, sent=%s got=%s",
+                   Widen(reqId).c_str(), Widen(env->requestId).c_str());
+            continue;
+        }
+
+        *outReply = env->payloadPlist;
+        T2_LOG("sendBiometricCommand", L"OK, reqId=%s reply=%zuB %s",
+               Widen(reqId).c_str(), outReply->size(), HexDump(*outReply).c_str());
+        return true;
+    }
 }
 
 bool Connection::GetFdrCalibration(std::vector<uint8_t>* outBlob, std::chrono::milliseconds timeout) {
