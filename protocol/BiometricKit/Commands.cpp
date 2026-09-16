@@ -32,8 +32,8 @@ std::vector<uint8_t> EncodeMatchInitData(uint32_t flags, uint32_t macosUserId,
 
     // The 68-byte macOS-captured payload (InlineIdentities / PaddedNoIdentities)
     // and the Linux counted payload (LegacyCounted) are retained as explicit
-    // A/B variants. VerifyConfig default is now InlineIdentities (macOS
-    // wire format on this machine: 8 + N*20 = 68 B for N=3).
+    // A/B variants. VerifyConfig default is LegacyCounted (Linux probe
+    // --identity-blob-format=counted: 68 + 4 + N*20 = 132 B for N=3).
     if (layout == MatchIdentityLayout::InlineIdentities) {
         MatchOptionsV1 header{};
         header.flags = flags;

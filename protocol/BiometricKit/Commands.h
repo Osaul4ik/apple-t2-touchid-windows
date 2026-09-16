@@ -164,7 +164,7 @@ std::vector<uint8_t> EncodeBmCommand(Command command, uint16_t version, uint16_t
 std::vector<uint8_t> EncodeMatchInitData(uint32_t flags, uint32_t macosUserId,
                                           const std::vector<IdentityRecordV1>& identities,
                                           MatchIdentityLayout layout =
-                                              MatchIdentityLayout::InlineIdentities);
+                                              MatchIdentityLayout::LegacyCounted);
 
 // Diagnostic-only name for a layout, for logging the wire format actually used.
 const wchar_t* MatchIdentityLayoutName(MatchIdentityLayout layout);

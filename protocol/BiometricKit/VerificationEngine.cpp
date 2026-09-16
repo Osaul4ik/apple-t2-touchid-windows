@@ -197,76 +197,17 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
         return VerifyOutcome::Malformed;
     }
 
-    // Non-matching identity warm-up immediately before StartMatch.
-    // VERIFIED FROM SOURCE: bridge-xpc-probe.py match-seconds branch with
-    // --resolve-any-finger-name (t2-fprintd.py verify_fprint() for requested
-    // finger == "any" AND a complete projection). After the first 0x42 from
-    // --identity-list it sends:
-    //   biometric_command(sock, 0x51, output_capacity=40*10)
-    //   biometric_command(sock, 0x42, data=uid, output_capacity=20*10)
-    //   biometric_command(sock, 0x51, output_capacity=40*10)
-    // then t2_fprint_match_gate.prepare_all fail-closes unless first==repeat
-    // for both views AND the configured 0x51 slice equals the first 0x42
-    // set. StartMatch still uses the FIRST 0x42 records, never the repeat.
-    std::vector<uint8_t> firstGlobalRaw;
-    auto globalCmd = EncodeBmCommand(Command::GlobalIdentityList, /*version=*/1, /*value=*/0);
-    if (!conn->SendBiometricCommand(globalCmd, kGlobalIdentityListOutputCapacity,
-                                    &firstGlobalRaw, config_.ioTimeout)) {
-        T2_LOG("verify", L"GlobalIdentityList (cmd 0x51, capacity=%u) failed",
-               kGlobalIdentityListOutputCapacity);
-        return VerifyOutcome::TransportError;
-    }
-    if (firstGlobalRaw.size() % 40 != 0) {
-        T2_LOG("verify", L"GlobalIdentityList reply malformed (reply=%zuB, not a multiple of 40)",
-               firstGlobalRaw.size());
-        return VerifyOutcome::Malformed;
-    }
-
-    std::vector<uint8_t> idReq(4);
-    std::memcpy(idReq.data(), &config_.macosUserId, 4);
-    auto idCmd = EncodeBmCommand(Command::IdentityList, /*version=*/1, /*value=*/0, idReq);
-    std::vector<uint8_t> repeatedUserRaw;
-    if (!conn->SendBiometricCommand(idCmd, kIdentityListOutputCapacity,
-                                    &repeatedUserRaw, config_.ioTimeout)) {
-        T2_LOG("verify", L"repeated IdentityList (cmd 0x42) failed");
-        return VerifyOutcome::TransportError;
-    }
-
-    std::vector<uint8_t> repeatedGlobalRaw;
-    if (!conn->SendBiometricCommand(globalCmd, kGlobalIdentityListOutputCapacity,
-                                    &repeatedGlobalRaw, config_.ioTimeout)) {
-        T2_LOG("verify", L"repeated GlobalIdentityList (cmd 0x51) failed");
-        return VerifyOutcome::TransportError;
-    }
-
-    if (firstUserRaw != repeatedUserRaw || firstGlobalRaw != repeatedGlobalRaw) {
-        T2_LOG("verify",
-               L"live identity inventory is unstable "
-               L"(user %zuB vs %zuB, global %zuB vs %zuB)",
-               firstUserRaw.size(), repeatedUserRaw.size(),
-               firstGlobalRaw.size(), repeatedGlobalRaw.size());
-        return VerifyOutcome::Malformed;
-    }
-
-    std::vector<std::array<uint8_t, 20>> configured;
-    if (!ConfiguredGlobalIdentities(firstGlobalRaw, config_.macosUserId, &configured) ||
-        !SamePerUserSet(configured, identities)) {
-        T2_LOG("verify",
-               L"global and per-user identity inventories disagree "
-               L"(configured=%zu per-user=%zu global=%zuB)",
-               configured.size(), identities.size(), firstGlobalRaw.size());
-        return VerifyOutcome::Malformed;
-    }
+    // LINUX 1:1 minimal match path (bridge-xpc-probe.py --match-seconds):
+    // after --identity-list (single 0x42 from RunLinuxReadySequence) go
+    // straight to StartMatch. No 0x51/0x42/0x51 gate (that is only the
+    // --resolve-any-finger-name / fprintd projection path). No macOS
+    // pre-match cmds 48/39/46/40.
     T2_LOG("verify",
-           L"identity warm-up OK: 0x42/0x51/0x42/0x51 user=%zuB global=%zuB identities=%zu (StartMatch uses full first 0x42 list)",
-           firstUserRaw.size(), firstGlobalRaw.size(), identities.size());
+           L"LINUX minimal path: single 0x42 identity-list (%zu identities, %zuB raw) — "
+           L"no 0x51 gate, no macOS pre-match 48/39/46/40",
+           identities.size(), firstUserRaw.size());
 
-    // LINUX PARITY: load_calibration_events (and any events from the identity
-    // warm-up commands) must NOT enter the match event stream. Linux records
-    // them under result["load_calibration_events"] and starts the match loop
-    // clean. On Windows those events were previously left in pendingEvents_
-    // and delivered as the first "match" statuses (MatchingCancelled + 94),
-    // which is a known divergence from the working Linux path.
+    // LINUX PARITY: warm-up events must NOT enter the match event stream.
     {
         size_t dropped = conn->DiscardPendingEvents();
         if (dropped > 0) {
@@ -280,68 +221,16 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     auto cancelCmd = EncodeBmCommand(Command::Cancel, 1, 0);
     std::vector<uint8_t> reply;
 
-    // macOS live unlock pre-match (unified log 16.09.2026 on this machine):
-    //   48 getEnabledForUnlock (inSize=0)
-    //   39 getSKSLockState (inSize=4, uid)
-    //   46 getProtectedConfig (inSize=4, uid)
-    //   12 Cancel
-    //   40 getBiometrickitdInfo (inSize=0)
-    //   39 + 46 + 12 again (best-effort; first pass is the critical one)
-    //   4  StartMatch (inSize=68)
-    // Successful status path then includes 89 Idle before 90 Capture, and
-    // 55/72/95 after FingerOn. Windows never saw 89/55 without this prefix.
-    {
-        T2_LOG("verify", L"macOS pre-match: 48/39/46/12/40 (enabled/sks/protected/cancel/info)");
-        std::vector<uint8_t> uid4(4);
-        std::memcpy(uid4.data(), &config_.macosUserId, 4);
+    // start match (cmd 4) — Linux counted default: II60x + count + records
+    // (132 B for 3 identities). Override with --match-layout inline|padded.
 
-        auto cmd48 = EncodeBmCommand(Command::GetEnabledForUnlock, 1, 0);
-        if (!conn->SendBiometricCommand(cmd48, 16, &reply, config_.ioTimeout)) {
-            T2_LOG("verify", L"GetEnabledForUnlock (cmd 48) failed");
-            return VerifyOutcome::TransportError;
-        }
-        T2_LOG("verify", L"GetEnabledForUnlock OK, reply=%zuB", reply.size());
-
-        auto cmd39 = EncodeBmCommand(Command::GetSksLockStateMac, 1, 0, uid4);
-        if (!conn->SendBiometricCommand(cmd39, 16, &reply, config_.ioTimeout)) {
-            T2_LOG("verify", L"GetSksLockState (cmd 39) failed");
-            return VerifyOutcome::TransportError;
-        }
-        T2_LOG("verify", L"GetSksLockState OK, reply=%zuB", reply.size());
-
-        auto cmd46 = EncodeBmCommand(Command::GetProtectedConfig, 1, 0, uid4);
-        if (!conn->SendBiometricCommand(cmd46, 64, &reply, config_.ioTimeout)) {
-            T2_LOG("verify", L"GetProtectedConfig (cmd 46) failed");
-            return VerifyOutcome::TransportError;
-        }
-        T2_LOG("verify", L"GetProtectedConfig OK, reply=%zuB", reply.size());
-
-        conn->SendBiometricCommand(cancelCmd, 0, &reply, config_.ioTimeout); // best-effort
-        T2_LOG("verify", L"Cancel after protected-config issued");
-
-        auto cmd40 = EncodeBmCommand(Command::GetBiometrickitdInfo, 1, 0);
-        if (!conn->SendBiometricCommand(cmd40, 64, &reply, config_.ioTimeout)) {
-            T2_LOG("verify", L"GetBiometrickitdInfo (cmd 40) failed");
-            return VerifyOutcome::TransportError;
-        }
-        T2_LOG("verify", L"GetBiometrickitdInfo OK, reply=%zuB", reply.size());
-
-        // Drain any status events these queries produced so StartMatch loop
-        // still starts clean (same rationale as LoadCalibration drain).
-        size_t dropped = conn->DiscardPendingEvents();
-        if (dropped > 0) {
-            T2_LOG("verify", L"discarded %zu event(s) after macOS pre-match queries", dropped);
-        }
-    }
-
-    // start match (cmd 4) — macOS inSize=68 on this machine (3 identities)
     auto matchInitData = EncodeMatchInitData(config_.matchFlags, config_.macosUserId,
                                               identities, config_.matchLayout);
     T2_LOG("verify",
-           L"start match: layout=%s payload=%zuB flags=%u (macOS reference for %zu identities = %zuB)",
+           L"start match LINUX 1:1: layout=%s payload=%zuB flags=%u (Linux counted for %zu identities expects %zuB)",
            MatchIdentityLayoutName(config_.matchLayout), matchInitData.size(),
            config_.matchFlags, identities.size(),
-           sizeof(MatchOptionsV1) + identities.size() * sizeof(IdentityRecordV1));
+           sizeof(MatchInitDataV1) + sizeof(uint32_t) + identities.size() * sizeof(IdentityRecordV1));
     auto startCmd = EncodeBmCommand(Command::StartMatch, 1, 0, matchInitData);
     if (!conn->SendBiometricCommand(startCmd, 0, &reply, config_.ioTimeout)) {
         return VerifyOutcome::TransportError;

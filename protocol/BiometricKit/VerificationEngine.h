@@ -59,10 +59,10 @@ struct VerifyConfig {
     //
     // Hardware A/B on Windows already showed that switching 132→68 alone
     // does not unlock the image pipeline (still no 55/72/95). The default
-    // is therefore the macOS-verified 68-byte InlineIdentities form so the
+    // is therefore the Linux default LegacyCounted form (II60x+count+records) so the
     // next run starts from the wire format that the SEP actually accepts
     // on this firmware, not the Linux-derived counted blob.
-    MatchIdentityLayout matchLayout = MatchIdentityLayout::InlineIdentities;
+    MatchIdentityLayout matchLayout = MatchIdentityLayout::LegacyCounted; // Linux --identity-blob-format=counted
 
     // MatchInitDataV1 / MatchOptionsV1 flags field. Linux probe default is 0;
     // its help text notes "use 1 for an unlock match". Keep 0 as default to
