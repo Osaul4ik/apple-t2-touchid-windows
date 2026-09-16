@@ -40,6 +40,26 @@ bool ParseStatusEventHeader(const std::vector<uint8_t>& data,
                              uint32_t* outEmbeddedType,
                              std::vector<uint8_t>* outEventData);
 
+// VERIFIED FROM SOURCE (bridge-xpc-probe.py summarize_event, embedded_type
+// == 0xE3FF8001 branch): this is the COMPLETE set of fields the reference
+// implementation itself decodes from a "status" event body — nothing more.
+// In particular, the reference never derives a finger-presence, "verify
+// progress", or any other semantic signal from this event kind; if a
+// caller wants such a signal, it is not available at this layer of the
+// protocol as currently understood, not a bug in this parser.
+struct StatusEventBody {
+    std::optional<uint32_t> statusCode;       // eventData[0:4), u32le
+    std::optional<uint64_t> statusDataLength; // eventData[8:16), u64le
+};
+
+// eventData: the bytes AFTER the 24-byte header (i.e. ParseStatusEventHeader's
+// outEventData), for an event whose embedded_type == kEmbeddedTypeStatus.
+// Never returns false - every field is independently optional based on
+// eventData's length, matching the reference's own "if len(event_data) >= N"
+// gating exactly, so a short body degrades gracefully instead of failing
+// the whole event.
+StatusEventBody ParseStatusEventBody(const std::vector<uint8_t>& eventData);
+
 struct MatchResult {
     MatchOutcome outcome;
     // Populated only when outcome == Match; the caller (verify engine) may

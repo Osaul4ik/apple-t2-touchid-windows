@@ -664,34 +664,57 @@ static int CmdVerify(int argc, wchar_t* argv[]) {
         return 1;
     }
 
-    // Diagnostic-only pre-check (docs/linux-reference-analysis.md §6.6):
-    // verification cannot produce a real match_result while the
-    // keybag/catacomb is unavailable, and that dependency is documented
-    // but its byte-level encoding in the 0x27 SKS-lock-state reply is
-    // NOT verified from source - so this prints the raw bytes for the
-    // person running the test to eyeball, rather than guessing a
-    // locked/unlocked threshold. A run that ends in nothing but
-    // status/statistics events for the whole match window (visible with
-    // --verbose) and never a match_result is the symptom this is meant
-    // to help diagnose; if that happens, try `unlock` first.
+    // Diagnostic-only pre-check. Correction from an earlier version of this
+    // block: "keybag" and "Catacomb" are two DIFFERENT SEP-side subsystems,
+    // not two names for the same thing. The `unlock` command (AKS endpoint 7,
+    // load_keybag/set-system-keybag/change_lock_state) only touches the
+    // AppleKeyStore keybag - the FileVault-style data-protection keybag - and
+    // is a completely separate protocol path from BiometricKit verification
+    // (docs/linux-reference-analysis.md §6.6-6.7). Doing that unlock does not
+    // necessarily arm the Catacomb (BiometricKit's own SEP-side store of
+    // enrolled identity records - the name and its 0x38/0x3a/0x3c query
+    // opcodes come from Apple's own BiometricSupport.framework, per the
+    // decompiled-source references in the Linux project's FINDINGS.md).
+    // Since IdentityList (0x42) above already returns real records, the
+    // Catacomb clearly has data - so what actually needs checking here is
+    // its *state* at match time, not whether AKS-side unlock happened.
+    // Byte-level meaning of these replies is NOT verified from source, so -
+    // same as before - this only prints raw bytes rather than guessing a
+    // ready/not-ready threshold.
     {
-        std::vector<uint8_t> lockStateReply;
         std::vector<uint8_t> uidData(4);
         std::memcpy(uidData.data(), &cfg.macosUserId, 4);
-        auto lockStateCmd = EncodeBmCommand(Command::SksLockState, 1, 0, uidData);
-        if (bridge.SendBiometricCommand(lockStateCmd, 64, &lockStateReply, std::chrono::milliseconds(5000))) {
-            std::wcout << L"sks lock state (raw, meaning not yet verified from source): ";
-            for (uint8_t b : lockStateReply) {
+        auto printRaw = [](const wchar_t* label, const std::vector<uint8_t>& data) {
+            std::wcout << label << L" (raw, meaning not yet verified from source): ";
+            for (uint8_t b : data) {
                 wchar_t tmp[4];
                 swprintf(tmp, 4, L"%02x", b);
                 std::wcout << tmp;
             }
             std::wcout << L"\n";
-        } // best-effort - absence of this reply must not block verify itself
+        };
+        std::vector<uint8_t> reply;
+        auto sksCmd = EncodeBmCommand(Command::SksLockState, 1, 0, uidData);
+        if (bridge.SendBiometricCommand(sksCmd, 64, &reply, std::chrono::milliseconds(5000))) {
+            printRaw(L"sks lock state (0x27)", reply);
+        }
+        auto uuidCmd = EncodeBmCommand(Command::CatacombUuid, 1, 0, uidData);
+        if (bridge.SendBiometricCommand(uuidCmd, 16, &reply, std::chrono::milliseconds(5000))) {
+            printRaw(L"catacomb uuid (0x38)", reply);
+        }
+        auto hashCmd = EncodeBmCommand(Command::CatacombHash, 1, 0, uidData);
+        if (bridge.SendBiometricCommand(hashCmd, 33, &reply, std::chrono::milliseconds(5000))) {
+            printRaw(L"catacomb hash (0x3a)", reply);
+        }
+        auto stateCmd = EncodeBmCommand(Command::CatacombState, 1, 0);
+        if (bridge.SendBiometricCommand(stateCmd, 4096, &reply, std::chrono::milliseconds(5000))) {
+            printRaw(L"catacomb state (0x3c)", reply);
+        }
+        // Every query above is best-effort - a missing reply must not block
+        // verify itself, since none of this is required protocol-wise.
     }
 
-    std::wcout << L"place finger on sensor (keybag/catacomb must already be unlocked - "
-               << L"run `unlock` first if this is the first verify since boot)...\n";
+    std::wcout << L"place finger on sensor...\n";
     VerificationEngine engine(cfg);
     std::optional<std::array<uint8_t, 16>> matchedUuid;
     VerifyOutcome outcome = engine.Verify(&bridge, &matchedUuid);

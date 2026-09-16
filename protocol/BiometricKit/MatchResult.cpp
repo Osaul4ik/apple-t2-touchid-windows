@@ -38,6 +38,26 @@ bool ParseStatusEventHeader(const std::vector<uint8_t>& data,
     return true;
 }
 
+StatusEventBody ParseStatusEventBody(const std::vector<uint8_t>& eventData) {
+    // VERIFIED FROM SOURCE: struct.unpack_from("<I", event_data) for the
+    // first field (gated on len >= 4), struct.unpack_from("<Q", event_data, 8)
+    // for the second (gated on len >= 16). Bytes [4:8) of event_data are not
+    // read by the reference either - not an oversight here, it simply isn't
+    // part of what the reference decodes.
+    StatusEventBody body;
+    if (eventData.size() >= 4) {
+        uint32_t statusCode = 0;
+        std::memcpy(&statusCode, eventData.data(), sizeof(statusCode));
+        body.statusCode = statusCode;
+    }
+    if (eventData.size() >= 16) {
+        uint64_t statusDataLength = 0;
+        std::memcpy(&statusDataLength, eventData.data() + 8, sizeof(statusDataLength));
+        body.statusDataLength = statusDataLength;
+    }
+    return body;
+}
+
 // Constant-time compare: always touches all 16 bytes regardless of where
 // (or whether) a mismatch occurs, so timing does not leak which byte of a
 // candidate UUID differed from the enrolled UUID.

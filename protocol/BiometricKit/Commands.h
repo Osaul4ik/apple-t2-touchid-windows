@@ -47,6 +47,8 @@ enum class Command : uint16_t {
     LoadCalibration   = 0x20,
     SksLockState      = 0x27,
     SensorInfo        = 0x35,
+    CatacombUuid      = 0x38,
+    CatacombHash      = 0x3a,
     CatacombState     = 0x3c,
     IdentityList      = 0x42,
     SensorReadiness   = 0x53,

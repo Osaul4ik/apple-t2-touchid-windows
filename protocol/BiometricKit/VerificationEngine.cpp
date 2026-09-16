@@ -4,6 +4,7 @@
 #include "../BridgeXpc/PlistPayload.h"
 #include "../BridgeXpc/Log.h"
 #include <cstring>
+#include <string>
 
 namespace t2::biometrickit {
 
@@ -142,11 +143,34 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
             // that ambiguity is exactly what made a real capture (3
             // back-to-back verify runs, all timing out on nothing but
             // <200B status/statistics events) unreadable after the fact.
+            //
+            // event_type=status also gets its body's two VERIFIED FROM
+            // SOURCE fields (ParseStatusEventBody / MatchResult.h) logged
+            // structured, matching what bridge-xpc-probe.py itself decodes
+            // for this event kind - status_code and status_data_length.
+            // There is deliberately no finger=/progress= field here: the
+            // reference implementation does not decode any such signal from
+            // this event kind either, so adding one here would be inventing
+            // a field this project has no source for, which is exactly what
+            // Milestone 2's "no guessing undocumented protocol details"
+            // rule forbids. If a finger-presence signal exists on the wire
+            // at all, it is not part of what has been reverse-engineered so
+            // far — see docs/linux-reference-analysis.md and the reference
+            // project's own bridge-xpc-probe.py::summarize_event.
             const wchar_t* kind = (embeddedType == kEmbeddedTypeStatus) ? L"status"
                                  : (embeddedType == kEmbeddedTypeStatistics) ? L"statistics"
                                  : L"unknown";
-            T2_LOG("verify", L"non-match event: embedded_type=0x%08X (%s) body=%zuB",
-                   embeddedType, kind, eventData.size());
+            if (embeddedType == kEmbeddedTypeStatus) {
+                StatusEventBody body = ParseStatusEventBody(eventData);
+                T2_LOG("verify",
+                       L"event_type=%s embedded_type=0x%08X body=%zuB status_code=%s status_data_length=%s",
+                       kind, embeddedType, eventData.size(),
+                       body.statusCode ? std::to_wstring(*body.statusCode).c_str() : L"(n/a)",
+                       body.statusDataLength ? std::to_wstring(*body.statusDataLength).c_str() : L"(n/a)");
+            } else {
+                T2_LOG("verify", L"event_type=%s embedded_type=0x%08X body=%zuB",
+                       kind, embeddedType, eventData.size());
+            }
             continue;
         }
 

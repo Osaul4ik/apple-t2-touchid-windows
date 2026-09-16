@@ -307,11 +307,15 @@ bool Connection::SendBiometricCommand(const std::vector<uint8_t>& innerBmMessage
 
         if (!env->isReply) {
             // Async bridge-side callback: ack it (same contract as
-            // WaitForEvent) and keep waiting for the actual reply.
+            // WaitForEvent) and keep waiting for the actual reply. A
+            // wider dump cap than the 32B default (see the matching note
+            // on WaitForEvent below) so status/statistics events (the
+            // ones seen here in practice, 131-167B) print in full instead
+            // of "..."-truncated at a third of their length.
             T2_LOG("sendBiometricCommand", L"async event while waiting for reply "
                    "(reqId=%s), event reqId=%s payload=%zuB %s - acking and continuing",
                    Widen(reqId).c_str(), Widen(env->requestId).c_str(),
-                   env->payloadPlist.size(), HexDump(env->payloadPlist).c_str());
+                   env->payloadPlist.size(), HexDump(env->payloadPlist, 512).c_str());
             if (!AcknowledgeEvent(env->requestId)) {
                 T2_LOG("sendBiometricCommand", L"AcknowledgeEvent failed for "
                        "event reqId=%s", Widen(env->requestId).c_str());
@@ -354,6 +358,13 @@ bool Connection::SendBiometricCommand(const std::vector<uint8_t>& innerBmMessage
         }
 
         *outReply = std::move(statusBlob->blob);
+        // Left at the 32B default deliberately, unlike the two async-event
+        // dumps above: this line's blob is a generic command reply and can
+        // legitimately BE the identity-list reply (cmd 0x42) - real
+        // enrolled-identity UUIDs, which the rest of this project treats as
+        // "opaque and never logged" (see CmdIdentities). Raising this one's
+        // cap the same way would print those UUIDs in the clear under
+        // --verbose.
         T2_LOG("sendBiometricCommand", L"OK, reqId=%s blob=%zuB %s",
                Widen(reqId).c_str(), outReply->size(), HexDump(*outReply).c_str());
         return true;
@@ -440,7 +451,19 @@ bool Connection::WaitForEvent(std::vector<uint8_t>* outEventPayload,
             }
             T2_LOG("waitForEvent", L"event acked, reqId=%s payload=%zuB %s",
                    Widen(env->requestId).c_str(), env->payloadPlist.size(),
-                   HexDump(env->payloadPlist).c_str());
+                   // 512B, not the 32B default: this line is currently the
+                   // ONLY window into what these async status/statistics
+                   // events actually contain during a match session (see
+                   // VerificationEngine's own embedded_type logging, which
+                   // names the event kind but not its body). 512B was
+                   // chosen, not just "bigger than 32": the observed
+                   // status/statistics events (131-167B) fit under it and
+                   // now dump in full, while a genuine match_result event
+                   // is >= kMinMatchResultEventBytes (0xC70 = 3184B,
+                   // MatchResult.h) and so stays truncated here same as
+                   // before - this line must never be the thing that
+                   // prints an enrolled identity UUID in the clear.
+                   HexDump(env->payloadPlist, 512).c_str());
             *outEventPayload = env->payloadPlist;
             return true;
         }
