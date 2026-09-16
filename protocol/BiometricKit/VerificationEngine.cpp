@@ -297,6 +297,35 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     // start match (cmd 4) — Linux counted default: II60x + count + records
     // (132 B for 3 identities). Override with --match-layout inline|padded.
 
+    // 17.09.2026: LINUX PARITY FIX. Every biometric_command()/
+    // request_with_events() call in the reference returns its OWN local
+    // events list (VERIFIED FROM SOURCE: reset_events, fdr_events,
+    // calibration_events, identities_events, etc. are each a fresh list
+    // scoped to that one call) - none of them ever feed into the match
+    // session's own `events`, which starts empty exactly at
+    // `match_reply, events = biometric_command(sock, 4, data=match_data)`.
+    // This project's pendingEvents_ is shared across every
+    // SendBiometricCommand/GetFdrCalibration call on this connection
+    // (ResetSensor, warm-up Cancel, LoadCalibration, both IdentityList and
+    // GlobalIdentityList reads for the stability gate above), so without
+    // this clear, WaitForEvent() below hands the match-session loop
+    // whatever leftover events those warm-up calls happened to observe -
+    // confirmed on the 16.09.2026 hardware capture, where the match
+    // session's first two logged events (80 MatchingCancelled, unnamed 94)
+    // were actually acked during LoadCalibration's own reply-wait, well
+    // before StartMatch was even sent. DiscardPendingEvents() already
+    // existed for exactly this (Connection.cpp/.h) but was never called.
+    // Events queued during StartMatch's OWN SendBiometricCommand call just
+    // below are unaffected - they land in pendingEvents_ after this point,
+    // same as the reference's own per-call `events` for cmd 4.
+    const size_t discardedPreMatchEvents = conn->DiscardPendingEvents();
+    if (discardedPreMatchEvents > 0) {
+        T2_LOG("verify",
+               L"discarded %zu pre-StartMatch event(s) accumulated during warm-up "
+               L"(Linux never attributes these to the match session)",
+               discardedPreMatchEvents);
+    }
+
     auto matchInitData = EncodeMatchInitData(config_.matchFlags, config_.macosUserId,
                                               identities, config_.matchLayout);
     T2_LOG("verify",
