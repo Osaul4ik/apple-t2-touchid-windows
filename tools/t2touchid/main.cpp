@@ -355,7 +355,7 @@ static int CmdNetwork(int argc, wchar_t* argv[]) {
     }
     ScanOptions opt;
     opt.concurrency = 64;
-    opt.connectTimeoutMs = 150;
+    opt.connectTimeoutMs = 10;  // ~1ms observed RTT; 150ms was overkill for this link
     opt.includeTcpOnly = true;
     opt.onProgress = [](unsigned tried, unsigned total, unsigned tcp, unsigned http2) {
         std::wcout << L"  scanned " << tried << L"/" << total
@@ -507,7 +507,7 @@ static bool DiscoverBiometricKitBridge(int argc, wchar_t* argv[], int firstArgIn
 
     ScanOptions opt;
     opt.concurrency = 64;
-    opt.connectTimeoutMs = 150;
+    opt.connectTimeoutMs = 4;  // ~1ms observed RTT; 150ms was overkill for this link
     opt.includeTcpOnly = true;
     auto hits = ScanHttp2Preface(ep, opt);
 

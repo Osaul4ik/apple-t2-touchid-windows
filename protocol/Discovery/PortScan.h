@@ -29,8 +29,10 @@ struct ScanOptions {
     uint16_t portBegin = 49152;
     uint16_t portEnd = 65535;
     unsigned concurrency = 64;
-    // Linux default --probe-timeout 0.15; used for connect. Recv uses max(300, this).
-    unsigned connectTimeoutMs = 150;
+    // Linux default --probe-timeout 0.15 (150ms). Lowered to 4ms here:
+    // observed RTT to the T2 peer over this NCM link is ~1ms, so 150ms was
+    // far more headroom than the link needs for a single probe.
+    unsigned connectTimeoutMs = 10;
     bool includeTcpOnly = true;
     // If a TCP-open peer stays fully silent (0 bytes) on the passive
     // recv-only attempt, retry once by sending our own HTTP/2 client
