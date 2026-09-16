@@ -43,6 +43,50 @@ static bool SetSocketTimeout(SOCKET s, int optname, std::chrono::milliseconds ti
     return setsockopt(s, SOL_SOCKET, optname, reinterpret_cast<const char*>(&ms), sizeof(ms)) == 0;
 }
 
+// Narrow, bounded extraction of one integer field from the peer's HELO
+// JSON - e.g. {"MaxSupportedProtocolVersion":1,"OSBuild":"...",
+// "BridgeXPCVersion":39,"ProcessName":"..."}. This is deliberately not a
+// general JSON parser (same "only the narrow shapes we need" philosophy as
+// PlistPayload.h): it looks for "<key>" followed by : and reads the
+// unsigned decimal digits that follow, whitespace-tolerant, and fails
+// closed (returns false) on anything else - missing key, non-numeric
+// value, or a value so large it can't be an actual BridgeXPCVersion.
+static bool ExtractJsonIntField(const std::string& json, const std::string& key, int64_t* out) {
+    std::string needle = "\"" + key + "\"";
+    size_t pos = json.find(needle);
+    if (pos == std::string::npos) return false;
+    pos += needle.size();
+    pos = json.find(':', pos);
+    if (pos == std::string::npos) return false;
+    ++pos;
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) ++pos;
+    size_t start = pos;
+    while (pos < json.size() && json[pos] >= '0' && json[pos] <= '9') ++pos;
+    if (pos == start) return false; // no digits found
+    int64_t value = 0;
+    for (size_t i = start; i < pos; ++i) {
+        value = value * 10 + (json[i] - '0');
+        if (value > 0xFFFFFF) return false; // implausible for a protocol version, fail closed
+    }
+    *out = value;
+    return true;
+}
+
+// Builds this client's own HELO body. VERIFIED FROM SOURCE
+// (t2_bridge_wire.py send_helo(), matching docs/linux-reference-analysis.md
+// line 187): the client sends its OWN HELO - MaxSupportedProtocolVersion,
+// its own OSBuild/ProcessName - reusing only the peer's BridgeXPCVersion.
+// Field order and separator style (no spaces, matching Python's
+// separators=(",", ":")) mirror the reference exactly even though this is
+// JSON and a real parser wouldn't care about either - no reason to differ
+// from a verified-working format.
+static std::vector<uint8_t> BuildClientHeloBody(int64_t bridgeXpcVersion) {
+    std::string json = "{\"MaxSupportedProtocolVersion\":1,\"OSBuild\":\"Windows\","
+                        "\"BridgeXPCVersion\":" + std::to_string(bridgeXpcVersion) +
+                        ",\"ProcessName\":\"t2touchid\"}";
+    return std::vector<uint8_t>(json.begin(), json.end());
+}
+
 ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned long interfaceIndex,
                                    uint16_t port, std::chrono::milliseconds connectTimeout) {
     socket_ = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
@@ -71,11 +115,28 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
         return ConnectResult::HeloTimeout;
     }
 
-    // Echo a HELO body; per Linux reference the client's BridgeXPCVersion
-    // must match whatever the peer just sent — we do not invent our own
-    // arbitrary version.
-    std::string helloJson = std::string(helo.body.begin(), helo.body.end());
-    if (!WriteFrame(FrameType::Helo, helo.body)) { // echo verbatim, simplest correct behavior
+    // BUG FIX: this used to echo the peer's own HELO body straight back
+    // (WriteFrame(FrameType::Helo, helo.body)). That is NOT what the
+    // verified reference does. docs/linux-reference-analysis.md line 187
+    // (itself sourced from bridge-xpc-probe.py's send_helo()) says the
+    // client replies with its OWN HELO JSON - only reusing the peer's
+    // BridgeXPCVersion number - not a copy of the T2's self-description
+    // (its own OSBuild/ProcessName). Sending the device's own HELO back to
+    // it, unchanged, doesn't identify us as a real client, which is a
+    // plausible reason bridgeOS accepts the handshake (framing is valid,
+    // so HELO/getBridgeVersion/setClientVersion/reset/cancel all still
+    // "work") but then withholds the FDR calibration blob on a policy it
+    // gates by client identity - GetFdrCalibration comes back with [None]
+    // ("bridgeOS returned no usable FDR calibration data") instead of an
+    // error, so nothing before it ever caught this.
+    std::string peerHeloJson(helo.body.begin(), helo.body.end());
+    int64_t bridgeXpcVersion = 0;
+    if (!ExtractJsonIntField(peerHeloJson, "BridgeXPCVersion", &bridgeXpcVersion)) {
+        Close();
+        return ConnectResult::HeloMalformed;
+    }
+    std::vector<uint8_t> ownHelo = BuildClientHeloBody(bridgeXpcVersion);
+    if (!WriteFrame(FrameType::Helo, ownHelo)) {
         Close();
         return ConnectResult::HeloMalformed;
     }
