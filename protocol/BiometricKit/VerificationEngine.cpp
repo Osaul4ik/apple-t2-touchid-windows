@@ -264,143 +264,35 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     T2_LOG("verify", L"identity inventory stable across 0x42->0x51->0x42->0x51 (%zu configured)",
            configuredFirst.size());
 
-    auto cancelCmd = EncodeBmCommand(Command::Cancel, 1, 0);
     std::vector<uint8_t> reply;
+    // Kept for the CancelGuard below (post-match cleanup on every exit
+    // path) — unrelated to the removed pre-match sequence.
+    auto cancelCmd = EncodeBmCommand(Command::Cancel, 1, 0);
 
-    // macOS live-unlock pre-match sequence — VERIFIED FROM SOURCE, a real
-    // macOS unified-log capture of biometrickitd on this exact machine/
-    // firmware (16.09.2026, /mnt/user-data/uploads/touchid-unlock.log),
-    // not the earlier docs/ macos-verified.md §4 command SET alone — that
-    // gave the commands issued but not their order. The full ordered trace
-    // for a successful unlock, exact timestamps:
-    //   48 GetEnabledForUnlock
-    //   39 GetSksLockStateMac(uid)
-    //   46 GetProtectedConfig(uid)
-    //   12 Cancel                        -> async status 80 MatchingCancelled
-    //   39 GetSksLockStateMac(uid)        (repeat)
-    //   40 GetBiometrickitdInfo
-    //   46 GetProtectedConfig(uid)        (repeat)
-    //   [cmd 84, inSize=20, undocumented - fires from an unrelated periodic
-    //    statistics(type 29) callback, not part of this gate; not ported,
-    //    no verified request/reply format exists for it]
-    //   12 Cancel (again)                -> async status 89 SensorOperationModeIdle
-    //   4 StartMatch (68B)               -> 90 Capture -> ... -> 55 ImageCaptured
-    // StartMatch is issued ONLY after the SECOND Cancel, and that second
-    // Cancel is the last thing sent before it - nothing else comes between.
-    // The resulting 89 Idle transition is exactly the status this project's
-    // own Windows captures have never once observed (docs/ macos-verified.md
-    // §2's "failing Windows session" trace has no 80 and no 89 either).
-    // Windows previously went straight from identity-list to StartMatch with
-    // no Cancel adjacent to it at all. Only request sizes are documented
-    // (48/40: inSize=0; 39/46: inSize=4, macosUserId) - no reply format is
-    // documented for any of them, so none is parsed; outputCapacity=0
-    // matches the existing convention for commands whose reply body this
-    // project does not read (ResetSensor, Cancel, LoadCalibration, StartMatch
-    // above/below). Best-effort, like the existing warm-up Cancel: a failure
-    // here does not by itself justify aborting a verify that has a stable,
-    // non-empty identity list.
-    {
-        std::vector<uint8_t> uidReq(4);
-        std::memcpy(uidReq.data(), &config_.macosUserId, 4);
-
-        auto enabledForUnlockCmd = EncodeBmCommand(Command::GetEnabledForUnlock, 1, 0);
-        auto sksLockStateCmd = EncodeBmCommand(Command::GetSksLockStateMac, 1, 0, uidReq);
-        auto protectedConfigCmd = EncodeBmCommand(Command::GetProtectedConfig, 1, 0, uidReq);
-        auto biometrickitdInfoCmd = EncodeBmCommand(Command::GetBiometrickitdInfo, 1, 0);
-
-        conn->SendBiometricCommand(enabledForUnlockCmd, 0, &reply, config_.ioTimeout);
-        T2_LOG("verify", L"macOS pre-match: GetEnabledForUnlock (cmd 48) issued");
-
-        conn->SendBiometricCommand(sksLockStateCmd, 0, &reply, config_.ioTimeout);
-        T2_LOG("verify", L"macOS pre-match: GetSksLockStateMac (cmd 39) issued");
-
-        conn->SendBiometricCommand(protectedConfigCmd, 0, &reply, config_.ioTimeout);
-        T2_LOG("verify", L"macOS pre-match: GetProtectedConfig (cmd 46) issued");
-
-        conn->SendBiometricCommand(cancelCmd, 0, &reply, config_.ioTimeout);
-        T2_LOG("verify", L"macOS pre-match: Cancel (cmd 12), first - expect async MatchingCancelled");
-
-        conn->SendBiometricCommand(sksLockStateCmd, 0, &reply, config_.ioTimeout);
-        T2_LOG("verify", L"macOS pre-match: GetSksLockStateMac (cmd 39), repeat");
-
-        conn->SendBiometricCommand(biometrickitdInfoCmd, 0, &reply, config_.ioTimeout);
-        T2_LOG("verify", L"macOS pre-match: GetBiometrickitdInfo (cmd 40) issued");
-
-        conn->SendBiometricCommand(protectedConfigCmd, 0, &reply, config_.ioTimeout);
-        T2_LOG("verify", L"macOS pre-match: GetProtectedConfig (cmd 46), repeat");
-
-        conn->SendBiometricCommand(cancelCmd, 0, &reply, config_.ioTimeout);
-        T2_LOG("verify", L"macOS pre-match: Cancel (cmd 12), second (last before StartMatch) - "
-               L"expect async SensorOperationModeIdle");
-    }
-
-    // WAIT FOR CONFIRMED 89 Idle — 16.09.2026 finding: a real hardware
-    // capture (t2touchid verify -v) showed the blind DiscardPendingEvents()
-    // this replaces threw away exactly 0 pre-StartMatch events, and the
-    // second Cancel's own async completion (expected: 80 MatchingCancelled
-    // -> 89 Idle, per the macOS reference order in MatchResult.cpp) did NOT
-    // arrive before StartMatch was sent at all — 80 showed up as the FIRST
-    // event of the *match* stream instead, and 89 never appeared anywhere
-    // in the whole session. So the previous "send second Cancel, discard
-    // whatever's queued, immediately send StartMatch" was a race: on real
-    // macOS, StartMatch is issued only after the sensor has actually
-    // reached Idle, not merely after the Cancel command's own reply.
-    // This block now blocks on WaitForEvent (same primitive the post-
-    // StartMatch match loop already uses) until either a status event with
-    // statusCode==89 is observed, or a bounded deadline elapses. Every
-    // other event seen along the way (80 MatchingCancelled, statistics,
-    // etc.) is still discarded from the match stream, same as before —
-    // only 89 is treated as the release condition. If the deadline is hit
-    // without 89, this fails OPEN (logs and proceeds to StartMatch
-    // anyway): downgrading a still-unverified wait condition into a hard
-    // fail-closed gate is not justified by a single capture, and every
-    // other best-effort step in this pre-match sequence (48/39/46/40, all
-    // of which returned non-zero status=258 on the same capture) already
-    // follows that same non-blocking convention.
-    {
-        auto idleDeadline = steady_clock::now() + config_.ioTimeout;
-        size_t discardedBeforeIdle = 0;
-        bool sawIdle = false;
-        while (steady_clock::now() < idleDeadline) {
-            std::vector<uint8_t> eventPayload;
-            if (!conn->WaitForEvent(&eventPayload, idleDeadline)) {
-                break;
-            }
-            discardedBeforeIdle++;
-
-            auto statusData = bridgexpc::DecodeStatusEventData(eventPayload);
-            if (!statusData) continue;
-            uint32_t embeddedType = 0;
-            std::vector<uint8_t> eventData;
-            if (!ParseStatusEventHeader(*statusData, &embeddedType, &eventData)) continue;
-            if (embeddedType != kEmbeddedTypeStatus) continue;
-
-            StatusEventBody body = ParseStatusEventBody(eventData);
-            T2_LOG("verify",
-                   L"pre-StartMatch event: status_code=%s status_name=%s",
-                   body.statusCode ? std::to_wstring(*body.statusCode).c_str() : L"(n/a)",
-                   body.statusCode
-                       ? (StatusCodeName(*body.statusCode) ? StatusCodeName(*body.statusCode)
-                                                            : L"(not seen in macOS reference capture)")
-                       : L"(n/a)");
-            if (body.statusCode && *body.statusCode == 89) {
-                sawIdle = true;
-                break;
-            }
-        }
-        if (sawIdle) {
-            T2_LOG("verify",
-                   L"confirmed 89 SensorOperationModeIdle after %zu discarded "
-                   L"pre-StartMatch event(s) - proceeding to StartMatch",
-                   discardedBeforeIdle - 1);
-        } else {
-            T2_LOG("verify",
-                   L"89 Idle NOT observed before deadline (%zu event(s) discarded "
-                   L"instead) - proceeding to StartMatch anyway (best-effort, not "
-                   L"yet fail-closed)",
-                   discardedBeforeIdle);
-        }
-    }
+    // REVERTED (16.09.2026): the macOS-log-derived pre-match sequence that
+    // used to live here (GetEnabledForUnlock/GetSksLockStateMac/
+    // GetProtectedConfig/GetBiometrickitdInfo, a double Cancel, and a wait
+    // for an async 89 Idle event before StartMatch) is GONE. Two back-to-
+    // back real-hardware captures with it in place never once produced an
+    // 80 MatchingCancelled or 89 Idle event before StartMatch — both times
+    // the eventual 80 showed up only after StartMatch was already sent, as
+    // the first event of the match stream itself, meaning that whole
+    // sequence bought nothing but ~1s of dead time and four guaranteed
+    // status=258 failures (48/39/46/40 are simply not usable on this
+    // bridge/firmware, unlike the biometrickitd process macOS's own log was
+    // captured from, which presumably has entitlements this client does
+    // not). Root cause is not confirmed to be this gap, but there is no
+    // remaining evidence FOR the macOS sequence either, so per explicit
+    // instruction this driver now does the identity-list-stable check above
+    // and then goes STRAIGHT to StartMatch — exactly what
+    // t2-fprintd.py/bridge-xpc-probe.py's real --timed-match path does
+    // (VERIFIED FROM SOURCE: biometric_command(sock, 4, data=match_data) is
+    // the very next call after the identity/stability gate, no Cancel, no
+    // wait, nothing else between). config_.skipResetSensor/
+    // skipLoadCalibration also now default to false for the same reason:
+    // Linux's warm_up always sends both; skipping them was a macOS-capture-
+    // only assumption with the same lack of confirmation as the sequence
+    // just removed.
 
     // start match (cmd 4) — Linux counted default: II60x + count + records
     // (132 B for 3 identities). Override with --match-layout inline|padded.

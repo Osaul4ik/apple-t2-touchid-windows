@@ -66,20 +66,20 @@ struct VerifyConfig {
     // match both Linux fprintd and the macOS capture; expose via CLI for A/B.
     uint32_t matchFlags = 0;
 
-    // docs/ macos-verified.md §4 (16.09.2026 macOS live-unlock capture,
-    // same machine): "Across the whole capture: 4, 12, 39, 40, 44, 46, 48,
-    // 56, 61, 62, 63, 74, 80, 84. Never 2 (ResetSensor) and never 0x20
-    // (LoadCalibration)... Both are now opt-in." So the macOS-verified
-    // default is to skip both; Linux always sends both, which is why the
-    // Linux-parity path (skip=false) existed, but this project talks to
-    // real bridgeOS firmware, not the Linux reference target, and the two
-    // disagree here — the hardware capture wins. §7's "Next diagnostic
-    // step" explicitly re-enables LoadCalibration via CLI on top of this
-    // default (--load-calibration) as the next A/B to try, precisely
-    // because this default is skip=true, not skip=false. Identity list +
-    // StartMatch still always run.
-    bool skipResetSensor = true;
-    bool skipLoadCalibration = true;
+    // REVERTED (16.09.2026): previously defaulted to true/true on the
+    // strength of a macOS unified-log capture (docs/ macos-verified.md §4)
+    // showing cmd 2/0x20 absent from a live unlock. That capture also
+    // implied a whole pre-match command sequence (see the now-removed
+    // block in Verify()) that two real-hardware runs failed to validate —
+    // no evidence has since confirmed the macOS-log path over Linux's own,
+    // and Linux's warm_up() (t2-biometric-ready.sh / t2-fprintd.py
+    // _run_probe(), VERIFIED FROM SOURCE) unconditionally sends both
+    // ResetSensor and LoadCalibration before every identity-list read.
+    // Defaulting to skip=false restores that Linux parity; CLI flags still
+    // allow forcing skip=true for an explicit A/B against the old
+    // macOS-derived path.
+    bool skipResetSensor = false;
+    bool skipLoadCalibration = false;
 };
 
 // One VerificationEngine instance == one in-flight session (Milestone 2
