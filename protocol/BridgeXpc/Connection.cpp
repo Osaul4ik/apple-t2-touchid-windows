@@ -90,10 +90,23 @@ static bool ExtractJsonIntField(const std::string& json, const std::string& key,
 // separators=(",", ":")) mirror the reference exactly even though this is
 // JSON and a real parser wouldn't care about either - no reason to differ
 // from a verified-working format.
+//
+// 17.09.2026: OSBuild/ProcessName literals changed from "Windows"/
+// "t2touchid" to the EXACT literals the real, proven-working Linux client
+// sends (t2_bridge_wire.py send_helo() body + T2Backend._run_probe()'s
+// hardcoded ProcessName="t2-touchid-probe" - VERIFIED FROM SOURCE, not
+// guessed). Rationale: every other pre-StartMatch field/command/reply this
+// project sends has now been independently cross-checked against the
+// reference's real runtime path and matches byte-for-byte (see
+// docs/linux-reference-analysis.md, EP7-TRANSPORT-ANALYSIS.md); this HELO
+// body was the one remaining place the client told bridgeOS/SEP something
+// the working reference never says. Not confirmed to be the root cause -
+// pure string change, zero wire-shape/parsing impact, cheap to test and
+// easy to revert if the next hardware capture shows no difference.
 static std::vector<uint8_t> BuildClientHeloBody(int64_t bridgeXpcVersion) {
-    std::string json = "{\"MaxSupportedProtocolVersion\":1,\"OSBuild\":\"Windows\","
+    std::string json = "{\"MaxSupportedProtocolVersion\":1,\"OSBuild\":\"Linux\","
                         "\"BridgeXPCVersion\":" + std::to_string(bridgeXpcVersion) +
-                        ",\"ProcessName\":\"t2touchid\"}";
+                        ",\"ProcessName\":\"t2-touchid-probe\"}";
     return std::vector<uint8_t>(json.begin(), json.end());
 }
 
