@@ -94,9 +94,22 @@ enum class Command : uint16_t {
     StartMatch        = 4,
     Cancel            = 0x0c,
     LoadCalibration   = 0x20,
-    SksLockState      = 0x27,
+    SksLockState      = 0x27, // Linux probe number; macOS live uses 39
     SensorInfo        = 0x35,
     CatacombUuid      = 0x38,
+    // macOS live unlock pre-match sequence (unified log 16.09.2026, bridgeOS 23P5067):
+    //   48 getEnabledForUnlock (inSize=0)
+    //   39 performGetSKSLockStateCommand (inSize=4, uid)
+    //   46 performGetProtectedConfigCommand (inSize=4, uid)
+    //   12 Cancel
+    //   40 performGetBiometrickitdInfoCommand (inSize=0)
+    //   … then 4 StartMatch (inSize=68)
+    // Windows previously skipped all of these and went straight to StartMatch;
+    // the sensor then never emitted 89 Idle or 55 ImageCaptured.
+    GetSksLockStateMac   = 39,
+    GetBiometrickitdInfo = 40,
+    GetProtectedConfig   = 46,
+    GetEnabledForUnlock  = 48,
     CatacombHash      = 0x3a,
     CatacombState     = 0x3c,
     IdentityList      = 0x42,

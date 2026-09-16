@@ -278,14 +278,63 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     }
 
     auto cancelCmd = EncodeBmCommand(Command::Cancel, 1, 0);
+    std::vector<uint8_t> reply;
 
-    // start match (cmd 4)
-    //
-    // 16.09.2026 FIX: the payload used to be MatchInitDataV1 + uint32 count
-    // + records = 132 bytes for the 3 identities on this machine. The macOS
-    // capture shows biometrickitd sending inSize=68 for the same command on
-    // the same machine with the same 3 identities. 68 == 8 + 3*20, so the
-    // identity records go inline after an 8-byte header with no count word.
+    // macOS live unlock pre-match (unified log 16.09.2026 on this machine):
+    //   48 getEnabledForUnlock (inSize=0)
+    //   39 getSKSLockState (inSize=4, uid)
+    //   46 getProtectedConfig (inSize=4, uid)
+    //   12 Cancel
+    //   40 getBiometrickitdInfo (inSize=0)
+    //   39 + 46 + 12 again (best-effort; first pass is the critical one)
+    //   4  StartMatch (inSize=68)
+    // Successful status path then includes 89 Idle before 90 Capture, and
+    // 55/72/95 after FingerOn. Windows never saw 89/55 without this prefix.
+    {
+        T2_LOG("verify", L"macOS pre-match: 48/39/46/12/40 (enabled/sks/protected/cancel/info)");
+        std::vector<uint8_t> uid4(4);
+        std::memcpy(uid4.data(), &config_.macosUserId, 4);
+
+        auto cmd48 = EncodeBmCommand(Command::GetEnabledForUnlock, 1, 0);
+        if (!conn->SendBiometricCommand(cmd48, 16, &reply, config_.ioTimeout)) {
+            T2_LOG("verify", L"GetEnabledForUnlock (cmd 48) failed");
+            return VerifyOutcome::TransportError;
+        }
+        T2_LOG("verify", L"GetEnabledForUnlock OK, reply=%zuB", reply.size());
+
+        auto cmd39 = EncodeBmCommand(Command::GetSksLockStateMac, 1, 0, uid4);
+        if (!conn->SendBiometricCommand(cmd39, 16, &reply, config_.ioTimeout)) {
+            T2_LOG("verify", L"GetSksLockState (cmd 39) failed");
+            return VerifyOutcome::TransportError;
+        }
+        T2_LOG("verify", L"GetSksLockState OK, reply=%zuB", reply.size());
+
+        auto cmd46 = EncodeBmCommand(Command::GetProtectedConfig, 1, 0, uid4);
+        if (!conn->SendBiometricCommand(cmd46, 64, &reply, config_.ioTimeout)) {
+            T2_LOG("verify", L"GetProtectedConfig (cmd 46) failed");
+            return VerifyOutcome::TransportError;
+        }
+        T2_LOG("verify", L"GetProtectedConfig OK, reply=%zuB", reply.size());
+
+        conn->SendBiometricCommand(cancelCmd, 0, &reply, config_.ioTimeout); // best-effort
+        T2_LOG("verify", L"Cancel after protected-config issued");
+
+        auto cmd40 = EncodeBmCommand(Command::GetBiometrickitdInfo, 1, 0);
+        if (!conn->SendBiometricCommand(cmd40, 64, &reply, config_.ioTimeout)) {
+            T2_LOG("verify", L"GetBiometrickitdInfo (cmd 40) failed");
+            return VerifyOutcome::TransportError;
+        }
+        T2_LOG("verify", L"GetBiometrickitdInfo OK, reply=%zuB", reply.size());
+
+        // Drain any status events these queries produced so StartMatch loop
+        // still starts clean (same rationale as LoadCalibration drain).
+        size_t dropped = conn->DiscardPendingEvents();
+        if (dropped > 0) {
+            T2_LOG("verify", L"discarded %zu event(s) after macOS pre-match queries", dropped);
+        }
+    }
+
+    // start match (cmd 4) — macOS inSize=68 on this machine (3 identities)
     auto matchInitData = EncodeMatchInitData(config_.matchFlags, config_.macosUserId,
                                               identities, config_.matchLayout);
     T2_LOG("verify",
@@ -294,7 +343,6 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
            config_.matchFlags, identities.size(),
            sizeof(MatchOptionsV1) + identities.size() * sizeof(IdentityRecordV1));
     auto startCmd = EncodeBmCommand(Command::StartMatch, 1, 0, matchInitData);
-    std::vector<uint8_t> reply;
     if (!conn->SendBiometricCommand(startCmd, 0, &reply, config_.ioTimeout)) {
         return VerifyOutcome::TransportError;
     }
