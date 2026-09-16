@@ -3,13 +3,47 @@
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
 #include <netioapi.h>
+#include <windows.h>
 #include <cstring>
+#include <cstdio>
 
 #pragma comment(lib, "Ws2_32.lib")
 #pragma comment(lib, "Iphlpapi.lib")
 
 namespace t2::discovery {
 namespace {
+
+// Nudges the T2 to answer by sending one ICMPv6 echo to the all-nodes
+// multicast address on this interface — the exact manual workaround an
+// operator has to reach for today ("try pinging ff02::1%<ifIndex>").
+// This shells out to the system ping.exe (rather than driving raw ICMPv6
+// via Icmp6SendEcho2, whose reply-capture semantics for a *multicast*
+// destination are the fragile part) — we don't need to parse *our* copy
+// of the reply, we only need Windows' own IPv6 stack to observe the T2's
+// unicast reply on the wire, which is what actually populates the
+// neighbor table entry FindNeighborPeer reads afterwards.
+bool PromptPeerViaMulticastPing(unsigned long ifIndex, unsigned timeoutMs) {
+    if (ifIndex == 0) return false;
+
+    wchar_t cmd[128];
+    _snwprintf_s(cmd, _TRUNCATE, L"ping.exe -6 -n 1 -w %u ff02::1%%%lu",
+                 timeoutMs, ifIndex);
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi{};
+
+    if (!CreateProcessW(nullptr, cmd, nullptr, nullptr, FALSE,
+                         CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        return false;
+    }
+    WaitForSingleObject(pi.hProcess, timeoutMs + 1000);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return true;
+}
 
 bool LooksLikeT2Ncm(const std::wstring& description, const std::wstring& friendly) {
     auto has = [](const std::wstring& s, const wchar_t* needle) {
@@ -87,15 +121,24 @@ bool FillFromAdapter(IP_ADAPTER_ADDRESSES* a, NcmEndpoint* out) {
     }
 
     // Real discovery, not derivation: look up whatever the Windows IPv6
-    // neighbor table actually confirmed on this interface. Left as
-    // PeerSource::None (peerLinkLocal stays zeroed) if nothing qualifies
-    // yet — the caller decides what to do about that (prompt for
-    // traffic, suggest --host), this function does not guess.
+    // neighbor table actually confirmed on this interface. If nothing
+    // qualifies yet, send the one-off ff02::1 multicast ping ourselves
+    // (an operator would otherwise have to do this by hand every time)
+    // and check the neighbor table once more before giving up — still
+    // left as PeerSource::None (peerLinkLocal stays zeroed) if that
+    // retry also comes up empty, so the caller can fall back to --host.
     if (gotLocal) {
         in6_addr peer{};
         if (FindNeighborPeer(out->ifIndex, &peer)) {
             out->peerLinkLocal = peer;
             out->peerSource = PeerSource::NeighborTable;
+        } else {
+            PromptPeerViaMulticastPing(out->ifIndex, 300);
+            Sleep(250);
+            if (FindNeighborPeer(out->ifIndex, &peer)) {
+                out->peerLinkLocal = peer;
+                out->peerSource = PeerSource::NeighborTable;
+            }
         }
     }
 

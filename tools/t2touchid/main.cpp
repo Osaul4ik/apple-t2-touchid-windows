@@ -330,9 +330,10 @@ static int CmdNetwork(int argc, wchar_t* argv[]) {
         if (ep.peerSource == PeerSource::None) {
             std::wcout << L"peer:     (none found)\n";
             std::wcout << L"  no Reachable/Stale/Delay/Probe IPv6 neighbor "
-                          L"on ifIndex " << ep.ifIndex << L" yet.\n";
-            std::wcout << L"  try pinging ff02::1%" << ep.ifIndex
-                       << L" to prompt the T2 to answer, or pass --host fe80::...\n";
+                          L"on ifIndex " << ep.ifIndex << L" yet, even after "
+                          L"an automatic ff02::1 prompt ping.\n";
+            std::wcout << L"  try running the command again (the T2 may just "
+                          L"need another moment), or pass --host fe80::...\n";
         } else {
             std::wcout << L"peer:     ";
             for (char c : peer) std::wcout << static_cast<wchar_t>(c);
@@ -501,13 +502,22 @@ static bool DiscoverBiometricKitBridge(int argc, wchar_t* argv[], int firstArgIn
         ep.peerSource = PeerSource::ManualOverride;
     }
     if (ep.peerSource == PeerSource::None) {
-        std::wcout << L"no peer to scan - run 'network' first or pass --host fe80::...\n";
+        std::wcout << L"no peer to scan (automatic ff02::1 prompt ping didn't "
+                      L"turn one up) - run 'network' first or pass --host fe80::...\n";
         return false;
     }
 
     ScanOptions opt;
     opt.concurrency = 64;
-    opt.connectTimeoutMs = 4;  // ~1ms observed RTT; 150ms was overkill for this link
+    // BUG FIX: this was 4ms, well under the 10ms that `network`'s own
+    // scan (CmdNetwork, same link, same probe) uses and has verified on
+    // real hardware. On a USB NCM link ~1ms RTT is typical but not
+    // guaranteed every probe — 4ms left too many of the 64 concurrent
+    // connect()s timing out before SETTINGS arrived, which is why
+    // `identities`/`verify` intermittently reported "no HTTP/2
+    // candidates" right after `network` had just found 7. Match the
+    // proven value instead of re-guessing a smaller one.
+    opt.connectTimeoutMs = 10;
     opt.includeTcpOnly = true;
     auto hits = ScanHttp2Preface(ep, opt);
 
