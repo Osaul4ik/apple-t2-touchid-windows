@@ -6,6 +6,8 @@
 #include <cstring>
 #include <string>
 
+using t2::log::HexDump;
+
 namespace t2::biometrickit {
 
 using namespace std::chrono;
@@ -167,6 +169,19 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
                        kind, embeddedType, eventData.size(),
                        body.statusCode ? std::to_wstring(*body.statusCode).c_str() : L"(n/a)",
                        body.statusDataLength ? std::to_wstring(*body.statusDataLength).c_str() : L"(n/a)");
+            } else if (embeddedType == kEmbeddedTypeStatistics) {
+                // Raw dump, not just size: statistics events are ~28B and
+                // this project has never decoded their fields (see the
+                // comment above — "statistics ... content not parsed in
+                // detail"). Dumping the whole body (well under
+                // kMinMatchResultEventBytes, so never risks printing
+                // anything UUID-shaped) is meant to let a hardware capture
+                // of several finger presentations in a row show whether any
+                // byte in here tracks something like a per-attempt quality
+                // score around a `status_code=78` (retry) moment — still no
+                // meaning assigned here, just the bytes for comparison.
+                T2_LOG("verify", L"event_type=%s embedded_type=0x%08X body=%zuB %s",
+                       kind, embeddedType, eventData.size(), HexDump(eventData, eventData.size()).c_str());
             } else {
                 T2_LOG("verify", L"event_type=%s embedded_type=0x%08X body=%zuB",
                        kind, embeddedType, eventData.size());
