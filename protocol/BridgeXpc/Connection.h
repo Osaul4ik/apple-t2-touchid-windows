@@ -76,6 +76,15 @@ public:
     bool WaitForEvent(std::vector<uint8_t>* outEventPayload,
                        std::chrono::steady_clock::time_point deadline);
 
+    // Discard events retained during LoadCalibration / identity warm-up
+    // BEFORE StartMatch is issued. Linux keeps load_calibration_events
+    // separate from the match event stream; feeding those pre-match
+    // statuses (MatchingCancelled, 94, …) into the verify loop as if they
+    // belonged to the match session is a Windows-only divergence that can
+    // leave the sensor state machine in an unexpected ordinal sequence.
+    // Returns how many events were dropped (for logging).
+    size_t DiscardPendingEvents();
+
     void Close();
 
 private:

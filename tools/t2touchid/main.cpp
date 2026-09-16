@@ -668,6 +668,9 @@ static int CmdVerify(int argc, wchar_t* argv[]) {
                            << L"' (expected inline|padded|legacy)\n";
                 return 1;
             }
+        } else if (a == L"--match-flags" && i + 1 < argc) {
+            // Linux: --match-processed-flags (default 0; "use 1 for an unlock match")
+            cfg.matchFlags = static_cast<uint32_t>(_wtoi(argv[++i]));
         }
     }
 
@@ -744,7 +747,8 @@ int wmain(int argc, wchar_t* argv[]) {
         std::wcout << L"  identities [ifIndex] [--host fe80::...] [--uid N]\n";
         std::wcout << L"  warmup     [ifIndex] [--host fe80::...] [--uid N]\n";
         std::wcout << L"  verify     [ifIndex] [--host fe80::...] [--uid N] [--seconds N]\n"
-                      L"             [--match-layout inline|padded|legacy]\n";
+                      L"             [--match-layout inline|padded|legacy]\n"
+                      L"             [--match-flags N]  (0=default, 1=unlock match per Linux)\n";
         std::wcout << L"  --verbose/-v (or env T2TOUCHID_VERBOSE=1): print step-by-step\n";
         std::wcout << L"    BridgeXPC diagnostics to the console. Always available in\n";
         std::wcout << L"    DebugView (run as Administrator, Capture Global Win32) even\n";

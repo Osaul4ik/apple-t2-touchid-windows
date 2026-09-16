@@ -483,6 +483,19 @@ bool Connection::GetFdrCalibration(std::vector<uint8_t>* outBlob, std::chrono::m
     }
 }
 
+size_t Connection::DiscardPendingEvents() {
+    const size_t n = pendingEvents_.size();
+    if (n > 0) {
+        T2_LOG("discardPending",
+               L"dropping %zu pre-match event(s) retained during "
+               L"LoadCalibration/identity warm-up (Linux keeps these "
+               L"out of the match event stream)",
+               n);
+        pendingEvents_.clear();
+    }
+    return n;
+}
+
 bool Connection::WaitForEvent(std::vector<uint8_t>* outEventPayload,
                                std::chrono::steady_clock::time_point deadline) {
     for (;;) {

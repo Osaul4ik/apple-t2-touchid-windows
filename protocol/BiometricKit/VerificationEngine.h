@@ -63,6 +63,11 @@ struct VerifyConfig {
     // next run starts from the wire format that the SEP actually accepts
     // on this firmware, not the Linux-derived counted blob.
     MatchIdentityLayout matchLayout = MatchIdentityLayout::InlineIdentities;
+
+    // MatchInitDataV1 / MatchOptionsV1 flags field. Linux probe default is 0;
+    // its help text notes "use 1 for an unlock match". Keep 0 as default to
+    // match both Linux fprintd and the macOS capture; expose via CLI for A/B.
+    uint32_t matchFlags = 0;
 };
 
 // One VerificationEngine instance == one in-flight session (Milestone 2

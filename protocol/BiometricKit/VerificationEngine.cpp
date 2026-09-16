@@ -251,6 +251,22 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
            L"identity warm-up OK: 0x42/0x51/0x42/0x51 user=%zuB global=%zuB identities=%zu (StartMatch uses full first 0x42 list)",
            firstUserRaw.size(), firstGlobalRaw.size(), identities.size());
 
+    // LINUX PARITY: load_calibration_events (and any events from the identity
+    // warm-up commands) must NOT enter the match event stream. Linux records
+    // them under result["load_calibration_events"] and starts the match loop
+    // clean. On Windows those events were previously left in pendingEvents_
+    // and delivered as the first "match" statuses (MatchingCancelled + 94),
+    // which is a known divergence from the working Linux path.
+    {
+        size_t dropped = conn->DiscardPendingEvents();
+        if (dropped > 0) {
+            T2_LOG("verify",
+                   L"discarded %zu pre-StartMatch event(s) so match loop sees "
+                   L"only post-StartMatch traffic",
+                   dropped);
+        }
+    }
+
     auto cancelCmd = EncodeBmCommand(Command::Cancel, 1, 0);
 
     // start match (cmd 4)
@@ -260,11 +276,13 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     // capture shows biometrickitd sending inSize=68 for the same command on
     // the same machine with the same 3 identities. 68 == 8 + 3*20, so the
     // identity records go inline after an 8-byte header with no count word.
-    auto matchInitData = EncodeMatchInitData(0, config_.macosUserId, identities,
-                                              config_.matchLayout);
-    T2_LOG("verify", L"start match: layout=%s payload=%zuB (macOS reference for %zu identities = %zuB)",
+    auto matchInitData = EncodeMatchInitData(config_.matchFlags, config_.macosUserId,
+                                              identities, config_.matchLayout);
+    T2_LOG("verify",
+           L"start match: layout=%s payload=%zuB flags=%u (macOS reference for %zu identities = %zuB)",
            MatchIdentityLayoutName(config_.matchLayout), matchInitData.size(),
-           identities.size(), sizeof(MatchOptionsV1) + identities.size() * sizeof(IdentityRecordV1));
+           config_.matchFlags, identities.size(),
+           sizeof(MatchOptionsV1) + identities.size() * sizeof(IdentityRecordV1));
     auto startCmd = EncodeBmCommand(Command::StartMatch, 1, 0, matchInitData);
     std::vector<uint8_t> reply;
     if (!conn->SendBiometricCommand(startCmd, 0, &reply, config_.ioTimeout)) {
