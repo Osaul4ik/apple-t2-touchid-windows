@@ -14,6 +14,8 @@
 #include <windows.h>
 #include "../../protocol/AppleKeyStore/Client.h"
 #include "../../protocol/BridgeXpc/Connection.h"
+#include "../../protocol/BiometricKit/Commands.h"
+#include "../../protocol/BiometricKit/VerificationEngine.h"
 #include "../../protocol/Discovery/Adapter.h"
 #include "../../protocol/Discovery/PortScan.h"
 #include "../../protocol/Discovery/RemoteXpc.h"
@@ -24,6 +26,9 @@
 #include <conio.h>
 #include <chrono>
 #include <vector>
+#include <optional>
+#include <array>
+#include <cstring>
 
 using namespace t2::applekeystore;
 
@@ -446,10 +451,234 @@ static int CmdNetwork(int argc, wchar_t* argv[]) {
     return 0;
 }
 
+// Shared discovery+connect step for `identities` and `verify` (Gate 6
+// phase 2 / Gate 7, now confirmed live on real hardware via `network`:
+// BridgeXPC HELO handshake + getBridgeVersion both verified). Deliberately
+// NOT refactored out of CmdNetwork itself - CmdNetwork's scan+report path
+// is already hardware-verified and is left untouched; this duplicates the
+// minimal subset of it rather than risk that confirmed behavior.
+// Accepts the same trailing args as `network` (an ifIndex and/or
+// --host fe80::...) starting at argv[firstArgIndex].
+static bool DiscoverBiometricKitBridge(int argc, wchar_t* argv[], int firstArgIndex,
+                                        t2::bridgexpc::Connection* outConn) {
+    using namespace t2::discovery;
+    using namespace t2::bridgexpc;
+
+    unsigned long ifIndexOverride = 0;
+    std::string hostOverride;
+    for (int i = firstArgIndex; i < argc; ++i) {
+        std::wstring a = argv[i];
+        if (a == L"--host" && i + 1 < argc) {
+            std::wstring w = argv[++i];
+            hostOverride.clear();
+            for (wchar_t c : w) hostOverride.push_back(static_cast<char>(c & 0xFF));
+        } else if (!a.empty() && a[0] >= L'0' && a[0] <= L'9') {
+            ifIndexOverride = static_cast<unsigned long>(_wtoi(a.c_str()));
+        }
+    }
+
+    NcmEndpoint ep;
+    if (ifIndexOverride != 0) {
+        if (!GetEndpointByIfIndex(ifIndexOverride, &ep)) {
+            std::wcout << L"no Preferred IPv6 link-local on ifIndex " << ifIndexOverride << L"\n";
+            return false;
+        }
+    } else {
+        auto endpoints = FindT2NcmEndpoints();
+        if (endpoints.empty()) {
+            std::wcout << L"no T2 NCM adapter found - try 'network' first.\n";
+            return false;
+        }
+        ep = endpoints.front();
+    }
+    if (!hostOverride.empty()) {
+        in6_addr parsed{};
+        if (!ParseIpv6(hostOverride.c_str(), &parsed)) {
+            std::wcout << L"invalid --host IPv6\n";
+            return false;
+        }
+        ep.peerLinkLocal = parsed;
+        ep.peerSource = PeerSource::ManualOverride;
+    }
+    if (ep.peerSource == PeerSource::None) {
+        std::wcout << L"no peer to scan - run 'network' first or pass --host fe80::...\n";
+        return false;
+    }
+
+    ScanOptions opt;
+    opt.concurrency = 64;
+    opt.connectTimeoutMs = 150;
+    opt.includeTcpOnly = true;
+    auto hits = ScanHttp2Preface(ep, opt);
+
+    std::vector<uint16_t> candidatePorts;
+    for (const auto& h : hits) {
+        if (h.http2PrefaceOk) candidatePorts.push_back(h.port);
+    }
+    if (candidatePorts.empty()) {
+        std::wcout << L"no HTTP/2 candidates on peer - run 'network' for full diagnostics.\n";
+        return false;
+    }
+
+    auto discovered = DiscoverServicePort(ep, candidatePorts, "com.apple.eos.BiometricKit",
+                                           std::chrono::milliseconds(2000));
+    if (!discovered.found) {
+        std::wcout << L"BiometricKit service not advertised by any candidate.\n";
+        return false;
+    }
+    std::wcout << L"BiometricKit BridgeXPC port: " << discovered.port << L"\n";
+
+    ConnectResult cr = outConn->Connect(ep.peerLinkLocal, ep.ifIndex, discovered.port,
+                                         std::chrono::milliseconds(2000));
+    if (cr != ConnectResult::Ok) {
+        std::wcout << L"BridgeXPC connect/HELO failed on port " << discovered.port << L"\n";
+        return false;
+    }
+    return true;
+}
+
+// Gate 8 phase 1: read the enrolled identity list. Runs the verified setup
+// sequence (getBridgeVersion -> setClientVersion -> reset -> cancel ->
+// FDR calibration -> identity-list) but does NOT start a match - this is a
+// read-only probe. NOT YET RUN ON REAL HARDWARE past the BridgeXPC
+// handshake step; the handshake itself (Connect/HELO/getBridgeVersion) is
+// hardware-confirmed (see docs/gate6-discovery.md), the biometric commands
+// below are implemented per docs/linux-reference-analysis.md but await a
+// real hardware run before they can be called verified.
+static int CmdIdentities(int argc, wchar_t* argv[]) {
+    using namespace t2::bridgexpc;
+    using namespace t2::biometrickit;
+
+    uint32_t macosUserId = 501; // convention default, NOT a protocol requirement (Milestone 1 §6)
+    for (int i = 2; i < argc; ++i) {
+        std::wstring a = argv[i];
+        if (a == L"--uid" && i + 1 < argc) {
+            macosUserId = static_cast<uint32_t>(_wtoi(argv[++i]));
+        }
+    }
+
+    Connection bridge;
+    if (!DiscoverBiometricKitBridge(argc, argv, 2, &bridge)) {
+        return 1;
+    }
+
+    int64_t bridgeVersion = 0;
+    if (!bridge.GetBridgeVersion(&bridgeVersion, std::chrono::milliseconds(2000))) {
+        std::wcout << L"getBridgeVersion failed after connect.\n";
+        return 1;
+    }
+    int64_t clientVersion = (bridgeVersion < 2) ? bridgeVersion : 2; // min(api_version,2), VERIFIED FROM SOURCE
+    if (!bridge.SetClientVersion(clientVersion, std::chrono::milliseconds(2000))) {
+        std::wcout << L"setClientVersion failed.\n";
+        return 1;
+    }
+
+    std::vector<uint8_t> reply;
+    auto resetCmd = EncodeBmCommand(Command::ResetSensor, 0, 2);
+    if (!bridge.SendBiometricCommand(resetCmd, 64, &reply, std::chrono::milliseconds(5000))) {
+        std::wcout << L"reset-sensor command failed.\n";
+        return 1;
+    }
+    auto cancelCmd = EncodeBmCommand(Command::Cancel, 0, 0);
+    bridge.SendBiometricCommand(cancelCmd, 64, &reply, std::chrono::milliseconds(5000)); // best-effort
+
+    std::vector<uint8_t> fdrBlob;
+    if (!bridge.GetFdrCalibration(&fdrBlob, std::chrono::milliseconds(5000))) {
+        std::wcout << L"read FDR calibration failed - bridgeOS returned no usable data.\n";
+        return 1;
+    }
+    auto loadCalibrationCmd = EncodeBmCommand(Command::LoadCalibration, /*version=*/1, /*value=*/3, fdrBlob);
+    if (!bridge.SendBiometricCommand(loadCalibrationCmd, 64, &reply, std::chrono::milliseconds(5000))) {
+        std::wcout << L"load-calibration command failed.\n";
+        return 1;
+    }
+
+    std::vector<uint8_t> idReq(4);
+    std::memcpy(idReq.data(), &macosUserId, 4);
+    auto idCmd = EncodeBmCommand(Command::IdentityList, 0, 0, idReq);
+    if (!bridge.SendBiometricCommand(idCmd, 4096, &reply, std::chrono::milliseconds(5000))) {
+        std::wcout << L"identity-list command failed.\n";
+        return 1;
+    }
+    std::vector<IdentityRecordV1> identities;
+    if (!ParseIdentityList(reply, &identities)) {
+        std::wcout << L"identity-list reply malformed (not a whole number of 20-byte records).\n";
+        return 1;
+    }
+
+    std::wcout << L"macOS user id: " << macosUserId << L"\n";
+    std::wcout << L"enrolled identities: " << identities.size() << L"\n";
+    for (size_t i = 0; i < identities.size(); ++i) {
+        // UUID itself is opaque and never logged, per Milestone 1 §7/§14 -
+        // only the record index and its embedded user_id are shown.
+        std::wcout << L"  [" << i << L"] user_id=" << identities[i].userId << L"\n";
+    }
+    return 0;
+}
+
+// Gate 8 phase 2: full verify cycle via VerificationEngine (identity list ->
+// start match -> event loop -> verdict -> cancel). Runs live sensor
+// hardware and needs a finger on the touchpad's sensor during the match
+// window. Same hardware-verification caveat as CmdIdentities above: the
+// BridgeXPC transport is hardware-confirmed, the match sequence itself is
+// implemented per docs/linux-reference-analysis.md but is NOT YET RUN ON
+// REAL HARDWARE.
+static int CmdVerify(int argc, wchar_t* argv[]) {
+    using namespace t2::bridgexpc;
+    using namespace t2::biometrickit;
+
+    VerifyConfig cfg;
+    for (int i = 2; i < argc; ++i) {
+        std::wstring a = argv[i];
+        if (a == L"--uid" && i + 1 < argc) {
+            cfg.macosUserId = static_cast<uint32_t>(_wtoi(argv[++i]));
+        } else if (a == L"--seconds" && i + 1 < argc) {
+            cfg.matchWindow = std::chrono::seconds(_wtoi(argv[++i]));
+        }
+    }
+
+    Connection bridge;
+    if (!DiscoverBiometricKitBridge(argc, argv, 2, &bridge)) {
+        return 1;
+    }
+
+    std::wcout << L"place finger on sensor...\n";
+    VerificationEngine engine(cfg);
+    std::optional<std::array<uint8_t, 16>> matchedUuid;
+    VerifyOutcome outcome = engine.Verify(&bridge, &matchedUuid);
+
+    switch (outcome) {
+        case VerifyOutcome::Match:
+            std::wcout << L"verify-match\n";
+            return 0;
+        case VerifyOutcome::NoMatch:
+            std::wcout << L"verify-no-match\n";
+            return 0;
+        case VerifyOutcome::Timeout:
+            std::wcout << L"verify-timeout (no match_result event within window)\n";
+            return 1;
+        case VerifyOutcome::TransportError:
+            std::wcout << L"verify-failed: transport error\n";
+            return 1;
+        case VerifyOutcome::RejectedByDevice:
+            std::wcout << L"verify-failed: device rejected start-match\n";
+            return 1;
+        case VerifyOutcome::Malformed:
+            std::wcout << L"verify-failed: malformed reply from device\n";
+            return 1;
+        case VerifyOutcome::Busy:
+            std::wcout << L"verify-failed: engine busy (should not happen on a one-shot CLI call)\n";
+            return 1;
+    }
+    return 1;
+}
+
 
 int wmain(int argc, wchar_t* argv[]) {
     if (argc < 2) {
         std::wcout << L"usage: t2touchid.exe <status|register-ool|capabilities|device-state|load-keybag|set-system-keybag|unlock|network|identities|verify>\n";
+        std::wcout << L"  identities [ifIndex] [--host fe80::...] [--uid N]\n";
+        std::wcout << L"  verify     [ifIndex] [--host fe80::...] [--uid N] [--seconds N]\n";
         return 1;
     }
 
@@ -492,10 +721,13 @@ int wmain(int argc, wchar_t* argv[]) {
         // Does not need the transport device handle — pure user-mode IPv6 scan.
         return CmdNetwork(argc, argv);
     }
-    if (cmd == L"identities" || cmd == L"verify") {
-        std::wcout << L"not yet wired - requires RemoteXPC BiometricKit port "
-                      L"+ live BridgeXpc connection (Gate 6 phase 2 / Gate 7)\n";
-        return 2;
+    if (cmd == L"identities") {
+        // Gate 8 phase 1 - see CmdIdentities for hardware-verification status.
+        return CmdIdentities(argc, argv);
+    }
+    if (cmd == L"verify") {
+        // Gate 8 phase 2 - see CmdVerify for hardware-verification status.
+        return CmdVerify(argc, argv);
     }
 
     std::wcout << L"unknown command\n";

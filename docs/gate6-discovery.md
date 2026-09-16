@@ -64,14 +64,38 @@ claims a port without seeing it in a decoded `Services` dictionary.
 `t2touchid.exe network` now runs Phase 2 automatically against every
 Phase-1/1.5 HTTP/2 hit and prints the BiometricKit port if found.
 
-**Not yet verified on real T2 hardware** — the byte-level framing is
-implemented per the verification source above but has not been run
-against a live T2 `remoted`-equivalent yet. If it fails hardware
-verification, the two most likely culprits are (a) the non-HPACK HEADERS
-"channel open" frame not being accepted as-is by T2's HTTP/2
-implementation, or (b) `RemoteXPCVersionFlags`/`MessagingProtocolVersion`
-needing a value T2's older `remoted` build expects instead of the
-iOS-17-era one idevice sends.
+**Verified on real T2 hardware (16.09.2026)** — Phase 2 RemoteXPC discovery
+found `com.apple.eos.BiometricKit` and returned its BridgeXPC port (49197
+on this run, out of 21 HTTP/2-SETTINGS candidates in the 49152–65535
+range). Neither of the two failure culprits below materialized: the
+non-HPACK HEADERS channel-open frame was accepted as-is, and the
+`RemoteXPCVersionFlags`/`MessagingProtocolVersion` values idevice sends
+were accepted by this T2's `remoted`.
+
+## Gate 7 phase 1 — BridgeXPC HELO + getBridgeVersion (verified on real hardware, 16.09.2026)
+
+`t2touchid.exe network` now also opens a real `bridgexpc::Connection` to
+the discovered port and runs the HELO handshake (Milestone 1 §7) followed
+by `getBridgeVersion`. On real hardware this returned `BridgeXPC verified:
+HELO OK, bridge version=3` — confirming the port discovered in Phase 2 is
+a live BridgeXpc endpoint, not just a plausible-looking number, and that
+this repo's HELO/getBridgeVersion wire format matches the real device.
+
+Previously-open questions this closes: the byte-level RemoteXPC framing
+described in Phase 2 above works against the live T2 `remoted`-equivalent
+as implemented, with no changes needed to the channel-open frame or the
+version-flags fields.
+
+## Gate 8 — BiometricKit commands (implemented, CLI wired, NOT yet run on real hardware)
+
+`t2touchid.exe identities` and `t2touchid.exe verify` are now wired to the
+discovered/verified BridgeXPC connection above, running the sequence from
+`docs/linux-reference-analysis.md` §2 (`setClientVersion` → reset sensor →
+cancel → FDR calibration → identity-list, then for `verify` only:
+start-match → event loop → verdict). This is unverified past the
+handshake — the biometric command layer (`SendBiometricCommand`,
+`VerificationEngine`) was already implemented before this hardware run but
+has not itself been exercised against the sensor yet.
 
 ## Hardware baseline (01.09.2026)
 
@@ -97,3 +121,17 @@ after the active-preface fallback, so on this boot they are either decoys
 or a genuinely different set of ports than the earlier baseline — still
 open whether that's boot-to-boot port churn or these 6 were never
 BiometricKit-related to begin with.
+
+### Third run (16.09.2026) — Phase 2 + Gate 7 phase 1 both confirmed
+
+| Item | Value |
+|------|-------|
+| Adapter | Ethernet 2 / Apple T2 USB NCM Network Adapter |
+| ifIndex | 3 |
+| Scan result | 28 TCP-open, 21 HTTP/2 SETTINGS (49152–65535, concurrency 64, 150ms timeout) |
+| BiometricKit BridgeXPC port | 49197 |
+| BridgeXPC handshake | HELO OK, `getBridgeVersion` → bridge version 3 |
+
+First real-hardware confirmation of both Phase 2 (RemoteXPC service
+discovery) and Gate 7 phase 1 (live BridgeXpc HELO + getBridgeVersion) —
+see the sections above.
