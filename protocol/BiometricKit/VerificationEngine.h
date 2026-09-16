@@ -20,11 +20,24 @@ enum class VerifyOutcome {
     UnstableIdentityInventory, // port of Linux FprintMatchGateError("live identity
                           // inventory is unstable"): first/repeat 0x42 or 0x51 snapshot
                           // disagreed — fail-closed, StartMatch never sent
-    NoImageCaptured,      // finger was detected (FingerOn/FingerOff) but the SEP never
-                          // reported ImageCaptured/ImageForProcessing/ImageWasAccepted —
-                          // the sensor sees the finger and never scans it. Distinct from
-                          // Timeout (= nothing happened at all) on purpose: these two have
-                          // completely different causes and used to be indistinguishable.
+    // REMOVED (17.09.2026): NoImageCaptured used to relabel an ordinary
+    // Timeout whenever sawFingerOn && imagePipelineEvents==0 — i.e.
+    // whenever status codes 55/72/95 (ImageCaptured/ImageForProcessing/
+    // ImageWasAccepted) never appeared. VERIFIED FROM SOURCE
+    // (jmurth1234/t2-touchid-linux, src/t2-fprintd.py verdict_from_result):
+    // the reference's own production verify path never inspects, waits
+    // for, or requires those three status codes anywhere — it only scans
+    // match_events for event_kind=="match_result" and falls through to
+    // "verify-no-match" otherwise. The 55/72/95 sequence this project used
+    // to gate on came solely from a macOS unified-log capture of
+    // biometrickitd's own internal statusMessage: prints, never confirmed
+    // as something a remote BridgeXPC client (this driver included) is
+    // even supposed to receive. Keeping a distinct outcome for their
+    // absence manufactured a diagnosis the reference itself doesn't make.
+    // A timeout with sawFingerOn is now just Timeout, same as Linux calls
+    // it verify-no-match; fingerTouchCycles/imagePipelineEvents are still
+    // logged in the session summary for information, not used to pick the
+    // outcome.
 };
 
 struct VerifyConfig {

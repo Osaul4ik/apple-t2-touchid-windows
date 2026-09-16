@@ -704,7 +704,14 @@ static int CmdVerify(int argc, wchar_t* argv[]) {
         return 1;
     }
 
-    std::wcout << L"place finger on sensor...\n";
+    // 17.09.2026: the macOS reference sequence this project's own docs cite
+    // (docs/milestone-2b-progress.md, "Reference order of a SUCCESSFUL
+    // unlock") shows match_result arriving on the SECOND finger placement
+    // of the session (finger on -> off -> on again -> match_result), not
+    // the first. Both hardware captures analyzed so far only ever recorded
+    // one touch cycle before the window ran out. Not confirmed as the
+    // cause, but cheap to rule out, so the prompt now says so.
+    std::wcout << L"place finger on sensor (lift and place again if prompted)...\n";
     VerificationEngine engine(cfg);
     std::optional<std::array<uint8_t, 16>> matchedUuid;
     VerifyOutcome outcome = engine.Verify(&bridge, &matchedUuid);
@@ -717,7 +724,17 @@ static int CmdVerify(int argc, wchar_t* argv[]) {
             std::wcout << L"verify-no-match\n";
             return 0;
         case VerifyOutcome::Timeout:
-            std::wcout << L"verify-timeout (no match_result event within window)\n";
+            // REMOVED (17.09.2026): this case used to split into Timeout vs.
+            // NoImageCaptured depending on whether status codes 55/72/95
+            // (ImageCaptured/ImageForProcessing/ImageWasAccepted) showed up.
+            // VERIFIED FROM SOURCE (t2-fprintd.py verdict_from_result): the
+            // reference's own verify verdict never inspects those codes at
+            // all, only match_events' event_kind=="match_result" — so that
+            // split was diagnosing a symptom the reference itself doesn't
+            // treat as meaningful. finger_touch_cycles/image_pipeline_events
+            // are still in the --verbose session-summary log if useful, just
+            // not used to pick this message anymore.
+            std::wcout << L"verify-timeout (no match_result event within window) " << kSeeVerboseHint;
             return 1;
         case VerifyOutcome::TransportError:
             std::wcout << L"verify-failed: transport error " << kSeeVerboseHint;
@@ -730,12 +747,6 @@ static int CmdVerify(int argc, wchar_t* argv[]) {
             return 1;
         case VerifyOutcome::Busy:
             std::wcout << L"verify-failed: engine busy (should not happen on a one-shot CLI call)\n";
-            return 1;
-        case VerifyOutcome::NoImageCaptured:
-            std::wcout << L"verify-no-image: sensor reported the finger (FingerOn/FingerOff) but never\n"
-                          L"                 reported ImageCaptured/ImageForProcessing/ImageWasAccepted.\n"
-                          L"                 The match never got as far as comparing anything. "
-                       << kSeeVerboseHint;
             return 1;
     }
     return 1;

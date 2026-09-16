@@ -439,9 +439,11 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
                eventData.size(), kMinMatchResultEventBytes);
     }
 
-    if (outcome == VerifyOutcome::Timeout && sawFingerOn && imagePipelineEvents == 0) {
-        outcome = VerifyOutcome::NoImageCaptured;
-    }
+    // REMOVED (17.09.2026): no longer relabels Timeout as NoImageCaptured.
+    // VERIFIED FROM SOURCE (t2-fprintd.py verdict_from_result): the
+    // reference's own verdict is match_result-only; sawFingerOn/
+    // imagePipelineEvents never gate its outcome. They stay below purely
+    // as session-summary diagnostics.
     T2_LOG("verify",
            L"session summary: finger_touch_cycles=%zu image_pipeline_events=%zu unnamed_status_events=%zu "
            L"layout=%s flags=%u reset=%s cal=%s outcome=%d",
