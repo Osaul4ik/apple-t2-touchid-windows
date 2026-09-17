@@ -205,9 +205,10 @@ AksResult Client::Unlock(int32_t handle, std::vector<uint8_t>& secretUtf8, uint6
     // VERIFIED FROM SOURCE (jmurth1234/t2-touchid-linux, t2-aks-tool.c
     // unlock_keybag): the secret blob is padded to a 4-byte boundary on
     // the wire; secretLen still records the true, unpadded length, and
-    // the pad bytes themselves are zero. session default (1) matches
-    // README.md's documented manual unlock step (`unlock-keybag 1
-    // HANDLE`) — see Client.h.
+    // the pad bytes themselves are zero. session default (1) matches the
+    // project's actual boot-time path (t2-keybag-load.sh / t2-keybag-
+    // unlock.sh) — see Client.h; no literal README instruction backs this,
+    // that prior citation didn't hold up on verification.
     size_t paddedSecretLen = (secretUtf8.size() + 3) & ~size_t(3);
 
     std::vector<uint8_t> req;

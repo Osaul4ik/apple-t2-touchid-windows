@@ -385,11 +385,21 @@ T2AksExchange(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
         return STATUS_INVALID_DEVICE_STATE;
     }
 
-    // Accept either V1 or V2 reply header.
-    if (replyWireLength < T2_AKS_V1_WIRE_SIZE || replyWireLength > T2_SEP_OOL_SIZE) {
+    // VERIFIED FROM SOURCE (t2_sep_transport.c t2_aks_exchange_locked): the
+    // only ioctl-reachable reply path in the Linux driver requires a V2
+    // reply unconditionally — it hardcodes T2_SEP_AKS_HEADER_V2_SIZE /
+    // T2_SEP_AKS_HEADER_V2 and returns -EPROTO on anything else. The V1
+    // header only appears in a *different*, boot-time-only, non-ioctl
+    // function (t2_aks_probe_capabilities) that this driver does not
+    // implement as a separate path (see file header comment). A previous
+    // version of this function also accepted a V1-sized/versioned reply
+    // here, which is a real reply this driver can never legitimately
+    // receive on this path — silently accepting it would mask a malformed
+    // or spoofed EP7 reply that Linux itself would reject. Require V2 only.
+    if (replyWireLength < T2_AKS_V2_WIRE_SIZE || replyWireLength > T2_SEP_OOL_SIZE) {
         T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
             "T2TouchIdTransport: AKS reply rejected - replyWireLength=%u out of bounds "
-            "(expect >=%u, <=%u)\n", replyWireLength, (UINT32)T2_AKS_V1_WIRE_SIZE, T2_SEP_OOL_SIZE));
+            "(expect >=%u, <=%u)\n", replyWireLength, (UINT32)T2_AKS_V2_WIRE_SIZE, T2_SEP_OOL_SIZE));
         return STATUS_DEVICE_PROTOCOL_ERROR;
     }
 
@@ -402,12 +412,11 @@ T2AksExchange(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
 
     RtlCopyMemory(&replyHeaderSize, outBase, sizeof(UINT32));
     RtlCopyMemory(&replyVersion, outBase + sizeof(UINT32) + 16, sizeof(UINT32));
-    if (!((replyHeaderSize == T2_AKS_HEADER_V2_SIZE && replyVersion == T2_AKS_VERSION_V2) ||
-          (replyHeaderSize == T2_AKS_HEADER_V1_SIZE && replyVersion == T2_AKS_VERSION_V1))) {
+    if (replyHeaderSize != T2_AKS_HEADER_V2_SIZE || replyVersion != T2_AKS_VERSION_V2) {
         T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
             "T2TouchIdTransport: AKS reply rejected - replyHeaderSize=0x%x replyVersion=%u "
-            "(expected V1 0x%x or V2 0x%x)\n",
-            replyHeaderSize, replyVersion, T2_AKS_HEADER_V1_SIZE, T2_AKS_HEADER_V2_SIZE));
+            "(expected V2 0x%x/%u)\n",
+            replyHeaderSize, replyVersion, T2_AKS_HEADER_V2_SIZE, (UINT32)T2_AKS_VERSION_V2));
         return STATUS_DEVICE_PROTOCOL_ERROR;
     }
 
@@ -434,11 +443,10 @@ T2AksExchange(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
         return status;
     }
 
-    // Body starts after the wire header that matches the reply version.
+    // Body starts after the V2 wire header (replyVersion is enforced to be
+    // V2 above, so there is no V1 case to branch on here).
     {
-        SIZE_T wireHeaderSize = (replyVersion == T2_AKS_VERSION_V1)
-            ? T2_AKS_V1_WIRE_SIZE : T2_AKS_V2_WIRE_SIZE;
-        SIZE_T bodyLen = replyWireLength - wireHeaderSize;
+        SIZE_T bodyLen = replyWireLength - T2_AKS_V2_WIRE_SIZE;
         if (bodyLen > ResponseCapacity) {
             // VERIFIED FROM SOURCE: the Linux ioctl handler returns -ENOSPC
             // in this situation rather than silently truncating.

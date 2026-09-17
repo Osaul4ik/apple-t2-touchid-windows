@@ -41,20 +41,63 @@ using namespace t2::applekeystore;
 static const wchar_t* kSeeVerboseHint =
     L"(re-run with --verbose, or attach DebugView, for the detailed reason)\n";
 
+// Matches the Linux reference's char secret[1024] + protect_secret_buffer()
+// (mlock/RLIMIT_CORE=0/PR_SET_DUMPABLE=0 in t2-aks-tool.c): same 1024-byte
+// capacity, reserved once up front so no push_back() here can ever trigger
+// a reallocation.
+static constexpr size_t kMaxSecretBytes = 1024;
+
+// VERIFIED FROM SOURCE (jmurth1234/t2-touchid-linux, t2-aks-tool.c
+// protect_secret_buffer / unlock_keybag): the Linux tool mlock()s a FIXED
+// secret[1024] buffer before reading a single byte and keeps it locked
+// until the wire exchange completes and it's explicit_bzero()'d.
+//
+// Two gaps existed here relative to that reference, both now fixed:
+//   1. This used to build the password with std::vector::push_back with
+//      no reserve() up front. Each capacity-doubling reallocation copies
+//      the bytes typed so far into a new heap block and frees the old one
+//      WITHOUT zeroing it first — every password longer than the current
+//      capacity left a stale, plaintext prefix sitting in freed (and
+//      reusable) heap memory. Reserving kMaxSecretBytes once, before any
+//      character is read, makes reallocation impossible.
+//   2. Nothing here paralleled mlock(): the buffer could be paged to
+//      pagefile.sys, or captured whole by a crash dump, for as long as it
+//      lived. VirtualLock() is the direct Windows analog; it's taken here
+//      and held for the buffer's entire lifetime — including through the
+//      caller's use of it in Client::Unlock — not just released the
+//      instant this function returns. The caller (CmdUnlock) is
+//      responsible for VirtualUnlock() once the secret has been consumed
+//      and zeroed; see the comment there.
 static std::vector<uint8_t> ReadPasswordInteractive() {
     std::wcout << L"Password: ";
     std::vector<uint8_t> secret;
+    secret.reserve(kMaxSecretBytes);
+    if (!VirtualLock(secret.data(), secret.capacity())) {
+        // Same treatment as Linux: protect_secret_buffer() failing mlock()
+        // is fatal ("protect password memory"), not a silent fallback to
+        // an unlocked buffer.
+        std::wcout << L"\nfailed to lock password memory (VirtualLock)\n";
+        return {};
+    }
+
+    bool cancelled = false;
+    bool overflowed = false;
     for (;;) {
         int ch = _getch();
         if (ch == '\r' || ch == '\n') break;
         if (ch == 3) { // Ctrl+C
-            SecureZeroMemory(secret.data(), secret.size());
-            secret.clear();
-            std::wcout << L"\ncancelled\n";
-            return secret;
+            cancelled = true;
+            break;
         }
         if (ch == '\b') {
             if (!secret.empty()) secret.pop_back();
+            continue;
+        }
+        if (secret.size() == kMaxSecretBytes) {
+            // Same shape as Linux's read_secret_line() filling its buffer
+            // without a newline (EOVERFLOW): refuse outright rather than
+            // silently truncate or grow past the locked/reserved region.
+            overflowed = true;
             continue;
         }
         secret.push_back(static_cast<uint8_t>(ch));
@@ -62,6 +105,21 @@ static std::vector<uint8_t> ReadPasswordInteractive() {
         // command-line history (Milestone 2 §10).
     }
     std::wcout << L"\n";
+    if (cancelled) std::wcout << L"cancelled\n";
+    if (overflowed) std::wcout << L"password too long (max " << kMaxSecretBytes << L" bytes)\n";
+
+    if (secret.empty() || cancelled || overflowed) {
+        // Nothing usable is being returned — zero, unlock, and clear here
+        // so no locked page is ever left behind on a path the caller
+        // treats as "no password entered" and never touches again.
+        SecureZeroMemory(secret.data(), secret.capacity());
+        VirtualUnlock(secret.data(), secret.capacity());
+        secret.clear();
+        return secret;
+    }
+    // Still VirtualLock()'d on return (reserve() above means no
+    // reallocation happens between here and the caller, so this is the
+    // same physical pages) — see CmdUnlock for the matching VirtualUnlock.
     return secret;
 }
 
@@ -122,6 +180,18 @@ static int CmdCapabilities(Client& client) {
         return 1;
     }
     std::wcout << L"capability[1] = 0x" << std::hex << value << std::dec << L"\n";
+    // VERIFIED FROM SOURCE (t2-aks-tool.c capabilities): the Linux tool
+    // treats this as a pass/fail self-test, not just a printout — it
+    // returns exit code 1 unless the returned value is exactly 2
+    // (`return value == 2 ? 0 : 1`). A successful mailbox round-trip with
+    // any other value still means capability negotiation isn't behaving
+    // as expected; this previously always returned 0 on any successful
+    // exchange regardless of the value, which would mask that case in a
+    // script checking the exit code.
+    if (value != 2) {
+        std::wcout << L"capabilities: unexpected value (expected 2)\n";
+        return 1;
+    }
     return 0;
 }
 
@@ -223,8 +293,18 @@ static int CmdUnlock(Client& client, int32_t handle) {
         std::wcout << L"no password entered\n";
         return 1;
     }
+    // secret is VirtualLock()'d by ReadPasswordInteractive for its entire
+    // lifetime, mirroring Linux's protect_secret_buffer()/mlock() scope,
+    // which stays locked through the whole wire exchange in
+    // unlock_keybag(). Client::Unlock zeroes the buffer's full capacity
+    // internally before returning (see Client.cpp); capture the pointer
+    // and capacity now so the matching VirtualUnlock still has a valid
+    // range to release afterward, regardless of the outcome below.
+    uint8_t* lockedPtr = secret.data();
+    size_t lockedCapacity = secret.capacity();
     int8_t sepStatus = 0;
     AksResult r = client.Unlock(handle, secret, 1, &sepStatus); // zeroes `secret` internally
+    VirtualUnlock(lockedPtr, lockedCapacity);
     if (r != AksResult::Ok) {
         std::wcout << L"unlock failed\n";
         return 1;

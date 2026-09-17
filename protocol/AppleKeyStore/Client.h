@@ -75,14 +75,21 @@ public:
     // for load_keybag (0x03) / set_system_keybag (0x0d) / unlock_keybag
     // (0x04) — no "must be 1" check exists in that file for these three
     // ops (that check is real, but scoped to the unrelated copy-keybag-uuid
-    // opcode 0x06 and verify-password-acm opcode 0x21). However, the
-    // project's own production path — src/t2-keybag-load.sh, which is
-    // what actually runs on boot — hardcodes SESSION=1 and passes it to
-    // BOTH load-keybag and set-system-keybag; README.md's manual unlock
-    // instructions likewise show `unlock-keybag 1 HANDLE`. So 1 is the
-    // value this reference project actually uses end-to-end on real T2
-    // hardware, even though the bare CLI tool would accept other values
-    // without complaint. Default is 1 to match that working path.
+    // opcode 0x06 and verify-password-acm opcode 0x21, both enforced
+    // kernel-side in t2_aks_protocol.h). The project's own production
+    // path — src/t2-keybag-load.sh, which is what actually runs on boot —
+    // hardcodes SESSION=1 and passes it to BOTH load-keybag and
+    // set-system-keybag; that same value is then written to the runtime
+    // state file and read back by t2-keybag-unlock.sh for the unlock step,
+    // so 1 is the value this reference project actually uses end-to-end on
+    // real T2 hardware, even though the bare CLI tool would accept other
+    // values without complaint. (Earlier revisions of this comment also
+    // cited a literal `unlock-keybag 1 HANDLE` line in README.md as a
+    // second source — no such line exists in the current README; the
+    // documented manual path there is the `sudo t2-keybag-unlock` wrapper
+    // described above, not a raw CLI invocation. Removed that claim rather
+    // than leave an uncorroborated citation.) Default is 1 to match the
+    // working boot-time path.
     //
     // outSepStatus (optional): see GetDeviceState's doc below — same
     // semantics here. A nonzero value means the mailbox exchange
