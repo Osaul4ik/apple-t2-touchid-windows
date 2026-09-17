@@ -453,7 +453,7 @@ T2AksExchange(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
             return STATUS_BUFFER_TOO_SMALL;
         }
         if (bodyLen > 0 && ResponseBody != NULL) {
-            RtlCopyMemory(ResponseBody, outBase + wireHeaderSize, bodyLen);
+            RtlCopyMemory(ResponseBody, outBase + T2_AKS_V2_WIRE_SIZE, bodyLen);
         }
         *ResponseLength = bodyLen;
     }
