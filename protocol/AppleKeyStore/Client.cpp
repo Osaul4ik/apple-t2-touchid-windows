@@ -151,7 +151,21 @@ AksResult Client::LoadKeybag(const std::vector<uint8_t>& bagBytes, int32_t* outH
     if (r != AksResult::Ok) return r;
     if (outSepStatus && *outSepStatus != 0) return AksResult::Ok; // transport ok, SEP rejected — response body is empty
     if (response.size() < 8) return AksResult::IoError;
+
+    // VERIFIED FROM SOURCE (jmurth1234/t2-touchid-linux, t2-aks-tool.c
+    // load_keybag): response body is [status:u32][handle:i32]. `status`
+    // here is the AKS-operation-level result and is a SEPARATE signal from
+    // outSepStatus/sepStatus (the outer EP7 mailbox reply status) — the
+    // Linux tool checks it independently (`ret = status ? 1 : 0`) even
+    // when the mailbox exchange itself succeeded. This function previously
+    // read only the handle field and never inspected status, so a
+    // body-level rejection (sepStatus==0 but status!=0 — e.g. malformed or
+    // incompatible bag content) came back as a fabricated "Ok, handle=
+    // <garbage>" instead of a failure.
+    uint32_t bodyStatus = 0;
+    std::memcpy(&bodyStatus, response.data() + 0, 4);
     std::memcpy(outHandle, response.data() + 4, 4); // status:u32 | handle:i32
+    if (bodyStatus != 0) return AksResult::IoError;
     return AksResult::Ok;
 }
 
@@ -236,7 +250,26 @@ AksResult Client::Unlock(int32_t handle, std::vector<uint8_t>& secretUtf8, uint6
     SecureZeroMemory(secretUtf8.data(), secretUtf8.capacity());
     secretUtf8.clear();
 
-    return r;
+    if (r != AksResult::Ok) return r;
+    if (outSepStatus && *outSepStatus != 0) {
+        // Transport ok, SEP rejected at the mailbox level — response body
+        // is empty per the akstore.c contract, so there is nothing to read
+        // below. Caller distinguishes this case via outSepStatus.
+        return AksResult::Ok;
+    }
+
+    // VERIFIED FROM SOURCE (jmurth1234/t2-touchid-linux, t2-aks-tool.c
+    // unlock_keybag_secret): response body's status:u32 at offset 0 is the
+    // actual unlock result (0 = success, nonzero = wrong password / bad
+    // handle) and is checked independently of sepStatus there
+    // (`ret = get_le32(response) ? 1 : 0`). This function previously never
+    // inspected the response body at all, so a wrong password arriving as
+    // sepStatus==0 / bodyStatus!=0 was reported as a false AksResult::Ok
+    // ("unlock: OK" on the wrong password).
+    if (response.size() < 4) return AksResult::IoError;
+    uint32_t bodyStatus = 0;
+    std::memcpy(&bodyStatus, response.data(), 4);
+    return (bodyStatus == 0) ? AksResult::Ok : AksResult::IoError;
 }
 
 AksResult Client::GetCapabilities(uint64_t selector, uint64_t* outValue) {

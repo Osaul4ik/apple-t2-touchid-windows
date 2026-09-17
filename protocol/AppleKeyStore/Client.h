@@ -85,8 +85,15 @@ public:
     // without complaint. Default is 1 to match that working path.
     //
     // outSepStatus (optional): see GetDeviceState's doc below — same
-    // semantics here. A nonzero value means the transport exchange
-    // succeeded but SEP rejected the request (e.g. bad session/handle).
+    // semantics here. A nonzero value means the mailbox exchange
+    // succeeded but SEP rejected the request at the transport level (e.g.
+    // bad session/handle). Separately from that, this call also checks
+    // the body-level status:u32 the AKS operation itself returns
+    // (VERIFIED FROM SOURCE, t2-aks-tool.c load_keybag) and returns
+    // AksResult::IoError if it is nonzero even when outSepStatus is 0 —
+    // that field is the actual load-keybag result and was previously
+    // ignored here, which could report a rejected/malformed bag as a
+    // fabricated success with a garbage handle.
     AksResult LoadKeybag(const std::vector<uint8_t>& bagBytes, int32_t* outHandle,
                         uint64_t session = 1, int8_t* outSepStatus = nullptr);
     AksResult MakeSystemKeybag(int32_t handle, int32_t specialUserBag,
@@ -98,6 +105,14 @@ public:
     // rejection is opcode 0x04's SepStatus, which went undecoded and
     // silently dropped. Callers that skip this parameter get exactly the
     // old (misleading) behavior.
+    //
+    // Independently of outSepStatus, this call also checks the body-level
+    // status:u32 the unlock operation itself returns (VERIFIED FROM
+    // SOURCE, t2-aks-tool.c unlock_keybag_secret) and returns
+    // AksResult::IoError when it is nonzero, even if outSepStatus is 0 —
+    // that field is the real wrong-password/bad-handle signal for this
+    // opcode and was previously never read here, so a wrong password could
+    // come back as a false AksResult::Ok.
     AksResult Unlock(int32_t handle, std::vector<uint8_t>& secretUtf8 /* zeroed on return */,
                     uint64_t session = 1, int8_t* outSepStatus = nullptr);
     AksResult GetCapabilities(uint64_t selector, uint64_t* outValue);
