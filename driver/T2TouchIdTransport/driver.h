@@ -3,9 +3,12 @@
 // T2TouchIdTransport.sys — KMDF PCI driver for the Apple T2 SEP mailbox.
 //
 // Every numeric constant below is VERIFIED FROM SOURCE against the Linux
-// reference implementation (jmurth1234/t2-touchid-linux, src/t2_sep_transport.c),
-// as documented in docs/linux-reference-analysis.md (Milestone 1, section 3).
-// Do not add or change a constant here without updating that provenance.
+// reference implementation (jmurth1234/t2-touchid-linux, src/t2_sep_transport.c) —
+// that repository is the sole source of truth for this driver's wire
+// protocol; this project's own docs/ have contained unverified/incorrect
+// claims in the past and must not be treated as authoritative.
+// Do not add or change a constant here without re-checking it against
+// t2_sep_transport.c directly.
 
 #pragma once
 
