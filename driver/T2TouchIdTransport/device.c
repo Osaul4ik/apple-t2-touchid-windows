@@ -544,6 +544,29 @@ T2EvtDeviceD0Entry(
         inbox, (inbox & T2_SEP_INBOX_EMPTY_BIT) != 0,
         livenessOk ? "success" : "failed"));
 
+    // BUGFIX (regression from the Milestone 2B lifecycle hardening, never
+    // hardware-validated until now): a D0->D3->D0 cycle (system sleep, or
+    // PCI/ACPI runtime power management idling the SEP function between
+    // two separate t2touchid.exe invocations) resets the PCI_COMMAND
+    // register's bus-master + memory-space bits on the SEP function, the
+    // same bits T2EnablePciBusMaster sets once in PrepareHardware. MMIO
+    // register reads/writes (the liveness check above) work fine without
+    // them - only DMA does not - so livenessOk alone proves nothing about
+    // whether SEP can actually DMA into OOL_IN/OOL_OUT after resume. The
+    // fast-resume path below deliberately does NOT re-send SET_OOL_IN/OUT
+    // (SEP already retains that registration), so if bus-master silently
+    // came back disabled, every AKS exchange after such a resume times out
+    // exactly like the original "SEP cannot DMA into host OOL buffers"
+    // symptom T2EnablePciBusMaster's own header comment describes - this
+    // is the same bug via a different path, not a new one. Re-enable is
+    // idempotent (T2EnablePciBusMaster no-ops if already set), so call it
+    // unconditionally here rather than only in T2DmaRegisterOolBuffers.
+    NTSTATUS busMasterStatus = T2EnablePciBusMaster(Device);
+    BOOLEAN busMasterOk = NT_SUCCESS(busMasterStatus);
+    T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        "T2TouchIdTransport: D0Entry PCI bus-master re-arm status=0x%x (%s)\n",
+        busMasterStatus, busMasterOk ? "ok" : "failed"));
+
     // State-model fix (D0 resume OOL state inconsistency): an ordinary
     // D0 -> D3 -> D0 cycle must never leave TransportState and
     // Ool*Registered contradicting each other (HardwareReady while OOL is
@@ -567,7 +590,7 @@ T2EvtDeviceD0Entry(
     // whenever State == HardwareReady, so that path is unaffected).
     BOOLEAN oolFullyRegistered = ctx->OolInRegistered && ctx->OolOutRegistered;
 
-    if (livenessOk && oolFullyRegistered) {
+    if (livenessOk && busMasterOk && oolFullyRegistered) {
         T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
             "T2TouchIdTransport: D0Entry resume (PreviousState=%d, "
             "OolInRegistered=1, OolOutRegistered=1, PriorState=%d) -> Ready; "
@@ -577,10 +600,10 @@ T2EvtDeviceD0Entry(
     } else {
         T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
             "T2TouchIdTransport: D0Entry (PreviousState=%d, livenessOk=%d, "
-            "OolInRegistered=%d, OolOutRegistered=%d, PriorState=%d) -> "
-            "HardwareReady; next AKS exchange fails closed until "
-            "IOCTL_T2_REGISTER_OOL re-confirms with SEP\n",
-            PreviousState, livenessOk, ctx->OolInRegistered,
+            "busMasterOk=%d, OolInRegistered=%d, OolOutRegistered=%d, "
+            "PriorState=%d) -> HardwareReady; next AKS exchange fails "
+            "closed until IOCTL_T2_REGISTER_OOL re-confirms with SEP\n",
+            PreviousState, livenessOk, busMasterOk, ctx->OolInRegistered,
             ctx->OolOutRegistered, ctx->State));
         T2SetTransportState(ctx, T2TransportHardwareReady);
     }
