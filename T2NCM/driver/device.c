@@ -124,7 +124,26 @@ T2NcmDeviceCreate(
 
     KeInitializeEvent(&context->QuiesceEvent, NotificationEvent, FALSE);
 
-    status = WdfSpinLockCreate(WDF_NO_OBJECT_ATTRIBUTES, &context->StateLock);
+    // BUGFIX (memory leak): WDF_NO_OBJECT_ATTRIBUTES here means "no
+    // explicit parent", and per KMDF's documented default, an object
+    // created that way is parented to the WDFDRIVER, not to this
+    // WDFDEVICE. WdfObjectDelete(device) — called from both
+    // MiniportHaltEx and this function's own Fail path — only tears
+    // down children of `device`; a WDFDRIVER-parented spinlock survives
+    // every one of those deletes and is only freed when the whole
+    // driver unloads. Every MiniportInitializeEx (first load, every
+    // disable/enable cycle, every replug) therefore leaked one
+    // WDFSPINLOCK forever. Explicitly parenting it to `device` fixes
+    // that — compare with PacketFilterWorkItem below, which already
+    // did this correctly.
+    {
+        WDF_OBJECT_ATTRIBUTES spinLockAttributes;
+
+        WDF_OBJECT_ATTRIBUTES_INIT(&spinLockAttributes);
+        spinLockAttributes.ParentObject = device;
+
+        status = WdfSpinLockCreate(&spinLockAttributes, &context->StateLock);
+    }
     if (!NT_SUCCESS(status))
     {
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,

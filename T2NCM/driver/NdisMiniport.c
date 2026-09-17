@@ -638,6 +638,17 @@ T2NcmMiniportInitializeEx(
 Fail:
     if (context != NULL)
     {
+        // BUGFIX: mirror MiniportHaltEx's cleanup order. A failure that
+        // happens after T2NcmPowerArmHardware succeeded (e.g. the
+        // NdisMSetMiniportAttributes calls or T2NcmRxAllocateResources
+        // below) left MI_01 switched to alt 1 with BulkInPipe/
+        // BulkOutPipe bound. Without this call the alt-1 setting and
+        // its pipes were never parked back to alt 0 before the
+        // WDFDEVICE (and everything under it) was torn down — exactly
+        // the "stranded pipe on alt 1" state UsbTransport.c's own
+        // comments say must never happen, and a real source of the
+        // adapter coming up in a bad state on the next attempt.
+        T2NcmUsbDeactivateDataInterface(context);
         T2NcmRxFreeResources(context);
         T2NcmUsbReleaseHardware(context);
         WdfSpinLockAcquire(context->StateLock);
