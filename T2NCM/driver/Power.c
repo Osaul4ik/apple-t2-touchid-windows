@@ -13,8 +13,51 @@ T2NcmPowerArmHardware(
     _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
     )
 {
-    T2NCM_NTB_PARAMETERS ntbParams;
     NTSTATUS status;
+
+    // Fast re-arm: NtbParametersCached means a PRIOR arm on this same
+    // physical device already confirmed GET_NTB_PARAMETERS, format
+    // negotiation and SET_NTB_INPUT_SIZE, and DeviceContext still holds
+    // those values (T2NcmPowerQuiesceHardware does not touch them - see
+    // below). Every D0 re-entry after S3/selective-suspend/any other
+    // brief power dip otherwise spent several sequential control
+    // transfers — GET_NTB_PARAMETERS, NTB16 negotiation,
+    // SET_NTB_INPUT_SIZE, THEN the alt-setting switch — with MI_01
+    // sitting on alt 0 (no bulk endpoints at all) for the whole
+    // sequence. Anything the far side sends during that window has no
+    // pipe to land on; skipping straight to the alt-1 switch cuts that
+    // window down to the one control transfer that cannot be skipped.
+    // A failed fast re-arm falls back to the full slow path below on the
+    // NEXT arm attempt (see the Unwind block) rather than retrying here,
+    // so this function never loops.
+    if (DeviceContext->NtbParametersCached)
+    {
+        status = T2NcmUsbActivateDataInterface(DeviceContext);
+        if (NT_SUCCESS(status))
+        {
+            (VOID)T2NcmApplyPacketFilter(DeviceContext);
+
+            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
+                "T2Ncm: hardware fast-armed (NTB params reused: ntbIn=%lu "
+                "ntbOut=%lu), MI_01 on alt %u\n",
+                DeviceContext->NtbInMaxSize, DeviceContext->NtbOutMaxSize,
+                T2NCM_DATA_ALT_ACTIVE));
+
+            return STATUS_SUCCESS;
+        }
+
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
+            "T2Ncm: fast re-arm's alt-1 activation failed 0x%08X — "
+            "invalidating cached NTB parameters, next arm attempt takes "
+            "the full slow path\n", status));
+
+        // Do not trust these values again without re-confirming them.
+        DeviceContext->NtbParametersCached = FALSE;
+        return status;
+    }
+
+    {
+    T2NCM_NTB_PARAMETERS ntbParams;
 
     // Reset every negotiated output BEFORE attempting (re)negotiation.
     // Without this, a partial/failed attempt this cycle would leave
@@ -73,6 +116,10 @@ T2NcmPowerArmHardware(
     DeviceContext->NdpOutAlignment        = ntbParams.wNdpOutAlignment;
     DeviceContext->NtbOutMaxDatagrams     = ntbParams.wNtbOutMaxDatagrams;
 
+    // Confirmed for this physical device — trusted on every subsequent
+    // D0 re-entry until/unless a fast re-arm's activation fails above.
+    DeviceContext->NtbParametersCached    = TRUE;
+
     status = T2NcmUsbActivateDataInterface(DeviceContext);
     if (!NT_SUCCESS(status))
     {
@@ -97,6 +144,7 @@ T2NcmPowerArmHardware(
         T2NCM_DATA_ALT_ACTIVE));
 
     return STATUS_SUCCESS;
+    }
 }
 
 VOID

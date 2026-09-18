@@ -276,6 +276,19 @@ typedef struct _T2NCM_DEVICE_CONTEXT
     ULONG                NtbInMaxSize;
     ULONG                NtbOutMaxSize;
 
+    // TRUE once GET_NTB_PARAMETERS/format-negotiation/SET_NTB_INPUT_SIZE
+    // have succeeded at least once and the four fields above (plus
+    // NdpOutDivisor/NdpOutPayloadRemainder/NdpOutAlignment/
+    // NtbOutMaxDatagrams below) hold real, confirmed values. These are a
+    // property of the physical device's firmware, not of the current
+    // power cycle — same reasoning as the MAC-address comment in
+    // T2NcmPowerArmHardware — so once confirmed they are trusted across
+    // D0 re-entries instead of being re-queried every time. Cleared only
+    // if a fast re-arm's alt-1 activation fails, forcing the next D0
+    // entry back onto the full slow (re-query) path rather than trusting
+    // possibly-stale values. See Power.c.
+    BOOLEAN              NtbParametersCached;
+
     // RX diagnostics — retained from the pre-NDIS milestone because the
     // counters are still the fastest way to tell "the parser is fine but
     // NDIS isn't taking the frames" apart from "no frames are arriving".
