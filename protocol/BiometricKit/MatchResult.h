@@ -18,11 +18,27 @@ namespace t2::biometrickit {
 
 enum class MatchOutcome {
     Match,
+    // VERIFIED FROM SOURCE (bridge-xpc-probe.py summarize_event): event_kind
+    // is set to "match_result" the moment embedded_type==0xE3FF8002 is seen,
+    // BEFORE the >=0xC70 length check — the length check only gates whether
+    // the "matched" field gets populated. verdict_from_result() then returns
+    // "verify-no-match" for a match_result-kind event with no truthy
+    // "matched" field, and --stop-on-match-result stops on event_kind alone.
+    // So an event too short to contain a UUID is a NoMatch, not a distinct
+    // "keep waiting" state — this project now matches that exactly.
     NoMatch,
-    Malformed, // event too short / wrong embedded_type / corrupt — NEVER silently NoMatch
+    // Reserved for embeddedType != kEmbeddedTypeMatchResult reaching this
+    // function despite the caller's own filter (VerificationEngine.cpp only
+    // calls ParseMatchResult after checking embeddedType itself) — defensive
+    // only, not expected to occur via the normal call path.
+    Malformed,
 };
 
-// VERIFIED FROM SOURCE: valid match_result events are at least 0xC70 bytes.
+// VERIFIED FROM SOURCE: only events at least this long can carry an
+// enrolled-identity UUID (Apple's own >=0xC70-byte validation before
+// parsing). Below this length there is nothing to scan, so the result is
+// NoMatch, not a signal to keep waiting — matching bridge-xpc-probe.py's
+// summarize_event/verdict_from_result exactly (see MatchOutcome::NoMatch).
 constexpr size_t kMinMatchResultEventBytes = 0xC70;
 
 // VERIFIED FROM SOURCE (bridge-xpc-probe.py summarize_event): the `data`

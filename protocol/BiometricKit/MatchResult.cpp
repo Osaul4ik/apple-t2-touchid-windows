@@ -265,7 +265,16 @@ MatchResult ParseMatchResult(uint32_t embeddedType,
     }
 
     if (eventPayload.size() < kMinMatchResultEventBytes) {
-        return result; // Malformed — never treated as NoMatch (Milestone 2 §20)
+        // VERIFIED FROM SOURCE: bridge-xpc-probe.py's summarize_event sets
+        // event_kind="match_result" as soon as embedded_type matches, before
+        // the length check — the length check only gates the "matched"
+        // field. verdict_from_result() then reads a match_result-kind event
+        // with no truthy "matched" as an immediate "verify-no-match", and
+        // --stop-on-match-result stops the loop on event_kind alone. A
+        // too-short body is therefore a definite NoMatch here too, not a
+        // reason to keep waiting for another event.
+        result.outcome = MatchOutcome::NoMatch;
+        return result;
     }
 
     if (enrolledIdentities.empty()) {

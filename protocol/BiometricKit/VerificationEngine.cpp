@@ -440,13 +440,21 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
             *outMatchedUuid = mr.matchedIdentityUuid;
             break;
         } else if (mr.outcome == MatchOutcome::NoMatch) {
-            T2_LOG("verify", L"match_result outcome=NO_MATCH (no enrolled UUID found in event)");
+            T2_LOG("verify",
+                   eventData.size() < kMinMatchResultEventBytes
+                       ? L"match_result outcome=NO_MATCH (body=%zuB, shorter than min=%zuB — "
+                         L"treated as definite no-match per Linux reference, not a wait state)"
+                       : L"match_result outcome=NO_MATCH (no enrolled UUID found in event, body=%zuB min=%zuB)",
+                   eventData.size(), kMinMatchResultEventBytes);
             outcome = VerifyOutcome::NoMatch;
             break;
         }
-        T2_LOG("verify", L"match_result outcome=MALFORMED body=%zuB (min required=%zuB) — "
-               L"still waiting, not treated as NO_MATCH",
-               eventData.size(), kMinMatchResultEventBytes);
+        // mr.outcome == MatchOutcome::Malformed is unreachable here: this
+        // call site only invokes ParseMatchResult after the caller's own
+        // `embeddedType != kEmbeddedTypeMatchResult` check above already
+        // `continue`d for anything else. Kept as a silent no-op (loop just
+        // continues) rather than an assert, since Malformed's only purpose
+        // is defensive robustness against a future call-site change.
     }
 
     // REMOVED (17.09.2026): no longer relabels Timeout as NoImageCaptured.
