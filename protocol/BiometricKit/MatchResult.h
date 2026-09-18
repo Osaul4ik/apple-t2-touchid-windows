@@ -73,22 +73,28 @@ StatusEventBody ParseStatusEventBody(const std::vector<uint8_t>& eventData);
 // diagnostic-only.
 const wchar_t* EmbeddedTypeName(uint32_t embeddedType);
 
-// VERIFIED (16.09.2026 macOS unified-log capture on the target machine:
-// `-[BiometricKitDStatistics statusMessage:]` prints Apple's own symbolic
-// name next to every ordinal biometrickitd receives on this exact wire
-// format). Unlike StatusOrdinalHypothesis below, this is NOT an
-// enrollment-sourced guess: it is the matching daemon's own naming, taken
-// from a successful Touch ID unlock on the same hardware and the same
-// bridgeOS build (23P5067) as the failing Windows session.
-// Returns nullptr for ordinals the capture never produced.
+// NOT VERIFIED FROM SOURCE — DO NOT TRUST AS GROUND TRUTH. This table's
+// only claimed origin is an alleged macOS unified-log capture ("16.09.2026",
+// bridgeOS 23P5067) that exists solely as a comment in this repository.
+// jmurth1234/t2-touchid-linux — the actual reference this project is
+// otherwise built from — contains no trace of these names, this sequence,
+// or this capture anywhere in its source or docs (checked directly against
+// the repo, not from memory). Per explicit instruction: this source is not
+// trusted going forward. Kept only as an opaque, best-effort diagnostic
+// label for a human reading a log — never as a signal anything in this
+// codebase decides on (VerificationEngine.cpp's outcome logic already does
+// not read this function; it only logs its result). Returns nullptr for
+// any ordinal not in the unverified table.
 const wchar_t* StatusCodeName(uint32_t statusCode);
 
-// True for the ordinals that only ever appear once the sensor has actually
-// produced an image and handed it to the matcher (ImageCaptured,
-// ImageForProcessing, ImageWasAccepted, ImageQueueIsEmpty,
-// TemplateListUpdated). A verify session that sees FingerOn/FingerOff but
-// none of these has a sensor that detects the finger and never scans it -
-// a materially different failure from "matcher ran and said no".
+// NOT VERIFIED FROM SOURCE — DO NOT TRUST AS GROUND TRUTH, same unconfirmed
+// origin as StatusCodeName above. Linux's own reference never gates
+// anything on these three ordinals specifically, or on "did an image reach
+// the matcher" as a distinct signal from a plain match_result-based
+// verdict (VERIFIED FROM SOURCE: t2-fprintd.py verdict_from_result reads
+// only match_result events). This function exists purely to populate a
+// diagnostic counter (imagePipelineEvents) in the session-summary log line;
+// it must never be used to pick a VerifyOutcome.
 bool StatusCodeIsImagePipeline(uint32_t statusCode);
 
 // VERIFIED (same capture): a 0xE3FF8004 statistics body is 12 bytes -

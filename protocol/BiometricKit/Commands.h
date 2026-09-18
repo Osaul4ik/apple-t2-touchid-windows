@@ -28,13 +28,18 @@ struct IdentityRecordV1 {
 };
 static_assert(sizeof(uint32_t) + 16 == 20, "identity_record_v1_t must be 20 bytes");
 
-// LEGACY LAYOUT ONLY - see MatchIdentityLayout below and
-// docs/macos-verified-status-map.md section 3.
+// LEGACY LAYOUT ONLY - see MatchIdentityLayout below.
 //
-// This struct was derived from the Linux reference's "68-byte match
-// options structure". A 16.09.2026 macOS unified-log capture on the very
-// same machine (bridgeOS 23P5067, uid 501, 3 enrolled identities) shows
-// biometrickitd issuing start-match as:
+// UNVERIFIED / DISTRUSTED framing below — see MatchResult.cpp's DISTRUST
+// NOTICE. This struct was derived from the Linux reference's "68-byte
+// match options structure". The claim that follows — that a
+// 16.09.2026 macOS unified-log capture on the same machine (bridgeOS
+// 23P5067, uid 501, 3 enrolled identities) shows biometrickitd issuing
+// start-match differently — has no corroboration in t2-touchid-linux and
+// is kept only as a documented, explicitly-selectable A/B experiment, not
+// as a claim to build on. VerifyConfig's actual default (LegacyCounted,
+// in VerificationEngine.h) is the Linux-verified one, matching
+// bridge-xpc-probe.py's own `--identity-blob-format=counted` default:
 //
 //   performCommand:version:inValue:inData:inSize: 4 1 0 <ptr> 68
 //
@@ -68,18 +73,24 @@ static_assert(sizeof(MatchOptionsV1) == 8, "match_options_v1_t must be 8 bytes")
 // How the start-match (cmd 4) payload is serialized.
 //
 //  InlineIdentities    8-byte MatchOptionsV1 + N * IdentityRecordV1; no
-//                      count field, no padding. For N == 3 this is exactly
-//                      the 68-byte payload macOS sends. DEFAULT.
+//                      count field, no padding. For N == 3 this is 68
+//                      bytes, matching the UNVERIFIED/DISTRUSTED macOS
+//                      capture claim above. Kept only as an explicitly
+//                      selectable A/B experiment — NOT the default.
 //  PaddedNoIdentities  the 68-byte MatchInitDataV1 alone, identities not
-//                      sent at all. Also 68 bytes on the wire, so the
-//                      macOS capture cannot tell it apart from
+//                      sent at all. Also 68 bytes on the wire, so even the
+//                      distrusted capture claim cannot tell it apart from
 //                      InlineIdentities by size - kept as an explicitly
-//                      selectable A/B variant instead of pretending the
-//                      capture disambiguated the two.
-//  LegacyCounted       MatchInitDataV1 + uint32 count + N records. What
-//                      this project sent up to 16.09.2026 (132 bytes for
-//                      N == 3). Kept only so the regression can be
-//                      reproduced on demand.
+//                      selectable A/B variant, same caveat as above.
+//  LegacyCounted       MatchInitDataV1 + uint32 count + N records
+//                      (132 bytes for N == 3). This is what
+//                      bridge-xpc-probe.py itself sends by default
+//                      (VERIFIED FROM SOURCE) and is VerifyConfig's actual
+//                      default (VerificationEngine.h). A/B-tested against
+//                      InlineIdentities on real hardware with "a
+//                      bit-identical failure shape" — i.e. the choice
+//                      between these three layouts is not what's blocking
+//                      verify.
 enum class MatchIdentityLayout {
     InlineIdentities,
     PaddedNoIdentities,
@@ -94,22 +105,21 @@ enum class Command : uint16_t {
     StartMatch        = 4,
     Cancel            = 0x0c,
     LoadCalibration   = 0x20,
-    SksLockState      = 0x27, // Linux probe number; macOS live uses 39
+    SksLockState      = 0x27, // Linux probe number
     SensorInfo        = 0x35,
     CatacombUuid      = 0x38,
-    // macOS live unlock pre-match sequence (unified log 16.09.2026, bridgeOS 23P5067):
-    //   48 getEnabledForUnlock (inSize=0)
-    //   39 performGetSKSLockStateCommand (inSize=4, uid)
-    //   46 performGetProtectedConfigCommand (inSize=4, uid)
-    //   12 Cancel
-    //   40 performGetBiometrickitdInfoCommand (inSize=0)
-    //   … then 4 StartMatch (inSize=68)
-    // Windows previously skipped all of these and went straight to StartMatch;
-    // the sensor then never emitted 89 Idle or 55 ImageCaptured.
-    GetSksLockStateMac   = 39,
-    GetBiometrickitdInfo = 40,
-    GetProtectedConfig   = 46,
-    GetEnabledForUnlock  = 48,
+    // REMOVED (17.09.2026): this used to also declare GetSksLockStateMac=39,
+    // GetBiometrickitdInfo=40, GetProtectedConfig=46, GetEnabledForUnlock=48
+    // for a pre-StartMatch probe sequence. That sequence, and the four
+    // constants, came only from an unconfirmed claim (an alleged macOS
+    // unified-log capture) that is not corroborated anywhere in
+    // jmurth1234/t2-touchid-linux — grep across that project's source and
+    // docs finds no trace of these opcodes, this sequence, or the
+    // entitlement-gap theory attached to them. t2-fprintd.py/
+    // bridge-xpc-probe.py's own StartMatch path (VERIFIED FROM SOURCE)
+    // never sends any of this. Per explicit instruction: do not trust that
+    // source; treat Linux as the reference. See VerificationEngine.cpp for
+    // where the call sequence itself was already removed.
     CatacombHash      = 0x3a,
     CatacombState     = 0x3c,
     IdentityList      = 0x42,

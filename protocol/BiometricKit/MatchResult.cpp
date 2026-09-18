@@ -17,16 +17,23 @@
 // - the first signed word of the event is NOT a reliable success signal
 //   (VERIFIED, this file never reads it).
 //
-// 16.09.2026 native macOS reference refinement:
-// a successful match on the same MacBookPro T2 / bridgeOS 23P5067 shows the
-// status sequence around a real capture as:
-//   63 FingerOn -> 55 ImageCaptured -> 72 ImageForProcessing ->
-//   95 ImageWasAccepted -> 91 SensorOperationModePause.
-// Status 55/72/95 are therefore the only statuses used here as the
-// definitive "image reached the matcher pipeline" indicators. 53
-// (ImageQueueIsEmpty) and 73 (TemplateListUpdated) occur later in the
-// lifecycle and are not evidence that a new image was captured for the
-// current finger-on event.
+// DISTRUST NOTICE (per explicit instruction, superseding the "16.09.2026
+// native macOS reference refinement" note this replaces): the claim below
+// — a named status-code sequence (FingerOn/ImageCaptured/.../Pause) from an
+// alleged live macOS/bridgeOS 23P5067 capture — has no corroboration
+// anywhere in jmurth1234/t2-touchid-linux, checked directly against that
+// repo's source and docs, not assumed from memory. It exists only as a
+// comment in this file. StatusCodeName() and StatusCodeIsImagePipeline()
+// below still encode it for best-effort diagnostic labeling only (they are
+// never read by VerificationEngine.cpp's outcome logic — see that file),
+// but it must not be treated as ground truth, and no future change should
+// build new match/no-match logic on top of it. Orient on the Linux
+// reference instead: its own verify path (t2-fprintd.py
+// verdict_from_result) never inspects these ordinals at all, and its
+// enrollment conformance matrix (a genuinely Linux-sourced, disassembly-
+// confirmed document) actually classifies most of this ordinal range
+// (81..84, 89..97) as a no-op with no semantic content — the opposite of
+// what the distrusted capture claims.
 
 #include "MatchResult.h"
 #include <cstring>
@@ -101,29 +108,15 @@ const wchar_t* EmbeddedTypeName(uint32_t embeddedType) {
 }
 
 const wchar_t* StatusCodeName(uint32_t statusCode) {
-    // VERIFIED (16.09.2026 macOS unified-log capture, MacBookPro T2,
-    // bridgeOS 23P5067 - the same machine and firmware the Windows client
-    // talks to). Source lines look like:
-    //   -[BiometricKitDStatistics statusMessage:]: 55 (ImageCaptured)
-    // i.e. Apple's own daemon printing the symbolic name for the ordinal
-    // carried in the 0xE3FF8001 body this project already decodes. Every
-    // entry below was observed at least twice in that capture during
-    // successful Touch ID unlocks.
-    //
-    // Reference order of a SUCCESSFUL unlock on that capture:
-    //   80 MatchingCancelled -> 89 Idle -> 90 Capture -> 63 FingerOn ->
-    //   55 ImageCaptured -> 72 ImageForProcessing -> 95 ImageWasAccepted ->
-    //   91 Pause -> 64 FingerOff -> 90 Capture -> 63 FingerOn ->
-    //   [0xE3FF8002 match_result] -> 74 RequestFingerOff ->
-    //   53 ImageQueueIsEmpty -> 91 Pause -> 73 TemplateListUpdated ->
-    //   80 MatchingCancelled -> 64 FingerOff
-    //
-    // Current Windows investigation has now reproduced two independent
-    // 20-second sessions with both 68-byte match layouts, plus a 61407-byte
-    // FDR calibration load, and all still stop at 63 -> 91 with no 55/72/95.
-    // Therefore this map deliberately treats 55/72/95 as the diagnostic
-    // image-pipeline boundary; later statuses 53/73 are not evidence that
-    // image acquisition succeeded.
+    // UNVERIFIED / DISTRUSTED — see the file-level DISTRUST NOTICE above.
+    // This table's claimed origin (a macOS unified-log capture allegedly
+    // showing `-[BiometricKitDStatistics statusMessage:]` printing these
+    // names) is not corroborated by t2-touchid-linux and cannot be
+    // independently checked from this codebase. It is kept only so a human
+    // reading a log has a readable guess instead of a bare integer.
+    // Do not add new logic that depends on any of these names being
+    // correct, and do not treat their absence/presence as evidence of
+    // anything about the real protocol.
     switch (statusCode) {
         case 53: return L"ImageQueueIsEmpty";
         case 55: return L"ImageCaptured";
@@ -137,21 +130,17 @@ const wchar_t* StatusCodeName(uint32_t statusCode) {
         case 90: return L"SensorOperationModeCapture";
         case 91: return L"SensorOperationModePause";
         case 95: return L"ImageWasAccepted";
-        default: return nullptr; // ordinal not produced by the reference capture
+        default: return nullptr; // not in the unverified table
     }
 }
 
 bool StatusCodeIsImagePipeline(uint32_t statusCode) {
-    // VERIFIED FROM THE NATIVE MATCH CAPTURE ON 16.09.2026:
-    // 55 == ImageCaptured
-    // 72 == ImageForProcessing
-    // 95 == ImageWasAccepted
-    //
-    // These three statuses form the actual capture/processing chain for the
-    // current finger presentation. 53 (ImageQueueIsEmpty) and 73
-    // (TemplateListUpdated) are post-match lifecycle events in the same
-    // reference sequence, so they are deliberately NOT counted as evidence
-    // that an image was captured for the current attempt.
+    // UNVERIFIED / DISTRUSTED — see the file-level DISTRUST NOTICE above.
+    // 55/72/95 are only "the image pipeline" according to the same
+    // uncorroborated capture StatusCodeName relies on. Kept purely to
+    // populate a diagnostic counter in the session-summary log
+    // (imagePipelineEvents in VerificationEngine.cpp) — that counter is
+    // informational only and is never used to choose a VerifyOutcome.
     switch (statusCode) {
         case 55: // ImageCaptured
         case 72: // ImageForProcessing
@@ -163,16 +152,16 @@ bool StatusCodeIsImagePipeline(uint32_t statusCode) {
 }
 
 StatisticsEventBody ParseStatisticsEventBody(const std::vector<uint8_t>& eventData) {
-    // VERIFIED (same capture): biometrickitd reports a 0xE3FF8004 body of
-    // exactly 12 bytes ("MCDMExtractMessageData ... 12 ... 0xe3ff8004"),
-    // and prints it as `type` + one 8-byte value shown both as an integer
-    // and as a double. The 12 bytes start after the same
-    // kStatusEventBodyFixedFieldsBytes prefix the status body uses
-    // (ordinal:u64 + payload_length:u64), which the failing Windows
-    // capture independently confirms: its 28-byte statistics bodies decode
-    // as ordinal=0, length=12, then type/value - e.g. type 4 value 1,
-    // type 35 value 1, type 25 value 1215, type 30 value 2169, all of
-    // which fall inside the type range the macOS capture also shows.
+    // UNVERIFIED / DISTRUSTED for the "biometrickitd reports a 12-byte body
+    // of type+value" framing — same uncorroborated capture as the
+    // DISTRUST NOTICE above. What IS independently, directly observed on
+    // real Windows-side hardware captures (not attributed to the macOS
+    // claim): 28-byte statistics bodies decoding as ordinal=0, length=12,
+    // then a 4-byte type and an 8-byte value at these offsets — e.g.
+    // type 4 value 1, type 35 value 1, type 25 value 1215, type 30 value
+    // 2169. The offsets below are kept because they match what this
+    // project's own hardware actually produced, not because of the macOS
+    // claim about it.
     StatisticsEventBody body;
     if (eventData.size() >= kStatusEventBodyFixedFieldsBytes + 4) {
         uint32_t type = 0;
@@ -207,41 +196,45 @@ const wchar_t* StatusOrdinalHypothesis(uint32_t ordinal) {
     // source. Returns nullptr for ordinals with no enrollment-side meaning
     // to hypothesize from at all.
     //
-    // 16.09.2026 refinement: the native macOS verify capture emits 55/72/95
-    // for the real image pipeline, while the failing Windows capture emits
-    // 78 and 81 but never emits 55/72/95. There is therefore no basis in the
-    // native verify capture to call 78 "rejected capture". Until a native
-    // verify capture actually shows 78, leave it unlabeled here rather than
-    // presenting the enrollment-derived guess as if it were confirmed.
+    // NOTE: an earlier revision of this comment resolved the tension below
+    // by treating StatusCodeName's table as "the authority" and dismissing
+    // Linux's own no-op range on that basis. That table's only claimed
+    // origin is an unconfirmed macOS capture with no trace in
+    // jmurth1234/t2-touchid-linux (checked directly against that repo) —
+    // per explicit instruction, it is no longer trusted, so it cannot be
+    // used to override what Linux itself documents. The honest state is:
+    // Linux's enrollment conformance matrix (enrollment_research/
+    // FINDINGS.md, VERIFIED FROM SOURCE, static-confirmed from disassembly)
+    // marks ordinals 81..84 and 89..97 as a complete no-op domain for the
+    // ENROLLMENT operation ("no feedback, state change, command, or
+    // terminal result"). Whether that also holds for a MATCH/verify
+    // operation is genuinely unconfirmed either way — this project has no
+    // Linux-sourced evidence for or against it. 63/64 are the one place the
+    // distrusted capture and Linux's own matrix independently agree
+    // (finger-present / finger-removed feedback), so they are named below;
+    // everything else in the 78..98 range stays an enrollment-sourced
+    // hypothesis, explicitly not claimed to transfer to verify.
     switch (ordinal) {
-        // 63/64 are directly named by the successful macOS verify capture;
-        // do not duplicate them with an enrollment-derived hypothesis.
-        case 63:
-        case 64:
-            return nullptr;
+        case 63: return L"finger-present feedback (Linux-verified, enrollment path)";
+        case 64: return L"finger-removed/waiting feedback (Linux-verified, enrollment path)";
         case 66: return L"HYPOTHESIS(enrollment-sourced): cancelled-terminal";
         case 67: return L"HYPOTHESIS(enrollment-sourced): generic-failure-terminal";
         case 68: return L"HYPOTHESIS(enrollment-sourced): timeout-terminal";
         case 70: return L"HYPOTHESIS(enrollment-sourced): continue-without-new-progress";
         case 74: return L"HYPOTHESIS(enrollment-sourced): waiting-for-finger-removal";
         case 78:
-            return nullptr; // unverified on the native verify path
         case 85: case 87: case 88: case 98:
             return L"HYPOTHESIS(enrollment-sourced): rejected-capture feedback (retry)";
         case 86: return L"HYPOTHESIS(enrollment-sourced): rejected-small-coverage feedback";
         case 93: return L"HYPOTHESIS(enrollment-sourced): dirty-sensor advisory";
+        case 81: case 82: case 83: case 84:
+        case 89: case 90: case 91: case 92: case 94: case 95: case 96: case 97:
+            return L"Linux-verified no-op range for enrollment (81..84, 89..97); "
+                    L"unconfirmed for verify";
         default:
             if (ordinal >= 100 && ordinal <= 355) {
                 return L"HYPOTHESIS(enrollment-sourced): progress ordinal (100..355 range)";
             }
-            // No enrollment-side meaning to hypothesize. NOTE (16.09.2026):
-            // the enrollment table calls 81..84 and 94..97 "no-op" ranges,
-            // but the failing Windows capture shows the SEP emitting
-            // status_code=81 on every finger presentation, and 94 right
-            // after load-calibration - so that table's "no-op" claim does
-            // not hold for the verify path. StatusCodeName above (macOS
-            // sourced) is the authority; 78 and 81 are NOT named there,
-            // i.e. they never occur in a successful macOS unlock at all.
             return nullptr;
     }
 }

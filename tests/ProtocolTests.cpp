@@ -255,12 +255,14 @@ static void TestMatchPayload_LegacyIsTheOldOneHundredThirtyTwo() {
     CHECK(payload.size() == 132); // what the failing hardware capture shows
 }
 
-static void TestStatusCodeNames_FromMacOsCapture() {
+// Locks in the current (unverified — see MatchResult.cpp's DISTRUST
+// NOTICE) table's behavior so future edits are deliberate, not a claim
+// that these names are confirmed correct.
+static void TestStatusCodeNames_UnverifiedTable() {
     CHECK(std::wstring(biometrickit::StatusCodeName(55)) == L"ImageCaptured");
     CHECK(std::wstring(biometrickit::StatusCodeName(63)) == L"FingerOn");
     CHECK(std::wstring(biometrickit::StatusCodeName(95)) == L"ImageWasAccepted");
-    // 78 and 81 appear in the failing Windows capture and in NO successful
-    // macOS unlock - they must stay unnamed here.
+    // 78 and 81 are simply not present in the unverified table.
     CHECK(biometrickit::StatusCodeName(78) == nullptr);
     CHECK(biometrickit::StatusCodeName(81) == nullptr);
 
@@ -330,7 +332,7 @@ int wmain() {
     TestMatchPayload_InlineMatchesMacOsSize();
     TestMatchPayload_PaddedIsAlsoSixtyEight();
     TestMatchPayload_LegacyIsTheOldOneHundredThirtyTwo();
-    TestStatusCodeNames_FromMacOsCapture();
+    TestStatusCodeNames_UnverifiedTable();
     TestStatisticsEventBody_DecodesTypeAndValue();
     TestLinuxIdentityCapacitiesAndGlobalCommand();
 

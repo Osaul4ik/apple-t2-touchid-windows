@@ -280,10 +280,20 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     // sequence bought nothing but ~1s of dead time and four guaranteed
     // status=258 failures (48/39/46/40 are simply not usable on this
     // bridge/firmware, unlike the biometrickitd process macOS's own log was
-    // captured from, which presumably has entitlements this client does
-    // not). Root cause is not confirmed to be this gap, but there is no
-    // remaining evidence FOR the macOS sequence either, so per explicit
-    // instruction this driver now does the identity-list-stable check above
+    // allegedly captured from). That macOS capture itself is not trusted
+    // (see MatchResult.cpp's DISTRUST NOTICE) — but even taking the
+    // entitlement-gap theory on its own terms, Linux's actual, disassembly-
+    // confirmed research (t2-touchid-linux, enrollment_research/
+    // FINDINGS.md, "Enrollment authorization container and trust
+    // boundaries") is evidence AGAINST it for this build: it documents that
+    // biometrickitd's capability-bit check (`isClient:entitled:forMethod:`)
+    // "returns true" on every valid permission-group path regardless of
+    // the entitlement bit, and that the one confirmed use of status 258 in
+    // that document is an invalid credential-set object/length in
+    // ENROLLMENT auth parsing — unrelated to StartMatch or to these four
+    // opcodes. So there is now a Linux-sourced reason to doubt the
+    // entitlement-gap theory specifically, not just an absence of evidence
+    // for it. This driver now does the identity-list-stable check above
     // and then goes STRAIGHT to StartMatch — exactly what
     // t2-fprintd.py/bridge-xpc-probe.py's real --timed-match path does
     // (VERIFIED FROM SOURCE: biometric_command(sock, 4, data=match_data) is
@@ -391,7 +401,7 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
                        body.statusCode
                            ? (StatusCodeName(*body.statusCode)
                                   ? StatusCodeName(*body.statusCode)
-                                  : L"(not seen in macOS reference capture)")
+                                  : L"(unnamed, unverified table)")
                            : L"(n/a)",
                        body.statusDataLength ? std::to_wstring(*body.statusDataLength).c_str() : L"(n/a)",
                        body.statusCode
