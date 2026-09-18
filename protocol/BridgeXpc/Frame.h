@@ -25,9 +25,12 @@ constexpr uint16_t kProtocolVersion = 1;
 // Hard ceiling independent of whatever the remote peer claims in
 // body_length. VERIFIED FROM SOURCE gives no upper bound from Apple's side,
 // so this is a defensive, locally chosen limit (INFERRED-safe, not a
-// protocol fact) sized generously above the largest observed body (FDR
-// calibration blob) with headroom, and documented as such.
-constexpr uint64_t kMaxFrameBodyBytes = 4u * 1024u * 1024u; // 4 MiB
+// protocol fact). Set to match jmurth1234/t2-touchid-linux's own chosen
+// ceiling (src/t2_bridge_wire.py, MAX_FRAME_BODY = 16 * 1024 * 1024) for
+// parity with the reference implementation — the previous 4 MiB value here
+// was a narrower, independently-chosen limit that could reject a frame the
+// Linux reference would accept.
+constexpr uint64_t kMaxFrameBodyBytes = 16u * 1024u * 1024u; // 16 MiB
 
 enum class FrameType : uint32_t {
     Helo = 1,
