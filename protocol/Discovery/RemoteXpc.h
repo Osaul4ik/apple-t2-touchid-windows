@@ -165,13 +165,16 @@ bool ProbeServiceOnPort(const NcmEndpoint& endpoint, uint16_t port,
                          std::chrono::milliseconds timeout,
                          uint16_t* outServicePort);
 
-// Tries each candidate port from the END of candidatePorts backward (see
-// the 16.09.2026 real-hardware finding in RemoteXpc.cpp for why - this
-// deliberately diverges from discover-biometric-port.py's ascending
-// `for candidate_port in candidate_ports` walk): connect, handshake, read
-// the peer record, look for Services[serviceName]["Port"]. A port that
-// answers RemoteXPC but does not advertise serviceName is a decoy — the
-// loop moves on to the next candidate rather than reporting it as a match.
+// Tries each candidate port ascending from index 0 (a worker pool, not a
+// plain loop, but ascending order is still the tie-break — see the
+// REVERTED note in RemoteXpc.cpp: an earlier revision walked backward from
+// the end of candidatePorts, but that diverged from
+// discover-biometric-port.py's ascending `for candidate_port in
+// candidate_ports` walk for no verified benefit and was reverted): connect,
+// handshake, read the peer record, look for Services[serviceName]["Port"].
+// A port that answers RemoteXPC but does not advertise serviceName is a
+// decoy — the loop moves on to the next candidate rather than reporting it
+// as a match.
 DiscoveredService DiscoverServicePort(const NcmEndpoint& endpoint,
                                        const std::vector<uint16_t>& candidatePorts,
                                        const std::string& serviceName,
