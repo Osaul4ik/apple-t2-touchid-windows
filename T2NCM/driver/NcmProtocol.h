@@ -45,46 +45,14 @@ T2NcmSetNtbInputSize(
     _In_ const T2NCM_NTB_PARAMETERS* Parameters
     );
 
-// Task 8: find and read the device's real MAC-address string, validate,
-// store in DeviceContext->PermanentMacAddress. Fails explicitly if no
-// string descriptor unambiguously matches the MAC-address shape (12 hex
-// characters) — never invents a MAC and never guesses among several
-// candidates.
+// Task 8: the T2 has no hardware MAC (confirmed on REV_0201: no MAC string,
+// iSerialNumber is all NULs). NDIS still needs a station address, so this
+// deterministically derives a locally-administered one from the device's
+// ContainerID (stable per physical device across reboots/replugs).
 //
-// Variant 1 note: this does NOT read the CDC Ethernet Functional
-// Descriptor (that lives under MI_00's slice of the configuration
-// descriptor, which is invisible to an MI_01-only WDFUSBDEVICE — see
-// the historical-note comment in NcmProtocol.c). Instead it scans the
-// device's string table directly (T2NcmScanForMacStringIndex): first
-// for a dedicated MAC string, then — only if that finds nothing — for
-// iSerialNumber doubling as the MAC, which is what real T2 hardware
-// turned out to do. Neither pass is PDO-filtered, so this works from
-// MI_01 alone with no dependency on an MI_00 stub. Device.c still
-// treats a failure here as non-fatal/best-effort (defensive — a future
-// firmware/revision with neither shape would otherwise cost the whole
-// data path), but on known-good hardware this is expected to succeed.
-NTSTATUS
-T2NcmReadMacAddress(
-    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
-    );
-
-// Task 8 follow-up: real T2 units in the wild have turned up with an
-// all-zero iMACAddress/iSerialNumber string table (confirmed on
-// REV_0201 via raw string-descriptor byte dump — not a parsing bug,
-// the device genuinely reports nothing). NDIS still needs *some*
-// station address to bring an adapter up, so this wraps
-// T2NcmReadMacAddress: on success, behaves identically (real,
-// permanent address). On failure, deterministically derives a
-// locally-administered address from the device's ContainerID (stable
-// per physical device across reboots/replugs) instead of leaving the
-// adapter with no address at all.
-//
-// This never silently mislabels a generated address as permanent:
-// DeviceContext->MacAddressIsPermanent distinguishes the two cases for
-// anything downstream (IOCTL_T2NCM_GET_STATUS, logs) that cares which
-// kind of address it's looking at. MacAddressValid means "usable by
-// NDIS", not "burned into hardware" — check MacAddressIsPermanent for
-// that.
+// DeviceContext->MacAddressIsPermanent is always FALSE (the address is
+// generated, never a burned-in one). MacAddressValid means "usable by
+// NDIS".
 NTSTATUS
 T2NcmEnsureMacAddress(
     _In_ PT2NCM_DEVICE_CONTEXT DeviceContext

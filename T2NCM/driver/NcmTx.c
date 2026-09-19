@@ -327,7 +327,7 @@ T2NcmEvtTxWriteComplete(
         // device only got part of the NTB — never treat that as "sent".
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
             "T2Ncm: TX short write (%Iu of %lu bytes) despite success "
-            "status — treating as failed\n", written, requestContext->BlockLength));
+            "status - treating as failed\n", written, requestContext->BlockLength));
         InterlockedIncrement64(&deviceContext->TxFramesRejected);
         InterlockedIncrement64(&deviceContext->OutErrors);
         ndisStatus = NDIS_STATUS_FAILURE;
@@ -585,7 +585,7 @@ T2NcmTxSendFrame(
     if (DeviceContext->BulkOutPipe == NULL)
     {
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2Ncm: T2NcmTxSendFrame called with no BulkOutPipe — the data "
+            "T2Ncm: T2NcmTxSendFrame called with no BulkOutPipe - the data "
             "interface must be active first\n"));
         return STATUS_INVALID_DEVICE_STATE;
     }
@@ -641,7 +641,7 @@ T2NcmTxSendFrame(
     {
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
             "T2Ncm: TX short write (%lu of %lu bytes) despite success "
-            "status — treating as failed\n", bytesWritten, blockLength));
+            "status - treating as failed\n", bytesWritten, blockLength));
         InterlockedIncrement64(&DeviceContext->TxFramesRejected);
         return STATUS_UNSUCCESSFUL;
     }

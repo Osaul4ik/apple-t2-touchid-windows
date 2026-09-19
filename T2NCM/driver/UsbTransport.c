@@ -107,7 +107,7 @@ T2NcmUsbPrepareHardware(
     {
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
             "T2Ncm: WdfUsbTargetDeviceGetInterface(0) returned NULL after a "
-            "successful SelectConfig — should not happen\n"));
+            "successful SelectConfig - should not happen\n"));
         return STATUS_DEVICE_CONFIGURATION_ERROR;
     }
 
@@ -214,7 +214,7 @@ T2NcmUsbActivateDataInterface(
         {
             T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
                 "T2Ncm: MI_01 bulk IN EP is 0x%02X, not the 0x%02X seen on the "
-                "reference revision — continuing, discovery is authoritative\n",
+                "reference revision - continuing, discovery is authoritative\n",
                 info.EndpointAddress, T2NCM_EXPECTED_BULK_IN_EP));
         }
 
@@ -224,7 +224,7 @@ T2NcmUsbActivateDataInterface(
         {
             T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
                 "T2Ncm: MI_01 bulk OUT EP is 0x%02X, not the 0x%02X seen on the "
-                "reference revision — continuing, discovery is authoritative\n",
+                "reference revision - continuing, discovery is authoritative\n",
                 info.EndpointAddress, T2NCM_EXPECTED_BULK_OUT_EP));
         }
     }
@@ -259,7 +259,7 @@ Unwind:
         {
             T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
                 "T2Ncm: unwind to alt %u after failed activation ALSO failed "
-                "0x%08X — MI_01 alt-setting state is now unknown\n",
+                "0x%08X - MI_01 alt-setting state is now unknown\n",
                 T2NCM_DATA_ALT_IDLE, unwindStatus));
         }
     }
@@ -307,7 +307,7 @@ T2NcmUsbDeactivateDataInterface(
         // cannot be parked on alt 0 is a real finding for the next
         // hardware session.
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
-            "T2Ncm: parking MI_01 on alt %u failed 0x%08X — continuing\n",
+            "T2Ncm: parking MI_01 on alt %u failed 0x%08X - continuing\n",
             T2NCM_DATA_ALT_IDLE, status));
         return;
     }

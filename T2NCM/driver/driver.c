@@ -79,7 +79,7 @@ DriverEntry(
     }
 
     T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
-        "T2Ncm: DriverEntry OK — NDIS is the power policy owner\n"));
+        "T2Ncm: DriverEntry OK - NDIS is the power policy owner\n"));
 
     return STATUS_SUCCESS;
 }

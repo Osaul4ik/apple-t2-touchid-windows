@@ -260,7 +260,7 @@ T2NcmNegotiateNtbFormat(
     if ((Parameters->bmNtbFormatsSupported & T2NCM_BM_NTB16_SUPPORTED_BIT) == 0)
     {
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2Ncm: refusing to negotiate — NTB16 not in bmNtbFormatsSupported=0x%04X "
+            "T2Ncm: refusing to negotiate - NTB16 not in bmNtbFormatsSupported=0x%04X "
             "(this driver never falls back to NTB32)\n",
             Parameters->bmNtbFormatsSupported));
         return STATUS_NOT_SUPPORTED;
@@ -361,453 +361,18 @@ T2NcmSetNtbInputSize(
 }
 
 // ---------------------------------------------------------------------
-// HISTORICAL NOTE (Task 8, superseded — code removed, not just unused,
-// because this driver builds /W4 /WX and an unused static function is a
-// hard error here, not a warning to ignore):
-//
-// The original approach walked the USB configuration descriptor looking
-// for the CDC Ethernet Functional Descriptor nested under MI_00, on the
-// theory that a raw standard GET_DESCRIPTOR(CONFIGURATION) is a
-// device-level USB operation that bypasses PDO scoping and always
-// returns every interface. Real hardware disproved that: usbccgp
-// filters/synthesizes the configuration descriptor per child PDO
-// regardless of whether the request is sent via
-// WdfUsbTargetDeviceRetrieveConfigDescriptor or a manually-built raw
-// control transfer. A WDFUSBDEVICE bound to MI_01 gets back a
-// descriptor buffer that simply does not contain MI_00's interface
-// descriptor or the CS_INTERFACE Ethernet Functional Descriptor nested
-// under it — USBD_ParseConfigurationDescriptorEx correctly returned
-// NULL for T2NCM_CONTROL_IFACE_NUM every time, producing exactly the
-// "MI_00 interface descriptor not found" error this approach hit in
-// practice. Unlike class requests addressed by
-// wIndex=T2NCM_CONTROL_IFACE_NUM (those DO reach MI_00's control logic,
-// because wIndex routing happens at the EP0/class-request layer, not
-// the config-descriptor-synthesis layer), this cannot work from an
-// MI_01-only binding, full stop.
-//
-// Replaced below by T2NcmScanForMacStringIndex, which sidesteps the
-// whole problem: it never touches the configuration descriptor at all,
-// only the (unfiltered) string table.
+// MAC address: this device has no hardware MAC to read. On real T2 units
+// (confirmed on REV_0201) the string table carries no MAC-address string
+// and iSerialNumber is 40 NUL characters, and the CDC Ethernet
+// Functional Descriptor (MI_00) is invisible from an MI_01-only binding.
+// So the station address is always generated - see
+// T2NcmEnsureMacAddress below.
 // ---------------------------------------------------------------------
 
-_Success_(return)
-static
-BOOLEAN
-T2NcmHexNibble(
-    _In_  WCHAR Ch,
-    _Out_ UCHAR* Value
-    )
-{
-    if (Ch >= L'0' && Ch <= L'9') { *Value = (UCHAR)(Ch - L'0');      return TRUE; }
-    if (Ch >= L'A' && Ch <= L'F') { *Value = (UCHAR)(Ch - L'A' + 10); return TRUE; }
-    if (Ch >= L'a' && Ch <= L'f') { *Value = (UCHAR)(Ch - L'a' + 10); return TRUE; }
-    return FALSE;
-}
-
-// The CDC Ethernet MAC-address string is always exactly 12 hex
-// characters (6 bytes) — fixed-size stack buffer, no pool allocation
-// needed.
-#define T2NCM_MAC_STRING_CHARS 12u
-
 // ---------------------------------------------------------------------
-// Variant 1 fix: T2NcmFindMacStringIndex (above) cannot work from an
-// MI_01-only binding — MI_00's slice of the configuration descriptor is
-// invisible to this WDFUSBDEVICE, full stop (see its comment). This is
-// the actual replacement path.
-//
-// GET_DESCRIPTOR(STRING, index, langId) is NOT scoped by usbccgp the
-// way GET_DESCRIPTOR(CONFIGURATION) is — a child PDO's string requests
-// are answered straight from the device's own flat string table, since
-// usbccgp has no per-function string list to synthesize (strings aren't
-// tied to any one interface the way configuration-descriptor bytes
-// are). So instead of reading iMACAddress out of the (invisible)
-// Ethernet Functional Descriptor, this scans the string table directly
-// for whichever string has exactly the CDC MAC-address shape: 12 hex
-// digits.
-//
-// Two passes, in order:
-//   1. Every index EXCEPT iManufacturer/iProduct/iSerialNumber. A
-//      dedicated, standalone MAC string is the strongest evidence, so
-//      it always wins when present. More than one match here is
-//      AMBIGUOUS and fails closed (STATUS_DEVICE_PROTOCOL_ERROR) rather
-//      than guessing — Task 8's "never invent a MAC" rule covers "never
-//      pick among several candidates" too.
-//   2. Only if pass 1 found nothing at all: iSerialNumber itself, in
-//      case this device reuses its serial number as the Ethernet
-//      address (real T2 hardware does — pass 1 alone came up empty on
-//      it). This never runs, and never overrides pass 1's result, when
-//      pass 1 found even one dedicated match.
-// A missing index is an expected, silent skip during scanning (the
-// device NAKs/stalls it) — only pass summaries are logged, not each
-// probe. If BOTH passes come up empty, every non-empty string
-// descriptor is dumped for diagnosis (T2NcmLogAllStringDescriptors).
-// ---------------------------------------------------------------------
-#define T2NCM_MAC_SCAN_MIN_INDEX   1u
-#define T2NCM_MAC_SCAN_MAX_INDEX   32u  // generous; a real T2 has a handful of strings
-
-// Probes one string index and reports whether its content is exactly
-// T2NCM_MAC_STRING_CHARS hex digits. Shared by both scan passes below
-// and by the diagnostic dump, so the "what counts as MAC-shaped" rule
-// lives in exactly one place.
-static
-BOOLEAN
-T2NcmStringIsMacShape(
-    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext,
-    _In_ UCHAR                 Index
-    )
-{
-    NTSTATUS status;
-    USHORT numChars;
-    WCHAR chars[T2NCM_MAC_STRING_CHARS];
-    UCHAR i;
-
-    numChars = 0;
-    status = WdfUsbTargetDeviceQueryString(
-        DeviceContext->UsbDevice, NULL, NULL, NULL, &numChars, Index, 0);
-    if (!NT_SUCCESS(status) || numChars != T2NCM_MAC_STRING_CHARS)
-    {
-        return FALSE;
-    }
-
-    RtlZeroMemory(chars, sizeof(chars));
-    numChars = T2NCM_MAC_STRING_CHARS;
-    status = WdfUsbTargetDeviceQueryString(
-        DeviceContext->UsbDevice, NULL, NULL, (PUSHORT)chars, &numChars, Index, 0);
-    if (!NT_SUCCESS(status) || numChars != T2NCM_MAC_STRING_CHARS)
-    {
-        return FALSE;
-    }
-
-    for (i = 0; i < T2NCM_MAC_STRING_CHARS; i++)
-    {
-        UCHAR nibble;
-        if (!T2NcmHexNibble(chars[i], &nibble))
-        {
-            return FALSE;
-        }
-    }
-
-    return TRUE;
-}
-
-// Diagnostic-only: called after BOTH scan passes below have come up
-// completely empty, to dump every non-empty string descriptor's raw
-// content so a failure can be root-caused from the log alone, without
-// needing a USB capture. Never called on a successful path — this is
-// pure last-resort visibility, not part of the discovery logic itself.
-static
-VOID
-T2NcmLogAllStringDescriptors(
-    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
-    )
-{
-    UCHAR idx;
-
-    T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
-        "T2Ncm: MAC discovery failed both passes — dumping every non-empty "
-        "string descriptor in indices %u..%u for diagnosis\n",
-        T2NCM_MAC_SCAN_MIN_INDEX, T2NCM_MAC_SCAN_MAX_INDEX));
-
-    for (idx = T2NCM_MAC_SCAN_MIN_INDEX; idx <= T2NCM_MAC_SCAN_MAX_INDEX; idx++)
-    {
-        NTSTATUS status;
-        USHORT numChars = 0;
-        WCHAR buffer[64];
-        USHORT toRead;
-
-        status = WdfUsbTargetDeviceQueryString(
-            DeviceContext->UsbDevice, NULL, NULL, NULL, &numChars, idx, 0);
-        if (!NT_SUCCESS(status) || numChars == 0)
-        {
-            continue;
-        }
-
-        if (numChars > (sizeof(buffer) / sizeof(buffer[0])) - 1)
-        {
-            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
-                "T2Ncm:   index %u: %u chars (too long to dump here)\n",
-                idx, numChars));
-            continue;
-        }
-
-        RtlZeroMemory(buffer, sizeof(buffer));
-        toRead = numChars;
-        status = WdfUsbTargetDeviceQueryString(
-            DeviceContext->UsbDevice, NULL, NULL, (PUSHORT)buffer, &toRead, idx, 0);
-        if (!NT_SUCCESS(status))
-        {
-            continue;
-        }
-
-        buffer[toRead < ((sizeof(buffer) / sizeof(buffer[0])) - 1)
-                   ? toRead
-                   : ((sizeof(buffer) / sizeof(buffer[0])) - 1)] = L'\0';
-
-        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
-            "T2Ncm:   index %u (%u chars, actually read %u): \"%ws\"\n",
-            idx, numChars, toRead, buffer));
-
-        // %ws stops at the first embedded NUL, which silently hides real
-        // content (e.g. binary/GUID-shaped strings, or a short read where
-        // toRead < numChars). Dump the raw bytes too so nothing is lost.
-        {
-            CHAR hex[3 * (sizeof(buffer) / sizeof(buffer[0])) + 1];
-            PCHAR cursor = hex;
-            SIZE_T remaining = sizeof(hex);
-            USHORT hi;
-
-            hex[0] = '\0';
-            for (hi = 0; hi < toRead; hi++)
-            {
-                UCHAR lo  = (UCHAR)(buffer[hi] & 0xFF);
-                UCHAR hib = (UCHAR)((buffer[hi] >> 8) & 0xFF);
-
-                if (!NT_SUCCESS(RtlStringCbPrintfExA(
-                        cursor, remaining, &cursor, &remaining, 0,
-                        "%02X%02X ", lo, hib)))
-                {
-                    break;
-                }
-            }
-
-            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
-                "T2Ncm:   index %u raw bytes (LE per char): %s\n", idx, hex));
-        }
-    }
-}
-
-static
-NTSTATUS
-T2NcmScanForMacStringIndex(
-    _In_  PT2NCM_DEVICE_CONTEXT DeviceContext,
-    _Out_ UCHAR*                MacStringIndex
-    )
-{
-    USB_DEVICE_DESCRIPTOR deviceDesc;
-    UCHAR excludeManufacturer, excludeProduct, serialIndex;
-    UCHAR candidateIndex = 0;
-    ULONG matchCount = 0;
-    UCHAR idx;
-
-    *MacStringIndex = 0;
-    RtlZeroMemory(&deviceDesc, sizeof(deviceDesc));
-
-    // Cached by WDF at device creation — synchronous, no bus I/O, cannot
-    // fail the way a real control transfer can.
-    WdfUsbTargetDeviceGetDeviceDescriptor(DeviceContext->UsbDevice, &deviceDesc);
-
-    excludeManufacturer = deviceDesc.iManufacturer;
-    excludeProduct      = deviceDesc.iProduct;
-    serialIndex         = deviceDesc.iSerialNumber;
-
-    // Pass 1: every index EXCEPT iManufacturer/iProduct/iSerialNumber.
-    // A dedicated, standalone MAC-address string (if the device has
-    // one) is the strongest evidence and always wins over the fallback
-    // below — a device that reuses its serial number for the MAC
-    // wouldn't also carry a second, unrelated 12-hex-char string, so
-    // there's no real ambiguity between the two passes in practice.
-    for (idx = T2NCM_MAC_SCAN_MIN_INDEX; idx <= T2NCM_MAC_SCAN_MAX_INDEX; idx++)
-    {
-        if ((excludeManufacturer != 0 && idx == excludeManufacturer) ||
-            (excludeProduct      != 0 && idx == excludeProduct)      ||
-            (serialIndex         != 0 && idx == serialIndex))
-        {
-            continue;
-        }
-
-        if (T2NcmStringIsMacShape(DeviceContext, idx))
-        {
-            matchCount++;
-            candidateIndex = idx;
-
-            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
-                "T2Ncm: string index %u has MAC-address shape (12 hex chars) — "
-                "candidate #%lu\n", idx, matchCount));
-        }
-    }
-
-    if (matchCount == 1)
-    {
-        *MacStringIndex = candidateIndex;
-
-        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
-            "T2Ncm: MAC address string found unambiguously at index %u\n",
-            candidateIndex));
-
-        return STATUS_SUCCESS;
-    }
-
-    if (matchCount > 1)
-    {
-        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2Ncm: %lu dedicated string descriptors matched the "
-            "MAC-address shape — ambiguous, refusing to guess which one "
-            "is real\n", matchCount));
-        return STATUS_DEVICE_PROTOCOL_ERROR;
-    }
-
-    // Pass 2 (fallback, only reached when pass 1 found NOTHING): some
-    // devices don't carry a separate MAC string at all and instead
-    // derive/reuse the Ethernet address from iSerialNumber whenever it
-    // happens to already be 12 hex characters. Real T2 hardware appears
-    // to be one of them — this is exactly the shape observed after pass
-    // 1 came up empty on it.
-    if (serialIndex != 0 && T2NcmStringIsMacShape(DeviceContext, serialIndex))
-    {
-        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
-            "T2Ncm: no dedicated MAC string found — falling back to "
-            "iSerialNumber (index %u), which has the right shape\n",
-            serialIndex));
-
-        *MacStringIndex = serialIndex;
-        return STATUS_SUCCESS;
-    }
-
-    T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-        "T2Ncm: no string descriptor — dedicated or iSerialNumber — in "
-        "indices %u..%u matched the MAC-address shape (12 hex chars)\n",
-        T2NCM_MAC_SCAN_MIN_INDEX, T2NCM_MAC_SCAN_MAX_INDEX));
-
-    T2NcmLogAllStringDescriptors(DeviceContext);
-
-    return STATUS_NOT_FOUND;
-}
-
-NTSTATUS
-T2NcmReadMacAddress(
-    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
-    )
-{
-    NTSTATUS status;
-    UCHAR macStringIndex = 0;
-    USHORT numChars = 0;
-    WCHAR macChars[T2NCM_MAC_STRING_CHARS];
-    UCHAR macBytes[6];
-    UCHAR i;
-    BOOLEAN allZero, allFF;
-
-    // Task 8: must fail explicitly, never fabricate a MAC.
-    DeviceContext->MacAddressValid = FALSE;
-
-    // Variant 1: T2NcmFindMacStringIndex (config-descriptor walk) cannot
-    // see MI_00 from here — T2NcmScanForMacStringIndex (string-table
-    // scan) is the one that actually works from an MI_01-only binding.
-    status = T2NcmScanForMacStringIndex(DeviceContext, &macStringIndex);
-    if (!NT_SUCCESS(status))
-    {
-        return status;
-    }
-
-    if (macStringIndex == 0)
-    {
-        // Not reachable in practice — T2NcmScanForMacStringIndex only
-        // ever returns STATUS_SUCCESS with an index from its scan range
-        // (>= T2NCM_MAC_SCAN_MIN_INDEX), never 0. Kept as a defensive
-        // check rather than trusted implicitly.
-        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2Ncm: MAC string index resolved to 0 — treating as absent\n"));
-        return STATUS_DEVICE_PROTOCOL_ERROR;
-    }
-
-    // First call: String == NULL means "just tell me the length" — WDF
-    // fills in *NumCharacters with the string's actual character count.
-    status = WdfUsbTargetDeviceQueryString(
-        DeviceContext->UsbDevice, NULL, NULL, NULL, &numChars, macStringIndex, 0);
-    if (!NT_SUCCESS(status))
-    {
-        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2Ncm: QueryString(length) for iMACAddress index %u failed 0x%08X\n",
-            macStringIndex, status));
-        return status;
-    }
-
-    // The CDC Ethernet MAC-address string must be exactly 12 hex
-    // characters (6 bytes). Anything else means this isn't a real MAC
-    // string, so refuse to parse it instead of taking a truncated or
-    // padded guess.
-    if (numChars != T2NCM_MAC_STRING_CHARS)
-    {
-        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2Ncm: iMACAddress string is %u characters, expected exactly %u\n",
-            numChars, T2NCM_MAC_STRING_CHARS));
-        return STATUS_DEVICE_PROTOCOL_ERROR;
-    }
-
-    // Second call: String points at our buffer, *NumCharacters on input
-    // is that buffer's capacity in characters; on output it's the
-    // number actually copied.
-    RtlZeroMemory(macChars, sizeof(macChars));
-    numChars = T2NCM_MAC_STRING_CHARS;
-    status = WdfUsbTargetDeviceQueryString(
-        DeviceContext->UsbDevice, NULL, NULL, (PUSHORT)macChars, &numChars, macStringIndex, 0);
-    if (!NT_SUCCESS(status))
-    {
-        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2Ncm: QueryString(data) for iMACAddress failed 0x%08X\n", status));
-        return status;
-    }
-
-    if (numChars != T2NCM_MAC_STRING_CHARS)
-    {
-        // Never trust the first call's length to still hold — re-verify
-        // what actually came back on the second call before indexing it.
-        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2Ncm: iMACAddress data call returned %u characters, expected exactly %u\n",
-            numChars, T2NCM_MAC_STRING_CHARS));
-        return STATUS_DEVICE_PROTOCOL_ERROR;
-    }
-
-    for (i = 0; i < 6; i++)
-    {
-        UCHAR hi, lo;
-        if (!T2NcmHexNibble(macChars[2 * i], &hi) ||
-            !T2NcmHexNibble(macChars[2 * i + 1], &lo))
-        {
-            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-                "T2Ncm: iMACAddress string contains a non-hex character\n"));
-            return STATUS_DEVICE_PROTOCOL_ERROR;
-        }
-        macBytes[i] = (UCHAR)((hi << 4) | lo);
-    }
-
-    allZero = TRUE;
-    allFF = TRUE;
-    for (i = 0; i < 6; i++)
-    {
-        if (macBytes[i] != 0x00) { allZero = FALSE; }
-        if (macBytes[i] != 0xFF) { allFF = FALSE; }
-    }
-    if (allZero || allFF)
-    {
-        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2Ncm: iMACAddress decoded to an all-%s sentinel value — rejecting\n",
-            allZero ? "zero" : "0xFF"));
-        return STATUS_DEVICE_PROTOCOL_ERROR;
-    }
-
-    if (macBytes[0] & 0x01)
-    {
-        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
-            "T2Ncm: iMACAddress has the multicast bit set (first octet 0x%02X) — "
-            "unusual for a station address, continuing\n", macBytes[0]));
-    }
-
-    RtlCopyMemory(DeviceContext->PermanentMacAddress, macBytes, sizeof(macBytes));
-    DeviceContext->MacAddressValid = TRUE;
-
-    T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
-        "T2Ncm: MAC address %02X:%02X:%02X:%02X:%02X:%02X\n",
-        macBytes[0], macBytes[1], macBytes[2], macBytes[3], macBytes[4], macBytes[5]));
-
-    return STATUS_SUCCESS;
-}
-
-// ---------------------------------------------------------------------
-// Fallback for devices with no usable MAC string at all (confirmed real
-// on REV_0201 — see the raw byte dump in T2NcmLogAllStringDescriptors's
-// output). FNV-1a is used purely as a fast, well-distributed
-// fingerprint — this has no security requirement, it only needs to map
-// the same 16-byte ContainerID to the same 6 bytes every time.
+// Generated station address. FNV-1a is used purely as a fast,
+// well-distributed fingerprint - no security requirement, it only needs
+// to map the same 16-byte ContainerID to the same 6 bytes every time.
 // ---------------------------------------------------------------------
 static
 VOID
@@ -919,7 +484,7 @@ T2NcmGenerateLocallyAdministeredMac(
 
     T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
         "T2Ncm: DEVPKEY_Device_ContainerId query failed (0x%08X, "
-        "type=%u, len=%u) — falling back to a VID/PID/REV seed\n",
+        "type=%u, len=%u) - falling back to a VID/PID/REV seed\n",
         status, propertyType, resultLength));
 
     // Weak fallback: identical on every unit of this exact VID/PID/REV,
@@ -946,27 +511,11 @@ T2NcmEnsureMacAddress(
     UCHAR generatedMac[6];
     BOOLEAN usedContainerId;
 
-    status = T2NcmReadMacAddress(DeviceContext);
-    if (NT_SUCCESS(status))
-    {
-        // T2NcmReadMacAddress already set PermanentMacAddress and
-        // MacAddressValid = TRUE for a real, device-reported address.
-        DeviceContext->MacAddressIsPermanent = TRUE;
-        return STATUS_SUCCESS;
-    }
-
-    T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
-        "T2Ncm: no permanent MAC available (0x%08X) — generating a "
-        "locally-administered address instead of leaving NDIS without "
-        "one\n", status));
-
     status = T2NcmGenerateLocallyAdministeredMac(DeviceContext, generatedMac, &usedContainerId);
     if (!NT_SUCCESS(status))
     {
-        // T2NcmGenerateLocallyAdministeredMac has no failing path today
-        // (its own fallback always produces something) — kept as a
-        // defensive check rather than trusted implicitly, matching this
-        // file's existing style for "not reachable in practice" guards.
+        // No failing path today (the generator's own fallback always
+        // produces something) - kept as a defensive check.
         DeviceContext->MacAddressValid = FALSE;
         DeviceContext->MacAddressIsPermanent = FALSE;
         return status;
@@ -976,10 +525,10 @@ T2NcmEnsureMacAddress(
     DeviceContext->MacAddressValid = TRUE;
     DeviceContext->MacAddressIsPermanent = FALSE;
 
-    T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
+    T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
         "T2Ncm: using generated locally-administered MAC "
-        "%02X:%02X:%02X:%02X:%02X:%02X (seed: %s) — NOT a hardware "
-        "address\n",
+        "%02X:%02X:%02X:%02X:%02X:%02X (seed: %s); the device has no "
+        "hardware MAC\n",
         generatedMac[0], generatedMac[1], generatedMac[2],
         generatedMac[3], generatedMac[4], generatedMac[5],
         usedContainerId ? "ContainerID" : "VID/PID/REV (weak, may collide)"));

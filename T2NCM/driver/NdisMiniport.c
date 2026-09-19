@@ -113,7 +113,7 @@ T2NcmWaitForDrain(
         if (waitedMs >= maxWaitMs)
         {
             T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-                "T2Ncm: drain timed out after %lums (rxNbls=%ld txReqs=%ld) — "
+                "T2Ncm: drain timed out after %lums (rxNbls=%ld txReqs=%ld) - "
                 "proceeding anyway; this is a reference leak, not a slow "
                 "device\n", maxWaitMs,
                 DeviceContext->OutstandingRxNbls,
@@ -303,7 +303,7 @@ T2NcmRegisterDiagnosticDevice(
     if (status != NDIS_STATUS_SUCCESS)
     {
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
-            "T2Ncm: NdisRegisterDeviceEx failed 0x%08X — continuing without "
+            "T2Ncm: NdisRegisterDeviceEx failed 0x%08X - continuing without "
             "the diagnostic device; the adapter itself is unaffected\n", status));
         DeviceContext->NdisDeviceHandle = NULL;
         DeviceContext->ControlDeviceObject = NULL;
@@ -435,7 +435,7 @@ T2NcmMiniportInitializeEx(
         // register an 802.3 adapter with no station address, and making
         // one up here would be inventing hardware identity.
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2Ncm: no usable station address (0x%08X) — cannot register an "
+            "T2Ncm: no usable station address (0x%08X) - cannot register an "
             "Ethernet adapter\n", status));
         goto Fail;
     }
@@ -626,7 +626,7 @@ T2NcmMiniportInitializeEx(
     NdisMIndicateStatusEx(NdisMiniportHandle, &statusIndication);
 
     T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
-        "T2Ncm: adapter registered and PAUSED — waiting for MiniportRestart "
+        "T2Ncm: adapter registered and PAUSED - waiting for MiniportRestart "
         "(mac=%02X:%02X:%02X:%02X:%02X:%02X permanent=%u)\n",
         context->CurrentMacAddress[0], context->CurrentMacAddress[1],
         context->CurrentMacAddress[2], context->CurrentMacAddress[3],
@@ -769,7 +769,7 @@ T2NcmMiniportRestart(
         // this ever fires, the inverted model has been broken somewhere
         // and a loud failure is more useful than silent USB errors.
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2Ncm: restart requested while at power state %u — refusing\n",
+            "T2Ncm: restart requested while at power state %u - refusing\n",
             (ULONG)context->PowerState));
         return NDIS_STATUS_FAILURE;
     }
@@ -783,13 +783,13 @@ T2NcmMiniportRestart(
         // (GET_NTB_PARAMETERS). Restart itself makes exactly one call
         // and takes whatever answer comes back; it does not loop.
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
-            "T2Ncm: restart requested with no bulk pipes — re-arming\n"));
+            "T2Ncm: restart requested with no bulk pipes - re-arming\n"));
 
         status = T2NcmPowerArmHardware(context);
         if (!NT_SUCCESS(status))
         {
             T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-                "T2Ncm: restart — re-arm failed 0x%08X\n", status));
+                "T2Ncm: restart - re-arm failed 0x%08X\n", status));
             return NDIS_STATUS_FAILURE;
         }
     }
@@ -1383,7 +1383,7 @@ T2NcmMiniportResetEx(
     *AddressingReset = FALSE;
 
     T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
-        "T2Ncm: MiniportResetEx — restarting the RX engine\n"));
+        "T2Ncm: MiniportResetEx - restarting the RX engine\n"));
 
     T2NcmRxStop(context);
 
@@ -1425,7 +1425,7 @@ T2NcmMiniportShutdownEx(
     InterlockedExchange(&context->DataPathRunning, 0);
 
     T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
-        "T2Ncm: MiniportShutdownEx (action=%u) — data path closed\n",
+        "T2Ncm: MiniportShutdownEx (action=%u) - data path closed\n",
         (ULONG)ShutdownAction));
 }
 

@@ -340,7 +340,7 @@ T2NcmRxParseNtb(
     if (Length < sizeof(T2NCM_WIRE_NTH16))
     {
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
-            "T2Ncm: RX NTB shorter than NTH16 (%Iu bytes) — dropping\n", Length));
+            "T2Ncm: RX NTB shorter than NTH16 (%Iu bytes) - dropping\n", Length));
         InterlockedIncrement64(&DeviceContext->RxFramesRejected);
         return;
     }
@@ -352,7 +352,7 @@ T2NcmRxParseNtb(
     if (nth.dwSignature != T2NCM_NTH16_SIGNATURE)
     {
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
-            "T2Ncm: RX NTH16 signature mismatch (0x%08X) — dropping NTB\n",
+            "T2Ncm: RX NTH16 signature mismatch (0x%08X) - dropping NTB\n",
             nth.dwSignature));
         InterlockedIncrement64(&DeviceContext->RxFramesRejected);
         return;
@@ -361,7 +361,7 @@ T2NcmRxParseNtb(
     if (nth.wHeaderLength != T2NCM_NTH16_HEADER_LENGTH)
     {
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
-            "T2Ncm: RX NTH16 wHeaderLength=%u (expected %u) — dropping NTB\n",
+            "T2Ncm: RX NTH16 wHeaderLength=%u (expected %u) - dropping NTB\n",
             nth.wHeaderLength, T2NCM_NTH16_HEADER_LENGTH));
         InterlockedIncrement64(&DeviceContext->RxFramesRejected);
         return;
@@ -374,7 +374,7 @@ T2NcmRxParseNtb(
     if (blockLength < sizeof(T2NCM_WIRE_NTH16) || blockLength > Length)
     {
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2Ncm: RX NTH16 wBlockLength=%u out of bounds (received %Iu) — "
+            "T2Ncm: RX NTH16 wBlockLength=%u out of bounds (received %Iu) - "
             "dropping NTB\n", blockLength, Length));
         InterlockedIncrement64(&DeviceContext->RxFramesRejected);
         return;
@@ -383,7 +383,7 @@ T2NcmRxParseNtb(
     if (DeviceContext->NtbInMaxSize != 0 && blockLength > DeviceContext->NtbInMaxSize)
     {
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
-            "T2Ncm: RX NTB blockLength=%u exceeds negotiated NtbInMaxSize=%lu — "
+            "T2Ncm: RX NTB blockLength=%u exceeds negotiated NtbInMaxSize=%lu - "
             "dropping NTB\n", blockLength, DeviceContext->NtbInMaxSize));
         InterlockedIncrement64(&DeviceContext->RxFramesRejected);
         return;
@@ -394,7 +394,7 @@ T2NcmRxParseNtb(
         ndpOffset + T2NCM_NDP16_HEADER_LENGTH > blockLength)
     {
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2Ncm: RX NDP16 offset %u out of bounds (block=%u) — dropping NTB\n",
+            "T2Ncm: RX NDP16 offset %u out of bounds (block=%u) - dropping NTB\n",
             ndpOffset, blockLength));
         InterlockedIncrement64(&DeviceContext->RxFramesRejected);
         return;
@@ -405,7 +405,7 @@ T2NcmRxParseNtb(
     if (ndp.dwSignature != T2NCM_NDP16_SIGNATURE_NOCRC)
     {
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
-            "T2Ncm: RX NDP16 signature 0x%08X not the handled NCM0 variant — "
+            "T2Ncm: RX NDP16 signature 0x%08X not the handled NCM0 variant - "
             "dropping NTB\n", ndp.dwSignature));
         InterlockedIncrement64(&DeviceContext->RxFramesRejected);
         return;
@@ -417,7 +417,7 @@ T2NcmRxParseNtb(
         ((ndpLength - T2NCM_NDP16_HEADER_LENGTH) % sizeof(T2NCM_WIRE_NDP16_ENTRY)) != 0)
     {
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2Ncm: RX NDP16 wLength=%u invalid/out of bounds (block=%u) — "
+            "T2Ncm: RX NDP16 wLength=%u invalid/out of bounds (block=%u) - "
             "dropping NTB\n", ndpLength, blockLength));
         InterlockedIncrement64(&DeviceContext->RxFramesRejected);
         return;
@@ -449,7 +449,7 @@ T2NcmRxParseNtb(
         {
             T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
                 "T2Ncm: RX datagram entry %u out of bounds (index=%u len=%u "
-                "block=%u) — skipping this datagram only\n",
+                "block=%u) - skipping this datagram only\n",
                 i, entry.wDatagramIndex, entry.wDatagramLength, blockLength));
             InterlockedIncrement64(&DeviceContext->RxFramesRejected);
             InterlockedIncrement64(&DeviceContext->InErrors);
@@ -460,7 +460,7 @@ T2NcmRxParseNtb(
             entry.wDatagramLength > T2NCM_MAX_FRAME_SIZE)
         {
             T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
-                "T2Ncm: RX datagram entry %u length %u outside [%u,%u] — "
+                "T2Ncm: RX datagram entry %u length %u outside [%u,%u] - "
                 "skipping this datagram only\n",
                 i, entry.wDatagramLength, T2NCM_ETHERNET_HEADER_LEN,
                 T2NCM_MAX_FRAME_SIZE));
@@ -606,7 +606,7 @@ T2NcmEvtRxReadComplete(
     if (buffer == NULL)
     {
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2Ncm: RX read completion had a NULL buffer — dropping\n"));
+            "T2Ncm: RX read completion had a NULL buffer - dropping\n"));
         InterlockedIncrement64(&deviceContext->RxFramesRejected);
         return;
     }
@@ -634,7 +634,7 @@ T2NcmEvtRxReadersFailed(
     // hidden inside the read engine.
     T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
         "T2Ncm: RX continuous reader stopped itself (status=0x%08X, "
-        "usbdStatus=0x%08X) — bulk-IN reads will not resume until the "
+        "usbdStatus=0x%08X) - bulk-IN reads will not resume until the "
         "adapter is restarted\n", Status, UsbdStatus));
 
     return FALSE;
@@ -660,7 +660,7 @@ T2NcmRxStart(
     if (DeviceContext->BulkInPipe == NULL)
     {
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2Ncm: T2NcmRxStart called with no BulkInPipe — "
+            "T2Ncm: T2NcmRxStart called with no BulkInPipe - "
             "T2NcmUsbActivateDataInterface must succeed first\n"));
         return STATUS_INVALID_DEVICE_STATE;
     }
@@ -668,7 +668,7 @@ T2NcmRxStart(
     if (DeviceContext->NtbInMaxSize == 0)
     {
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2Ncm: T2NcmRxStart called with NtbInMaxSize=0 — "
+            "T2Ncm: T2NcmRxStart called with NtbInMaxSize=0 - "
             "GET_NTB_PARAMETERS must succeed first\n"));
         return STATUS_INVALID_DEVICE_STATE;
     }
@@ -691,7 +691,7 @@ T2NcmRxStart(
     if (maxPacketSize == 0)
     {
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2Ncm: BulkInPipe reports MaximumPacketSize=0 — cannot size "
+            "T2Ncm: BulkInPipe reports MaximumPacketSize=0 - cannot size "
             "the continuous reader buffer\n"));
         return STATUS_INVALID_DEVICE_STATE;
     }
@@ -749,7 +749,7 @@ T2NcmRxStart(
 
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
             "T2Ncm: T2NcmRxStart reusing existing reader config on the same "
-            "pipe object (Pause/Restart cycle) — WdfIoTargetStart only\n"));
+            "pipe object (Pause/Restart cycle) - WdfIoTargetStart only\n"));
     }
 
     status = WdfIoTargetStart(WdfUsbTargetPipeGetIoTarget(DeviceContext->BulkInPipe));

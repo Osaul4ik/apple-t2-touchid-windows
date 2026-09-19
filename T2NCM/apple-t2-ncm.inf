@@ -100,6 +100,7 @@ BusType             = 15
 *HardwareLoopback   = 0
 
 AddReg              = AppleT2Ncm_AddReg
+DelReg              = AppleT2Ncm_DelReg
 
 [T2Ncm.CopyDriverFiles]
 T2Ncm.sys
@@ -143,29 +144,18 @@ HKR, Ndi,            Service,    0, "T2Ncm"
 HKR, Ndi\Interfaces, UpperRange, 0, "ndis5"
 HKR, Ndi\Interfaces, LowerRange, 0, "ethernet"
 
-HKR, Ndi\params\NetworkAddress, Optional, 0, "1"
-
-; Opt this ONE USB function (T2's NCM Data interface, MI_01) out of USB
-; selective suspend. Scoped at the INF/registry level deliberately, not
-; at runtime: DeviceContext->WdfDevice is created with
-; WdfDeviceMiniportCreate (driver/device.c), whose documented handle
-; restriction — already hit once on real hardware as a WDF_VIOLATION
-; (0x10D) bugcheck when WdfDeviceQueryPropertyEx was tried against it,
-; see driver/NcmProtocol.c — means the usual runtime fix
-; (WdfDeviceStopIdle/WdfDeviceResumeIdle held for the duration of an
-; active BridgeXPC session) is not a safe API to call on this object.
-; This registry value is the Microsoft-documented alternative that
-; needs no runtime device-power API at all: it tells the USB stack this
-; one function should never be considered for idle-based suspend,
-; leaving selective suspend fully enabled and effective for every other
-; USB device on the system, and even for T2's own MI_00 control
-; interface (apple-t2-ncm-ctrl-stub.inf, unaffected by this value).
-; Suspected root cause: an idle-triggered pause of this adapter mid-
-; verify silently discards every RX frame arriving during the pause
-; (T2NcmEvtRxReadComplete's DataPathRunning gate, driver/NcmRx.c) —
-; including the one BridgeXPC event (match_result) the whole verify
-; session is waiting on. Not yet hardware-confirmed.
-HKR,, "EnableSelectiveSuspend", 0x00010001, 0
+; The generated MAC is fixed by design (the device has no hardware MAC) and
+; the driver never reads a user-supplied override, so the "Network Address"
+; entry on the adapter's Advanced tab must not exist. Removing the AddReg
+; line above only stops NEW installs from creating it; this DelReg also
+; cleans it up on an already-installed adapter when the driver is updated.
+[AppleT2Ncm_DelReg]
+HKR, Ndi\params\NetworkAddress
+; USB selective suspend is left at its default for this function. An
+; earlier build forced it off (EnableSelectiveSuspend=0); that had no
+; observable effect, so the override is removed here and cleaned up on
+; already-installed adapters when the driver is updated.
+HKR,, "EnableSelectiveSuspend"
 
 
 ; ============================================================================

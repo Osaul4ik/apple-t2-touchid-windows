@@ -168,7 +168,7 @@ T2NcmPowerArmHardware(
         }
 
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
-            "T2Ncm: fast re-arm's alt-1 activation failed 0x%08X — "
+            "T2Ncm: fast re-arm's alt-1 activation failed 0x%08X - "
             "invalidating cached NTB parameters, next arm attempt takes "
             "the full slow path\n", status));
 
@@ -261,7 +261,7 @@ T2NcmPowerArmHardware(
     (VOID)T2NcmApplyPacketFilter(DeviceContext);
 
     T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
-        "T2Ncm: hardware armed — ntbIn=%lu ntbOut=%lu, MI_01 on alt %u\n",
+        "T2Ncm: hardware armed - ntbIn=%lu ntbOut=%lu, MI_01 on alt %u\n",
         DeviceContext->NtbInMaxSize, DeviceContext->NtbOutMaxSize,
         T2NCM_DATA_ALT_ACTIVE));
 
@@ -337,7 +337,7 @@ T2NcmPowerSetDeviceState(
             // enable, or replug), a wedged S3 resume is not.
             (void)T2NcmTrySetState(DeviceContext, T2NcmStatePrepared, T2NcmStateUsbReady);
             T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-                "T2Ncm: D0 re-arm failed 0x%08X — adapter will have no data "
+                "T2Ncm: D0 re-arm failed 0x%08X - adapter will have no data "
                 "path until it is reinitialized; reporting the power "
                 "transition as successful regardless\n", status));
         }
