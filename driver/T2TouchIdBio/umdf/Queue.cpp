@@ -78,10 +78,13 @@ Payload* RetrieveProbedPayload(_In_ WDFREQUEST Request, _Out_ bool* fitsFully)
     const NTSTATUS status = WdfRequestRetrieveOutputBuffer(
         Request, sizeof(DWORD), reinterpret_cast<PVOID*>(&out), &outLen);
     if (!NT_SUCCESS(status) || out == nullptr) {
+        T2BioLog("  output buffer unusable (status=0x%08x) -> completing with error", status);
         WdfRequestComplete(Request, NT_SUCCESS(status) ? STATUS_INVALID_PARAMETER : status);
         return nullptr;
     }
     if (outLen < sizeof(Payload)) {
+        T2BioLog("  size probe: have=%llu need=%llu -> reporting required size",
+                 static_cast<unsigned long long>(outLen), static_cast<unsigned long long>(sizeof(Payload)));
         out->PayloadSize = static_cast<DWORD>(sizeof(Payload)); // required size, first member of both payloads
         WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, sizeof(DWORD));
         return nullptr;
@@ -98,6 +101,7 @@ void HandleGetAttributes(_In_ WDFREQUEST Request)
         return; // already completed (error or size probe)
     }
     FillAttributes(*out);
+    T2BioLog("  GET_ATTRIBUTES ok payload=%lu", static_cast<unsigned long>(out->PayloadSize));
     WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, out->PayloadSize);
 }
 
@@ -116,6 +120,7 @@ void HandleGetSensorStatus(_In_ WDFREQUEST Request)
     // Global\T2SepReady from T2SepBootstrap.
     out->SensorStatus  = WINBIO_SENSOR_READY;
     out->VendorDiagnostics.Size = 0;
+    T2BioLog("  GET_SENSOR_STATUS ok sensorStatus=%d (READY)", static_cast<int>(out->SensorStatus));
     WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, out->PayloadSize);
 }
 
@@ -215,15 +220,22 @@ void CompleteCaptureData(_In_ WDFREQUEST Request, HRESULT winBioHresult,
                                offsetof(WINBIO_DATA, Data);
     const size_t needed = headerBytes + payload.size();
 
+    T2BioLog("  CAPTURE_DATA complete: winBioHresult=0x%08x sensorStatus=%d reject=%d payload=%llu",
+             static_cast<unsigned>(winBioHresult), static_cast<int>(sensorStatus),
+             static_cast<int>(rejectDetail), static_cast<unsigned long long>(payload.size()));
+
     PWINBIO_CAPTURE_DATA out = nullptr;
     size_t outLen = 0;
     const NTSTATUS status = WdfRequestRetrieveOutputBuffer(
         Request, sizeof(DWORD), reinterpret_cast<PVOID*>(&out), &outLen);
     if (!NT_SUCCESS(status) || out == nullptr) {
+        T2BioLog("  CAPTURE_DATA: output buffer unusable (status=0x%08x)", status);
         WdfRequestComplete(Request, NT_SUCCESS(status) ? STATUS_INVALID_PARAMETER : status);
         return;
     }
     if (outLen < needed) {
+        T2BioLog("  CAPTURE_DATA size probe: have=%llu need=%llu -> WBF will retry",
+                 static_cast<unsigned long long>(outLen), static_cast<unsigned long long>(needed));
         out->PayloadSize = static_cast<DWORD>(needed);
         WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, sizeof(DWORD));
         return;
@@ -256,6 +268,7 @@ bool ConnectForCapture(t2::bridgexpc::Connection* outConn)
         T2BioLog("CAPTURE_DATA: BiometricKit BridgeXPC discovery/connect failed");
         return false;
     }
+    T2BioLog("CAPTURE_DATA: connected to BiometricKit BridgeXPC");
     return true;
 }
 
@@ -270,6 +283,7 @@ bool ConnectForCapture(t2::bridgexpc::Connection* outConn)
 // actually persist {macosUserId} as this account's "template" record.
 void HandleCaptureEnroll(_In_ WDFREQUEST Request)
 {
+    T2BioLog("CAPTURE_DATA(enroll): begin, macosUserId=%u", static_cast<unsigned>(kDefaultMacosUserId));
     t2::bridgexpc::Connection conn;
     if (!ConnectForCapture(&conn)) {
         CompleteCaptureData(Request, WINBIO_E_DEVICE_FAILURE, WINBIO_SENSOR_FAILURE, 0, {});
@@ -283,7 +297,7 @@ void HandleCaptureEnroll(_In_ WDFREQUEST Request)
     const bool warmedUp = engine.WarmUp(&conn, &identities);
 
     if (!warmedUp) {
-        T2BioLog("CAPTURE_DATA(enroll): WarmUp failed");
+        T2BioLog("CAPTURE_DATA(enroll): WarmUp failed (BridgeXPC identity-list read)");
         CompleteCaptureData(Request, WINBIO_E_DEVICE_FAILURE, WINBIO_SENSOR_FAILURE, 0, {});
         return;
     }
@@ -312,6 +326,9 @@ void HandleCaptureEnroll(_In_ WDFREQUEST Request)
 // VerifyOutcome straight onto the WinBioHresult this IOCTL completes with.
 void HandleCaptureVerify(_In_ WDFREQUEST Request)
 {
+    T2BioLog("CAPTURE_DATA(verify): begin, macosUserId=%u, window=%llds",
+             static_cast<unsigned>(kDefaultMacosUserId),
+             static_cast<long long>(kCaptureMatchWindow.count()));
     t2::bridgexpc::Connection conn;
     if (!ConnectForCapture(&conn)) {
         CompleteCaptureData(Request, WINBIO_E_DEVICE_FAILURE, WINBIO_SENSOR_FAILURE, 0, {});
@@ -325,8 +342,9 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request)
     std::optional<std::array<uint8_t, 16>> matchedUuid;
     const VerifyOutcome outcome = engine.Verify(&conn, &matchedUuid);
 
-    T2BioLog("CAPTURE_DATA(verify): outcome=%d", static_cast<int>(outcome));
     const HRESULT hr = MapVerifyOutcomeToHresult(outcome);
+    T2BioLog("CAPTURE_DATA(verify): outcome=%d -> hresult=0x%08x", static_cast<int>(outcome),
+             static_cast<unsigned>(hr));
     const WINBIO_SENSOR_STATUS sensorStatus =
         (outcome == VerifyOutcome::TransportError || outcome == VerifyOutcome::RejectedByDevice ||
          outcome == VerifyOutcome::UnstableIdentityInventory)
@@ -344,12 +362,20 @@ void HandleCaptureData(_In_ WDFREQUEST Request)
     const NTSTATUS status = WdfRequestRetrieveInputBuffer(
         Request, sizeof(WINBIO_CAPTURE_PARAMETERS), reinterpret_cast<PVOID*>(&in), &inLen);
     if (!NT_SUCCESS(status) || in == nullptr || inLen < sizeof(WINBIO_CAPTURE_PARAMETERS)) {
+        T2BioLog("CAPTURE_DATA: bad input buffer (status=0x%08x len=%llu need=%llu) -> STATUS_INVALID_PARAMETER",
+                 status, static_cast<unsigned long long>(inLen),
+                 static_cast<unsigned long long>(sizeof(WINBIO_CAPTURE_PARAMETERS)));
         WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
         return;
     }
 
+    T2BioLog("CAPTURE_DATA: purpose=0x%02x flags=0x%02x format owner=0x%04x type=0x%04x",
+             static_cast<unsigned>(in->Purpose), static_cast<unsigned>(in->Flags),
+             static_cast<unsigned>(in->Format.Owner), static_cast<unsigned>(in->Format.Type));
+
     CaptureBusyGuard guard;
     if (!guard.acquired) {
+        T2BioLog("CAPTURE_DATA: another capture is already in flight -> DATA_COLLECTION_IN_PROGRESS");
         // Mirrors VerificationEngine::IsBusy()'s existing rule, at the WBDI
         // layer this time (design doc 6): a second CAPTURE_DATA arriving
         // while one is already in flight is a normal WBDI occurrence, not
@@ -372,8 +398,25 @@ void HandleCaptureData(_In_ WDFREQUEST Request)
         // advertises WINBIO_CAPABILITY_SENSOR for 1:1 verify (design doc 3),
         // never identify - a request for anything else is a WBF/engine
         // config mismatch, not something to guess an answer for.
+        T2BioLog("CAPTURE_DATA: unsupported purpose 0x%02x -> E_NOTIMPL", static_cast<unsigned>(in->Purpose));
         CompleteCaptureData(Request, E_NOTIMPL, WINBIO_SENSOR_FAILURE, 0, {});
         return;
+    }
+}
+
+} // namespace
+
+namespace {
+
+const char* IoctlName(ULONG code)
+{
+    switch (code) {
+    case IOCTL_BIOMETRIC_GET_ATTRIBUTES:   return "GET_ATTRIBUTES";
+    case IOCTL_BIOMETRIC_RESET:            return "RESET";
+    case IOCTL_BIOMETRIC_CALIBRATE:        return "CALIBRATE";
+    case IOCTL_BIOMETRIC_GET_SENSOR_STATUS:return "GET_SENSOR_STATUS";
+    case IOCTL_BIOMETRIC_CAPTURE_DATA:     return "CAPTURE_DATA";
+    default:                               return "(unsupported)";
     }
 }
 
@@ -386,10 +429,10 @@ extern "C" VOID T2BioEvtIoDeviceControl(_In_ WDFQUEUE Queue,
                                         _In_ ULONG IoControlCode)
 {
     UNREFERENCED_PARAMETER(Queue);
-    UNREFERENCED_PARAMETER(OutputBufferLength);
-    UNREFERENCED_PARAMETER(InputBufferLength);
 
-    T2BioLog("IOCTL 0x%08x", IoControlCode);
+    T2BioLog("IOCTL %s (0x%08x) in=%llu out=%llu", IoctlName(IoControlCode), IoControlCode,
+             static_cast<unsigned long long>(InputBufferLength),
+             static_cast<unsigned long long>(OutputBufferLength));
 
     switch (IoControlCode) {
     case IOCTL_BIOMETRIC_GET_ATTRIBUTES:
@@ -402,6 +445,7 @@ extern "C" VOID T2BioEvtIoDeviceControl(_In_ WDFQUEUE Queue,
 
     case IOCTL_BIOMETRIC_RESET:
         // No sensor state to reset yet.
+        T2BioLog("  RESET -> STATUS_SUCCESS (no state)");
         WdfRequestComplete(Request, STATUS_SUCCESS);
         return;
 
@@ -412,6 +456,7 @@ extern "C" VOID T2BioEvtIoDeviceControl(_In_ WDFQUEUE Queue,
     default:
         // IOCTL_BIOMETRIC_CALIBRATE is never sent while status never says
         // "not calibrated"; anything else is unsupported.
+        T2BioLog("  unsupported IOCTL 0x%08x -> STATUS_NOT_SUPPORTED", IoControlCode);
         WdfRequestComplete(Request, STATUS_NOT_SUPPORTED);
         return;
     }

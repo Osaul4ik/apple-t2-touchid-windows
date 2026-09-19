@@ -37,6 +37,7 @@
 // engine_adapter, removed from master in 2024; last present in c73af47~1).
 #include <windows.h>
 #include <stddef.h>
+#include <stdarg.h>
 #include <strsafe.h>
 
 // winbio_adapter.h's inline Wbio*() helpers use ARGUMENT_PRESENT, which
@@ -64,17 +65,60 @@ namespace {
 const GUID kAdapterId =
     { 0x756db001, 0x3595, 0x4ee9, { 0xa2, 0xdc, 0xbf, 0x42, 0xf0, 0x41, 0xce, 0xb5 } };
 
+// ---------------------------------------------------------------------------
+// DebugView trace. Every line starts with "T2TouchIdEngine:" (DebugView filter:
+// T2TouchId*) followed by [pid:tid]. wbiosrvc is a normal service process, so
+// run DebugView as Administrator with Capture -> Capture Global Win32.
+//   -> Name   : callback entered
+//        ...  : selected arguments
+//   <- Name   : callback returned, with the HRESULT WBF will see
+// ---------------------------------------------------------------------------
+void EngLog(_In_z_ const char* fmt, ...)
+{
+    char msg[256];
+    va_list ap;
+    va_start(ap, fmt);
+    const HRESULT fmtHr = StringCchVPrintfA(msg, ARRAYSIZE(msg), fmt, ap);
+    va_end(ap);
+    if (FAILED(fmtHr)) {
+        return;
+    }
+    char line[400];
+    if (SUCCEEDED(StringCchPrintfA(line, ARRAYSIZE(line), "T2TouchIdEngine: [%lu:%lu] %s\n",
+                                   static_cast<unsigned long>(GetCurrentProcessId()),
+                                   static_cast<unsigned long>(GetCurrentThreadId()), msg))) {
+        OutputDebugStringA(line);
+    }
+}
+
+const char* HrName(HRESULT hr)
+{
+    switch (hr) {
+    case S_OK:           return "S_OK";
+    case E_NOTIMPL:      return "E_NOTIMPL";
+    case E_POINTER:      return "E_POINTER";
+    case E_INVALIDARG:   return "E_INVALIDARG";
+    case E_UNEXPECTED:   return "E_UNEXPECTED";
+    case E_OUTOFMEMORY:  return "E_OUTOFMEMORY";
+    default:             return "?";
+    }
+}
+
 void Trace(_In_z_ const char* fn, _In_opt_ PWINBIO_PIPELINE pipeline)
 {
-    char buf[160];
-    if (SUCCEEDED(StringCchPrintfA(buf, ARRAYSIZE(buf),
-                                   "T2TouchIdEngine: %s pipeline=%p\n", fn, (void*)pipeline))) {
-        OutputDebugStringA(buf);
-    }
+    unsigned long calls = 0;
     if (pipeline != nullptr && pipeline->EngineContext != nullptr &&
         pipeline->EngineContext->Signature == kContextSignature) {
-        pipeline->EngineContext->CallCount++;
+        calls = ++pipeline->EngineContext->CallCount;
     }
+    EngLog("-> %s pipeline=%p call#%lu", fn, static_cast<void*>(pipeline), calls);
+}
+
+// Logs the value a callback is about to hand back to WBF and passes it through.
+HRESULT TraceRet(_In_z_ const char* fn, HRESULT hr)
+{
+    EngLog("<- %s hr=0x%08lx %s", fn, static_cast<unsigned long>(hr), HrName(hr));
+    return hr;
 }
 
 // Zero the Identity out-parameter the way an empty result looks.
@@ -92,46 +136,46 @@ HRESULT WINAPI EngineAttach(_Inout_ PWINBIO_PIPELINE Pipeline)
 {
     Trace("Attach", Pipeline);
     if (!ARGUMENT_PRESENT(Pipeline)) {
-        return E_POINTER;
+        return TraceRet("Attach", E_POINTER);
     }
     if (Pipeline->EngineContext != nullptr) {
         // Attach on a pipeline that already has an engine context is a
         // framework bug or a double attach; do not leak / overwrite.
-        return E_UNEXPECTED;
+        return TraceRet("Attach", E_UNEXPECTED);
     }
     PWINIBIO_ENGINE_CONTEXT ctx = static_cast<PWINIBIO_ENGINE_CONTEXT>(
         HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*ctx)));
     if (ctx == nullptr) {
-        return E_OUTOFMEMORY;
+        return TraceRet("Attach", E_OUTOFMEMORY);
     }
     ctx->Signature = kContextSignature;
     Pipeline->EngineContext = ctx;
-    return S_OK;
+    return TraceRet("Attach", S_OK);
 }
 
 HRESULT WINAPI EngineDetach(_Inout_ PWINBIO_PIPELINE Pipeline)
 {
     Trace("Detach", Pipeline);
     if (!ARGUMENT_PRESENT(Pipeline)) {
-        return E_POINTER;
+        return TraceRet("Detach", E_POINTER);
     }
     PWINIBIO_ENGINE_CONTEXT ctx = Pipeline->EngineContext;
     if (ctx == nullptr) {
-        return E_UNEXPECTED;
+        return TraceRet("Detach", E_UNEXPECTED);
     }
     Pipeline->EngineContext = nullptr;
     if (ctx->Signature == kContextSignature) {
         ctx->Signature = 0;
         HeapFree(GetProcessHeap(), 0, ctx);
     }
-    return S_OK;
+    return TraceRet("Detach", S_OK);
 }
 
 HRESULT WINAPI EngineClearContext(_Inout_ PWINBIO_PIPELINE Pipeline)
 {
     Trace("ClearContext", Pipeline);
     // No sample / feature set / enrollment is held yet, nothing to clear.
-    return ARGUMENT_PRESENT(Pipeline) ? S_OK : E_POINTER;
+    return TraceRet("ClearContext", ARGUMENT_PRESENT(Pipeline) ? S_OK : E_POINTER);
 }
 
 // ---------------------------------------------------------------------------
@@ -145,7 +189,7 @@ HRESULT WINAPI EngineQueryPreferredFormat(
 {
     Trace("QueryPreferredFormat", Pipeline);
     if (!ARGUMENT_PRESENT(StandardFormat) || !ARGUMENT_PRESENT(VendorFormat)) {
-        return E_POINTER;
+        return TraceRet("QueryPreferredFormat", E_POINTER);
     }
     // Must equal SupportedFormat[0] reported by the sensor (umdf/Queue.cpp,
     // GET_ATTRIBUTES) or WBF has no common format. Placeholder until the
@@ -153,7 +197,7 @@ HRESULT WINAPI EngineQueryPreferredFormat(
     StandardFormat->Owner = WINBIO_ANSI_381_FORMAT_OWNER;
     StandardFormat->Type  = WINBIO_ANSI_381_FORMAT_TYPE;
     RtlZeroMemory(VendorFormat, sizeof(*VendorFormat));
-    return S_OK;
+    return TraceRet("QueryPreferredFormat", S_OK);
 }
 
 HRESULT WINAPI EngineQueryIndexVectorSize(
@@ -162,12 +206,12 @@ HRESULT WINAPI EngineQueryIndexVectorSize(
 {
     Trace("QueryIndexVectorSize", Pipeline);
     if (!ARGUMENT_PRESENT(IndexElementCount)) {
-        return E_POINTER;
+        return TraceRet("QueryIndexVectorSize", E_POINTER);
     }
     // ASSUMPTION: 0 = engine does not build a search index for the storage
     // adapter (matching is 1:1 in the SEP, design doc 4).
     *IndexElementCount = 0;
-    return S_OK;
+    return TraceRet("QueryIndexVectorSize", S_OK);
 }
 
 HRESULT WINAPI EngineQueryHashAlgorithms(
@@ -180,13 +224,13 @@ HRESULT WINAPI EngineQueryHashAlgorithms(
     Trace("QueryHashAlgorithms", Pipeline);
     if (!ARGUMENT_PRESENT(AlgorithmCount) || !ARGUMENT_PRESENT(AlgorithmBufferSize) ||
         !ARGUMENT_PRESENT(AlgorithmBuffer)) {
-        return E_POINTER;
+        return TraceRet("QueryHashAlgorithms", E_POINTER);
     }
     // No template hashing: matching is done by the SEP, no template leaves it.
     *AlgorithmCount      = 0;
     *AlgorithmBufferSize = 0;
     *AlgorithmBuffer     = nullptr;
-    return S_OK;
+    return TraceRet("QueryHashAlgorithms", S_OK);
 }
 
 HRESULT WINAPI EngineSetHashAlgorithm(
@@ -195,9 +239,10 @@ HRESULT WINAPI EngineSetHashAlgorithm(
     _In_reads_z_(AlgorithmBufferSize) PUCHAR AlgorithmBuffer)
 {
     Trace("SetHashAlgorithm", Pipeline);
+    EngLog("     algorithmBufferSize=%llu", static_cast<unsigned long long>(AlgorithmBufferSize));
     UNREFERENCED_PARAMETER(AlgorithmBufferSize);
     UNREFERENCED_PARAMETER(AlgorithmBuffer);
-    return E_NOTIMPL; // never offered any algorithm to choose from
+    return TraceRet("SetHashAlgorithm", E_NOTIMPL); // never offered any algorithm to choose from
 }
 
 HRESULT WINAPI EngineQuerySampleHint(
@@ -206,10 +251,10 @@ HRESULT WINAPI EngineQuerySampleHint(
 {
     Trace("QuerySampleHint", Pipeline);
     if (!ARGUMENT_PRESENT(SampleHint)) {
-        return E_POINTER;
+        return TraceRet("QuerySampleHint", E_POINTER);
     }
     *SampleHint = 1; // one capture is enough for a verify (SEP matches internally)
-    return S_OK;
+    return TraceRet("QuerySampleHint", S_OK);
 }
 
 // ---------------------------------------------------------------------------
@@ -223,13 +268,14 @@ HRESULT WINAPI EngineAcceptSampleData(
     _Out_ PWINBIO_REJECT_DETAIL RejectDetail)
 {
     Trace("AcceptSampleData", Pipeline);
+    EngLog("     sampleSize=%llu purpose=0x%02x", static_cast<unsigned long long>(SampleSize), static_cast<unsigned>(Purpose));
     UNREFERENCED_PARAMETER(SampleBuffer);
     UNREFERENCED_PARAMETER(SampleSize);
     UNREFERENCED_PARAMETER(Purpose);
     if (ARGUMENT_PRESENT(RejectDetail)) {
         *RejectDetail = 0;
     }
-    return E_NOTIMPL;
+    return TraceRet("AcceptSampleData", E_NOTIMPL);
 }
 
 HRESULT WINAPI EngineExportEngineData(
@@ -239,10 +285,11 @@ HRESULT WINAPI EngineExportEngineData(
     _Out_ PSIZE_T SampleSize)
 {
     Trace("ExportEngineData", Pipeline);
+    EngLog("     flags=0x%02x", static_cast<unsigned>(Flags));
     UNREFERENCED_PARAMETER(Flags);
     if (ARGUMENT_PRESENT(SampleBuffer)) { *SampleBuffer = nullptr; }
     if (ARGUMENT_PRESENT(SampleSize))   { *SampleSize = 0; }
-    return E_NOTIMPL;
+    return TraceRet("ExportEngineData", E_NOTIMPL);
 }
 
 HRESULT WINAPI EngineVerifyFeatureSet(
@@ -257,6 +304,7 @@ HRESULT WINAPI EngineVerifyFeatureSet(
     _Out_ PWINBIO_REJECT_DETAIL RejectDetail)
 {
     Trace("VerifyFeatureSet", Pipeline);
+    EngLog("     subFactor=0x%02x", static_cast<unsigned>(SubFactor));
     UNREFERENCED_PARAMETER(Identity);
     UNREFERENCED_PARAMETER(SubFactor);
     if (ARGUMENT_PRESENT(Match))           { *Match = FALSE; }   // never a match
@@ -265,7 +313,7 @@ HRESULT WINAPI EngineVerifyFeatureSet(
     if (ARGUMENT_PRESENT(HashValue))       { *HashValue = nullptr; }
     if (ARGUMENT_PRESENT(HashSize))        { *HashSize = 0; }
     if (ARGUMENT_PRESENT(RejectDetail))    { *RejectDetail = 0; }
-    return E_NOTIMPL;
+    return TraceRet("VerifyFeatureSet", E_NOTIMPL);
 }
 
 HRESULT WINAPI EngineIdentifyFeatureSet(
@@ -286,7 +334,7 @@ HRESULT WINAPI EngineIdentifyFeatureSet(
     if (ARGUMENT_PRESENT(HashValue))       { *HashValue = nullptr; }
     if (ARGUMENT_PRESENT(HashSize))        { *HashSize = 0; }
     if (ARGUMENT_PRESENT(RejectDetail))    { *RejectDetail = 0; }
-    return E_NOTIMPL;
+    return TraceRet("IdentifyFeatureSet", E_NOTIMPL);
 }
 
 // ---------------------------------------------------------------------------
@@ -296,7 +344,7 @@ HRESULT WINAPI EngineIdentifyFeatureSet(
 HRESULT WINAPI EngineCreateEnrollment(_Inout_ PWINBIO_PIPELINE Pipeline)
 {
     Trace("CreateEnrollment", Pipeline);
-    return E_NOTIMPL;
+    return TraceRet("CreateEnrollment", E_NOTIMPL);
 }
 
 HRESULT WINAPI EngineUpdateEnrollment(
@@ -305,7 +353,7 @@ HRESULT WINAPI EngineUpdateEnrollment(
 {
     Trace("UpdateEnrollment", Pipeline);
     if (ARGUMENT_PRESENT(RejectDetail)) { *RejectDetail = 0; }
-    return E_NOTIMPL;
+    return TraceRet("UpdateEnrollment", E_NOTIMPL);
 }
 
 HRESULT WINAPI EngineGetEnrollmentStatus(
@@ -314,7 +362,7 @@ HRESULT WINAPI EngineGetEnrollmentStatus(
 {
     Trace("GetEnrollmentStatus", Pipeline);
     if (ARGUMENT_PRESENT(RejectDetail)) { *RejectDetail = 0; }
-    return E_NOTIMPL;
+    return TraceRet("GetEnrollmentStatus", E_NOTIMPL);
 }
 
 HRESULT WINAPI EngineGetEnrollmentHash(
@@ -325,7 +373,7 @@ HRESULT WINAPI EngineGetEnrollmentHash(
     Trace("GetEnrollmentHash", Pipeline);
     if (ARGUMENT_PRESENT(HashValue)) { *HashValue = nullptr; }
     if (ARGUMENT_PRESENT(HashSize))  { *HashSize = 0; }
-    return E_NOTIMPL;
+    return TraceRet("GetEnrollmentHash", E_NOTIMPL);
 }
 
 HRESULT WINAPI EngineCheckForDuplicate(
@@ -338,7 +386,7 @@ HRESULT WINAPI EngineCheckForDuplicate(
     ZeroIdentity(Identity);
     if (ARGUMENT_PRESENT(SubFactor)) { *SubFactor = 0; }
     if (ARGUMENT_PRESENT(Duplicate)) { *Duplicate = FALSE; }
-    return E_NOTIMPL;
+    return TraceRet("CheckForDuplicate", E_NOTIMPL);
 }
 
 HRESULT WINAPI EngineCommitEnrollment(
@@ -349,17 +397,18 @@ HRESULT WINAPI EngineCommitEnrollment(
     _In_ SIZE_T PayloadBlobSize)
 {
     Trace("CommitEnrollment", Pipeline);
+    EngLog("     subFactor=0x%02x payloadSize=%llu", static_cast<unsigned>(SubFactor), static_cast<unsigned long long>(PayloadBlobSize));
     UNREFERENCED_PARAMETER(Identity);
     UNREFERENCED_PARAMETER(SubFactor);
     UNREFERENCED_PARAMETER(PayloadBlob);
     UNREFERENCED_PARAMETER(PayloadBlobSize);
-    return E_NOTIMPL;
+    return TraceRet("CommitEnrollment", E_NOTIMPL);
 }
 
 HRESULT WINAPI EngineDiscardEnrollment(_Inout_ PWINBIO_PIPELINE Pipeline)
 {
     Trace("DiscardEnrollment", Pipeline);
-    return S_OK; // nothing is ever created, so discarding is trivially done
+    return TraceRet("DiscardEnrollment", S_OK); // nothing is ever created, so discarding is trivially done
 }
 
 // ---------------------------------------------------------------------------
@@ -373,10 +422,11 @@ HRESULT ControlUnitCommon(
     _Out_ PULONG OperationStatus)
 {
     Trace(fn, Pipeline);
+    EngLog("     controlCode=0x%08lx", static_cast<unsigned long>(ControlCode));
     UNREFERENCED_PARAMETER(ControlCode);
     if (ARGUMENT_PRESENT(ReceiveDataSize)) { *ReceiveDataSize = 0; }
     if (ARGUMENT_PRESENT(OperationStatus)) { *OperationStatus = 0; }
-    return E_NOTIMPL;
+    return TraceRet(fn, E_NOTIMPL);
 }
 
 HRESULT WINAPI EngineControlUnit(
@@ -422,8 +472,9 @@ HRESULT WINAPI EngineNotifyPowerChange(
     _In_ ULONG PowerEventType)
 {
     Trace("NotifyPowerChange", Pipeline);
+    EngLog("     powerEventType=%lu", static_cast<unsigned long>(PowerEventType));
     UNREFERENCED_PARAMETER(PowerEventType);
-    return ARGUMENT_PRESENT(Pipeline) ? S_OK : E_POINTER;
+    return TraceRet("NotifyPowerChange", ARGUMENT_PRESENT(Pipeline) ? S_OK : E_POINTER);
 }
 
 // Reserved_1 is documented as "reserved, must be set to NULL" - it is not a
@@ -438,25 +489,25 @@ HRESULT WINAPI EngineNotifyPowerChange(
 HRESULT WINAPI EnginePipelineInit(_Inout_ PWINBIO_PIPELINE Pipeline)
 {
     Trace("PipelineInit", Pipeline);
-    return ARGUMENT_PRESENT(Pipeline) ? S_OK : E_POINTER;
+    return TraceRet("PipelineInit", ARGUMENT_PRESENT(Pipeline) ? S_OK : E_POINTER);
 }
 
 HRESULT WINAPI EnginePipelineCleanup(_Inout_ PWINBIO_PIPELINE Pipeline)
 {
     Trace("PipelineCleanup", Pipeline);
-    return ARGUMENT_PRESENT(Pipeline) ? S_OK : E_POINTER;
+    return TraceRet("PipelineCleanup", ARGUMENT_PRESENT(Pipeline) ? S_OK : E_POINTER);
 }
 
 HRESULT WINAPI EngineActivate(_Inout_ PWINBIO_PIPELINE Pipeline)
 {
     Trace("Activate", Pipeline);
-    return ARGUMENT_PRESENT(Pipeline) ? S_OK : E_POINTER;
+    return TraceRet("Activate", ARGUMENT_PRESENT(Pipeline) ? S_OK : E_POINTER);
 }
 
 HRESULT WINAPI EngineDeactivate(_Inout_ PWINBIO_PIPELINE Pipeline)
 {
     Trace("Deactivate", Pipeline);
-    return ARGUMENT_PRESENT(Pipeline) ? S_OK : E_POINTER;
+    return TraceRet("Deactivate", ARGUMENT_PRESENT(Pipeline) ? S_OK : E_POINTER);
 }
 
 // QueryExtendedInfo is called once during unit configuration (and again on
@@ -469,11 +520,12 @@ HRESULT WINAPI EngineQueryExtendedInfo(
     _In_ SIZE_T EngineInfoSize)
 {
     Trace("QueryExtendedInfo", Pipeline);
+    EngLog("     engineInfoSize=%llu (need %llu)", static_cast<unsigned long long>(EngineInfoSize), static_cast<unsigned long long>(sizeof(WINBIO_EXTENDED_ENGINE_INFO)));
     if (!ARGUMENT_PRESENT(Pipeline) || !ARGUMENT_PRESENT(EngineInfo)) {
-        return E_POINTER;
+        return TraceRet("QueryExtendedInfo", E_POINTER);
     }
     if (EngineInfoSize < sizeof(WINBIO_EXTENDED_ENGINE_INFO)) {
-        return E_INVALIDARG;
+        return TraceRet("QueryExtendedInfo", E_INVALIDARG);
     }
     RtlZeroMemory(EngineInfo, sizeof(*EngineInfo));
     EngineInfo->GenericEngineCapabilities = 0; // no iterative-improvement / spoof-detection claims yet
@@ -481,7 +533,7 @@ HRESULT WINAPI EngineQueryExtendedInfo(
     // Specific.Fingerprint.Capabilities and EnrollmentRequirements stay zeroed
     // (least-assumption placeholder) until enrollment (stage 3) defines real
     // sample-coverage requirements.
-    return S_OK;
+    return TraceRet("QueryExtendedInfo", S_OK);
 }
 
 // IdentifyAll is the multi-person "who is in camera frame" callback for
@@ -496,7 +548,7 @@ HRESULT WINAPI EngineIdentifyAll(
     Trace("IdentifyAll", Pipeline);
     if (ARGUMENT_PRESENT(PresenceCount)) { *PresenceCount = 0; }
     if (ARGUMENT_PRESENT(PresenceArray)) { *PresenceArray = nullptr; }
-    return E_NOTIMPL;
+    return TraceRet("IdentifyAll", E_NOTIMPL);
 }
 
 HRESULT WINAPI EngineSetEnrollmentSelector(
@@ -504,8 +556,9 @@ HRESULT WINAPI EngineSetEnrollmentSelector(
     _In_ ULONGLONG SelectorValue)
 {
     Trace("SetEnrollmentSelector", Pipeline);
+    EngLog("     selector=0x%llx", static_cast<unsigned long long>(SelectorValue));
     UNREFERENCED_PARAMETER(SelectorValue); // single-subject sensor, nothing to select
-    return ARGUMENT_PRESENT(Pipeline) ? S_OK : E_POINTER;
+    return TraceRet("SetEnrollmentSelector", ARGUMENT_PRESENT(Pipeline) ? S_OK : E_POINTER);
 }
 
 // Unreachable in practice: WBF only calls this right after a successful
@@ -517,8 +570,9 @@ HRESULT WINAPI EngineSetEnrollmentParameters(
     _In_ PWINBIO_EXTENDED_ENROLLMENT_PARAMETERS Parameters)
 {
     Trace("SetEnrollmentParameters", Pipeline);
+    EngLog("     parameters=%p", static_cast<const void*>(Parameters));
     UNREFERENCED_PARAMETER(Parameters);
-    return E_NOTIMPL;
+    return TraceRet("SetEnrollmentParameters", E_NOTIMPL);
 }
 
 // No enrollment is ever in progress (CreateEnrollment always fails), so per
@@ -530,16 +584,17 @@ HRESULT WINAPI EngineQueryExtendedEnrollmentStatus(
     _In_ SIZE_T EnrollmentStatusSize)
 {
     Trace("QueryExtendedEnrollmentStatus", Pipeline);
+    EngLog("     statusSize=%llu (need %llu)", static_cast<unsigned long long>(EnrollmentStatusSize), static_cast<unsigned long long>(sizeof(WINBIO_EXTENDED_ENROLLMENT_STATUS)));
     if (!ARGUMENT_PRESENT(Pipeline) || !ARGUMENT_PRESENT(EnrollmentStatus)) {
-        return E_POINTER;
+        return TraceRet("QueryExtendedEnrollmentStatus", E_POINTER);
     }
     if (EnrollmentStatusSize < sizeof(WINBIO_EXTENDED_ENROLLMENT_STATUS)) {
-        return E_INVALIDARG;
+        return TraceRet("QueryExtendedEnrollmentStatus", E_INVALIDARG);
     }
     RtlZeroMemory(EnrollmentStatus, sizeof(*EnrollmentStatus));
     EnrollmentStatus->TemplateStatus = WINBIO_E_INVALID_OPERATION;
     EnrollmentStatus->Factor = WINBIO_TYPE_FINGERPRINT;
-    return S_OK;
+    return TraceRet("QueryExtendedEnrollmentStatus", S_OK);
 }
 
 // No private in-memory template cache exists, so there is nothing to
@@ -548,7 +603,7 @@ HRESULT WINAPI EngineQueryExtendedEnrollmentStatus(
 HRESULT WINAPI EngineRefreshCache(_Inout_ PWINBIO_PIPELINE Pipeline)
 {
     Trace("RefreshCache", Pipeline);
-    return ARGUMENT_PRESENT(Pipeline) ? S_OK : E_POINTER;
+    return TraceRet("RefreshCache", ARGUMENT_PRESENT(Pipeline) ? S_OK : E_POINTER);
 }
 
 // E_NOTIMPL is the documented "no dynamic calibration needed" answer (WBF
@@ -561,11 +616,12 @@ HRESULT WINAPI EngineSelectCalibrationFormat(
     _Out_ PSIZE_T MaxBufferSize)
 {
     Trace("SelectCalibrationFormat", Pipeline);
+    EngLog("     formatCount=%llu", static_cast<unsigned long long>(FormatCount));
     UNREFERENCED_PARAMETER(FormatArray);
     UNREFERENCED_PARAMETER(FormatCount);
     if (ARGUMENT_PRESENT(SelectedFormat)) { RtlZeroMemory(SelectedFormat, sizeof(*SelectedFormat)); }
     if (ARGUMENT_PRESENT(MaxBufferSize))  { *MaxBufferSize = 0; }
-    return E_NOTIMPL;
+    return TraceRet("SelectCalibrationFormat", E_NOTIMPL);
 }
 
 // Unreachable given SelectCalibrationFormat's E_NOTIMPL above - WBF only
@@ -584,7 +640,7 @@ HRESULT WINAPI EngineQueryCalibrationData(
     UNREFERENCED_PARAMETER(MaxBufferSize);
     if (ARGUMENT_PRESENT(DiscardAndRepeatCapture)) { *DiscardAndRepeatCapture = FALSE; }
     if (ARGUMENT_PRESENT(CalibrationBufferSize))   { *CalibrationBufferSize = 0; }
-    return E_NOTIMPL;
+    return TraceRet("QueryCalibrationData", E_NOTIMPL);
 }
 
 // Anti-spoof policy intake, not a matching decision (winbio_adapter.h: "errors
@@ -596,9 +652,10 @@ HRESULT WINAPI EngineSetAccountPolicy(
     _In_ SIZE_T PolicyItemCount)
 {
     Trace("SetAccountPolicy", Pipeline);
+    EngLog("     policyItemCount=%llu", static_cast<unsigned long long>(PolicyItemCount));
     UNREFERENCED_PARAMETER(PolicyItemArray);
     UNREFERENCED_PARAMETER(PolicyItemCount);
-    return ARGUMENT_PRESENT(Pipeline) ? S_OK : E_POINTER;
+    return TraceRet("SetAccountPolicy", ARGUMENT_PRESENT(Pipeline) ? S_OK : E_POINTER);
 }
 
 // ---------------------------------------------------------------------------
@@ -668,7 +725,7 @@ BOOL APIENTRY DllMain(HMODULE ModuleHandle, DWORD ReasonForCall, LPVOID Reserved
     UNREFERENCED_PARAMETER(Reserved);
     if (ReasonForCall == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(ModuleHandle);
-        OutputDebugStringA("T2TouchIdEngine: DLL loaded\n");
+        EngLog("DLL loaded (module=%p)", static_cast<void*>(ModuleHandle));
     }
     return TRUE;
 }
@@ -677,7 +734,8 @@ BOOL APIENTRY DllMain(HMODULE ModuleHandle, DWORD ReasonForCall, LPVOID Reserved
 // GetProcAddress(WINBIO_QUERY_ENGINE_INTERFACE_FN_NAME).
 extern "C" HRESULT WINAPI WbioQueryEngineInterface(_Out_ PWINBIO_ENGINE_INTERFACE* EngineInterface)
 {
-    OutputDebugStringA("T2TouchIdEngine: WbioQueryEngineInterface\n");
+    EngLog("WbioQueryEngineInterface (advertising VERSION_3, size=%llu)",
+           static_cast<unsigned long long>(sizeof(WINBIO_ENGINE_INTERFACE)));
     if (EngineInterface == nullptr) {
         return E_POINTER;
     }

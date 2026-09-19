@@ -8,22 +8,34 @@
 #include <initguid.h>
 #include "Internal.h"
 
+// DebugView: run as Administrator, Capture -> Capture Global Win32 (WUDFHost.exe
+// is a LocalService process in session 0). Filter: T2TouchId*  - the engine
+// adapter (wbiosrvc) uses the "T2TouchIdEngine:" prefix, this driver
+// "T2TouchIdBio:". One OutputDebugString call per line so lines from parallel
+// IOCTL threads do not interleave.
 void T2BioLog(_In_z_ const char* fmt, ...)
 {
     char buf[256];
     va_list ap;
     va_start(ap, fmt);
-    if (SUCCEEDED(StringCchVPrintfA(buf, ARRAYSIZE(buf), fmt, ap))) {
-        OutputDebugStringA("T2TouchIdBio: ");
-        OutputDebugStringA(buf);
-        OutputDebugStringA("\n");
-    }
+    const HRESULT fmtHr = StringCchVPrintfA(buf, ARRAYSIZE(buf), fmt, ap);
     va_end(ap);
+    if (FAILED(fmtHr)) {
+        return;
+    }
+    char line[400];
+    if (SUCCEEDED(StringCchPrintfA(line, ARRAYSIZE(line), "T2TouchIdBio: [%lu:%lu] %s\n",
+                                   static_cast<unsigned long>(GetCurrentProcessId()),
+                                   static_cast<unsigned long>(GetCurrentThreadId()), buf))) {
+        OutputDebugStringA(line);
+    }
 }
 
 extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject,
                                 _In_ PUNICODE_STRING RegistryPath)
 {
+    T2BioLog("DriverEntry (UMDF %d.%d)", UMDF_VERSION_MAJOR, UMDF_VERSION_MINOR);
+
     WDF_DRIVER_CONFIG config;
     WDF_DRIVER_CONFIG_INIT(&config, T2BioEvtDeviceAdd);
 
@@ -32,6 +44,8 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject,
                                             WDF_NO_HANDLE);
     if (!NT_SUCCESS(status)) {
         T2BioLog("WdfDriverCreate failed 0x%08x", status);
+    } else {
+        T2BioLog("DriverEntry ok");
     }
     return status;
 }
@@ -40,6 +54,7 @@ extern "C" NTSTATUS T2BioEvtDeviceAdd(_In_ WDFDRIVER Driver,
                                       _Inout_ PWDFDEVICE_INIT DeviceInit)
 {
     UNREFERENCED_PARAMETER(Driver);
+    T2BioLog("EvtDeviceAdd");
 
     WDFDEVICE device = nullptr;
     NTSTATUS status = WdfDeviceCreate(&DeviceInit, WDF_NO_OBJECT_ATTRIBUTES, &device);
@@ -65,6 +80,8 @@ extern "C" NTSTATUS T2BioEvtDeviceAdd(_In_ WDFDRIVER Driver,
     status = WdfIoQueueCreate(device, &queueConfig, WDF_NO_OBJECT_ATTRIBUTES, WDF_NO_HANDLE);
     if (!NT_SUCCESS(status)) {
         T2BioLog("WdfIoQueueCreate failed 0x%08x", status);
+    } else {
+        T2BioLog("EvtDeviceAdd ok: biometric interface + parallel IOCTL queue created");
     }
     return status;
 }
