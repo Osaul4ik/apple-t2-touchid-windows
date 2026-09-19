@@ -158,7 +158,17 @@ std::vector<PortCandidate> ScanHttp2Preface(const NcmEndpoint& endpoint,
     unsigned workers = options.concurrency;
     if (workers == 0) workers = 1;
     if (workers > total) workers = total;
-    if (workers > 64) workers = 64;
+    // OPTIMIZATION: this used to cap at 64, which for the full 16384-port
+    // dynamic range means 256 sequential probes per worker. The 64 number
+    // was never actually load-bearing — every WaitReadable/connect select()
+    // call here uses a fresh, thread-local fd_set holding exactly one
+    // socket, so FD_SETSIZE (also 64) never comes into play; that made 64
+    // look like a real ceiling when it wasn't. 256 workers means 64
+    // ports/worker instead of 256 — a 4x cut in the worst-case wall-clock
+    // cost of a full scan, which matters most for
+    // DiscoverBiometricKitBridge's retry ladder in main.cpp, where a
+    // full scan can run more than once.
+    if (workers > 256) workers = 256;
 
     // Recv window: at least connect timeout; prefer a bit longer on Windows
     // NCM (partial deliveries). Still matches Linux spirit of ~150ms default

@@ -614,15 +614,26 @@ static bool DiscoverBiometricKitBridge(int argc, wchar_t* argv[], int firstArgIn
         return false;
     }
 
-    // Discovery race: a single 10ms full-port scan is flaky under USB NCM
-    // jitter — `network` can find the port, then `identities` immediately
-    // after reports "no HTTP/2 candidates". Retry with longer timeouts.
+    // Discovery race: a single scan is flaky under USB NCM jitter —
+    // `network` can find the port, then `identities` immediately after
+    // reports "no HTTP/2 candidates". Retry with a longer timeout.
+    //
+    // OPTIMIZATION: this used to be 3 full-range rescans at {25, 50,
+    // 100}ms with concurrency capped at 64 (256 ports/worker each) — up
+    // to ~256*(25+50+100) ≈ 44.8s worst case, all of it spent before
+    // DiscoverServicePort even starts. Cut to 2 attempts at {20, 60}ms
+    // with concurrency raised to 256 (see the matching cap change in
+    // PortScan.cpp — 64 ports/worker instead of 256): worst case is now
+    // ~64*(20+60) ≈ 5.1s. Two attempts, not one, because the flakiness
+    // this retry exists for is real jitter, not just "timeout was too
+    // low" — a second try at a still-modest timeout is worth keeping as
+    // a safety net.
     ScanOptions opt;
-    opt.concurrency = 64;
+    opt.concurrency = 256;
     opt.includeTcpOnly = true;
     std::vector<uint16_t> candidatePorts;
-    const unsigned timeoutsMs[] = {25, 50, 100};
-    for (unsigned attempt = 0; attempt < 3; ++attempt) {
+    const unsigned timeoutsMs[] = {20, 60};
+    for (unsigned attempt = 0; attempt < 2; ++attempt) {
         opt.connectTimeoutMs = timeoutsMs[attempt];
         auto hits = ScanHttp2Preface(ep, opt);
         candidatePorts.clear();
