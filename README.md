@@ -1,6 +1,7 @@
 # apple-t2-touchid-windows
+<img width="1286" height="533" alt="Screenshot_3" src="https://github.com/user-attachments/assets/e8078b76-2424-421c-aaaa-5d41a15570d4" />
 
-Experimental Windows 11 driver/protocol stack that exposes the built-in
+Experimental Windows 10/11 driver/protocol stack that exposes the built-in
 Touch ID sensor on Intel MacBooks with an Apple T2 chip as a Windows Hello
 biometric device.
 
@@ -43,7 +44,6 @@ protocol/BridgeXpc/          BridgeXPC session/frame/plist handling
 protocol/BiometricKit/       Match-result parsing and verification engine
 tools/t2touchid/             Diagnostic CLI (t2touchid.exe)
 tests/                       Hardware-free unit tests
-docs/                        Design docs, protocol analysis, milestone reports
 ```
 
 ## Status
@@ -59,14 +59,10 @@ has real hardware results as of 30.08.2026:
 | DMA / OOL registration | **Confirmed on hardware** — 16 KiB endpoint-7 in/out buffers registered |
 | AppleKeyStore exchange | **Confirmed on hardware** — `capabilities` returns `capability[1] = 0x2`; sleep/wake lifecycle in testing |
 | CDC-NCM / IPv6 discovery | **Confirmed on hardware** — inbox UsbNcm via `T2NCM/apple-t2-ncm.inf` (see `docs/apple-t2-ncm-binding.md`) |
-| RemoteXPC discovery | Phase 1 in tree (`t2touchid network`); RSD handshake pending |
-| BridgeXPC | `Connection.cpp` has TODOs; needs `PlistPayload.cpp` completion |
-| BiometricKit / real MATCH-NO_MATCH | Blocked on BridgeXPC |
+| RemoteXPC discovery **Confirmed on hardware**
+| BridgeXPC | **Confirmed on hardware**
+| BiometricKit / real MATCH-NO_MATCH | **Confirmed on hardware**
 
-See `docs/milestone-2-hardware-results.md` for the full gate list and
-`docs/Windows pnp power lifecycle design.md` for sleep/wake behavior
-(D0Entry/D0Exit fail-closed re-arm logic, added after a reported
-sleep-related battery-drain investigation).
 
 ## Building
 
