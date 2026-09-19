@@ -133,11 +133,36 @@ bool FillFromAdapter(IP_ADAPTER_ADDRESSES* a, NcmEndpoint* out) {
             out->peerLinkLocal = peer;
             out->peerSource = PeerSource::NeighborTable;
         } else {
+            // OPTIMIZATION: this used to be PromptPeerViaMulticastPing()
+            // followed by an unconditional Sleep(250) and a single
+            // check — ~550ms of dead time even in the common case where
+            // the neighbor table populates in 10-20ms. That fixed wait
+            // was also the part most exposed to VPN interference: a
+            // VPN's LWF/WFP filter driver sitting in the network stack
+            // adds jitter to ICMPv6 round-trip time, and a blind sleep
+            // has no way to notice the answer arrived early — it just
+            // burns the full budget regardless.
+            //
+            // Polling every 10ms instead means we pick up the neighbor
+            // entry on the tick right after it lands, whatever that
+            // takes, instead of always paying for the worst case. The
+            // ping still gets its full timeout to elicit a reply; only
+            // the "wait for the table to update" half became
+            // responsive. Total budget is kept close to the original
+            // (300ms ping + up to ~250ms poll) so a genuinely slow
+            // reply is no worse off than before.
             PromptPeerViaMulticastPing(out->ifIndex, 300);
-            Sleep(250);
-            if (FindNeighborPeer(out->ifIndex, &peer)) {
-                out->peerLinkLocal = peer;
-                out->peerSource = PeerSource::NeighborTable;
+
+            const int kPeerPollIntervalMs = 10;
+            const int kPeerPollBudgetMs = 250;
+            for (int waited = 0; waited < kPeerPollBudgetMs;
+                 waited += kPeerPollIntervalMs) {
+                if (FindNeighborPeer(out->ifIndex, &peer)) {
+                    out->peerLinkLocal = peer;
+                    out->peerSource = PeerSource::NeighborTable;
+                    break;
+                }
+                Sleep(kPeerPollIntervalMs);
             }
         }
     }
@@ -228,7 +253,23 @@ std::vector<NcmEndpoint> FindT2NcmEndpoints() {
     if (GetAdaptersAddresses(AF_INET6, flags, nullptr, addrs, &size) != NO_ERROR)
         return result;
 
+    // OPTIMIZATION: GetAdaptersAddresses returns adapters in binding
+    // order, and an active VPN client commonly forces its own virtual
+    // adapter to the front of that order (for kill-switch / tunnel
+    // priority). T2 NCM, brought up later by a USB plug event, ends up
+    // toward the end. Walking front-to-back meant every VPN/virtual
+    // adapter got checked — and any that happened to also pass
+    // LooksLikeT2Ncm would start its (blocking) ping/poll — before we
+    // ever reached the real one. The list is singly-linked (no Prev),
+    // so reversing means collecting pointers first, then walking that
+    // back to front.
+    std::vector<IP_ADAPTER_ADDRESSES*> ordered;
     for (auto* a = addrs; a; a = a->Next) {
+        ordered.push_back(a);
+    }
+
+    for (auto it = ordered.rbegin(); it != ordered.rend(); ++it) {
+        IP_ADAPTER_ADDRESSES* a = *it;
         std::wstring friendly = a->FriendlyName ? a->FriendlyName : L"";
         std::wstring description = a->Description ? a->Description : L"";
         if (!LooksLikeT2Ncm(description, friendly)) continue;

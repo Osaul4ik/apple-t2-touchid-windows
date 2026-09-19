@@ -29,10 +29,13 @@ struct ScanOptions {
     uint16_t portBegin = 49152;
     uint16_t portEnd = 65535;
     unsigned concurrency = 64;
-    // Linux default --probe-timeout 0.15 (150ms). Lowered to 4ms here:
-    // observed RTT to the T2 peer over this NCM link is ~1ms, so 150ms was
-    // far more headroom than the link needs for a single probe.
-    unsigned connectTimeoutMs = 10;
+    // Linux default --probe-timeout 0.15 (150ms). Lowered here: observed
+    // RTT to the T2 peer over this NCM link is ~1ms, so 150ms was far
+    // more headroom than the link needs for a single probe. 20ms leaves
+    // margin for VPN-induced jitter (see Adapter.cpp's neighbor-poll
+    // comment) without reintroducing the old 150ms cost across 16384
+    // ports.
+    unsigned connectTimeoutMs = 20;
     bool includeTcpOnly = true;
     // If a TCP-open peer stays fully silent (0 bytes) on the passive
     // recv-only attempt, retry once by sending our own HTTP/2 client
