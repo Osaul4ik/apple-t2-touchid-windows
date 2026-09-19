@@ -76,6 +76,149 @@ jobs:
     - uses: actions/checkout@v4
 
     # =========================================================================
+    # ORDER MATTERS: the native build runs BEFORE any dotnet command.
+    # Sepvaultgui.csproj and T2sepbootstrap.vcxproj share driver/T2TouchIdBio/;
+    # `dotnet restore/build` write obj\project.assets.json (net8.0-windows)
+    # there, and the vcxproj's legacy Microsoft.NuGet.targets then failed in
+    # ResolveNuGetPackageAssets ("Sequence contains no elements"). Building the
+    # vcxproj first means it never sees that file. (Directory.Build.props in
+    # that folder separates the two obj\ dirs as well; ResolveNuGetPackages=false
+    # on the msbuild line below is a third guard.)
+    # =========================================================================
+    # =========================================================================
+    # T2SepBootstrap.vcxproj links T2TouchIdProtocol.lib, which compiles
+    # BridgeXpc/PlistPayload.cpp - so it needs the same vcpkg libplist
+    # bootstrap as tools/t2touchid, even though T2SepBootstrapService.cpp
+    # itself never touches plist directly.
+    # =========================================================================
+    - name: Add MSBuild to PATH
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Bootstrap vcpkg
+      run: |
+        $ErrorActionPreference = "Stop"
+        git clone --depth 1 https://github.com/microsoft/vcpkg.git vcpkg
+        .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+      shell: pwsh
+
+    - name: Install libplist (vcpkg)
+      run: |
+        $ErrorActionPreference = "Stop"
+        .\vcpkg\vcpkg.exe install libplist:x64-windows
+      shell: pwsh
+
+    - name: Locate libplist library file
+      run: |
+        $ErrorActionPreference = "Stop"
+        $libDir = "vcpkg\installed\x64-windows\lib"
+        $lib = Get-ChildItem -Path $libDir -Filter "*.lib" |
+          Where-Object { $_.Name -match "plist" -and $_.Name -notmatch "\+\+" } |
+          Select-Object -First 1
+
+        if (-not $lib) {
+          Write-Error "No plist .lib found under $libDir after vcpkg install."
+          exit 1
+        }
+
+        Write-Host "OK: found $($lib.Name)"
+        Add-Content -Path $env:GITHUB_ENV -Value "PLIST_LIB_NAME=$($lib.Name)"
+        Add-Content -Path $env:GITHUB_ENV -Value "VCPKG_INSTALLED_DIR=$PWD\vcpkg\installed\x64-windows"
+      shell: pwsh
+
+    # =========================================================================
+    # Target only T2SepBootstrap within the solution, not the whole .sln:
+    # MSBuild then builds it plus its explicit ProjectReference
+    # (T2TouchIdProtocol), but never touches T2TouchIdTransport (the KMDF
+    # driver also in this .sln) - so no WDK install needed here. No
+    # WindowsTargetPlatformVersion pin either, unlike the driver workflows:
+    # that pin exists there to match exactly what those workflows'  WDK
+    # installer shipped, which doesn't apply to these plain v143 user-mode
+    # projects.
+    # =========================================================================
+    - name: Build T2SepBootstrap (+ T2TouchIdProtocol dependency)
+      run: |
+        msbuild $env:SOLUTION `
+          /t:$env:BOOTSTRAP_PROJECT `
+          /p:Configuration=$env:CONFIGURATION `
+          /p:Platform=$env:PLATFORM `
+          /p:VcpkgInstalledDir=$env:VCPKG_INSTALLED_DIR `
+          /p:PlistLibName=$env:PLIST_LIB_NAME `
+          /p:ResolveNuGetPackages=false `
+          /nologo /verbosity:minimal /clp:Summary
+      shell: pwsh
+
+    # Only on failure: list NuGet-ish files next to the vcxproj and re-run the
+    # same build at diagnostic verbosity, so the trigger of the legacy
+    # Microsoft.NuGet.targets error (which lock/assets file it reads and why)
+    # is in the artifact instead of being guessed.
+    - name: Diagnose T2SepBootstrap build failure (NuGet)
+      if: failure()
+      run: |
+        Write-Host "::group::Files under driver/T2TouchIdBio that NuGet could pick up"
+        Get-ChildItem -Path "driver/T2TouchIdBio" -Recurse -Force -File -ErrorAction SilentlyContinue |
+          Where-Object { $_.Name -match 'project(\.assets|\.lock)?\.json|nuget' -or $_.FullName -match '\\obj\\' } |
+          ForEach-Object { $_.FullName }
+        Write-Host "::endgroup::"
+
+        New-Item -ItemType Directory -Path "bootstrap-diag" -Force | Out-Null
+        $diagLog = Join-Path $PWD "bootstrap-diag\bootstrap-diag.log"
+        msbuild $env:SOLUTION `
+          /t:$env:BOOTSTRAP_PROJECT `
+          /p:Configuration=$env:CONFIGURATION `
+          /p:Platform=$env:PLATFORM `
+          /p:VcpkgInstalledDir=$env:VCPKG_INSTALLED_DIR `
+          /p:PlistLibName=$env:PLIST_LIB_NAME `
+          /nologo /clp:Summary "/flp:logfile=$diagLog;verbosity=diagnostic" | Out-Null
+
+        Write-Host "::group::ProjectLockFile / assets / lock references in the diagnostic log"
+        Select-String -Path $diagLog -Pattern 'ProjectLockFile|project\.assets\.json|project\.lock\.json|ResolveNuGetPackages' |
+          Select-Object -First 40 | ForEach-Object { $_.ToString() }
+        Write-Host "::endgroup::"
+      shell: pwsh
+
+    - name: Upload bootstrap diagnostic log
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: bootstrap-diag-${{ github.sha }}
+        retention-days: 14
+        if-no-files-found: warn
+        path: bootstrap-diag/
+
+    - name: Stage T2SepBootstrap.exe + runtime DLLs
+      run: |
+        $ErrorActionPreference = "Stop"
+        $exePath = "build\$env:BOOTSTRAP_PROJECT\$env:PLATFORM\$env:CONFIGURATION\$env:BOOTSTRAP_PROJECT.exe"
+        if (-not (Test-Path $exePath)) {
+          Write-Error "Built exe not found: $exePath"
+          exit 1
+        }
+
+        $packageDir = "artifacts\T2SepBootstrap"
+        New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
+        Copy-Item -Path $exePath -Destination $packageDir -Force
+
+        $pdbPath = "build\$env:BOOTSTRAP_PROJECT\$env:PLATFORM\$env:CONFIGURATION\$env:BOOTSTRAP_PROJECT.pdb"
+        if (Test-Path $pdbPath) {
+          Copy-Item -Path $pdbPath -Destination $packageDir -Force
+        }
+
+        # Same dynamic-plist dependency as t2touchid.exe/T2TouchIdTests.exe:
+        # plist-2.0.lib is just the import lib for vcpkg's dynamically-built
+        # plist-2.0.dll - the actual DLL and its own dependencies
+        # (libxml2/zlib/liblzma/iconv) live in vcpkg's bin dir, not lib.
+        $vcpkgBinDir = Join-Path $env:VCPKG_INSTALLED_DIR "bin"
+        if (-not (Test-Path $vcpkgBinDir)) {
+          Write-Error "vcpkg bin dir not found: $vcpkgBinDir"
+          exit 1
+        }
+        Copy-Item -Path (Join-Path $vcpkgBinDir "*.dll") -Destination $packageDir -Force
+
+        Write-Host "OK: staged T2SepBootstrap.exe and its runtime DLLs:"
+        Get-ChildItem $packageDir | ForEach-Object { Write-Host "  - $($_.Name)" }
+      shell: pwsh
+
+    # =========================================================================
     # SepVaultGui: net8.0-windows / UseWPF, plain SDK-style csproj, not in
     # T2TouchId.sln. Built standalone with the .NET SDK - same reasoning as
     # the other projects here, use the right tool for what's actually there
@@ -151,100 +294,6 @@ jobs:
         }
         $sizeMb = [Math]::Round((Get-Item $exePath).Length / 1MB, 1)
         Write-Host "OK: published $exePath ($sizeMb MB, requires .NET 8 Desktop Runtime on target)"
-      shell: pwsh
-
-    # =========================================================================
-    # T2SepBootstrap.vcxproj links T2TouchIdProtocol.lib, which compiles
-    # BridgeXpc/PlistPayload.cpp - so it needs the same vcpkg libplist
-    # bootstrap as tools/t2touchid, even though T2SepBootstrapService.cpp
-    # itself never touches plist directly.
-    # =========================================================================
-    - name: Add MSBuild to PATH
-      uses: microsoft/setup-msbuild@v2
-
-    - name: Bootstrap vcpkg
-      run: |
-        $ErrorActionPreference = "Stop"
-        git clone --depth 1 https://github.com/microsoft/vcpkg.git vcpkg
-        .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
-      shell: pwsh
-
-    - name: Install libplist (vcpkg)
-      run: |
-        $ErrorActionPreference = "Stop"
-        .\vcpkg\vcpkg.exe install libplist:x64-windows
-      shell: pwsh
-
-    - name: Locate libplist library file
-      run: |
-        $ErrorActionPreference = "Stop"
-        $libDir = "vcpkg\installed\x64-windows\lib"
-        $lib = Get-ChildItem -Path $libDir -Filter "*.lib" |
-          Where-Object { $_.Name -match "plist" -and $_.Name -notmatch "\+\+" } |
-          Select-Object -First 1
-
-        if (-not $lib) {
-          Write-Error "No plist .lib found under $libDir after vcpkg install."
-          exit 1
-        }
-
-        Write-Host "OK: found $($lib.Name)"
-        Add-Content -Path $env:GITHUB_ENV -Value "PLIST_LIB_NAME=$($lib.Name)"
-        Add-Content -Path $env:GITHUB_ENV -Value "VCPKG_INSTALLED_DIR=$PWD\vcpkg\installed\x64-windows"
-      shell: pwsh
-
-    # =========================================================================
-    # Target only T2SepBootstrap within the solution, not the whole .sln:
-    # MSBuild then builds it plus its explicit ProjectReference
-    # (T2TouchIdProtocol), but never touches T2TouchIdTransport (the KMDF
-    # driver also in this .sln) - so no WDK install needed here. No
-    # WindowsTargetPlatformVersion pin either, unlike the driver workflows:
-    # that pin exists there to match exactly what those workflows'  WDK
-    # installer shipped, which doesn't apply to these plain v143 user-mode
-    # projects.
-    # =========================================================================
-    - name: Build T2SepBootstrap (+ T2TouchIdProtocol dependency)
-      run: |
-        msbuild $env:SOLUTION `
-          /t:$env:BOOTSTRAP_PROJECT `
-          /p:Configuration=$env:CONFIGURATION `
-          /p:Platform=$env:PLATFORM `
-          /p:VcpkgInstalledDir=$env:VCPKG_INSTALLED_DIR `
-          /p:PlistLibName=$env:PLIST_LIB_NAME `
-          /nologo /verbosity:minimal /clp:Summary
-      shell: pwsh
-
-    - name: Stage T2SepBootstrap.exe + runtime DLLs
-      run: |
-        $ErrorActionPreference = "Stop"
-        $exePath = "build\$env:BOOTSTRAP_PROJECT\$env:PLATFORM\$env:CONFIGURATION\$env:BOOTSTRAP_PROJECT.exe"
-        if (-not (Test-Path $exePath)) {
-          Write-Error "Built exe not found: $exePath"
-          exit 1
-        }
-
-        $packageDir = "artifacts\T2SepBootstrap"
-        New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
-        Copy-Item -Path $exePath -Destination $packageDir -Force
-
-        $pdbPath = "build\$env:BOOTSTRAP_PROJECT\$env:PLATFORM\$env:CONFIGURATION\$env:BOOTSTRAP_PROJECT.pdb"
-        if (Test-Path $pdbPath) {
-          Copy-Item -Path $pdbPath -Destination $packageDir -Force
-        }
-
-        # Same dynamic-plist dependency as t2touchid.exe/T2TouchIdTests.exe:
-        # plist-2.0.lib is just the import lib for vcpkg's dynamically-built
-        # plist-2.0.dll - the actual DLL and its own dependencies
-        # (libxml2/zlib/liblzma/iconv) live in vcpkg's bin dir, not lib.
-        $vcpkgBinDir = Join-Path $env:VCPKG_INSTALLED_DIR "bin"
-        if (-not (Test-Path $vcpkgBinDir)) {
-          Write-Error "vcpkg bin dir not found: $vcpkgBinDir"
-          exit 1
-        }
-        Copy-Item -Path (Join-Path $vcpkgBinDir "*.dll") -Destination $packageDir -Force
-
-        Write-Host "OK: staged T2SepBootstrap.exe and its runtime DLLs:"
-        Get-ChildItem $packageDir | ForEach-Object { Write-Host "  - $($_.Name)" }
       shell: pwsh
 
     - name: Upload SepVaultGui package (full, self-contained)
