@@ -355,17 +355,21 @@ static int CmdDeviceState(Client& client, int64_t handle, uint32_t selector) {
 
 // Cache fast-path shared by `network` and DiscoverBiometricKitBridge.
 //
-// The cache holds TWO ports for the adapter:
-//   * the RemoteXPC (HTTP/2) port the scan hit, and
-//   * the BridgeXPC service port (raw TCP) that port's peer record advertised.
-// The BridgeXPC listener does not accept a bare connect: on real hardware a
-// direct HELO to the cached service port fails until a RemoteXPC (RSD)
-// handshake on the HTTP/2 port has been done first - exactly the sequence
-// the scan path performs (Probe on HTTP/2 port, then Connect to the
-// advertised service port). So the fast path replays that sequence against
-// the cached RemoteXPC port: one probe + one HELO instead of a 16384-port
-// scan. Legacy cache entries with only the service port fall back to a
-// single direct HELO attempt.
+// The cache holds the BridgeXPC service port (raw TCP) and, when known, the
+// RemoteXPC (HTTP/2) port whose peer record advertised it. Fast path, in
+// order of cost:
+//   A. direct BridgeXPC HELO on the cached service port (one TCP connect);
+//   B. replay of the scan's own sequence against the cached RemoteXPC port:
+//      RSD probe -> advertised port -> HELO (covers the case where the
+//      service port only accepts clients after an RSD handshake, or moved);
+// and only if both fail does the caller fall back to the 16384-port scan.
+// Every path ends in a live BridgeXPC HELO, so a stale entry can never
+// produce a false "found".
+//
+// NOTE: requires Winsock to be initialised. Previously WSAStartup was only
+// called from inside ScanHttp2Preface, so on a cache hit (no scan) every
+// socket() call failed and the cache always looked "stale". wmain now calls
+// WSAStartup up front.
 //
 // On success `conn` is connected (HELO done) and *outPort is the BridgeXPC port.
 static bool TryCachedBridgePort(const t2::discovery::NcmEndpoint& ep,
@@ -380,34 +384,38 @@ static bool TryCachedBridgePort(const t2::discovery::NcmEndpoint& ep,
     const char* kName = "com.apple.eos.BiometricKit";
     const std::chrono::milliseconds kTimeout(2000);
 
+    // A: direct.
+    ConnectResult crA = conn->Connect(ep.peerLinkLocal, ep.ifIndex, svcPort,
+                                       std::chrono::milliseconds(1500));
+    if (crA == ConnectResult::Ok) {
+        *outPort = svcPort;
+        return true;
+    }
+
+    // B: RSD replay on the cached RemoteXPC port.
     if (rsdPort != 0) {
         uint16_t advertised = 0;
         if (ProbeServiceOnPort(ep, rsdPort, kName, kTimeout, &advertised)) {
-            ConnectResult cr = conn->Connect(ep.peerLinkLocal, ep.ifIndex, advertised, kTimeout);
-            if (cr == ConnectResult::Ok) {
+            ConnectResult crB = conn->Connect(ep.peerLinkLocal, ep.ifIndex, advertised, kTimeout);
+            if (crB == ConnectResult::Ok) {
                 if (advertised != svcPort) SaveCachedPort(ep, advertised, rsdPort);
                 *outPort = advertised;
                 return true;
             }
-            std::wcout << L"cached RemoteXPC port " << rsdPort << L" advertised BridgeXPC port "
-                       << advertised << L" but HELO failed (result="
-                       << static_cast<int>(cr) << L") - falling back to full scan.\n";
-        } else {
-            std::wcout << L"cached RemoteXPC port " << rsdPort
-                       << L" did not answer (T2 rebooted?) - falling back to full scan.\n";
+            std::wcout << L"cached ports (RemoteXPC " << rsdPort << L", BridgeXPC " << advertised
+                       << L"): HELO failed (direct result=" << static_cast<int>(crA)
+                       << L", via RSD result=" << static_cast<int>(crB)
+                       << L") - falling back to full scan.\n";
+            return false;
         }
+        std::wcout << L"cached ports (RemoteXPC " << rsdPort << L", BridgeXPC " << svcPort
+                   << L"): direct HELO failed (result=" << static_cast<int>(crA)
+                   << L") and RemoteXPC probe did not answer (T2 rebooted?) - falling back to full scan.\n";
         return false;
     }
 
-    // Legacy entry (service port only): one direct attempt.
-    ConnectResult cr = conn->Connect(ep.peerLinkLocal, ep.ifIndex, svcPort,
-                                      std::chrono::milliseconds(1500));
-    if (cr == ConnectResult::Ok) {
-        *outPort = svcPort;
-        return true;
-    }
-    std::wcout << L"cached port " << svcPort << L" did not accept a direct BridgeXPC HELO (result="
-               << static_cast<int>(cr) << L") - falling back to full scan.\n";
+    std::wcout << L"cached BridgeXPC port " << svcPort << L": direct HELO failed (result="
+               << static_cast<int>(crA) << L") - falling back to full scan.\n";
     return false;
 }
 
@@ -1077,6 +1085,18 @@ int wmain(int argc, wchar_t* argv[]) {
     argc = static_cast<int>(filtered.size());
 
     t2::log::InitFromEnvironment(verbose);
+
+    // Winsock must be up before ANY socket use. It used to be initialised
+    // only inside ScanHttp2Preface (PortScan.cpp), so a cache hit - which
+    // skips the scan - had every socket() fail with WSANOTINITIALISED.
+    // (Ref-counted, so PortScan's own WSAStartup is harmless.)
+    {
+        WSADATA wsa{};
+        if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+            std::wcout << L"WSAStartup failed\n";
+            return 1;
+        }
+    }
     if (t2::log::ConsoleEnabled()) {
         std::wcout << L"[verbose logging on - also mirrored to DebugView]\n";
     }
