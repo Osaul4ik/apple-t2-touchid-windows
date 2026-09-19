@@ -1,0 +1,588 @@
+name: CI NCM (CodeQL + PREfast + INF checks + Build + Package)
+
+# ===========================================================================
+# Білд T2NCM з перевірками. Об'єднує:
+#   BuildNCM_Inf.yml  - збірка T2Ncm.sys + T2NcmCtrl.sys, StampInf, InfVerif,
+#                       Inf2Cat, необов'язковий підпис, пакет
+#   Cit2touchid.yml   - CodeQL (windows-drivers) + PREfast, mustrun/mustfix,
+#                       звіти всередині пакета (checks/)
+#
+# Один job, один раннер. CodeQL трасує ОДИН виклик скрипта, який будує обидва
+# драйвери (T2Ncm.vcxproj + T2NcmCtrl.vcxproj) з прапорами PREfast. Якщо
+# mustfix чистий - той самий бінарник (без другого білда) штампується,
+# перевіряється InfVerif, каталогізується Inf2Cat, підписується і пакується
+# разом зі звітами. Без vcpkg/libplist і без T2TouchId.sln - це білд
+# T2NCM.
+# ===========================================================================
+on:
+  push:
+    branches: [ main, Dev_lifecycle, Hello_Prepare ]
+    paths:
+      - 'T2NCM/**'
+      - '.github/workflows/CiNCM.yml'
+  pull_request:
+    branches: [ main, Dev_lifecycle ]
+    paths:
+      - 'T2NCM/**'
+      - '.github/workflows/CiNCM.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ci-ncm-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  DRIVER_DIR: T2NCM/driver
+  DRIVER_PROJECT: T2NCM/driver/T2Ncm.vcxproj
+  DRIVER_NAME: T2Ncm
+  CTRL_PROJECT: T2NCM/driver/T2NcmCtrl.vcxproj
+  CTRL_NAME: T2NcmCtrl
+  CONFIGURATION: Release
+  PLATFORM: x64
+  SIGN_CERT_PFX: ${{ secrets.CERT }}
+  SIGN_CERT_PASSWORD: ${{ secrets.CERT_PWD }}
+
+jobs:
+  ci:
+    name: CodeQL + PREfast + INF checks + Build + Package (T2Ncm, T2NcmCtrl)
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      CODEQL_CLI_VERSION: 2.24.1
+      CODEQL_DRIVERS_PACK_VERSION: 1.8.2
+      CODEQL_CPP_QUERIES_PACK_VERSION: 0.0.4
+      CA_TREAT_WARNINGS_AS_ERRORS: true
+    outputs:
+      version: ${{ steps.setver.outputs.version }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Add MSBuild to PATH
+      uses: microsoft/setup-msbuild@v2
+
+    # =====================================================================
+    # Офіційний WDK-інсталятор (той самий fwlink, що і в інших workflow).
+    # =====================================================================
+    - name: Install WDK
+      run: |
+        $ErrorActionPreference = "Stop"
+        $wdkUrl = "https://go.microsoft.com/fwlink/?linkid=2085767"
+        $wdkInstaller = "$env:TEMP\wdksetup.exe"
+        Invoke-WebRequest -Uri $wdkUrl -OutFile $wdkInstaller
+        $proc = Start-Process -FilePath $wdkInstaller -ArgumentList "/quiet /norestart" -Wait -PassThru
+        $exitCode = $proc.ExitCode
+        if ($exitCode -ne 0 -and $exitCode -ne 3010) {
+          Write-Error "WDK installer exited with code $exitCode"
+          exit 1
+        }
+        Write-Host "OK: WDK installer exited with code $exitCode"
+      shell: pwsh
+
+    # Один прохід шукає всі WDK-інструменти (замість окремих Locate-кроків).
+    # SignTool потрібен лише якщо задані секрети підпису.
+    - name: Locate WDK tools (StampInf, InfVerif, Inf2Cat, SignTool)
+      run: |
+        $ErrorActionPreference = "Stop"
+        $roots = @(
+          "C:\Program Files (x86)\Windows Kits\10\bin",
+          "C:\Program Files (x86)\Windows Kits\10\Tools",
+          "C:\Program Files\Windows Kits\10\bin"
+        )
+        $needSign = ($env:SIGN_CERT_PFX -ne '' -and $env:SIGN_CERT_PASSWORD -ne '')
+        $tools = [ordered]@{
+          STAMPINF_PATH = @{ File = "StampInf.exe"; Required = $true }
+          INFVERIF_PATH = @{ File = "InfVerif.exe"; Required = $true }
+          INF2CAT_PATH  = @{ File = "Inf2Cat.exe";  Required = $true }
+          SIGNTOOL_PATH = @{ File = "signtool.exe"; Required = $needSign }
+        }
+        foreach ($entry in $tools.GetEnumerator()) {
+          $file = $entry.Value.File
+          $candidates = foreach ($root in $roots) {
+            if (Test-Path $root) {
+              Get-ChildItem -Path $root -Filter $file -Recurse -ErrorAction SilentlyContinue
+            }
+          }
+          $tool = $candidates | Where-Object { $_.FullName -match '\\x64\\' } | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $tool) { $tool = $candidates | Sort-Object FullName -Descending | Select-Object -First 1 }
+          if (-not $tool) {
+            if ($entry.Value.Required) {
+              Write-Error "$file was not found on this runner after the WDK install."
+              exit 1
+            }
+            Write-Host "SKIP: $file not found (not required - signing disabled)."
+            continue
+          }
+          Write-Host "OK: $file -> $($tool.FullName)"
+          Add-Content -Path $env:GITHUB_ENV -Value "$($entry.Key)=$($tool.FullName)"
+        }
+      shell: pwsh
+
+    - name: Download CodeQL CLI
+      run: |
+        $ErrorActionPreference = "Stop"
+        $url = "https://github.com/github/codeql-cli-binaries/releases/download/v$env:CODEQL_CLI_VERSION/codeql-win64.zip"
+        Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\codeql.zip"
+        Expand-Archive -Path "$env:TEMP\codeql.zip" -DestinationPath "$env:TEMP\codeql-home" -Force
+        $codeqlExe = Get-ChildItem -Path "$env:TEMP\codeql-home" -Filter "codeql.exe" -Recurse | Select-Object -First 1
+        if (-not $codeqlExe) {
+          Write-Error "codeql.exe not found after extraction."
+          exit 1
+        }
+        Add-Content -Path $env:GITHUB_ENV -Value "CODEQL_DIR=$($codeqlExe.DirectoryName)"
+      shell: pwsh
+
+    - name: Verify CodeQL install
+      run: |
+        & "$env:CODEQL_DIR\codeql.exe" --version
+      shell: pwsh
+
+    - name: Download windows-drivers query pack
+      run: |
+        $ErrorActionPreference = "Stop"
+        & "$env:CODEQL_DIR\codeql.exe" pack download "microsoft/windows-drivers@$env:CODEQL_DRIVERS_PACK_VERSION"
+      shell: pwsh
+
+    - name: Download cpp-queries dependency pack
+      run: |
+        $ErrorActionPreference = "Stop"
+        & "$env:CODEQL_DIR\codeql.exe" pack download "microsoft/cpp-queries@$env:CODEQL_CPP_QUERIES_PACK_VERSION"
+      shell: pwsh
+
+    - name: Compute driver version and date
+      id: setver
+      run: |
+        $ErrorActionPreference = "Stop"
+        $now = Get-Date
+        $driverDate    = $now.ToString("MM/dd/yyyy")
+        $driverVersion = "1.$($now.Year).$($now.ToString('MMdd')).$($now.ToString('HHmm'))"
+        Write-Host "==> Driver date (DriverVer date): $driverDate"
+        Write-Host "==> Driver version (DriverVer ver): $driverVersion"
+        Add-Content -Path $env:GITHUB_ENV -Value "DRIVER_DATE=$driverDate"
+        Add-Content -Path $env:GITHUB_ENV -Value "DRIVER_VERSION=$driverVersion"
+        Add-Content -Path $env:GITHUB_OUTPUT -Value "version=$driverVersion"
+      shell: pwsh
+
+    # =====================================================================
+    # ПЕРЕВІРКА 1 (швидка, до білда): узгодженість джерел.
+    # Ловить помилки, які інакше вилізли б лише при інсталяції на залізі:
+    #   - усі ClCompile з обох .vcxproj існують на диску;
+    #   - TargetName у .vcxproj == ім'я .sys у ServiceBinary відповідного INF;
+    #   - .sys перелічений у [SourceDisksFiles] свого INF;
+    #   - KmdfLibraryVersion в INF == KMDF_VERSION_MAJOR.MINOR у .vcxproj
+    #     (для KMDF >= 1.13 немає co-installer fallback - розбіжність =
+    #     драйвер не завантажиться);
+    #   - CatalogFile кожного INF має очікуване ім'я;
+    #   - HWID NCM-INF (&MI_01) і CtrlStub-INF (&MI_00) не перетинаються.
+    # =====================================================================
+    - name: Check INF <-> project consistency
+      run: |
+        $ErrorActionPreference = "Stop"
+        $problems = New-Object System.Collections.Generic.List[string]
+
+        function Read-InfText([string]$path) {
+          if (-not (Test-Path $path)) { $script:problems.Add("Missing file: $path"); return "" }
+          $lines = Get-Content -Path $path | Where-Object { $_ -notmatch '^\s*;' } | ForEach-Object { $_ -replace '\s;.*$', '' }
+          return ($lines -join "`n")
+        }
+        function Read-Text([string]$path) {
+          if (-not (Test-Path $path)) { $script:problems.Add("Missing file: $path"); return "" }
+          return (Get-Content -Path $path -Raw)
+        }
+
+        $targets = @(
+          @{ Name = $env:DRIVER_NAME; Proj = $env:DRIVER_PROJECT; Inf = "T2NCM/apple-t2-ncm.inf";           Cat = "apple-t2-ncm.cat";           Wdf = $true },
+          @{ Name = $env:CTRL_NAME;   Proj = $env:CTRL_PROJECT;   Inf = "T2NCM/apple-t2-ncm-ctrl-stub.inf"; Cat = "apple-t2-ncm-ctrl-stub.cat"; Wdf = $true }
+        )
+
+        $hwids = @{}
+        foreach ($t in $targets) {
+          $name = $t.Name
+          $sys  = "$name.sys"
+          $proj = Read-Text $t.Proj
+          $inf  = Read-InfText $t.Inf
+          Write-Host "==> Checking $name ($($t.Proj) <-> $($t.Inf))"
+
+          # TargetName
+          $tn = [regex]::Match($proj, '<TargetName>\s*([^<\s]+)\s*</TargetName>').Groups[1].Value
+          if ($tn -ne $name) { $problems.Add("${name}: TargetName in vcxproj is '$tn', expected '$name'") }
+
+          # Всі ClCompile існують
+          $projDir = Split-Path -Parent $t.Proj
+          foreach ($m in [regex]::Matches($proj, '<ClCompile\s+Include="([^"]+)"')) {
+            $src = Join-Path $projDir $m.Groups[1].Value
+            if (-not (Test-Path $src)) { $problems.Add("${name}: source listed in vcxproj not found: $src") }
+          }
+
+          # ServiceBinary
+          $sb = [regex]::Match($inf, '(?im)^\s*ServiceBinary\s*=\s*%12%\\(\S+)').Groups[1].Value
+          if ($sb -ne $sys) { $problems.Add("${name}: ServiceBinary in INF is '$sb', expected '$sys'") }
+
+          # [SourceDisksFiles]
+          $sdf = [regex]::Match($inf, '(?ims)^\s*\[SourceDisksFiles[^\]]*\](.*?)(?=^\s*\[|\z)').Groups[1].Value
+          if ($sdf -notmatch ('(?im)^\s*' + [regex]::Escape($sys) + '\s*=')) {
+            $problems.Add("${name}: $sys is not listed in [SourceDisksFiles] of $($t.Inf)")
+          }
+
+          # KMDF version
+          if ($t.Wdf) {
+            $maj = [regex]::Match($proj, '<KMDF_VERSION_MAJOR>\s*(\d+)\s*</KMDF_VERSION_MAJOR>').Groups[1].Value
+            $min = [regex]::Match($proj, '<KMDF_VERSION_MINOR>\s*(\d+)\s*</KMDF_VERSION_MINOR>').Groups[1].Value
+            $infKmdf = [regex]::Match($inf, '(?im)^\s*KmdfLibraryVersion\s*=\s*([\d.]+)').Groups[1].Value
+            if ("$maj.$min" -ne $infKmdf) {
+              $problems.Add("${name}: KMDF version mismatch - vcxproj $maj.$min vs INF KmdfLibraryVersion '$infKmdf'")
+            }
+          }
+
+          # CatalogFile
+          $cat = [regex]::Match($inf, '(?im)^\s*CatalogFile\s*=\s*(\S+)').Groups[1].Value
+          if ($cat -ne $t.Cat) { $problems.Add("${name}: CatalogFile is '$cat', expected '$($t.Cat)'") }
+
+          # HWID
+          $hwids[$name] = @([regex]::Matches($inf, '(?i)USB\\VID_[0-9A-F]{4}&PID_[0-9A-F]{4}[0-9A-Z&_]*') | ForEach-Object { $_.Value.ToUpper() } | Sort-Object -Unique)
+          if ($hwids[$name].Count -eq 0) { $problems.Add("${name}: no USB\VID_xxxx&PID_xxxx hardware ID found in INF") }
+        }
+
+        # MI_01 (NCM) vs MI_00 (CtrlStub)
+        foreach ($h in $hwids[$env:DRIVER_NAME])  { if ($h -notmatch '&MI_01') { $problems.Add("NCM INF HWID is not an &MI_01 child: $h") } }
+        foreach ($h in $hwids[$env:CTRL_NAME])    { if ($h -notmatch '&MI_00') { $problems.Add("CtrlStub INF HWID is not an &MI_00 child: $h") } }
+        $overlap = @($hwids[$env:DRIVER_NAME] | Where-Object { $hwids[$env:CTRL_NAME] -contains $_ })
+        if ($overlap.Count -gt 0) { $problems.Add("NCM and CtrlStub INFs bind the same HWID(s): $($overlap -join ', ')") }
+
+        # Composite INF: CatalogFile
+        $comp = Read-InfText "T2NCM/apple-t2-composite.inf"
+        $compCat = [regex]::Match($comp, '(?im)^\s*CatalogFile\s*=\s*(\S+)').Groups[1].Value
+        if ($compCat -ne "apple-t2-composite.cat") { $problems.Add("Composite: CatalogFile is '$compCat', expected 'apple-t2-composite.cat'") }
+
+        if ($problems.Count -gt 0) {
+          foreach ($p in $problems) { Write-Host "::error::$p" }
+          Write-Error "$($problems.Count) consistency problem(s) found."
+          exit 1
+        }
+        Write-Host "OK: INF <-> project consistency checks passed."
+      shell: pwsh
+
+    # =====================================================================
+    # ПЕРЕВІРКА 2: CodeQL трасує один скрипт, що будує ОБИДВА драйвери з
+    # PREfast (/analyze) всередині. Обидва бінарники потрапляють в одну
+    # CodeQL-базу, тож mustrun/mustfix покривають T2Ncm.sys і T2NcmCtrl.sys.
+    # WindowsTargetPlatformVersion прив'язаний до того, що поставив WDK.
+    # =====================================================================
+    - name: Write traced build script
+      run: |
+        $ErrorActionPreference = "Stop"
+        $script = Join-Path $env:RUNNER_TEMP "build-ncm.ps1"
+        $lines = @(
+          '$ErrorActionPreference = "Stop"',
+          'foreach ($proj in @($env:DRIVER_PROJECT, $env:CTRL_PROJECT)) {',
+          '  $name = [IO.Path]::GetFileNameWithoutExtension($proj)',
+          '  $log  = Join-Path $env:GITHUB_WORKSPACE ("static-analysis-logs\build-" + $name + ".log")',
+          ('  msbuild $proj /t:rebuild /p:Configuration=$env:CONFIGURATION /p:Platform=$env:PLATFORM ' +
+            '/p:WindowsTargetPlatformVersion=10.0.26100.0 /p:RunCodeAnalysis=true /p:EnableCppCoreCheck=true ' +
+            '/p:CodeAnalysisTreatWarningsAsErrors=$env:CA_TREAT_WARNINGS_AS_ERRORS ' +
+            '/nologo /verbosity:normal /clp:Summary "/flp:logfile=$log;verbosity=normal"'),
+          '  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }',
+          '}'
+        )
+        Set-Content -Path $script -Value $lines -Encoding utf8
+        New-Item -ItemType Directory -Path (Join-Path $env:GITHUB_WORKSPACE "static-analysis-logs") -Force | Out-Null
+        Add-Content -Path $env:GITHUB_ENV -Value "TRACED_BUILD_SCRIPT=$script"
+        Add-Content -Path $env:GITHUB_ENV -Value "BUILD_LOG_DIR=$(Join-Path $env:GITHUB_WORKSPACE 'static-analysis-logs')"
+        Get-Content $script
+      shell: pwsh
+
+    - name: Build CodeQL database (T2Ncm + T2NcmCtrl, PREfast baked in)
+      run: |
+        $ErrorActionPreference = "Stop"
+        $dbPath = Join-Path $env:RUNNER_TEMP "codeql-db"
+        & "$env:CODEQL_DIR\codeql.exe" database create $dbPath `
+          --language=cpp `
+          --source-root=. `
+          --command="pwsh -NoProfile -NonInteractive -File $env:TRACED_BUILD_SCRIPT"
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "codeql database create (traced build) failed (exit $LASTEXITCODE)."
+          exit 1
+        }
+        Add-Content -Path $env:GITHUB_ENV -Value "CODEQL_DB=$dbPath"
+      shell: pwsh
+
+    - name: Upload build logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: ncm-static-analysis-logs
+        retention-days: 14
+        if-no-files-found: warn
+        path: static-analysis-logs/
+
+    - name: Analyze with mustrun.qls (informational)
+      run: |
+        $ErrorActionPreference = "Stop"
+        $outDir = Join-Path $env:GITHUB_WORKSPACE "codeql-results"
+        New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+        & "$env:CODEQL_DIR\codeql.exe" database analyze "$env:CODEQL_DB" `
+          "microsoft/windows-drivers:windows-driver-suites/mustrun.qls" `
+          --format=sarifv2.1.0 `
+          --output="$outDir\codeql-mustrun.sarif"
+        if ($LASTEXITCODE -ne 0) { Write-Error "mustrun analysis failed (exit $LASTEXITCODE)."; exit 1 }
+        Add-Content -Path $env:GITHUB_ENV -Value "SARIF_MUSTRUN=$outDir\codeql-mustrun.sarif"
+      shell: pwsh
+
+    - name: Analyze with mustfix.qls (blocking)
+      run: |
+        $ErrorActionPreference = "Stop"
+        $outDir = Join-Path $env:GITHUB_WORKSPACE "codeql-results"
+        $sarifPath = "$outDir\codeql-mustfix.sarif"
+
+        & "$env:CODEQL_DIR\codeql.exe" database analyze "$env:CODEQL_DB" `
+          "microsoft/windows-drivers:windows-driver-suites/mustfix.qls" `
+          --format=sarifv2.1.0 `
+          --output=$sarifPath
+        if ($LASTEXITCODE -ne 0) { Write-Error "mustfix analysis failed (exit $LASTEXITCODE)."; exit 1 }
+
+        Add-Content -Path $env:GITHUB_ENV -Value "SARIF_MUSTFIX=$sarifPath"
+
+        $sarif = Get-Content -Path $sarifPath -Raw | ConvertFrom-Json
+        $resultCount = 0
+        foreach ($run in $sarif.runs) {
+          if (-not $run.results) { continue }
+          foreach ($r in $run.results) {
+            $resultCount++
+            $loc  = $r.locations | Select-Object -First 1
+            $uri  = $loc.physicalLocation.artifactLocation.uri
+            $line = $loc.physicalLocation.region.startLine
+            Write-Host "::error file=$uri,line=$line::[$($r.ruleId)] $($r.message.text)"
+          }
+        }
+        Write-Host "==> mustfix.qls results: $resultCount"
+
+        if ($resultCount -gt 0) {
+          Write-Host "::error::$resultCount Must-Fix defect(s) found - this driver would FAIL the WHCP Static Tools Logo Test."
+          exit 1
+        }
+        Write-Host "OK: 0 Must-Fix defects."
+      shell: pwsh
+
+    - name: Upload SARIF results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: ncm-codeql-results
+        retention-days: 14
+        if-no-files-found: warn
+        path: codeql-results/
+
+    # =====================================================================
+    # Усе нижче виконується лише якщо mustfix чистий (без if: always()).
+    # Той самий бінарник, що вже лежить на диску після CodeQL-проходу.
+    # =====================================================================
+    - name: Prepare NCM package folder
+      run: |
+        $ErrorActionPreference = "Stop"
+        $pkg = "artifacts\ncm"
+        New-Item -ItemType Directory -Path $pkg -Force | Out-Null
+
+        foreach ($name in @($env:DRIVER_NAME, $env:CTRL_NAME)) {
+          $outDir = "$env:DRIVER_DIR\build\$name\$env:PLATFORM\$env:CONFIGURATION"
+          $sys = "$outDir\$name.sys"
+          if (-not (Test-Path $sys)) { Write-Error "Built .sys not found: $sys"; exit 1 }
+          if ((Get-Item $sys).Length -eq 0) { Write-Error "Built .sys is empty: $sys"; exit 1 }
+          Copy-Item -Path $sys -Destination $pkg -Force
+          $pdb = "$outDir\$name.pdb"
+          if (Test-Path $pdb) { Copy-Item -Path $pdb -Destination $pkg -Force }
+        }
+
+        foreach ($inf in @("apple-t2-ncm.inf", "apple-t2-ncm-ctrl-stub.inf", "apple-t2-composite.inf")) {
+          $src = Join-Path "T2NCM" $inf
+          if (-not (Test-Path $src)) { Write-Error "INF not found: $src"; exit 1 }
+          Copy-Item -Path $src -Destination (Join-Path $pkg $inf) -Force
+        }
+
+        Write-Host "OK: staged package files:"
+        Get-ChildItem $pkg | ForEach-Object { Write-Host "  - $($_.Name)" }
+
+        $checks = "ncm-checks"
+        New-Item -ItemType Directory -Path $checks -Force | Out-Null
+
+        Add-Content -Path $env:GITHUB_ENV -Value "NCM_PACKAGE_DIR=$pkg"
+        Add-Content -Path $env:GITHUB_ENV -Value "NCM_CHECKS_DIR=$checks"
+      shell: pwsh
+
+    - name: Stamp INFs (date / version)
+      run: |
+        $ErrorActionPreference = "Stop"
+        # KmdfLibraryVersion (1.15) вже захардкоджений у wdfsect самих INF
+        # (і звіряється з .vcxproj на кроці consistency) - -k не потрібен.
+        foreach ($inf in @("apple-t2-ncm.inf", "apple-t2-ncm-ctrl-stub.inf", "apple-t2-composite.inf")) {
+          $infPath = (Resolve-Path (Join-Path $env:NCM_PACKAGE_DIR $inf)).Path
+          & "$env:STAMPINF_PATH" -f "$infPath" -a amd64 -d "$env:DRIVER_DATE" -v "$env:DRIVER_VERSION"
+          if ($LASTEXITCODE -ne 0) { Write-Error "StampInf for $inf failed (exit $LASTEXITCODE)."; exit 1 }
+
+          $expected = "$env:DRIVER_DATE,$env:DRIVER_VERSION"
+          $stamped = (Get-Content -Path $infPath | Select-String -Pattern '^\s*DriverVer\s*=').Line
+          Write-Host "==> ${inf}: $stamped"
+          if ($stamped -notmatch [regex]::Escape($expected)) {
+            Write-Error "$inf DriverVer was not stamped with '$expected'."
+            exit 1
+          }
+        }
+        Write-Host "OK: all INFs stamped."
+      shell: pwsh
+
+    # ПЕРЕВІРКА 3: InfVerif для всіх трьох INF (не зупиняється на першій
+    # помилці - збирає всі, лог кожного йде в checks/).
+    - name: Validate INFs (InfVerif)
+      run: |
+        $ErrorActionPreference = "Stop"
+        $failed = @()
+        foreach ($inf in @("apple-t2-ncm.inf", "apple-t2-ncm-ctrl-stub.inf", "apple-t2-composite.inf")) {
+          $path = Join-Path $env:NCM_PACKAGE_DIR $inf
+          $out  = & "$env:INFVERIF_PATH" /v "$path" 2>&1
+          $code = $LASTEXITCODE
+          $out | ForEach-Object { Write-Host $_ }
+          $out | Set-Content -Path (Join-Path $env:NCM_CHECKS_DIR "infverif-$inf.txt") -Encoding utf8
+          if ($code -ne 0) {
+            Write-Host "::error::InfVerif failed for $inf (exit $code)."
+            $failed += $inf
+          } else {
+            Write-Host "OK: InfVerif passed for $inf"
+          }
+        }
+        if ($failed.Count -gt 0) { Write-Error "InfVerif failed for: $($failed -join ', ')"; exit 1 }
+      shell: pwsh
+
+    # Усі INF в одній теці, кожен має свій CatalogFile - один прохід Inf2Cat
+    # видає три .cat.
+    - name: Generate CATs (Inf2Cat)
+      run: |
+        $ErrorActionPreference = "Stop"
+        $fullPkg = (Resolve-Path $env:NCM_PACKAGE_DIR).Path
+        $out = & "$env:INF2CAT_PATH" /driver:"$fullPkg" /os:10_X64 /verbose 2>&1
+        $code = $LASTEXITCODE
+        $out | ForEach-Object { Write-Host $_ }
+        $out | Set-Content -Path (Join-Path $env:NCM_CHECKS_DIR "inf2cat.txt") -Encoding utf8
+        if ($code -ne 0) { Write-Error "Inf2Cat failed (exit $code)."; exit 1 }
+
+        foreach ($cat in @("apple-t2-ncm.cat", "apple-t2-ncm-ctrl-stub.cat", "apple-t2-composite.cat")) {
+          $p = Join-Path $fullPkg $cat
+          if (-not (Test-Path $p)) { Write-Error "Inf2Cat did not produce $p"; exit 1 }
+          Write-Host "OK: $cat generated"
+        }
+      shell: pwsh
+
+    # Підпис необов'язковий (PoC-драйвер, не WHQL): без CERT/CERT_PWD вихід
+    # unsigned/test-signable.
+    - name: Sign .sys and .cat files with SignTool
+      if: ${{ env.SIGN_CERT_PFX != '' && env.SIGN_CERT_PASSWORD != '' }}
+      run: |
+        $ErrorActionPreference = "Stop"
+        $pfxPath = Join-Path $env:TEMP "ncm-signcert.pfx"
+        $cerPath = Join-Path $env:NCM_PACKAGE_DIR "$env:DRIVER_NAME.cer"
+        try {
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:SIGN_CERT_PFX))
+
+          $toSign = @(
+            "$env:DRIVER_NAME.sys", "$env:CTRL_NAME.sys",
+            "apple-t2-ncm.cat", "apple-t2-ncm-ctrl-stub.cat", "apple-t2-composite.cat"
+          )
+          foreach ($file in $toSign) {
+            $p = Join-Path $env:NCM_PACKAGE_DIR $file
+            & "$env:SIGNTOOL_PATH" sign /v /fd SHA256 /f "$pfxPath" /p "$env:SIGN_CERT_PASSWORD" `
+              /tr http://timestamp.digicert.com /td SHA256 "$p"
+            if ($LASTEXITCODE -ne 0) { Write-Error "Signing $file failed (exit $LASTEXITCODE)."; exit 1 }
+            Write-Host "OK: $file signed."
+          }
+
+          $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(
+            $pfxPath, $env:SIGN_CERT_PASSWORD,
+            [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable
+          )
+          Export-Certificate -Cert $cert -FilePath $cerPath | Out-Null
+          Write-Host "OK: all files signed; .cer exported."
+        }
+        finally {
+          if (Test-Path $pfxPath) { Remove-Item -Path $pfxPath -Force }
+        }
+      shell: pwsh
+
+    # ПЕРЕВІРКА 4: після підпису кожен файл справді має підпис. Статус
+    # довіри не перевіряємо (самопідписаний cert = NotTrusted), лише що
+    # підписувач присутній.
+    - name: Verify signatures are present
+      if: ${{ env.SIGN_CERT_PFX != '' && env.SIGN_CERT_PASSWORD != '' }}
+      run: |
+        $ErrorActionPreference = "Stop"
+        $bad = @()
+        foreach ($file in @("$env:DRIVER_NAME.sys", "$env:CTRL_NAME.sys", "apple-t2-ncm.cat", "apple-t2-ncm-ctrl-stub.cat", "apple-t2-composite.cat")) {
+          $sig = Get-AuthenticodeSignature -FilePath (Join-Path $env:NCM_PACKAGE_DIR $file)
+          if (-not $sig.SignerCertificate) { $bad += $file; Write-Host "::error::No signature on $file" }
+          else { Write-Host "OK: $file signed by $($sig.SignerCertificate.Subject) (status: $($sig.Status))" }
+        }
+        if ($bad.Count -gt 0) { Write-Error "Unsigned files: $($bad -join ', ')"; exit 1 }
+      shell: pwsh
+
+    - name: Warn if NCM package unsigned
+      if: ${{ env.SIGN_CERT_PFX == '' || env.SIGN_CERT_PASSWORD == '' }}
+      run: Write-Host "::warning::CERT/CERT_PWD secrets not set - T2Ncm.sys + T2NcmCtrl.sys + all CATs are UNSIGNED. Target machine needs test-signing mode."
+      shell: pwsh
+
+    # Дані перевірок їдуть ВСЕРЕДИНІ пакета (checks/): SARIF, PREfast-логи,
+    # InfVerif/Inf2Cat-виводи і SUMMARY.txt - хто завантажить драйвер, отримає
+    # і докази перевірки саме цього білда.
+    - name: Bundle checks with the package
+      run: |
+        $ErrorActionPreference = "Stop"
+        $checksDir = Join-Path $env:NCM_PACKAGE_DIR "checks"
+        New-Item -ItemType Directory -Path $checksDir -Force | Out-Null
+
+        Copy-Item -Path $env:SARIF_MUSTRUN -Destination (Join-Path $checksDir "codeql-mustrun.sarif") -Force
+        Copy-Item -Path $env:SARIF_MUSTFIX -Destination (Join-Path $checksDir "codeql-mustfix.sarif") -Force
+        Copy-Item -Path (Join-Path $env:NCM_CHECKS_DIR "*") -Destination $checksDir -Force
+        foreach ($log in Get-ChildItem -Path $env:BUILD_LOG_DIR -Filter "build-*.log" -ErrorAction SilentlyContinue) {
+          Copy-Item -Path $log.FullName -Destination (Join-Path $checksDir ("prefast-" + $log.Name)) -Force
+        }
+
+        function Get-SarifResultCount($path) {
+          $sarif = Get-Content -Path $path -Raw | ConvertFrom-Json
+          $count = 0
+          foreach ($run in $sarif.runs) { if ($run.results) { $count += $run.results.Count } }
+          return $count
+        }
+        $mustrunCount = Get-SarifResultCount $env:SARIF_MUSTRUN
+        $mustfixCount = Get-SarifResultCount $env:SARIF_MUSTFIX
+        $signed = if ($env:SIGN_CERT_PFX -and $env:SIGN_CERT_PASSWORD) { "yes" } else { "no - test-signing mode required on target machine" }
+
+        $summary = @(
+          "Apple T2 NCM static-analysis and packaging summary",
+          "===================================================",
+          "Drivers:         $env:DRIVER_NAME.sys (NDIS 6.30 miniport, MI_01), $env:CTRL_NAME.sys (KMDF claim stub, MI_00)",
+          "Driver version:  $env:DRIVER_VERSION",
+          "Built:           $env:DRIVER_DATE (local runner clock)",
+          "Commit:          $env:GITHUB_SHA",
+          "",
+          "CodeQL query pack: microsoft/windows-drivers@$env:CODEQL_DRIVERS_PACK_VERSION",
+          "PREfast:           enabled (RunCodeAnalysis + EnableCppCoreCheck, warnings-as-errors=$env:CA_TREAT_WARNINGS_AS_ERRORS)",
+          "",
+          "mustrun.qls (informational): $mustrunCount finding(s) - see codeql-mustrun.sarif",
+          "mustfix.qls (WHCP-blocking): $mustfixCount finding(s) - see codeql-mustfix.sarif",
+          "INF/project consistency:     passed",
+          "InfVerif (3 INFs):           passed - see infverif-*.txt",
+          "Inf2Cat (3 CATs):            passed - see inf2cat.txt",
+          "Signed:                      $signed"
+        )
+        $summary | Set-Content -Path (Join-Path $checksDir "SUMMARY.txt") -Encoding utf8
+
+        Write-Host "OK: bundled checks/:"
+        Get-ChildItem -Recurse $checksDir | ForEach-Object { Write-Host "  - $($_.FullName)" }
+      shell: pwsh
+
+    - name: Upload NCM package + checks
+      uses: actions/upload-artifact@v4
+      with:
+        name: AppleT2NCM-Checked-${{ env.DRIVER_VERSION }}
+        path: ${{ env.NCM_PACKAGE_DIR }}
+        if-no-files-found: error
