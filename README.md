@@ -59,7 +59,7 @@ has real hardware results as of 30.08.2026:
 | DMA / OOL registration | **Confirmed on hardware** — 16 KiB endpoint-7 in/out buffers registered |
 | AppleKeyStore exchange | **Confirmed on hardware** — `capabilities` returns `capability[1] = 0x2`; sleep/wake lifecycle in testing |
 | CDC-NCM / IPv6 discovery | **Confirmed on hardware** — inbox UsbNcm via `T2NCM/apple-t2-ncm.inf` (see `docs/apple-t2-ncm-binding.md`) |
-| RemoteXPC discovery **Confirmed on hardware**
+| RemoteXPC discovery | **Confirmed on hardware**
 | BridgeXPC | **Confirmed on hardware**
 | BiometricKit / real MATCH-NO_MATCH | **Confirmed on hardware**
 | WindowsHello | work in progress
