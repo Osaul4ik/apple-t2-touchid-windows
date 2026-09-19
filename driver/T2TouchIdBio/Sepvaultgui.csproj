@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <RootNamespace>T2TouchId.SepVaultGui</RootNamespace>
+    <AssemblyName>SepVaultGui</AssemblyName>
+    <!-- One-time admin tool: writes to %ProgramData%\T2TouchId and sets an
+         ACL restricted to SYSTEM/Administrators (see SepVaultFormat.cs) —
+         needs to run elevated, so ask for it up front rather than fail
+         confusingly partway through Write(). -->
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+  </PropertyGroup>
+
+</Project>
