@@ -279,7 +279,6 @@ bool Connection::SetClientVersion(int64_t version, std::chrono::milliseconds tim
         return false;
     }
 
-    negotiatedVersion_ = version;
     T2_LOG("setClientVersion", L"OK, negotiated=%lld", static_cast<long long>(version));
     return true;
 }

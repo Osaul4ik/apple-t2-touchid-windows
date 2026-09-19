@@ -364,7 +364,6 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     auto deadline = steady_clock::now() + config_.matchWindow;
     VerifyOutcome outcome = VerifyOutcome::Timeout; // default if loop exits via deadline
 
-    bool sawFingerOn = false;
     size_t imagePipelineEvents = 0;
     size_t unnamedStatusEvents = 0;
     size_t fingerTouchCycles = 0;
@@ -390,7 +389,7 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
                 StatusEventBody body = ParseStatusEventBody(eventData);
                 if (body.statusCode) {
                     const uint32_t code = *body.statusCode;
-                    if (code == 63) { sawFingerOn = true; fingerTouchCycles++; }
+                    if (code == 63) fingerTouchCycles++;
                     if (StatusCodeIsImagePipeline(code)) imagePipelineEvents++;
                     if (!StatusCodeName(code)) unnamedStatusEvents++;
                 }
@@ -451,9 +450,9 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
 
     // REMOVED (17.09.2026): no longer relabels Timeout as NoImageCaptured.
     // VERIFIED FROM SOURCE (t2-fprintd.py verdict_from_result): the
-    // reference's own verdict is match_result-only; sawFingerOn/
-    // imagePipelineEvents never gate its outcome. They stay below purely
-    // as session-summary diagnostics.
+    // reference's own verdict is match_result-only; the finger/image
+    // counters never gate its outcome. They stay below purely as
+    // session-summary diagnostics.
     T2_LOG("verify",
            L"session summary: finger_touch_cycles=%zu image_pipeline_events=%zu unnamed_status_events=%zu "
            L"layout=%s flags=%u reset=%s cal=%s outcome=%d",

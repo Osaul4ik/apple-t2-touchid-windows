@@ -16,14 +16,6 @@ struct PortCandidate {
     // Diagnostic: raw first bytes after connect (max 21, Linux recv size).
     unsigned char recvHead[21]{};
     int recvLen = 0;
-    // True if the peer was silent on the passive (Linux-reference) attempt
-    // and we sent our own HTTP/2 client preface + empty SETTINGS to probe
-    // whether it's a standard RFC 7540 server waiting for the client to go
-    // first. If http2PrefaceOk is true AND this is true, the port only
-    // answered *after* we spoke — that contradicts the "peer speaks first"
-    // assumption the passive scan is built on and must not be reported as
-    // an ordinary Phase-1 hit.
-    bool activePrefaceTried = false;
 };
 
 struct ScanOptions {
@@ -38,11 +30,6 @@ struct ScanOptions {
     // ports.
     unsigned connectTimeoutMs = 20;
     bool includeTcpOnly = true;
-    // If a TCP-open peer stays fully silent (0 bytes) on the passive
-    // recv-only attempt, retry once by sending our own HTTP/2 client
-    // preface + empty SETTINGS frame before giving up on that port.
-    // Diagnostic only — see PortCandidate::activePrefaceTried.
-    bool activePrefaceFallback = true;
     // tried, total, tcpHits, http2Hits
     std::function<void(unsigned, unsigned, unsigned, unsigned)> onProgress;
 

@@ -8,9 +8,6 @@
 #include <windows.h>
 #include <cstring>
 #include <bcrypt.h>
-#include <atomic>
-#include <thread>
-#include <mutex>
 #include <vector>
 
 #pragma comment(lib, "Ws2_32.lib")
@@ -26,7 +23,6 @@ constexpr uint32_t kXpcObjectVersion = 0x00000005u;
 // XPCFlag values (format.rs XPCFlag -> u32).
 constexpr uint32_t kFlagAlwaysSet = 0x00000001u;
 constexpr uint32_t kFlagDataFlag = 0x00000100u;
-constexpr uint32_t kFlagWantingReply = 0x00010000u;
 constexpr uint32_t kFlagInitHandshake = 0x00400000u;
 constexpr uint32_t kFlagCustomHandshakeTail = 0x00000201u; // Custom(0x201) sent after do_handshake's reply frame
 
@@ -667,7 +663,7 @@ RemoteXpcResult RemoteXpcConnection::FetchPeerRecord(std::chrono::milliseconds t
     }
 }
 
-// --------------------------------------------------------- DiscoverServicePort
+// ------------------------------------------------------------ ProbeServiceOnPort
 
 bool ProbeServiceOnPort(const NcmEndpoint& endpoint, uint16_t port,
                          const std::string& serviceName,
@@ -705,95 +701,5 @@ bool ProbeServiceOnPort(const NcmEndpoint& endpoint, uint16_t port,
     if (outServicePort) *outServicePort = static_cast<uint16_t>(portValue);
     return true;
 }
-
-DiscoveredService DiscoverServicePort(const NcmEndpoint& endpoint,
-                                       const std::vector<uint16_t>& candidatePorts,
-                                       const std::string& serviceName,
-                                       std::chrono::milliseconds perPortTimeout) {
-    DiscoveredService result;
-    if (candidatePorts.empty()) return result;
-
-    // OPTIMIZATION: this used to be a plain sequential for-loop, up to
-    // perPortTimeout (2000ms) TWICE per candidate (Connect + FetchPeerRecord)
-    // before moving on — worst case ~candidatePorts.size() * 4s. Now a
-    // worker pool, same pattern as PortScan.cpp's ScanHttp2Preface.
-    //
-    // Dispatch is still ascending from index 0 (REVERTED comment above
-    // explains why — no heuristic here, matches the Linux reference), and
-    // with candidatePorts.size() normally well under the 64-worker cap,
-    // every candidate typically starts probing in the same instant rather
-    // than one after another.
-    //
-    // Ascending order is preserved as the tie-break, not just the dispatch
-    // order: bestIndex below only ever moves to a *lower* index, so if two
-    // workers both find a match, the one that was earlier in
-    // candidatePorts wins — identical semantics to the old sequential
-    // "first match in scan order" behavior, just computed concurrently.
-    //
-    // No hard cancellation of in-flight probes: RemoteXpcConnection's
-    // Connect/FetchPeerRecord are blocking calls captured by reference in
-    // the worker lambda, so detaching a thread mid-call to "stop
-    // immediately" would leave dangling references into this function's
-    // locals the moment it returns — not safe. What "found -> stop
-    // immediately" means here is workers stop pulling *new* candidates
-    // the moment a match exists; already-dispatched probes still run to
-    // completion (bounded by perPortTimeout) and can still improve the
-    // answer if they turn out to have a lower index. In practice, with
-    // candidate counts this small, effectively all of them are already
-    // in flight before any answer comes back anyway.
-    const size_t total = candidatePorts.size();
-    std::atomic<size_t> next{0};
-    std::atomic<bool> found{false};
-    std::atomic<size_t> bestIndex{static_cast<size_t>(-1)};
-    std::mutex resultMu;
-
-    unsigned workers = static_cast<unsigned>(total);
-    if (workers > 64) workers = 64;
-    if (workers == 0) workers = 1;
-
-    auto probeOne = [&](size_t idx) {
-        uint16_t port = candidatePorts[idx];
-        uint16_t servicePort = 0;
-        if (!ProbeServiceOnPort(endpoint, port, serviceName, perPortTimeout, &servicePort)) {
-            return; // decoy, unreachable, or malformed — try the next one
-        }
-
-        size_t expected = bestIndex.load(std::memory_order_relaxed);
-        while (idx < expected) {
-            if (bestIndex.compare_exchange_weak(expected, idx,
-                    std::memory_order_relaxed, std::memory_order_relaxed)) {
-                std::lock_guard<std::mutex> lock(resultMu);
-                result.found = true;
-                result.port = servicePort;
-                found.store(true, std::memory_order_relaxed);
-                break;
-            }
-            // expected was refreshed by the failed CAS; loop re-checks
-            // idx < expected in case another, even-earlier index just won.
-        }
-    };
-
-    auto worker = [&]() {
-        for (;;) {
-            size_t i = next.fetch_add(1, std::memory_order_relaxed);
-            if (i >= total) break;
-            if (found.load(std::memory_order_relaxed) &&
-                i > bestIndex.load(std::memory_order_relaxed)) {
-                // A strictly-earlier match already won; this candidate
-                // could never change the answer even if it also matches.
-                continue;
-            }
-            probeOne(i);
-        }
-    };
-
-    std::vector<std::thread> threads;
-    threads.reserve(workers);
-    for (unsigned w = 0; w < workers; ++w) threads.emplace_back(worker);
-    for (auto& th : threads) th.join();
-
-    return result;
-}
-
 
 } // namespace t2::discovery

@@ -36,20 +36,11 @@ struct NcmEndpoint {
     bool hasMac = false;
     std::wstring friendlyName;
     std::wstring description;
-    std::wstring adapterName;
 };
 
 std::vector<NcmEndpoint> FindT2NcmEndpoints();
 bool GetEndpointByIfIndex(unsigned long ifIndex, NcmEndpoint* out);
 bool ParseIpv6(const char* text, in6_addr* out);
-
-// Retained as a utility (e.g. for --host suggestions or diagnostics),
-// but no longer used to automatically populate NcmEndpoint::peerLinkLocal.
-// EUI-64-from-MAC is only ever the *host's own* address in the standard
-// scheme — deriving a peer from it was never anything but a guess, and
-// on generated/locally-administered station addresses (see T2Ncm.sys's
-// MacAddressIsPermanent) it is a guess about an address nobody has.
-in6_addr LinkLocalFromMac(const unsigned char mac[6]);
 
 // Looks up the real T2 peer via the Windows IPv6 neighbor table
 // (GetIpNetTable2) for the given interface. Only a neighbor whose state

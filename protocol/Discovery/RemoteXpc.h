@@ -61,7 +61,6 @@ struct XpcObject {
         XpcObject o; o.kind = Kind::String; o.stringValue = std::move(s); return o;
     }
     static XpcObject MakeUInt64(uint64_t v) { XpcObject o; o.kind = Kind::UInt64; o.uintValue = v; return o; }
-    static XpcObject MakeInt64(int64_t v) { XpcObject o; o.kind = Kind::Int64; o.intValue = v; return o; }
     static XpcObject MakeBool(bool v) { XpcObject o; o.kind = Kind::Bool; o.boolValue = v; return o; }
     // 16 random bytes with the RFC 4122 v4 version/variant bits set —
     // matches uuid::Uuid::new_v4() used by send_device_handshake().
@@ -86,7 +85,6 @@ enum class RemoteXpcResult {
     ConnectFailed,
     PrefaceFailed,
     HandshakeIoFailed,
-    HandshakeTimeout,
     PeerRecordTimeout,
     PeerRecordMalformed,
     PeerGoAway,
@@ -145,39 +143,15 @@ private:
                         RemoteXpcResult* result);
 };
 
-struct DiscoveredService {
-    bool found = false;
-    uint16_t port = 0;
-};
-
-// Single-candidate check, factored out of DiscoverServicePort's worker-pool
-// probe so it can also be called the instant PortScan.cpp reports an
-// HTTP/2 hit, instead of only after a whole batch of candidates has been
-// collected. Opens its own one-shot RemoteXpcConnection to `port`, runs
+// Single-candidate check, called the instant PortScan.cpp reports an
+// HTTP/2 hit (and on a cached RemoteXPC port). Opens its own one-shot RemoteXpcConnection to `port`, runs
 // the RemoteXPC handshake, fetches the peer record, and looks for
 // Services[serviceName]["Port"]. Returns false for anything that isn't a
 // clean match — connect/handshake failure, wrong/missing service, or an
-// implausible port value — without distinguishing why (matches
-// DiscoverServicePort's "decoy, not a failure" treatment of the same
-// cases). On success, *outServicePort receives the advertised port.
+// implausible port value — without distinguishing why (a decoy is not a
+// failure). On success, *outServicePort receives the advertised port.
 bool ProbeServiceOnPort(const NcmEndpoint& endpoint, uint16_t port,
                          const std::string& serviceName,
                          std::chrono::milliseconds timeout,
                          uint16_t* outServicePort);
-
-// Tries each candidate port ascending from index 0 (a worker pool, not a
-// plain loop, but ascending order is still the tie-break — see the
-// REVERTED note in RemoteXpc.cpp: an earlier revision walked backward from
-// the end of candidatePorts, but that diverged from
-// discover-biometric-port.py's ascending `for candidate_port in
-// candidate_ports` walk for no verified benefit and was reverted): connect,
-// handshake, read the peer record, look for Services[serviceName]["Port"].
-// A port that answers RemoteXPC but does not advertise serviceName is a
-// decoy — the loop moves on to the next candidate rather than reporting it
-// as a match.
-DiscoveredService DiscoverServicePort(const NcmEndpoint& endpoint,
-                                       const std::vector<uint16_t>& candidatePorts,
-                                       const std::string& serviceName,
-                                       std::chrono::milliseconds perPortTimeout);
-
 } // namespace t2::discovery

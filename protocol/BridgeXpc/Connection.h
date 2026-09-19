@@ -16,7 +16,6 @@ enum class ConnectResult {
     ConnectFailed,
     HeloTimeout,
     HeloMalformed,
-    VersionNegotiationFailed,
 };
 
 // One connection per verification attempt (Milestone 1 finding: the Linux
@@ -89,7 +88,6 @@ public:
 
 private:
     SOCKET socket_ = INVALID_SOCKET;
-    int64_t negotiatedVersion_ = 0;
 
     bool ReadFrame(RawFrame* out, std::chrono::milliseconds timeout);
     bool WriteFrame(FrameType type, const std::vector<uint8_t>& body);

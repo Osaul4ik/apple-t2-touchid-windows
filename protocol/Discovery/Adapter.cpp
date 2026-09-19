@@ -57,15 +57,6 @@ bool LooksLikeT2Ncm(const std::wstring& description, const std::wstring& friendl
     return false;
 }
 
-std::wstring NarrowToWide(const char* s) {
-    if (!s) return {};
-    int n = MultiByteToWideChar(CP_ACP, 0, s, -1, nullptr, 0);
-    if (n <= 0) return {};
-    std::wstring out(static_cast<size_t>(n - 1), L'\0');
-    MultiByteToWideChar(CP_ACP, 0, s, -1, out.data(), n);
-    return out;
-}
-
 bool IsLinkLocal(const in6_addr& a) {
     return a.u.Byte[0] == 0xFE && (a.u.Byte[1] & 0xC0) == 0x80;
 }
@@ -101,7 +92,6 @@ bool FillFromAdapter(IP_ADAPTER_ADDRESSES* a, NcmEndpoint* out) {
     out->ifIndex = a->Ipv6IfIndex ? a->Ipv6IfIndex : a->IfIndex;
     out->friendlyName = a->FriendlyName ? a->FriendlyName : L"";
     out->description = a->Description ? a->Description : L"";
-    out->adapterName = a->AdapterName ? NarrowToWide(a->AdapterName) : L"";
 
     if (a->PhysicalAddressLength >= 6) {
         std::memcpy(out->mac, a->PhysicalAddress, 6);
@@ -209,21 +199,6 @@ bool FindNeighborPeer(unsigned long ifIndex, in6_addr* out) {
         *out = best;
     }
     return found;
-}
-
-in6_addr LinkLocalFromMac(const unsigned char mac[6]) {
-    in6_addr a{};
-    a.u.Byte[0] = 0xFE;
-    a.u.Byte[1] = 0x80;
-    a.u.Byte[8] = static_cast<unsigned char>(mac[0] ^ 0x02);
-    a.u.Byte[9] = mac[1];
-    a.u.Byte[10] = mac[2];
-    a.u.Byte[11] = 0xFF;
-    a.u.Byte[12] = 0xFE;
-    a.u.Byte[13] = mac[3];
-    a.u.Byte[14] = mac[4];
-    a.u.Byte[15] = mac[5];
-    return a;
 }
 
 bool ParseIpv6(const char* text, in6_addr* out) {
