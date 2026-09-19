@@ -150,6 +150,21 @@ struct DiscoveredService {
     uint16_t port = 0;
 };
 
+// Single-candidate check, factored out of DiscoverServicePort's worker-pool
+// probe so it can also be called the instant PortScan.cpp reports an
+// HTTP/2 hit, instead of only after a whole batch of candidates has been
+// collected. Opens its own one-shot RemoteXpcConnection to `port`, runs
+// the RemoteXPC handshake, fetches the peer record, and looks for
+// Services[serviceName]["Port"]. Returns false for anything that isn't a
+// clean match — connect/handshake failure, wrong/missing service, or an
+// implausible port value — without distinguishing why (matches
+// DiscoverServicePort's "decoy, not a failure" treatment of the same
+// cases). On success, *outServicePort receives the advertised port.
+bool ProbeServiceOnPort(const NcmEndpoint& endpoint, uint16_t port,
+                         const std::string& serviceName,
+                         std::chrono::milliseconds timeout,
+                         uint16_t* outServicePort);
+
 // Tries each candidate port from the END of candidatePorts backward (see
 // the 16.09.2026 real-hardware finding in RemoteXpc.cpp for why - this
 // deliberately diverges from discover-biometric-port.py's ascending

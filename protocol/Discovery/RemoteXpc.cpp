@@ -669,6 +669,43 @@ RemoteXpcResult RemoteXpcConnection::FetchPeerRecord(std::chrono::milliseconds t
 
 // --------------------------------------------------------- DiscoverServicePort
 
+bool ProbeServiceOnPort(const NcmEndpoint& endpoint, uint16_t port,
+                         const std::string& serviceName,
+                         std::chrono::milliseconds timeout,
+                         uint16_t* outServicePort) {
+    RemoteXpcConnection conn;
+    if (conn.Connect(endpoint, port, timeout) != RemoteXpcResult::Ok) {
+        return false; // couldn't even open this candidate
+    }
+    XpcObject peerRecord;
+    if (conn.FetchPeerRecord(timeout, &peerRecord) != RemoteXpcResult::Ok) {
+        // Several other T2 services share this HTTP/2 transport but
+        // reject or never complete an RSD handshake — expected decoy, not
+        // a discovery failure (matches discover-biometric-port.py's
+        // blanket `except Exception: continue`).
+        return false;
+    }
+    const XpcObject* services = peerRecord.FindField("Services");
+    if (!services || services->kind != XpcObject::Kind::Dictionary) return false;
+    const XpcObject* service = services->FindField(serviceName);
+    if (!service || service->kind != XpcObject::Kind::Dictionary) return false;
+    const XpcObject* portField = service->FindField("Port");
+    if (!portField) return false;
+    uint64_t portValue = 0;
+    if (portField->kind == XpcObject::Kind::UInt64) {
+        portValue = portField->uintValue;
+    } else if (portField->kind == XpcObject::Kind::Int64) {
+        portValue = static_cast<uint64_t>(portField->intValue);
+    } else if (portField->kind == XpcObject::Kind::String) {
+        try { portValue = std::stoull(portField->stringValue); } catch (...) { return false; }
+    } else {
+        return false;
+    }
+    if (portValue == 0 || portValue > 65535) return false; // not a plausible dynamic port
+    if (outServicePort) *outServicePort = static_cast<uint16_t>(portValue);
+    return true;
+}
+
 DiscoveredService DiscoverServicePort(const NcmEndpoint& endpoint,
                                        const std::vector<uint16_t>& candidatePorts,
                                        const std::string& serviceName,
@@ -716,33 +753,10 @@ DiscoveredService DiscoverServicePort(const NcmEndpoint& endpoint,
 
     auto probeOne = [&](size_t idx) {
         uint16_t port = candidatePorts[idx];
-        RemoteXpcConnection conn;
-        if (conn.Connect(endpoint, port, perPortTimeout) != RemoteXpcResult::Ok) {
-            return; // couldn't even open this candidate — try the next one
+        uint16_t servicePort = 0;
+        if (!ProbeServiceOnPort(endpoint, port, serviceName, perPortTimeout, &servicePort)) {
+            return; // decoy, unreachable, or malformed — try the next one
         }
-        XpcObject peerRecord;
-        if (conn.FetchPeerRecord(perPortTimeout, &peerRecord) != RemoteXpcResult::Ok) {
-            // Several other T2 services share this HTTP/2 transport but
-            // reject or never complete an RSD handshake — expected decoys,
-            // not a discovery failure (matches discover-biometric-port.py's
-            // blanket `except Exception: continue`).
-            return;
-        }
-        const XpcObject* services = peerRecord.FindField("Services");
-        if (!services || services->kind != XpcObject::Kind::Dictionary) return;
-        const XpcObject* service = services->FindField(serviceName);
-        if (!service || service->kind != XpcObject::Kind::Dictionary) return;
-        const XpcObject* portField = service->FindField("Port");
-        if (!portField) return;
-        uint64_t portValue = 0;
-        if (portField->kind == XpcObject::Kind::UInt64) portValue = portField->uintValue;
-        else if (portField->kind == XpcObject::Kind::Int64) portValue = static_cast<uint64_t>(portField->intValue);
-        else if (portField->kind == XpcObject::Kind::String) {
-            try { portValue = std::stoull(portField->stringValue); } catch (...) { return; }
-        } else {
-            return;
-        }
-        if (portValue == 0 || portValue > 65535) return; // not a plausible dynamic port
 
         size_t expected = bestIndex.load(std::memory_order_relaxed);
         while (idx < expected) {
@@ -750,7 +764,7 @@ DiscoveredService DiscoverServicePort(const NcmEndpoint& endpoint,
                     std::memory_order_relaxed, std::memory_order_relaxed)) {
                 std::lock_guard<std::mutex> lock(resultMu);
                 result.found = true;
-                result.port = static_cast<uint16_t>(portValue);
+                result.port = servicePort;
                 found.store(true, std::memory_order_relaxed);
                 break;
             }

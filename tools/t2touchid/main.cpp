@@ -17,6 +17,7 @@
 #include "../../protocol/BiometricKit/Commands.h"
 #include "../../protocol/BiometricKit/VerificationEngine.h"
 #include "../../protocol/Discovery/Adapter.h"
+#include "../../protocol/Discovery/PortCache.h"
 #include "../../protocol/Discovery/PortScan.h"
 #include "../../protocol/Discovery/RemoteXpc.h"
 #include "../../protocol/BridgeXpc/Log.h"
@@ -30,6 +31,9 @@
 #include <optional>
 #include <array>
 #include <cstring>
+#include <atomic>
+#include <thread>
+#include <mutex>
 
 using namespace t2::applekeystore;
 
@@ -628,47 +632,133 @@ static bool DiscoverBiometricKitBridge(int argc, wchar_t* argv[], int firstArgIn
     // this retry exists for is real jitter, not just "timeout was too
     // low" — a second try at a still-modest timeout is worth keeping as
     // a safety net.
-    ScanOptions opt;
-    opt.concurrency = 256;
-    opt.includeTcpOnly = true;
-    std::vector<uint16_t> candidatePorts;
-    const unsigned timeoutsMs[] = {20, 60};
-    for (unsigned attempt = 0; attempt < 2; ++attempt) {
-        opt.connectTimeoutMs = timeoutsMs[attempt];
-        auto hits = ScanHttp2Preface(ep, opt);
-        candidatePorts.clear();
-        for (const auto& h : hits) {
-            if (h.http2PrefaceOk) candidatePorts.push_back(h.port);
+    //
+    // FURTHER OPTIMIZATION: each attempt used to be two full phases —
+    // ScanHttp2Preface walked the *entire* port range and returned before
+    // DiscoverServicePort probed any of the resulting candidates over
+    // RemoteXPC. That means the wall time for an attempt was (whole scan)
+    // + (whole verify pass), even when the real BiometricKit port turned
+    // up in the first few hundred ports probed. Now every HTTP/2 hit is
+    // handed to a RemoteXPC checker thread the moment PortScan.cpp finds
+    // it (via ScanOptions::onHit), running *alongside* the still-in-flight
+    // scan of the remaining ports, and `stop` below — polled by
+    // PortScan.cpp's workers via ScanOptions::cancel — is set the instant
+    // any checker confirms com.apple.eos.BiometricKit. The scan no longer
+    // has to reach the end of the range (or even the end of an attempt's
+    // timeout) once a real hit has already been verified.
+    const char* kServiceName = "com.apple.eos.BiometricKit";
+    const std::chrono::milliseconds kCheckTimeout(2000);
+
+    // OPTIMIZATION: the BridgeXPC port is ephemeral (the T2 appears to
+    // pick a fresh one every boot — that's *why* the scan-then-verify
+    // pipeline below exists at all), but it does not move around within a
+    // single boot/session — repeated `identities`/`verify`/`warmup` calls
+    // against the same booted T2 keep hitting the same port. Try the
+    // cached port for this adapter first: one RemoteXPC probe, not a
+    // 16384-port scan. Still goes through the exact same
+    // ProbeServiceOnPort verification a scan hit would — a stale or wrong
+    // cache entry (T2 rebooted, different adapter, corrupted file) simply
+    // fails to verify and falls through to the real scan below, it can
+    // never produce a false "found".
+    uint16_t cachedPort = 0;
+    if (LoadCachedPort(ep, &cachedPort)) {
+        uint16_t verifiedPort = 0;
+        if (ProbeServiceOnPort(ep, cachedPort, kServiceName, kCheckTimeout, &verifiedPort)) {
+            ConnectResult cr = outConn->Connect(ep.peerLinkLocal, ep.ifIndex, verifiedPort,
+                                                 std::chrono::milliseconds(2000));
+            if (cr == ConnectResult::Ok) {
+                std::wcout << L"BiometricKit BridgeXPC port: " << verifiedPort
+                           << L"  (cached — skipped port scan)\n";
+                return true;
+            }
+            std::wcout << L"cached port " << cachedPort
+                       << L" verified over RemoteXPC but BridgeXPC HELO failed - "
+                          L"falling back to full scan.\n";
+        } else {
+            std::wcout << L"cached port " << cachedPort
+                       << L" is stale (T2 likely rebooted) - falling back to full scan.\n";
         }
-        if (!candidatePorts.empty()) {
+    }
+
+    uint16_t foundPort = 0;
+    const unsigned timeoutsMs[] = {20, 60};
+    for (unsigned attempt = 0; attempt < 2 && foundPort == 0; ++attempt) {
+        std::atomic<bool> stop{false};
+        std::atomic<bool> serviceFound{false};
+        std::mutex checkersMu;
+        std::vector<std::thread> checkers;
+
+        ScanOptions opt;
+        opt.concurrency = 256;
+        opt.includeTcpOnly = true;
+        opt.connectTimeoutMs = timeoutsMs[attempt];
+        opt.cancel = &stop;
+        opt.onHit = [&](const PortCandidate& c) {
+            if (!c.http2PrefaceOk) return;      // TCP-only hits aren't real candidates
+            if (serviceFound.load(std::memory_order_relaxed)) return; // already answered
+            uint16_t port = c.port;
+            std::lock_guard<std::mutex> lock(checkersMu);
+            checkers.emplace_back([&, port]() {
+                if (serviceFound.load(std::memory_order_relaxed)) return;
+                uint16_t servicePort = 0;
+                if (!ProbeServiceOnPort(ep, port, kServiceName, kCheckTimeout, &servicePort)) {
+                    return; // decoy or unreachable — not a discovery failure
+                }
+                bool expected = false;
+                if (serviceFound.compare_exchange_strong(expected, true)) {
+                    foundPort = servicePort;
+                    stop.store(true, std::memory_order_relaxed); // abort rest of the scan
+                }
+            });
+        };
+
+        auto hits = ScanHttp2Preface(ep, opt);
+        {
+            // Safe without extra synchronization on `checkers` itself:
+            // ScanHttp2Preface has already joined every scan worker by
+            // this point, so onHit can no longer fire and nothing else
+            // pushes into `checkers` concurrently with this loop.
+            std::lock_guard<std::mutex> lock(checkersMu);
+            for (auto& th : checkers) th.join();
+        }
+
+        if (foundPort != 0) {
             if (attempt > 0) {
-                std::wcout << L"HTTP/2 candidates found on retry " << (attempt + 1)
+                std::wcout << L"BiometricKit found on retry " << (attempt + 1)
                            << L" (timeout " << opt.connectTimeoutMs << L"ms)\n";
             }
             break;
         }
-        std::wcout << L"no HTTP/2 candidates (attempt " << (attempt + 1)
-                   << L", timeout " << opt.connectTimeoutMs << L"ms) — retrying...\n";
+        unsigned http2Count = 0;
+        for (const auto& h : hits) {
+            if (h.http2PrefaceOk) ++http2Count;
+        }
+        if (http2Count == 0) {
+            std::wcout << L"no HTTP/2 candidates (attempt " << (attempt + 1)
+                       << L", timeout " << opt.connectTimeoutMs << L"ms) — retrying...\n";
+        } else {
+            std::wcout << L"BiometricKit service not advertised by any of " << http2Count
+                       << L" HTTP/2 candidate(s) (attempt " << (attempt + 1)
+                       << L") — retrying...\n";
+        }
     }
-    if (candidatePorts.empty()) {
+    if (foundPort == 0) {
         std::wcout << L"no HTTP/2 candidates on peer after retries - run 'network' for full diagnostics.\n";
         return false;
     }
+    std::wcout << L"BiometricKit BridgeXPC port: " << foundPort << L"\n";
 
-    auto discovered = DiscoverServicePort(ep, candidatePorts, "com.apple.eos.BiometricKit",
-                                           std::chrono::milliseconds(2000));
-    if (!discovered.found) {
-        std::wcout << L"BiometricKit service not advertised by any candidate.\n";
-        return false;
-    }
-    std::wcout << L"BiometricKit BridgeXPC port: " << discovered.port << L"\n";
-
-    ConnectResult cr = outConn->Connect(ep.peerLinkLocal, ep.ifIndex, discovered.port,
+    ConnectResult cr = outConn->Connect(ep.peerLinkLocal, ep.ifIndex, foundPort,
                                          std::chrono::milliseconds(2000));
     if (cr != ConnectResult::Ok) {
-        std::wcout << L"BridgeXPC connect/HELO failed on port " << discovered.port << L"\n";
+        std::wcout << L"BridgeXPC connect/HELO failed on port " << foundPort << L"\n";
         return false;
     }
+    // Only cache after a live BridgeXPC connect actually succeeds — never
+    // cache a port on RemoteXPC verification alone, since that's exactly
+    // the "verified but BridgeXPC HELO failed" case the cache-hit path
+    // above already knows how to recover from.
+    SaveCachedPort(ep, foundPort);
     return true;
 }
 

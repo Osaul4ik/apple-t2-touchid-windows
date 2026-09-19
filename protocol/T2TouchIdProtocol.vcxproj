@@ -64,6 +64,7 @@
     <ClCompile Include="BridgeXpc\Frame.cpp" />
     <ClCompile Include="BridgeXpc\PlistPayload.cpp" />
     <ClCompile Include="Discovery\Adapter.cpp" />
+    <ClCompile Include="Discovery\PortCache.cpp" />
     <ClCompile Include="Discovery\PortScan.cpp" />
     <ClCompile Include="Discovery\RemoteXpc.cpp" />
   </ItemGroup>
@@ -77,6 +78,7 @@
     <ClInclude Include="BridgeXpc\Log.h" />
     <ClInclude Include="BridgeXpc\PlistPayload.h" />
     <ClInclude Include="Discovery\Adapter.h" />
+    <ClInclude Include="Discovery\PortCache.h" />
     <ClInclude Include="Discovery\PortScan.h" />
     <ClInclude Include="Discovery\RemoteXpc.h" />
   </ItemGroup>

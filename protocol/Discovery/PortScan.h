@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <vector>
 #include <functional>
+#include <atomic>
 
 namespace t2::discovery {
 
@@ -44,6 +45,26 @@ struct ScanOptions {
     bool activePrefaceFallback = true;
     // tried, total, tcpHits, http2Hits
     std::function<void(unsigned, unsigned, unsigned, unsigned)> onProgress;
+
+    // Fires synchronously, on whichever worker thread found it, the moment
+    // a candidate is accepted (same filter as what ends up in the returned
+    // vector: tcpOpen && (http2PrefaceOk || includeTcpOnly)) — i.e. before
+    // the rest of the port range has been scanned. Lets a caller start
+    // verifying a hit (e.g. a RemoteXPC probe) *while the scan is still
+    // running* instead of waiting for the full vector to come back. Keep
+    // this callback cheap/non-blocking: do real verification work on a
+    // separate thread it spawns, not inline here, or it will stall the
+    // worker that called it.
+    std::function<void(const PortCandidate&)> onHit;
+
+    // External stop signal, checked by every worker before it claims the
+    // next port. Set this (e.g. from onHit, once verification confirms a
+    // hit) to make the scan abandon the rest of the range immediately
+    // instead of exhaustively probing every port up to portEnd. Probes
+    // already in flight when this is set still run to completion (bounded
+    // by connectTimeoutMs / the recv window) — this only stops new ones
+    // from starting.
+    std::atomic<bool>* cancel = nullptr;
 };
 
 std::vector<PortCandidate> ScanHttp2Preface(const NcmEndpoint& endpoint,

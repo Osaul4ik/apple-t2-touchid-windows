@@ -178,6 +178,15 @@ std::vector<PortCandidate> ScanHttp2Preface(const NcmEndpoint& endpoint,
 
     auto worker = [&]() {
         for (;;) {
+            // OPTIMIZATION: checked before claiming each new port so a
+            // caller that already got what it needed via onHit (below) —
+            // e.g. a fused pipeline that just verified a candidate over
+            // RemoteXPC — can abort the rest of the range immediately,
+            // instead of every worker grinding on to portEnd regardless.
+            if (options.cancel &&
+                options.cancel->load(std::memory_order_relaxed)) {
+                break;
+            }
             unsigned i = next.fetch_add(1);
             if (i >= total) break;
             uint16_t port = static_cast<uint16_t>(options.portBegin + i);
@@ -193,8 +202,16 @@ std::vector<PortCandidate> ScanHttp2Preface(const NcmEndpoint& endpoint,
                     c.http2PrefaceOk = pr.http2;
                     c.recvLen = pr.headLen;
                     std::memcpy(c.recvHead, pr.head, sizeof(c.recvHead));
-                    std::lock_guard<std::mutex> lock(hitsMu);
-                    hits.push_back(c);
+                    {
+                        std::lock_guard<std::mutex> lock(hitsMu);
+                        hits.push_back(c);
+                    }
+                    // Fired outside hitsMu and before the progress report
+                    // below: the caller (if it wants to verify this hit
+                    // right away) should be able to start doing so, in
+                    // parallel with this worker moving on to the next
+                    // port, as soon as possible.
+                    if (options.onHit) options.onHit(c);
                 }
             }
             unsigned t = tried.fetch_add(1) + 1;
