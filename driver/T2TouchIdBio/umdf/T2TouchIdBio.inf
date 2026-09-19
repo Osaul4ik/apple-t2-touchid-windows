@@ -1,0 +1,70 @@
+; T2TouchIdBio.inf - WBDI biometric driver (UMDF 2), root-enumerated.
+; PoC-only. Not WHQL signed. Test-signing required (same as T2TouchIdTransport).
+;
+; There is no bus-enumerated hardware behind this node: the SEP is already
+; owned by T2TouchIdTransport.sys, so this is a virtual device (design doc
+; 7.2). Create it once with:  devcon install T2TouchIdBio.inf root\T2TouchIdBio
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = Biometric
+ClassGuid   = {53D29EF7-377C-4D14-864B-EB3A85769359}
+Provider    = %ManufacturerName%
+DriverVer   = ; filled by build
+CatalogFile = T2TouchIdBio.cat
+PnpLockdown = 1
+
+[Manufacturer]
+%ManufacturerName% = Standard,NT$ARCH$
+
+[Standard.NT$ARCH$]
+%T2TouchIdBio.DeviceDesc% = T2TouchIdBio_Install, root\T2TouchIdBio
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+T2TouchIdBio.dll = 1,,
+
+[DestinationDirs]
+UMDriverCopy = 13
+
+[T2TouchIdBio_Install.NT]
+CopyFiles = UMDriverCopy
+
+[T2TouchIdBio_Install.NT.HW]
+AddReg = T2TouchIdBio_HwAddReg
+
+[T2TouchIdBio_HwAddReg]
+; ACL and exclusivity from the "installing a biometric driver" docs, as
+; recorded in design doc 7.2.
+HKR,,Security,,"D:P(A;;GA;;;BA)(A;;GA;;;SY)"
+HKR,,Exclusive,0x00010001,1
+
+[T2TouchIdBio_Install.NT.Services]
+AddService = WUDFRd,0x000001fa,WUDFRD_ServiceInstall
+
+[WUDFRD_ServiceInstall]
+DisplayName   = %WudfRdDisplayName%
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %12%\WUDFRd.sys
+
+[T2TouchIdBio_Install.NT.Wdf]
+UmdfService              = T2TouchIdBio, T2TouchIdBio_UmdfInstall
+UmdfServiceOrder         = T2TouchIdBio
+UmdfHostProcessSharing   = ProcessSharingDisabled
+
+[T2TouchIdBio_UmdfInstall]
+UmdfLibraryVersion = $UMDFVERSION$
+ServiceBinary      = %13%\T2TouchIdBio.dll
+
+[UMDriverCopy]
+T2TouchIdBio.dll
+
+[Strings]
+ManufacturerName          = "Osaul4ik"
+DiskName                  = "T2TouchIdBio Installation Disk"
+T2TouchIdBio.DeviceDesc   = "Apple T2 Touch ID (Windows Hello sensor)"
+WudfRdDisplayName         = "Windows Driver Foundation - User-mode Driver Framework Reflector"
