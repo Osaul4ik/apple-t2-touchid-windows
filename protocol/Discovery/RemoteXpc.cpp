@@ -8,6 +8,10 @@
 #include <windows.h>
 #include <cstring>
 #include <bcrypt.h>
+#include <atomic>
+#include <thread>
+#include <mutex>
+#include <vector>
 
 #pragma comment(lib, "Ws2_32.lib")
 #pragma comment(lib, "Bcrypt.lib")
@@ -670,29 +674,51 @@ DiscoveredService DiscoverServicePort(const NcmEndpoint& endpoint,
                                        const std::string& serviceName,
                                        std::chrono::milliseconds perPortTimeout) {
     DiscoveredService result;
-    // REVERTED (16.09.2026): the descending ("highest port first") walk
-    // below was a user-observation-driven heuristic, explicitly marked at
-    // the time as "not re-derived from source" and pending re-verification.
-    // That re-verification happened and falsified it: a follow-up capture
-    // showed the same BiometricKit port (49252) reported both when port
-    // 59602 was the sole scanned candidate AND when the full 21-candidate
-    // ascending scan ran — i.e. the port bridgeOS actually advertises in
-    // its peer record's Services dict is a boot-scoped dynamic value,
-    // independent of which candidate is probed first or in which order.
-    // 59602 was a control-channel candidate that happened to be highest on
-    // one specific boot, not "the" BiometricKit port on any boot. This walk
-    // is now plain ascending (ports.begin() -> ports.end(), first match
-    // wins), matching discover-biometric-port.py's own discover_rsd_ports()
-    // exactly (VERIFIED FROM SOURCE: `for port in
-    // range(FIRST_DYNAMIC_PORT, LAST_DYNAMIC_PORT + 1)`, returning on the
-    // first peer record whose Services dict contains the target service
-    // name) — no port-ordering heuristic exists in the Linux reference at
-    // all, so this driver should not carry one either.
-    for (auto it = candidatePorts.begin(); it != candidatePorts.end(); ++it) {
-        uint16_t port = *it;
+    if (candidatePorts.empty()) return result;
+
+    // OPTIMIZATION: this used to be a plain sequential for-loop, up to
+    // perPortTimeout (2000ms) TWICE per candidate (Connect + FetchPeerRecord)
+    // before moving on — worst case ~candidatePorts.size() * 4s. Now a
+    // worker pool, same pattern as PortScan.cpp's ScanHttp2Preface.
+    //
+    // Dispatch is still ascending from index 0 (REVERTED comment above
+    // explains why — no heuristic here, matches the Linux reference), and
+    // with candidatePorts.size() normally well under the 64-worker cap,
+    // every candidate typically starts probing in the same instant rather
+    // than one after another.
+    //
+    // Ascending order is preserved as the tie-break, not just the dispatch
+    // order: bestIndex below only ever moves to a *lower* index, so if two
+    // workers both find a match, the one that was earlier in
+    // candidatePorts wins — identical semantics to the old sequential
+    // "first match in scan order" behavior, just computed concurrently.
+    //
+    // No hard cancellation of in-flight probes: RemoteXpcConnection's
+    // Connect/FetchPeerRecord are blocking calls captured by reference in
+    // the worker lambda, so detaching a thread mid-call to "stop
+    // immediately" would leave dangling references into this function's
+    // locals the moment it returns — not safe. What "found -> stop
+    // immediately" means here is workers stop pulling *new* candidates
+    // the moment a match exists; already-dispatched probes still run to
+    // completion (bounded by perPortTimeout) and can still improve the
+    // answer if they turn out to have a lower index. In practice, with
+    // candidate counts this small, effectively all of them are already
+    // in flight before any answer comes back anyway.
+    const size_t total = candidatePorts.size();
+    std::atomic<size_t> next{0};
+    std::atomic<bool> found{false};
+    std::atomic<size_t> bestIndex{static_cast<size_t>(-1)};
+    std::mutex resultMu;
+
+    unsigned workers = static_cast<unsigned>(total);
+    if (workers > 64) workers = 64;
+    if (workers == 0) workers = 1;
+
+    auto probeOne = [&](size_t idx) {
+        uint16_t port = candidatePorts[idx];
         RemoteXpcConnection conn;
         if (conn.Connect(endpoint, port, perPortTimeout) != RemoteXpcResult::Ok) {
-            continue; // couldn't even open this candidate — try the next one
+            return; // couldn't even open this candidate — try the next one
         }
         XpcObject peerRecord;
         if (conn.FetchPeerRecord(perPortTimeout, &peerRecord) != RemoteXpcResult::Ok) {
@@ -700,27 +726,58 @@ DiscoveredService DiscoverServicePort(const NcmEndpoint& endpoint,
             // reject or never complete an RSD handshake — expected decoys,
             // not a discovery failure (matches discover-biometric-port.py's
             // blanket `except Exception: continue`).
-            continue;
+            return;
         }
         const XpcObject* services = peerRecord.FindField("Services");
-        if (!services || services->kind != XpcObject::Kind::Dictionary) continue;
+        if (!services || services->kind != XpcObject::Kind::Dictionary) return;
         const XpcObject* service = services->FindField(serviceName);
-        if (!service || service->kind != XpcObject::Kind::Dictionary) continue;
+        if (!service || service->kind != XpcObject::Kind::Dictionary) return;
         const XpcObject* portField = service->FindField("Port");
-        if (!portField) continue;
+        if (!portField) return;
         uint64_t portValue = 0;
         if (portField->kind == XpcObject::Kind::UInt64) portValue = portField->uintValue;
         else if (portField->kind == XpcObject::Kind::Int64) portValue = static_cast<uint64_t>(portField->intValue);
         else if (portField->kind == XpcObject::Kind::String) {
-            try { portValue = std::stoull(portField->stringValue); } catch (...) { continue; }
+            try { portValue = std::stoull(portField->stringValue); } catch (...) { return; }
         } else {
-            continue;
+            return;
         }
-        if (portValue == 0 || portValue > 65535) continue; // not a plausible dynamic port
-        result.found = true;
-        result.port = static_cast<uint16_t>(portValue);
-        return result;
-    }
+        if (portValue == 0 || portValue > 65535) return; // not a plausible dynamic port
+
+        size_t expected = bestIndex.load(std::memory_order_relaxed);
+        while (idx < expected) {
+            if (bestIndex.compare_exchange_weak(expected, idx,
+                    std::memory_order_relaxed, std::memory_order_relaxed)) {
+                std::lock_guard<std::mutex> lock(resultMu);
+                result.found = true;
+                result.port = static_cast<uint16_t>(portValue);
+                found.store(true, std::memory_order_relaxed);
+                break;
+            }
+            // expected was refreshed by the failed CAS; loop re-checks
+            // idx < expected in case another, even-earlier index just won.
+        }
+    };
+
+    auto worker = [&]() {
+        for (;;) {
+            size_t i = next.fetch_add(1, std::memory_order_relaxed);
+            if (i >= total) break;
+            if (found.load(std::memory_order_relaxed) &&
+                i > bestIndex.load(std::memory_order_relaxed)) {
+                // A strictly-earlier match already won; this candidate
+                // could never change the answer even if it also matches.
+                continue;
+            }
+            probeOne(i);
+        }
+    };
+
+    std::vector<std::thread> threads;
+    threads.reserve(workers);
+    for (unsigned w = 0; w < workers; ++w) threads.emplace_back(worker);
+    for (auto& th : threads) th.join();
+
     return result;
 }
 
