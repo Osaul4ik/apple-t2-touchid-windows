@@ -695,26 +695,45 @@ T2NcmRxStart(
         return STATUS_INVALID_DEVICE_STATE;
     }
 
+    // Computed unconditionally (cheap arithmetic, no WDF call) so the
+    // trailing log line below always has a real value, whether or not
+    // this call actually reconfigures the reader.
     readerBufferSize =
         ((DeviceContext->NtbInMaxSize + maxPacketSize - 1) / maxPacketSize) * maxPacketSize;
 
-    WDF_USB_CONTINUOUS_READER_CONFIG_INIT(
-        &readerConfig,
-        T2NcmEvtRxReadComplete,
-        DeviceContext,
-        readerBufferSize);
-
-    readerConfig.EvtUsbTargetPipeReadersFailed = T2NcmEvtRxReadersFailed;
-    readerConfig.NumPendingReads = T2NCM_RX_PENDING_READS;
-
-    status = WdfUsbTargetPipeConfigContinuousReader(
-        DeviceContext->BulkInPipe, &readerConfig);
-    if (!NT_SUCCESS(status))
+    // WdfUsbTargetPipeConfigContinuousReader may be called only ONCE for
+    // a given pipe object — calling it again on a pipe that already has
+    // a continuous reader configured fails with STATUS_INVALID_DEVICE_
+    // STATE (0xC0000184), confirmed on hardware. A plain NDIS Pause ->
+    // Restart cycle (T2NcmMiniportPause/T2NcmMiniportRestart) does not
+    // touch the USB alt setting and so keeps the exact same BulkInPipe
+    // object across the cycle; only WdfIoTargetStop/Start should run
+    // then. Only actually reconfigure when BulkInPipe is a pipe object
+    // this function has not configured yet (fresh bring-up, or after
+    // T2NcmUsbActivateDataInterface handed back a brand-new pipe on
+    // re-arm — see driver.h and Power.c).
+    if (!DeviceContext->RxReaderConfigured)
     {
-        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2Ncm: WdfUsbTargetPipeConfigContinuousReader failed (0x%08X)\n",
-            status));
-        return status;
+        WDF_USB_CONTINUOUS_READER_CONFIG_INIT(
+            &readerConfig,
+            T2NcmEvtRxReadComplete,
+            DeviceContext,
+            readerBufferSize);
+
+        readerConfig.EvtUsbTargetPipeReadersFailed = T2NcmEvtRxReadersFailed;
+        readerConfig.NumPendingReads = T2NCM_RX_PENDING_READS;
+
+        status = WdfUsbTargetPipeConfigContinuousReader(
+            DeviceContext->BulkInPipe, &readerConfig);
+        if (!NT_SUCCESS(status))
+        {
+            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+                "T2Ncm: WdfUsbTargetPipeConfigContinuousReader failed (0x%08X)\n",
+                status));
+            return status;
+        }
+
+        DeviceContext->RxReaderConfigured = TRUE;
     }
 
     status = WdfIoTargetStart(WdfUsbTargetPipeGetIoTarget(DeviceContext->BulkInPipe));

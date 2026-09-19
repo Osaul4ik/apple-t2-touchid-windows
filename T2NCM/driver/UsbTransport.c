@@ -139,6 +139,7 @@ T2NcmUsbReleaseHardware(
     DeviceContext->BulkOutPipe = NULL;
     DeviceContext->DataInterface = NULL;
     DeviceContext->UsbDevice = NULL;
+    DeviceContext->RxReaderConfigured = FALSE;
 }
 
 static
@@ -231,6 +232,14 @@ T2NcmUsbActivateDataInterface(
     DeviceContext->BulkInPipe = bulkIn;
     DeviceContext->BulkOutPipe = bulkOut;
 
+    // WdfUsbInterfaceSelectSetting above just handed back a brand-new
+    // WDFUSBPIPE for BulkInPipe (a fresh alt-1 selection always does,
+    // per WDF) — any continuous-reader configuration T2NcmRxStart put on
+    // the PREVIOUS pipe object does not carry over. Clear the flag so
+    // the next T2NcmRxStart reconfigures it instead of calling
+    // WdfIoTargetStart on a pipe that was never configured.
+    DeviceContext->RxReaderConfigured = FALSE;
+
     T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
         "T2Ncm: MI_01 switched to alt %u, bulk IN/OUT pipes bound\n",
         T2NCM_DATA_ALT_ACTIVE));
@@ -257,6 +266,7 @@ Unwind:
 
     DeviceContext->BulkInPipe = NULL;
     DeviceContext->BulkOutPipe = NULL;
+    DeviceContext->RxReaderConfigured = FALSE;
 
     return status;
 }
@@ -274,6 +284,7 @@ T2NcmUsbDeactivateDataInterface(
     // the interface underneath it has already been torn down.
     DeviceContext->BulkInPipe = NULL;
     DeviceContext->BulkOutPipe = NULL;
+    DeviceContext->RxReaderConfigured = FALSE;
 
     // The device clears its Ethernet packet filter on SET_INTERFACE, so
     // whatever was pushed for the previous alt-1 activation is gone the
