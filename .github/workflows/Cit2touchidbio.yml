@@ -342,6 +342,11 @@ jobs:
       UMDF_DIR: driver/T2TouchIdBio/Umdf
       UMDF_PROJECT: driver/T2TouchIdBio/Umdf/T2TouchIdBio.vcxproj
       UMDF_NAME: T2TouchIdBio
+      # WBF Engine Adapter (plain user-mode DLL) shipped in the same package;
+      # the INF copies it to System32\WinBioPlugIns.
+      ENGINE_DIR: driver/T2TouchIdBio/EngineAdapter
+      ENGINE_PROJECT: driver/T2TouchIdBio/EngineAdapter/T2TouchIdEngineAdapter.vcxproj
+      ENGINE_NAME: T2TouchIdEngineAdapter
       # Must match UMDF_VERSION_MAJOR/MINOR in T2TouchIdBio.vcxproj (2.15).
       UMDF_STAMP_VERSION: 2.15.0
       # One-line switch: set to false to see PREfast findings without failing
@@ -480,6 +485,39 @@ jobs:
         Add-Content -Path $env:GITHUB_ENV -Value "UMDF_LOG_DIR=$logDir"
       shell: pwsh
 
+    # Engine adapter: no PREfast yet (bring-up; first compile against the real
+    # winbio_adapter.h happens here). Warnings land in engine-build.log.
+    - name: Build WBF engine adapter
+      run: |
+        $ErrorActionPreference = "Stop"
+        $logDir = Join-Path $env:GITHUB_WORKSPACE "umdf-analysis-logs"
+        New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+        $engineLog = Join-Path $logDir "engine-build.log"
+
+        msbuild $env:ENGINE_PROJECT `
+          /t:rebuild `
+          /p:Configuration=$env:CONFIGURATION `
+          /p:Platform=$env:PLATFORM `
+          /p:WindowsTargetPlatformVersion=10.0.26100.0 `
+          /nologo /verbosity:normal /clp:Summary `
+          "/flp:logfile=$engineLog;verbosity=normal"
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "msbuild (engine adapter) failed with exit code $LASTEXITCODE - see umdf-analysis-logs/engine-build.log."
+          exit 1
+        }
+        $dll = "$env:ENGINE_DIR\build\$env:ENGINE_NAME\$env:PLATFORM\$env:CONFIGURATION\$env:ENGINE_NAME.dll"
+        if (-not (Test-Path $dll)) { Write-Error "Engine adapter dll not produced: $dll"; exit 1 }
+        # The framework resolves this export by name via GetProcAddress.
+        # (dumpbin is not on PATH in this step; export names are plain ASCII in
+        # the PE export directory, so a byte scan is enough for this check.)
+        $ascii = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($dll))
+        if (-not $ascii.Contains('WbioQueryEngineInterface')) {
+          Write-Error "WbioQueryEngineInterface is not exported by $dll"
+          exit 1
+        }
+        Write-Host "OK: engine adapter built, WbioQueryEngineInterface exported."
+      shell: pwsh
+
     - name: Upload UMDF build / PREfast logs
       if: always()
       uses: actions/upload-artifact@v4
@@ -512,6 +550,15 @@ jobs:
         Copy-Item -Path $infSrcPath -Destination $packageDir -Force
         $pdbPath = "$buildOutDir\$env:UMDF_NAME.pdb"
         if (Test-Path $pdbPath) { Copy-Item -Path $pdbPath -Destination $packageDir -Force }
+
+        # Engine adapter: referenced by [SourceDisksFiles] of the INF, so Inf2Cat
+        # needs it in the package folder.
+        $engineOut = "$env:ENGINE_DIR\build\$env:ENGINE_NAME\$env:PLATFORM\$env:CONFIGURATION"
+        $engineDll = "$engineOut\$env:ENGINE_NAME.dll"
+        if (-not (Test-Path $engineDll)) { Write-Error "Built engine adapter not found: $engineDll"; exit 1 }
+        Copy-Item -Path $engineDll -Destination $packageDir -Force
+        $enginePdb = "$engineOut\$env:ENGINE_NAME.pdb"
+        if (Test-Path $enginePdb) { Copy-Item -Path $enginePdb -Destination $packageDir -Force }
 
         Write-Host "OK: staged UMDF files:"
         Get-ChildItem $packageDir | ForEach-Object { Write-Host "  - $($_.Name)" }
@@ -573,7 +620,7 @@ jobs:
           $bytes = [Convert]::FromBase64String($env:SIGN_CERT_PFX)
           [IO.File]::WriteAllBytes($pfxPath, $bytes)
 
-          foreach ($target in @($env:DLL_PATH, $env:CAT_PATH)) {
+          foreach ($target in @($env:DLL_PATH, (Join-Path $env:PACKAGE_DIR "$env:ENGINE_NAME.dll"), $env:CAT_PATH)) {
             & "$env:SIGNTOOL_PATH" sign /v /fd SHA256 /f "$pfxPath" /p "$env:SIGN_CERT_PASSWORD" `
               /tr http://timestamp.digicert.com /td SHA256 "$target"
             if ($LASTEXITCODE -ne 0) { Write-Error "Signing $target failed (exit code $LASTEXITCODE)."; exit 1 }
