@@ -5,11 +5,8 @@ Experimental Windows 10/11 driver/protocol stack that exposes the built-in
 Touch ID sensor on Intel MacBooks with an Apple T2 chip as a Windows Hello
 biometric device.
 
-**Status: proof-of-concept.** The SEP PCI transport, DMA/OOL registration,
-and AppleKeyStore exchange are confirmed working on real T2 hardware
-(30.08.2026). BridgeXPC/BiometricKit (the actual fingerprint-match path)
-and the Windows Hello WBDI driver are not yet implemented — see
-[Status](#status) below.
+**Status: proof-of-concept.** 
+Match\No-Match works.
 
 ## What this is
 
