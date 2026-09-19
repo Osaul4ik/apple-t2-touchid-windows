@@ -64,7 +64,7 @@ ParseResult ParseFrameHeader(const uint8_t* data, size_t len, FrameHeader* out);
 // blocking socket with a caller-supplied timeout. Returns std::nullopt on
 // timeout/EOF/protocol error (all fail-closed — never partial garbage).
 struct RawFrame {
-    FrameType type;
+    FrameType type{};   // always initialize (C26495)
     std::vector<uint8_t> body;
 };
 

@@ -89,7 +89,7 @@ inline std::wstring HexDump(const std::vector<uint8_t>& data, size_t maxBytes = 
     out.reserve(n * 2 + 3);
     wchar_t b[4];
     for (size_t i = 0; i < n; ++i) {
-        swprintf(b, 4, L"%02x", data[i]);
+        swprintf_s(b, L"%02x", data[i]);   // swprintf is banned (C28719)
         out += b;
     }
     if (data.size() > n) out += L"...";
