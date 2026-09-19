@@ -65,6 +65,21 @@ struct ScanOptions {
     // by connectTimeoutMs / the recv window) — this only stops new ones
     // from starting.
     std::atomic<bool>* cancel = nullptr;
+
+    // Real-hardware finding (2026-09-19, t2touchid `network`/`verify` on
+    // real T2 hardware): the RemoteXPC control-channel candidate that
+    // actually advertises com.apple.eos.BiometricKit is consistently found
+    // well into the upper part of the 49152-65535 range (observed e.g. at
+    // 59602), while the low end of the range is a dense cluster of decoy
+    // RemoteXPC services that complete the handshake but never advertise
+    // BiometricKit. Scanning ascending (the default, and what the Linux
+    // reference does) means the real candidate is discovered last, right
+    // when the USB NCM link is busiest with decoy checker threads already
+    // in flight from the low-end cluster — which is when RemoteXPC
+    // handshakes are most likely to time out. Scanning from the end
+    // instead surfaces the real candidate's onHit almost immediately, so
+    // its checker thread starts before link contention builds up.
+    bool scanFromEnd = false;
 };
 
 std::vector<PortCandidate> ScanHttp2Preface(const NcmEndpoint& endpoint,

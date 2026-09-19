@@ -189,7 +189,14 @@ std::vector<PortCandidate> ScanHttp2Preface(const NcmEndpoint& endpoint,
             }
             unsigned i = next.fetch_add(1);
             if (i >= total) break;
-            uint16_t port = static_cast<uint16_t>(options.portBegin + i);
+            // scanFromEnd: dispatch descending from portEnd instead of
+            // ascending from portBegin — see ScanOptions::scanFromEnd for
+            // why. `i` is still a plain 0..total-1 claim counter either
+            // way, so concurrency/cancel/progress semantics are unchanged;
+            // only which physical port each claimed index maps to flips.
+            uint16_t port = options.scanFromEnd
+                ? static_cast<uint16_t>(options.portEnd - i)
+                : static_cast<uint16_t>(options.portBegin + i);
             ProbeResult pr =
                 ProbePort(endpoint, port, options.connectTimeoutMs, recvMs);
             if (pr.connected) {

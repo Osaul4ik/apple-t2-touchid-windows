@@ -31,6 +31,7 @@
 #include <optional>
 #include <array>
 #include <cstring>
+#include <algorithm>
 #include <atomic>
 #include <thread>
 #include <mutex>
@@ -503,6 +504,8 @@ static int CmdNetwork(int argc, wchar_t* argv[]) {
     opt.concurrency = 64;
     opt.connectTimeoutMs = 25;  // 10ms was flaky under concurrent scan load
     opt.includeTcpOnly = true;
+    opt.scanFromEnd = true;  // see ScanOptions::scanFromEnd — real BiometricKit
+                              // candidate sits in the upper part of the range
     opt.onProgress = [](unsigned tried, unsigned total, unsigned tcp, unsigned http2) {
         std::wcout << L"  scanned " << tried << L"/" << total
                    << L"  tcp=" << tcp << L"  http2=" << http2 << L"\r" << std::flush;
@@ -552,6 +555,13 @@ static int CmdNetwork(int argc, wchar_t* argv[]) {
         std::wcout << L"try: --host fe80::... to override the discovered peer.\n";
         return 2;
     }
+
+    // With scanFromEnd, hits arrive in roughly descending-port order (and
+    // onHit/cancel can leave that order uneven besides) — sort ascending
+    // purely for a readable diagnostic table; this has no effect on scan
+    // or verification order above.
+    std::sort(hits.begin(), hits.end(),
+              [](const PortCandidate& a, const PortCandidate& b) { return a.port < b.port; });
 
     std::wcout << L"candidates: tcp_open=" << nTcp << L"  http2_settings=" << nHttp2;
     if (foundPort != 0) std::wcout << L"  (scan stopped early — BiometricKit already found)";
@@ -761,6 +771,9 @@ static bool DiscoverBiometricKitBridge(int argc, wchar_t* argv[], int firstArgIn
         opt.concurrency = 256;
         opt.includeTcpOnly = true;
         opt.connectTimeoutMs = timeoutsMs[attempt];
+        opt.scanFromEnd = true;  // see ScanOptions::scanFromEnd — real
+                                  // BiometricKit candidate sits in the
+                                  // upper part of the range
         opt.cancel = &stop;
         opt.onHit = [&](const PortCandidate& c) {
             if (!c.http2PrefaceOk) return;      // TCP-only hits aren't real candidates
