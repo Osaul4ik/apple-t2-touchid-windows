@@ -270,6 +270,8 @@ jobs:
     # ПЕРЕВІРКА 2: CodeQL трасує один скрипт, що будує ОБИДВА драйвери з
     # PREfast (/analyze) всередині. Обидва бінарники потрапляють в одну
     # CodeQL-базу, тож mustrun/mustfix покривають T2Ncm.sys і T2NcmCtrl.sys.
+    # Скрипт будує ОБИДВА проєкти навіть після першої помилки і падає в кінці -
+    # так усі PREfast-знахідки видно за один прогін.
     # WindowsTargetPlatformVersion прив'язаний до того, що поставив WDK.
     # =====================================================================
     - name: Write traced build script
@@ -278,6 +280,7 @@ jobs:
         $script = Join-Path $env:RUNNER_TEMP "build-ncm.ps1"
         $lines = @(
           '$ErrorActionPreference = "Stop"',
+          '$failed = 0',
           'foreach ($proj in @($env:DRIVER_PROJECT, $env:CTRL_PROJECT)) {',
           '  $name = [IO.Path]::GetFileNameWithoutExtension($proj)',
           '  $log  = Join-Path $env:GITHUB_WORKSPACE ("static-analysis-logs\build-" + $name + ".log")',
@@ -285,8 +288,9 @@ jobs:
             '/p:WindowsTargetPlatformVersion=10.0.26100.0 /p:RunCodeAnalysis=true /p:EnableCppCoreCheck=true ' +
             '/p:CodeAnalysisTreatWarningsAsErrors=$env:CA_TREAT_WARNINGS_AS_ERRORS ' +
             '/nologo /verbosity:normal /clp:Summary "/flp:logfile=$log;verbosity=normal"'),
-          '  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }',
-          '}'
+          '  if ($LASTEXITCODE -ne 0) { $failed = $LASTEXITCODE }',
+          '}',
+          'exit $failed'
         )
         Set-Content -Path $script -Value $lines -Encoding utf8
         New-Item -ItemType Directory -Path (Join-Path $env:GITHUB_WORKSPACE "static-analysis-logs") -Force | Out-Null

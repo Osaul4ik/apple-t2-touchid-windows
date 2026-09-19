@@ -390,6 +390,7 @@ T2NcmSetNtbInputSize(
 // only the (unfiltered) string table.
 // ---------------------------------------------------------------------
 
+_Success_(return)
 static
 BOOLEAN
 T2NcmHexNibble(
