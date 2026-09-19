@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{5D4C0C5A-0EC6-4238-A1A1-7A19AF5D2782}</ProjectGuid>
+    <RootNamespace>T2SepBootstrap</RootNamespace>
+    <WindowsTargetPlatformVersion>$(LatestTargetPlatformVersion)</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+    <SubSystem>Console</SubSystem>
+  </PropertyGroup>
+  <PropertyGroup Label="Configuration" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <UseDebugLibraries>true</UseDebugLibraries>
+  </PropertyGroup>
+  <PropertyGroup Label="Configuration" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup>
+    <TargetName>T2SepBootstrap</TargetName>
+    <!-- This project is added to T2TouchId.sln (repo root), so $(SolutionDir)
+         resolves to the repo root exactly like protocol/tools/tests do -
+         same build\ layout, same vcpkg dir, no path juggling needed. -->
+    <OutDir>$(SolutionDir)build\$(TargetName)\$(Platform)\$(Configuration)\</OutDir>
+    <IntDir>$(SolutionDir)build\$(TargetName)\$(Platform)\$(Configuration)\obj\</IntDir>
+    <VcpkgInstalledDir Condition="'$(VcpkgInstalledDir)'==''">$(SolutionDir)vcpkg\installed\x64-windows</VcpkgInstalledDir>
+    <PlistLibName Condition="'$(PlistLibName)'==''">plist-2.0.lib</PlistLibName>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <TreatWarningAsError>true</TreatWarningAsError>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <AdditionalLibraryDirectories>$(VcpkgInstalledDir)\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <!-- Ws2_32.lib / Rpcrt4.lib / setupapi.lib come in automatically via
+           #pragma comment(lib, ...) baked into Connection.obj/Client.obj
+           inside T2TouchIdProtocol.lib, same as tools/t2touchid. crypt32.lib
+           comes from T2SepBootstrapService.cpp's own #pragma comment; only
+           plist and advapi32 (SCM API - RegisterServiceCtrlHandlerExW /
+           SetServiceStatus / StartServiceCtrlDispatcherW) need listing
+           explicitly, since neither has such a pragma anywhere in this
+           translation unit's dependency chain. -->
+      <AdditionalDependencies>$(PlistLibName);advapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="T2SepBootstrapService.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="SepVaultFormat.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\protocol\T2TouchIdProtocol.vcxproj">
+      <Project>{5A008826-B113-4E2E-BD73-49EC4779E1C5}</Project>
+    </ProjectReference>
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

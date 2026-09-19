@@ -1,40 +1,44 @@
 name: CI T2TouchIdBio (SepVaultGui + T2SepBootstrap)
 
-# T2TouchIdBio (driver/T2TouchIdBio) is not part of T2TouchId.sln yet and has
-# two independent pieces at very different states of readiness:
+# T2TouchIdBio (driver/T2TouchIdBio) has two independent pieces:
 #
-#   - SepVaultGui (Sepvaultgui.csproj): a real, buildable .NET 8 WPF project.
-#     Built and published like any other project in this job.
+#   - SepVaultGui (Sepvaultgui.csproj): a .NET 8 WPF project, standalone -
+#     not part of T2TouchId.sln, built with the .NET SDK directly.
 #
-#   - T2SepBootstrapService.cpp: per driver/T2TouchIdBio/docs/Readme.MD, this
-#     has deliberately NOT had a .vcxproj added yet ("простіше створити його
-#     в IDE... ніж відтворювати GUID/toolset-специфічний XML вручну"). So
-#     there is nothing for MSBuild to build here. Rather than either skip it
-#     silently or hand-roll a project file the repo explicitly says to create
-#     in the IDE, this workflow does a compile-only sanity check (cl.exe /c,
-#     no link) against its real include paths (SepVaultFormat.h,
-#     ../../protocol/AppleKeyStore/Client.h) - enough to catch syntax/type
-#     errors on every push, without inventing build infrastructure that
-#     belongs in its own PR.
+#   - T2SepBootstrapService.cpp, now built through T2SepBootstrap.vcxproj
+#     (added to T2TouchId.sln alongside T2TouchIdProtocol/t2touchid/
+#     T2TouchIdTests). It links against T2TouchIdProtocol.lib via
+#     ProjectReference - same pattern as tools/t2touchid/t2touchid.vcxproj,
+#     which is why it needs the same vcpkg/libplist bootstrap those
+#     workflows already do.
 #
-# Same conventions as Cit2touchid.yml / BuildT2TouchId.yml: windows-2022,
-# own concurrency group, path-scoped triggers so this doesn't run (or
-# collide) on changes unrelated to T2TouchIdBio.
+# Only T2SepBootstrap (+ its protocol dependency) is targeted here, not the
+# whole T2TouchId.sln - that keeps this workflow WDK-free, since
+# T2TouchIdTransport (the KMDF driver, also in the .sln) is built and
+# packaged separately by Cit2touchid.yml / BuildT2TouchId.yml and needs the
+# WDK installed to do it. T2SepBootstrap and T2TouchIdProtocol are both
+# plain user-mode v143 projects and don't.
+#
+# Same conventions as those workflows otherwise: windows-2022, own
+# concurrency group, path-scoped triggers so this doesn't run on changes
+# unrelated to T2TouchIdBio.
 
 on:
   push:
     branches: [ main ]
     paths:
       - 'driver/T2TouchIdBio/**'
-      - 'protocol/AppleKeyStore/**'
+      - 'protocol/**'
       - 'driver/T2TouchIdTransport/public.h'
+      - 'T2TouchId.sln'
       - '.github/workflows/CiT2TouchIdBio.yml'
   pull_request:
     branches: [ main ]
     paths:
       - 'driver/T2TouchIdBio/**'
-      - 'protocol/AppleKeyStore/**'
+      - 'protocol/**'
       - 'driver/T2TouchIdTransport/public.h'
+      - 'T2TouchId.sln'
       - '.github/workflows/CiT2TouchIdBio.yml'
   workflow_dispatch:
 
@@ -47,29 +51,29 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  BIO_DIR: driver/T2TouchIdBio
+  SOLUTION: T2TouchId.sln
+  BOOTSTRAP_PROJECT: T2SepBootstrap
+  BOOTSTRAP_DIR: driver/T2TouchIdBio
   GUI_PROJECT: driver/T2TouchIdBio/Sepvaultgui.csproj
   GUI_ASSEMBLY_NAME: SepVaultGui
-  BOOTSTRAP_SRC: driver/T2TouchIdBio/T2SepBootstrapService.cpp
   DOTNET_VERSION: '8.0.x'
   CONFIGURATION: Release
   PLATFORM: x64
 
 jobs:
   ci:
-    name: Build SepVaultGui + compile-check T2SepBootstrapService
+    name: Build SepVaultGui + T2SepBootstrap
     runs-on: windows-2022
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
     - uses: actions/checkout@v4
 
     # =========================================================================
     # SepVaultGui: net8.0-windows / UseWPF, plain SDK-style csproj, not in
-    # T2TouchId.sln. Built standalone with the .NET SDK rather than MSBuild -
-    # same reasoning as the other projects using "locate the right tool for
-    # what's actually there" instead of assuming everything goes through the
-    # one build entry point.
+    # T2TouchId.sln. Built standalone with the .NET SDK - same reasoning as
+    # the other projects here, use the right tool for what's actually there
+    # instead of forcing everything through one build entry point.
     # =========================================================================
     - name: Setup .NET
       uses: actions/setup-dotnet@v4
@@ -88,10 +92,10 @@ jobs:
       shell: pwsh
 
     # =========================================================================
-    # Publish a self-contained win-x64 output so the uploaded artifact is
-    # something that actually runs on a target machine without a .NET 8
-    # runtime install, matching how the driver/tool packages from the other
-    # T2TouchId workflows are meant to be dropped onto real hardware.
+    # Publish a self-contained win-x64 output so the uploaded artifact
+    # actually runs on a target machine without a .NET 8 runtime install,
+    # matching how the driver/tool packages from the other T2TouchId
+    # workflows are meant to be dropped onto real hardware.
     # =========================================================================
     - name: Publish SepVaultGui (self-contained win-x64)
       run: |
@@ -112,38 +116,97 @@ jobs:
       shell: pwsh
 
     # =========================================================================
-    # T2SepBootstrapService.cpp has no .vcxproj yet (see the block comment at
-    # the top of this file / driver/T2TouchIdBio/docs/Readme.MD). Compile
-    # only (no link, no protocol.lib, no vcpkg/libplist) against its real
-    # relative includes - SepVaultFormat.h next to it, and
-    # ../../protocol/AppleKeyStore/Client.h, which MSVC resolves relative to
-    # T2SepBootstrapService.cpp's own directory for quoted includes, so no
-    # extra /I is needed. This is deliberately narrower than a full build:
-    # it exists to catch syntax/type errors on every push, not to produce
-    # T2SepBootstrap.exe. Same warning level/standard as the rest of this
-    # repo's user-mode C++ (protocol/T2TouchIdProtocol.vcxproj: /W4 /WX,
-    # stdcpp17).
+    # T2SepBootstrap.vcxproj links T2TouchIdProtocol.lib, which compiles
+    # BridgeXpc/PlistPayload.cpp - so it needs the same vcpkg libplist
+    # bootstrap as tools/t2touchid, even though T2SepBootstrapService.cpp
+    # itself never touches plist directly.
     # =========================================================================
-    - name: Setup MSVC (cl.exe) x64
-      uses: ilammy/msvc-dev-cmd@v1
-      with:
-        arch: x64
+    - name: Add MSBuild to PATH
+      uses: microsoft/setup-msbuild@v2
 
-    - name: Compile-check T2SepBootstrapService.cpp
+    - name: Bootstrap vcpkg
       run: |
         $ErrorActionPreference = "Stop"
-        $objDir = "artifacts\T2SepBootstrapService-check"
-        New-Item -ItemType Directory -Path $objDir -Force | Out-Null
+        git clone --depth 1 https://github.com/microsoft/vcpkg.git vcpkg
+        .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+      shell: pwsh
 
-        cl.exe /nologo /c /W4 /WX /EHsc /std:c++17 `
-          /Fo"$objDir\" `
-          "$env:BOOTSTRAP_SRC"
+    - name: Install libplist (vcpkg)
+      run: |
+        $ErrorActionPreference = "Stop"
+        .\vcpkg\vcpkg.exe install libplist:x64-windows
+      shell: pwsh
 
-        if ($LASTEXITCODE -ne 0) {
-          Write-Error "T2SepBootstrapService.cpp failed to compile (exit code $LASTEXITCODE)."
+    - name: Locate libplist library file
+      run: |
+        $ErrorActionPreference = "Stop"
+        $libDir = "vcpkg\installed\x64-windows\lib"
+        $lib = Get-ChildItem -Path $libDir -Filter "*.lib" |
+          Where-Object { $_.Name -match "plist" -and $_.Name -notmatch "\+\+" } |
+          Select-Object -First 1
+
+        if (-not $lib) {
+          Write-Error "No plist .lib found under $libDir after vcpkg install."
           exit 1
         }
-        Write-Host "OK: T2SepBootstrapService.cpp compiles clean (compile-only, not linked - no .vcxproj yet)."
+
+        Write-Host "OK: found $($lib.Name)"
+        Add-Content -Path $env:GITHUB_ENV -Value "PLIST_LIB_NAME=$($lib.Name)"
+        Add-Content -Path $env:GITHUB_ENV -Value "VCPKG_INSTALLED_DIR=$PWD\vcpkg\installed\x64-windows"
+      shell: pwsh
+
+    # =========================================================================
+    # Target only T2SepBootstrap within the solution, not the whole .sln:
+    # MSBuild then builds it plus its explicit ProjectReference
+    # (T2TouchIdProtocol), but never touches T2TouchIdTransport (the KMDF
+    # driver also in this .sln) - so no WDK install needed here. No
+    # WindowsTargetPlatformVersion pin either, unlike the driver workflows:
+    # that pin exists there to match exactly what those workflows'  WDK
+    # installer shipped, which doesn't apply to these plain v143 user-mode
+    # projects.
+    # =========================================================================
+    - name: Build T2SepBootstrap (+ T2TouchIdProtocol dependency)
+      run: |
+        msbuild $env:SOLUTION `
+          /t:$env:BOOTSTRAP_PROJECT `
+          /p:Configuration=$env:CONFIGURATION `
+          /p:Platform=$env:PLATFORM `
+          /p:VcpkgInstalledDir=$env:VCPKG_INSTALLED_DIR `
+          /p:PlistLibName=$env:PLIST_LIB_NAME `
+          /nologo /verbosity:minimal /clp:Summary
+      shell: pwsh
+
+    - name: Stage T2SepBootstrap.exe + runtime DLLs
+      run: |
+        $ErrorActionPreference = "Stop"
+        $exePath = "build\$env:BOOTSTRAP_PROJECT\$env:PLATFORM\$env:CONFIGURATION\$env:BOOTSTRAP_PROJECT.exe"
+        if (-not (Test-Path $exePath)) {
+          Write-Error "Built exe not found: $exePath"
+          exit 1
+        }
+
+        $packageDir = "artifacts\T2SepBootstrap"
+        New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
+        Copy-Item -Path $exePath -Destination $packageDir -Force
+
+        $pdbPath = "build\$env:BOOTSTRAP_PROJECT\$env:PLATFORM\$env:CONFIGURATION\$env:BOOTSTRAP_PROJECT.pdb"
+        if (Test-Path $pdbPath) {
+          Copy-Item -Path $pdbPath -Destination $packageDir -Force
+        }
+
+        # Same dynamic-plist dependency as t2touchid.exe/T2TouchIdTests.exe:
+        # plist-2.0.lib is just the import lib for vcpkg's dynamically-built
+        # plist-2.0.dll - the actual DLL and its own dependencies
+        # (libxml2/zlib/liblzma/iconv) live in vcpkg's bin dir, not lib.
+        $vcpkgBinDir = Join-Path $env:VCPKG_INSTALLED_DIR "bin"
+        if (-not (Test-Path $vcpkgBinDir)) {
+          Write-Error "vcpkg bin dir not found: $vcpkgBinDir"
+          exit 1
+        }
+        Copy-Item -Path (Join-Path $vcpkgBinDir "*.dll") -Destination $packageDir -Force
+
+        Write-Host "OK: staged T2SepBootstrap.exe and its runtime DLLs:"
+        Get-ChildItem $packageDir | ForEach-Object { Write-Host "  - $($_.Name)" }
       shell: pwsh
 
     - name: Upload SepVaultGui package
@@ -151,4 +214,11 @@ jobs:
       with:
         name: SepVaultGui-${{ github.sha }}
         path: artifacts/SepVaultGui
+        if-no-files-found: error
+
+    - name: Upload T2SepBootstrap package
+      uses: actions/upload-artifact@v4
+      with:
+        name: T2SepBootstrap-${{ github.sha }}
+        path: artifacts/T2SepBootstrap
         if-no-files-found: error
