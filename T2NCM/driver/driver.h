@@ -313,6 +313,16 @@ typedef struct _T2NCM_DEVICE_CONTEXT
     // see NcmRx.c.
     BOOLEAN              RxStarted;
 
+    // Whether WdfUsbTargetPipeConfigContinuousReader has already been
+    // called for the WDFUSBPIPE currently cached in BulkInPipe. WDF
+    // allows that call exactly once per pipe object — a plain NDIS
+    // Pause/Restart cycle reuses the SAME pipe object (no alt-setting
+    // reselect happens), so Restart must only WdfIoTargetStart it again,
+    // never reconfigure it. Cleared to FALSE only when BulkInPipe itself
+    // is replaced with a new pipe object (T2NcmUsbActivateDataInterface),
+    // which is the one event that actually invalidates this. See NcmRx.c.
+    BOOLEAN              RxReaderConfigured;
+
     // OUT-direction NDP geometry from GET_NTB_PARAMETERS.
     // wNtbOutMaxDatagrams==0 is the spec's own "device imposes no limit"
     // value, not a missing/invalid one.
