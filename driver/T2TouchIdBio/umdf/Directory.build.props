@@ -1,0 +1,14 @@
+<Project>
+  <!-- Sepvaultgui.csproj (SDK-style, restored with `dotnet restore`) and
+       T2sepbootstrap.vcxproj live in this same folder. Both default to
+       BaseIntermediateOutputPath = obj\ , so the csproj's obj\project.assets.json
+       (net8.0-windows) was visible to the vcxproj, whose legacy
+       Microsoft.NuGet.targets then ran ResolveNuGetPackageAssets on it and
+       failed with "Sequence contains no elements" (GiveErrorForMissingFramework)
+       in CI. One obj\<project>\ per project keeps their NuGet state apart.
+       Also applies to Umdf\T2TouchIdBio.vcxproj (nested folder) - harmless
+       there, its IntDir is set explicitly. -->
+  <PropertyGroup>
+    <BaseIntermediateOutputPath>$(MSBuildThisFileDirectory)obj\$(MSBuildProjectName)\</BaseIntermediateOutputPath>
+  </PropertyGroup>
+</Project>
