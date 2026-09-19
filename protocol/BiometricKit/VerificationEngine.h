@@ -17,9 +17,18 @@ enum class VerifyOutcome {
     RejectedByDevice,     // start-match command itself was rejected (word[0]!=0) — never silent success
     Malformed,
     Busy,                 // Milestone 2 §23: only one active session allowed
-    UnstableIdentityInventory, // port of Linux FprintMatchGateError("live identity
-                          // inventory is unstable"): first/repeat 0x42 or 0x51 snapshot
-                          // disagreed — fail-closed, StartMatch never sent
+    // REMOVED (18.09.2026): UnstableIdentityInventory was the outcome for
+    // the 0x42->0x51->0x42->0x51 identity-stability gate, itself removed
+    // from Verify() the same day — see VerificationEngine.cpp. That gate
+    // was a port of the finger-selection production path
+    // (t2_fprint_match_gate.prepare/prepare_all), reached on the Linux
+    // reference only via --match-finger-name / --resolve-any-finger-name
+    // / --resolve-any-identity-slot, none of which this project's CLI
+    // has ever sent or exposed. This driver's actual point of comparison
+    // — bare `bridge-xpc-probe.py --match-seconds` — never runs that
+    // gate and never produces this outcome, so keeping it here after
+    // removing the only code that returned it would just be dead API
+    // surface. No code returns this value any more.
     // REMOVED (17.09.2026): NoImageCaptured used to relabel an ordinary
     // Timeout whenever sawFingerOn && imagePipelineEvents==0 — i.e.
     // whenever status codes 55/72/95 (ImageCaptured/ImageForProcessing/
