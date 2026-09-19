@@ -1,0 +1,168 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// BridgeDiscovery.cpp — see BridgeDiscovery.h for why this exists as a
+// separate, silent copy of tools/t2touchid/main.cpp's discovery shape
+// instead of a shared refactor of that (still argv/cout-shaped) code.
+#include "BridgeDiscovery.h"
+#include "PortCache.h"
+#include "PortScan.h"
+#include "RemoteXpc.h"
+#include <atomic>
+#include <mutex>
+#include <thread>
+#include <vector>
+
+namespace t2::discovery {
+
+namespace {
+
+// Same constant and rationale as tools/t2touchid/main.cpp's
+// kBiometricKitService / kRemoteXpcCheckTimeout.
+constexpr const char* kBiometricKitService = "com.apple.eos.BiometricKit";
+constexpr std::chrono::milliseconds kRemoteXpcCheckTimeout{2000};
+
+// Mirrors main.cpp's TryCachedBridgePort exactly (path A: direct HELO on
+// the cached BridgeXPC port; path B: RSD replay on the cached RemoteXPC
+// port), minus every std::wcout diagnostic line — silent by design, see
+// header comment.
+bool TryCachedBridgePort(const NcmEndpoint& ep, t2::bridgexpc::Connection* conn,
+                          uint16_t* outPort) {
+    using namespace t2::bridgexpc;
+
+    uint16_t svcPort = 0, rsdPort = 0;
+    if (!LoadCachedPort(ep, &svcPort, &rsdPort)) {
+        return false;
+    }
+
+    ConnectResult crA = conn->Connect(ep.peerLinkLocal, ep.ifIndex, svcPort,
+                                       std::chrono::milliseconds(1500));
+    if (crA == ConnectResult::Ok) {
+        *outPort = svcPort;
+        return true;
+    }
+
+    if (rsdPort != 0) {
+        uint16_t advertised = 0;
+        if (ProbeServiceOnPort(ep, rsdPort, kBiometricKitService, kRemoteXpcCheckTimeout,
+                                &advertised)) {
+            ConnectResult crB = conn->Connect(ep.peerLinkLocal, ep.ifIndex, advertised,
+                                               kRemoteXpcCheckTimeout);
+            if (crB == ConnectResult::Ok) {
+                if (advertised != svcPort) {
+                    SaveCachedPort(ep, advertised, rsdPort);
+                }
+                *outPort = advertised;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Mirrors main.cpp's ScanAndProbe exactly (same concurrency shape: every
+// HTTP/2 hit gets its own RemoteXPC checker thread racing the still-running
+// scan; the first confirmed BiometricKit hit sets the scan's cancel flag).
+struct ScanProbeResult {
+    uint16_t servicePort = 0;
+    uint16_t rsdPort = 0;
+};
+
+ScanProbeResult ScanAndProbe(const NcmEndpoint& ep, ScanOptions opt) {
+    std::atomic<bool> stop{false};
+    std::atomic<bool> serviceFound{false};
+    std::mutex checkersMu;
+    std::vector<std::thread> checkers;
+    ScanProbeResult res;
+
+    opt.cancel = &stop;
+    opt.onHit = [&](const PortCandidate& c) {
+        if (!c.http2PrefaceOk) return;
+        if (serviceFound.load(std::memory_order_relaxed)) return;
+        uint16_t port = c.port;
+        std::lock_guard<std::mutex> lock(checkersMu);
+        checkers.emplace_back([&, port]() {
+            if (serviceFound.load(std::memory_order_relaxed)) return;
+            uint16_t servicePort = 0;
+            if (!ProbeServiceOnPort(ep, port, kBiometricKitService, kRemoteXpcCheckTimeout,
+                                    &servicePort)) {
+                return;
+            }
+            bool expected = false;
+            if (serviceFound.compare_exchange_strong(expected, true)) {
+                res.servicePort = servicePort;
+                res.rsdPort = port;
+                stop.store(true, std::memory_order_relaxed);
+            }
+        });
+    };
+
+    ScanHttp2Preface(ep, opt);
+    {
+        std::lock_guard<std::mutex> lock(checkersMu);
+        for (auto& th : checkers) th.join();
+    }
+    return res;
+}
+
+} // namespace
+
+bool PickDefaultT2Endpoint(NcmEndpoint* outEndpoint) {
+    if (outEndpoint == nullptr) return false;
+    auto endpoints = FindT2NcmEndpoints();
+    if (endpoints.empty()) return false;
+    *outEndpoint = endpoints.front();
+    return true;
+}
+
+bool ConnectToBiometricKitBridge(const NcmEndpoint& endpoint, t2::bridgexpc::Connection* outConn,
+                                  uint16_t* outServicePort, uint16_t* outRsdPort) {
+    using t2::bridgexpc::ConnectResult;
+
+    if (outConn == nullptr || endpoint.peerSource == PeerSource::None) {
+        return false;
+    }
+
+    // Cache fast path — same policy as the CLI: try it first, fall through
+    // to a full scan on any miss, never trust it without a live HELO.
+    {
+        uint16_t cachedPort = 0;
+        if (TryCachedBridgePort(endpoint, outConn, &cachedPort)) {
+            if (outServicePort) *outServicePort = cachedPort;
+            if (outRsdPort) *outRsdPort = 0; // path A/B both leave rsdPort ambiguous here; not needed by callers today
+            return true;
+        }
+    }
+
+    uint16_t foundPort = 0;
+    uint16_t foundRsdPort = 0;
+    const unsigned timeoutsMs[] = {20, 60};
+    constexpr unsigned kAttempts = sizeof(timeoutsMs) / sizeof(timeoutsMs[0]);
+    for (unsigned attempt = 0; attempt < kAttempts; ++attempt) {
+        ScanOptions opt;
+        opt.concurrency = 256;
+        opt.includeTcpOnly = true;
+        opt.connectTimeoutMs = timeoutsMs[attempt];
+        opt.scanFromEnd = true;
+
+        ScanProbeResult scan = ScanAndProbe(endpoint, opt);
+        if (scan.servicePort != 0) {
+            foundPort = scan.servicePort;
+            foundRsdPort = scan.rsdPort;
+            break;
+        }
+    }
+    if (foundPort == 0) {
+        return false;
+    }
+
+    ConnectResult cr = outConn->Connect(endpoint.peerLinkLocal, endpoint.ifIndex, foundPort,
+                                         std::chrono::milliseconds(2000));
+    if (cr != ConnectResult::Ok) {
+        return false;
+    }
+    SaveCachedPort(endpoint, foundPort, foundRsdPort);
+    if (outServicePort) *outServicePort = foundPort;
+    if (outRsdPort) *outRsdPort = foundRsdPort;
+    return true;
+}
+
+} // namespace t2::discovery

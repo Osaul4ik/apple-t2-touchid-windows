@@ -57,12 +57,48 @@
     <OutDir>build\$(TargetName)\$(Platform)\$(Configuration)\</OutDir>
     <IntDir>build\$(TargetName)\$(Platform)\$(Configuration)\obj\</IntDir>
   </PropertyGroup>
+  <PropertyGroup>
+    <!-- Same fallback pattern as protocol/T2TouchIdProtocol.vcxproj: local
+         vcpkg checkout next to the .sln, overridable on the command line
+         (BuildT2TouchId.yml passes the real values after `vcpkg install`).
+         Needed here because BridgeXpc/Connection.cpp (linked in below via
+         Discovery/BridgeDiscovery.cpp's dependency chain) pulls in
+         BridgeXpc/PlistPayload.cpp, which needs libplist. -->
+    <VcpkgInstalledDir Condition="'$(VcpkgInstalledDir)'==''">$(SolutionDir)vcpkg\installed\x64-windows</VcpkgInstalledDir>
+    <PlistLibName Condition="'$(PlistLibName)'==''">plist-2.0.lib</PlistLibName>
+  </PropertyGroup>
   <ItemDefinitionGroup>
     <ClCompile>
       <WarningLevel>Level4</WarningLevel>
       <TreatWarningAsError>true</TreatWarningAsError>
       <LanguageStandard>stdcpp17</LanguageStandard>
+      <PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <!-- ../../../protocol lets Internal.h/Queue.cpp #include protocol
+           headers by the same relative path tools/t2touchid/main.cpp uses
+           from its own directory depth. -->
+      <AdditionalIncludeDirectories>..\..\..\protocol;$(VcpkgInstalledDir)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
+    <Link>
+      <!-- OPEN RISK, not yet verified on hardware/a real build (see
+           Internal.h's top comment and driver/T2TouchIdBio/docs/
+           Windows-hello-design.MD section 2's own open-question list):
+           protocol/T2TouchIdProtocol.vcxproj (these four .cpp below) is a
+           PlatformToolset=v143 desktop StaticLibrary project; this project
+           is PlatformToolset=WindowsUserModeDriver10.0 / DriverType=UMDF.
+           Compiling the same protocol .cpp files directly into THIS project
+           (rather than linking the other project's .lib output) sidesteps
+           any CRT-linkage mismatch between the two toolsets (a UMDF driver
+           commonly wants a static CRT; the desktop CLI/lib project may not)
+           - but it has not been confirmed to actually link clean under the
+           UMDF driver toolset's default runtime library setting. If this
+           fails to link, the likely fix is an explicit matching
+           <RuntimeLibrary> setting here and in
+           protocol/T2TouchIdProtocol.vcxproj, not a change to the C++ code.
+           ws2_32.lib is required directly (BridgeXpc/Discovery use raw
+           Winsock, not a wrapper this project already links). -->
+      <AdditionalDependencies>ws2_32.lib;$(VcpkgInstalledDir)\lib\$(PlistLibName);%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(VcpkgInstalledDir)\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+    </Link>
     <DriverSign>
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
     </DriverSign>
@@ -70,6 +106,25 @@
   <ItemGroup>
     <ClCompile Include="Driver.cpp" />
     <ClCompile Include="Queue.cpp" />
+    <!-- Protocol sources this driver now depends on (CAPTURE_DATA ->
+         VerificationEngine -> BridgeXpc -> Discovery). Compiled directly
+         into this project rather than referenced as a .lib - see the
+         Link/AdditionalDependencies comment above for why, and the open
+         risk that goes with it. Keep this list in sync with
+         protocol/T2TouchIdProtocol.vcxproj's own ClCompile ItemGroup minus
+         AppleKeyStore/Client.cpp (CAPTURE_DATA never touches AppleKeyStore -
+         that's the T2SepBootstrap service's job, design doc 9.2). -->
+    <ClCompile Include="..\..\..\protocol\BiometricKit\Commands.cpp" />
+    <ClCompile Include="..\..\..\protocol\BiometricKit\MatchResult.cpp" />
+    <ClCompile Include="..\..\..\protocol\BiometricKit\VerificationEngine.cpp" />
+    <ClCompile Include="..\..\..\protocol\BridgeXpc\Connection.cpp" />
+    <ClCompile Include="..\..\..\protocol\BridgeXpc\Frame.cpp" />
+    <ClCompile Include="..\..\..\protocol\BridgeXpc\PlistPayload.cpp" />
+    <ClCompile Include="..\..\..\protocol\Discovery\Adapter.cpp" />
+    <ClCompile Include="..\..\..\protocol\Discovery\BridgeDiscovery.cpp" />
+    <ClCompile Include="..\..\..\protocol\Discovery\PortCache.cpp" />
+    <ClCompile Include="..\..\..\protocol\Discovery\PortScan.cpp" />
+    <ClCompile Include="..\..\..\protocol\Discovery\RemoteXpc.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Internal.h" />
