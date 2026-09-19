@@ -1,4 +1,4 @@
-name: CI T2TouchIdBio (SepVaultGui + T2SepBootstrap)
+name: CI T2TouchIdBio (SepVaultGui + T2SepBootstrap + UMDF/PREfast)
 
 # T2TouchIdBio (driver/T2TouchIdBio) has two independent pieces:
 #
@@ -22,6 +22,12 @@ name: CI T2TouchIdBio (SepVaultGui + T2SepBootstrap)
 # Same conventions as those workflows otherwise: windows-2022, own
 # concurrency group, path-scoped triggers so this doesn't run on changes
 # unrelated to T2TouchIdBio.
+#
+# A second job, `umdf`, builds driver/T2TouchIdBio/Umdf (the WBDI UMDF 2
+# skeleton) with PREfast and packages it (StampInf/Inf2Cat/optional signing).
+# It installs the WDK on its own runner, so the first job (`ci`) stays
+# WDK-free, and a failure in the still-unbuilt UMDF skeleton cannot block the
+# SepVaultGui / T2SepBootstrap artifacts.
 
 on:
   push:
@@ -31,7 +37,7 @@ on:
       - 'protocol/**'
       - 'driver/T2TouchIdTransport/public.h'
       - 'T2TouchId.sln'
-      - '.github/workflows/CiT2TouchIdBio.yml'
+      - '.github/workflows/Cit2touchidbio.yml'
   pull_request:
     branches: [ main ]
     paths:
@@ -39,7 +45,7 @@ on:
       - 'protocol/**'
       - 'driver/T2TouchIdTransport/public.h'
       - 'T2TouchId.sln'
-      - '.github/workflows/CiT2TouchIdBio.yml'
+      - '.github/workflows/Cit2touchidbio.yml'
   workflow_dispatch:
 
 concurrency:
@@ -260,4 +266,290 @@ jobs:
       with:
         name: T2SepBootstrap-${{ github.sha }}
         path: artifacts/T2SepBootstrap
+        if-no-files-found: error
+
+  # ===========================================================================
+  # Second, independent job: T2TouchIdBio UMDF 2 skeleton (WBDI) built with
+  # PREfast (/analyze via RunCodeAnalysis + EnableCppCoreCheck), same flags as
+  # the KMDF driver's build in Cit2touchid.yml.
+  #
+  # Why a separate job and not more steps in `ci` above:
+  #   - `ci` is deliberately WDK-free (SepVaultGui + T2SepBootstrap). UMDF needs
+  #     the WDK, so it gets its own runner and installs it there.
+  #   - the UMDF skeleton has not been compiled yet. As its own job a red
+  #     build/PREfast result can't stop SepVaultGui/T2SepBootstrap from being
+  #     built and uploaded by `ci`.
+  #
+  # Standalone .vcxproj (not in T2TouchId.sln), so no vcpkg/libplist needed -
+  # the skeleton links no protocol code yet. When VerificationEngine gets wired
+  # in, this job will need the same vcpkg bootstrap `ci` does.
+  # ===========================================================================
+  umdf:
+    name: Build T2TouchIdBio UMDF (PREfast) + Package
+    runs-on: windows-2022
+    timeout-minutes: 45
+
+    env:
+      UMDF_DIR: driver/T2TouchIdBio/Umdf
+      UMDF_PROJECT: driver/T2TouchIdBio/Umdf/T2TouchIdBio.vcxproj
+      UMDF_NAME: T2TouchIdBio
+      # Must match UMDF_VERSION_MAJOR/MINOR in T2TouchIdBio.vcxproj (2.15).
+      UMDF_STAMP_VERSION: 2.15.0
+      # One-line switch: set to false to see PREfast findings without failing
+      # the job (useful while the skeleton is still being brought up).
+      CA_TREAT_WARNINGS_AS_ERRORS: true
+      SIGN_CERT_PFX: ${{ secrets.CERT }}
+      SIGN_CERT_PASSWORD: ${{ secrets.CERT_PWD }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Add MSBuild to PATH
+      uses: microsoft/setup-msbuild@v2
+
+    # Same official WDK installer flow as Cit2touchid.yml / BuildT2TouchId.yml.
+    - name: Install WDK
+      run: |
+        $ErrorActionPreference = "Stop"
+        $wdkUrl = "https://go.microsoft.com/fwlink/?linkid=2085767"
+        $wdkInstaller = "$env:TEMP\wdksetup.exe"
+        Invoke-WebRequest -Uri $wdkUrl -OutFile $wdkInstaller
+        $proc = Start-Process -FilePath $wdkInstaller -ArgumentList "/quiet /norestart" -Wait -PassThru
+        $exitCode = $proc.ExitCode
+        if ($exitCode -ne 0 -and $exitCode -ne 3010) {
+          Write-Error "WDK installer exited with code $exitCode"
+          exit 1
+        }
+        Write-Host "OK: WDK installer exited with code $exitCode"
+      shell: pwsh
+
+    # Locate (don't assume) every WDK tool this job needs, once.
+    - name: Locate WDK tools (StampInf, Inf2Cat, signtool)
+      run: |
+        $ErrorActionPreference = "Stop"
+        $roots = @(
+          "C:\Program Files (x86)\Windows Kits\10\bin",
+          "C:\Program Files\Windows Kits\10\bin"
+        )
+        function Find-Tool($name) {
+          $candidates = foreach ($root in $roots) {
+            if (Test-Path $root) {
+              Get-ChildItem -Path $root -Filter $name -Recurse -ErrorAction SilentlyContinue
+            }
+          }
+          if (-not $candidates) {
+            Write-Error "$name was not found under Windows Kits 10\bin after WDK install."
+            exit 1
+          }
+          $tool = $candidates | Where-Object { $_.FullName -match '\\x64\\' } | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $tool) { $tool = $candidates | Sort-Object FullName -Descending | Select-Object -First 1 }
+          Write-Host "OK: found $name -> $($tool.FullName)"
+          return $tool.FullName
+        }
+        Add-Content -Path $env:GITHUB_ENV -Value "STAMPINF_PATH=$(Find-Tool 'StampInf.exe')"
+        Add-Content -Path $env:GITHUB_ENV -Value "INF2CAT_PATH=$(Find-Tool 'Inf2Cat.exe')"
+        Add-Content -Path $env:GITHUB_ENV -Value "SIGNTOOL_PATH=$(Find-Tool 'signtool.exe')"
+      shell: pwsh
+
+    - name: Compute driver version and date
+      run: |
+        $ErrorActionPreference = "Stop"
+        $now = Get-Date
+        $driverDate    = $now.ToString("MM/dd/yyyy")
+        $driverVersion = "1.$($now.Year).$($now.ToString('MMdd')).$($now.ToString('HHmm'))"
+        Write-Host "==> DriverVer: $driverDate,$driverVersion"
+        Add-Content -Path $env:GITHUB_ENV -Value "DRIVER_DATE=$driverDate"
+        Add-Content -Path $env:GITHUB_ENV -Value "DRIVER_VERSION=$driverVersion"
+      shell: pwsh
+
+    # =====================================================================
+    # PREfast is baked into this msbuild invocation exactly like the KMDF
+    # build (RunCodeAnalysis + EnableCppCoreCheck). WindowsTargetPlatformVersion
+    # is pinned to whatever this runner's WDK installer shipped; UMDF_VERSION_*
+    # (2.15) are already pinned inside the vcxproj. The UMDF project writes to
+    # <project dir>\build\..., not the repo-root build\ that the user-mode
+    # projects in the .sln use.
+    # =====================================================================
+    - name: Build UMDF driver (with PREfast /analyze)
+      run: |
+        $ErrorActionPreference = "Stop"
+        $logDir   = Join-Path $env:GITHUB_WORKSPACE "umdf-analysis-logs"
+        New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+        $buildLog = Join-Path $logDir "build.log"
+
+        msbuild $env:UMDF_PROJECT `
+          /t:rebuild `
+          /p:Configuration=$env:CONFIGURATION `
+          /p:Platform=$env:PLATFORM `
+          /p:WindowsTargetPlatformVersion=10.0.26100.0 `
+          /p:RunCodeAnalysis=true `
+          /p:EnableCppCoreCheck=true `
+          /p:CodeAnalysisTreatWarningsAsErrors=$env:CA_TREAT_WARNINGS_AS_ERRORS `
+          /nologo /verbosity:normal /clp:Summary `
+          "/flp:logfile=$buildLog;verbosity=normal"
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "msbuild (UMDF + PREfast) failed with exit code $LASTEXITCODE - see umdf-analysis-logs/build.log."
+          exit 1
+        }
+
+        # Informational: how many PREfast (C6xxx / C28xxx) warnings were reported.
+        $ca = @(Select-String -Path $buildLog -Pattern 'warning C(6|28)\d{3}' -ErrorAction SilentlyContinue)
+        Write-Host "==> PREfast warnings in build log: $($ca.Count)"
+        Add-Content -Path $env:GITHUB_ENV -Value "PREFAST_WARNING_COUNT=$($ca.Count)"
+        Add-Content -Path $env:GITHUB_ENV -Value "UMDF_LOG_DIR=$logDir"
+      shell: pwsh
+
+    - name: Upload UMDF build / PREfast logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: umdf-static-analysis-logs
+        retention-days: 14
+        if-no-files-found: warn
+        path: |
+          umdf-analysis-logs/
+          driver/T2TouchIdBio/Umdf/build/**/obj/*.nativecodeanalysis.xml
+
+    # =====================================================================
+    # Packaging: same StampInf / Inf2Cat / signtool sequence as the KMDF
+    # driver, adapted for a UMDF service DLL (-u instead of -k). Only reached
+    # when the build + PREfast above passed.
+    # =====================================================================
+    - name: Prepare UMDF package folder
+      run: |
+        $ErrorActionPreference = "Stop"
+        $buildOutDir = "$env:UMDF_DIR\build\$env:UMDF_NAME\$env:PLATFORM\$env:CONFIGURATION"
+        $dllPath     = "$buildOutDir\$env:UMDF_NAME.dll"
+        $infSrcPath  = "$env:UMDF_DIR\$env:UMDF_NAME.inf"
+        $packageDir  = "artifacts\umdf"
+
+        if (-not (Test-Path $dllPath))    { Write-Error "Built .dll not found: $dllPath"; exit 1 }
+        if (-not (Test-Path $infSrcPath)) { Write-Error ".inf file not found: $infSrcPath"; exit 1 }
+
+        New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
+        Copy-Item -Path $dllPath -Destination $packageDir -Force
+        Copy-Item -Path $infSrcPath -Destination $packageDir -Force
+        $pdbPath = "$buildOutDir\$env:UMDF_NAME.pdb"
+        if (Test-Path $pdbPath) { Copy-Item -Path $pdbPath -Destination $packageDir -Force }
+
+        Write-Host "OK: staged UMDF files:"
+        Get-ChildItem $packageDir | ForEach-Object { Write-Host "  - $($_.Name)" }
+
+        Add-Content -Path $env:GITHUB_ENV -Value "PACKAGE_DIR=$packageDir"
+        Add-Content -Path $env:GITHUB_ENV -Value "DLL_PATH=$packageDir\$env:UMDF_NAME.dll"
+        Add-Content -Path $env:GITHUB_ENV -Value "INF_PATH=$packageDir\$env:UMDF_NAME.inf"
+        Add-Content -Path $env:GITHUB_ENV -Value "CAT_PATH=$packageDir\$env:UMDF_NAME.cat"
+      shell: pwsh
+
+    - name: Stamp INF (architecture / date / version / UMDF)
+      run: |
+        $ErrorActionPreference = "Stop"
+        $infPath = (Resolve-Path $env:INF_PATH).Path
+
+        # -u must match UMDF_VERSION_MAJOR/MINOR in T2TouchIdBio.vcxproj; it
+        # replaces $UMDFVERSION$ in [T2TouchIdBio_UmdfInstall].
+        & "$env:STAMPINF_PATH" -f "$infPath" -a amd64 -d "$env:DRIVER_DATE" -v "$env:DRIVER_VERSION" -u "$env:UMDF_STAMP_VERSION"
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "StampInf exited with error code $LASTEXITCODE."
+          exit 1
+        }
+
+        Write-Host "==> Stamped INF contents:"
+        Get-Content -Path $infPath | Select-String -Pattern 'DriverVer|UmdfLibraryVersion|root\\T2TouchIdBio'
+        if (Select-String -Path $infPath -Pattern '\$UMDFVERSION\$' -Quiet) {
+          Write-Error 'INF still contains the $UMDFVERSION$ token after StampInf.'
+          exit 1
+        }
+        Write-Host "OK: INF stamped."
+      shell: pwsh
+
+    - name: Generate CAT file (Inf2Cat)
+      run: |
+        $ErrorActionPreference = "Stop"
+        $fullPackageDir = (Resolve-Path $env:PACKAGE_DIR).Path
+        & "$env:INF2CAT_PATH" /driver:"$fullPackageDir" /os:10_X64 /verbose
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "Inf2Cat exited with error code $LASTEXITCODE."
+          exit 1
+        }
+        if (-not (Test-Path $env:CAT_PATH)) {
+          Write-Error "Inf2Cat did not report an error, but no .cat file was produced at $env:CAT_PATH."
+          exit 1
+        }
+        Write-Host "OK: .cat generated -> $env:CAT_PATH"
+      shell: pwsh
+
+    # Signing stays OPTIONAL, same policy as the KMDF driver: a missing
+    # CERT/CERT_PWD secret pair means unsigned (test-signable) output.
+    - name: Sign .dll and .cat with SignTool
+      if: ${{ env.SIGN_CERT_PFX != '' && env.SIGN_CERT_PASSWORD != '' }}
+      run: |
+        $ErrorActionPreference = "Stop"
+        $pfxPath = Join-Path $env:TEMP "signcert.pfx"
+        $cerPath = Join-Path $env:PACKAGE_DIR "$env:UMDF_NAME.cer"
+
+        try {
+          $bytes = [Convert]::FromBase64String($env:SIGN_CERT_PFX)
+          [IO.File]::WriteAllBytes($pfxPath, $bytes)
+
+          foreach ($target in @($env:DLL_PATH, $env:CAT_PATH)) {
+            & "$env:SIGNTOOL_PATH" sign /v /fd SHA256 /f "$pfxPath" /p "$env:SIGN_CERT_PASSWORD" `
+              /tr http://timestamp.digicert.com /td SHA256 "$target"
+            if ($LASTEXITCODE -ne 0) { Write-Error "Signing $target failed (exit code $LASTEXITCODE)."; exit 1 }
+          }
+
+          $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(
+            $pfxPath, $env:SIGN_CERT_PASSWORD,
+            [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable
+          )
+          Export-Certificate -Cert $cert -FilePath $cerPath | Out-Null
+          Write-Host "OK: .dll and .cat signed; .cer exported."
+        }
+        finally {
+          if (Test-Path $pfxPath) { Remove-Item -Path $pfxPath -Force }
+        }
+      shell: pwsh
+
+    - name: Warn if packaging unsigned
+      if: ${{ env.SIGN_CERT_PFX == '' || env.SIGN_CERT_PASSWORD == '' }}
+      run: Write-Host "::warning::CERT/CERT_PWD secrets not set - packaging an UNSIGNED .dll/.cat. Target machine needs test-signing enabled."
+      shell: pwsh
+
+    # PREfast evidence travels inside the package, like checks/ in the KMDF one.
+    - name: Bundle PREfast results with the package
+      run: |
+        $ErrorActionPreference = "Stop"
+        $checksDir = Join-Path $env:PACKAGE_DIR "checks"
+        New-Item -ItemType Directory -Path $checksDir -Force | Out-Null
+
+        $buildLog = Join-Path $env:UMDF_LOG_DIR "build.log"
+        if (Test-Path $buildLog) {
+          Copy-Item -Path $buildLog -Destination (Join-Path $checksDir "prefast-build.log") -Force
+        }
+        Get-ChildItem -Path "$env:UMDF_DIR\build" -Recurse -Filter "*.nativecodeanalysis.xml" -ErrorAction SilentlyContinue |
+          ForEach-Object { Copy-Item -Path $_.FullName -Destination $checksDir -Force }
+
+        $signed = if ($env:SIGN_CERT_PFX -and $env:SIGN_CERT_PASSWORD) { "yes" } else { "no - test-signing required on target machine" }
+        @"
+        T2TouchIdBio (UMDF 2 / WBDI skeleton) build summary
+        ====================================================
+        Driver:          $env:UMDF_NAME.dll
+        Driver version:  $env:DRIVER_VERSION
+        Built:           $env:DRIVER_DATE (UTC build date; local runner clock)
+        Target:          root\T2TouchIdBio, UMDF $env:UMDF_STAMP_VERSION, class Biometric
+
+        PREfast:         enabled (RunCodeAnalysis + EnableCppCoreCheck, warnings-as-errors: $env:CA_TREAT_WARNINGS_AS_ERRORS)
+        PREfast warnings in build log: $env:PREFAST_WARNING_COUNT
+        Signed:          $signed
+        "@ | Set-Content -Path (Join-Path $checksDir "SUMMARY.txt") -Encoding utf8
+
+        Write-Host "OK: bundled checks/ into $env:PACKAGE_DIR :"
+        Get-ChildItem -Recurse $checksDir | ForEach-Object { Write-Host "  - $($_.FullName)" }
+      shell: pwsh
+
+    - name: Upload T2TouchIdBio UMDF package
+      uses: actions/upload-artifact@v4
+      with:
+        name: T2TouchIdBio-Umdf-${{ env.DRIVER_VERSION }}
+        path: artifacts/umdf
         if-no-files-found: error
