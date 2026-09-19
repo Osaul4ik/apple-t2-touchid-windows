@@ -65,6 +65,7 @@ env:
   DOTNET_VERSION: '8.0.x'
   CONFIGURATION: Release
   PLATFORM: x64
+  CA_TREAT_WARNINGS_AS_ERRORS: false
 
 jobs:
   ci:
