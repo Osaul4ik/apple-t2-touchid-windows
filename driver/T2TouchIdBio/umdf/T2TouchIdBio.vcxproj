@@ -72,6 +72,8 @@
       <WarningLevel>Level4</WarningLevel>
       <TreatWarningAsError>true</TreatWarningAsError>
       <LanguageStandard>stdcpp17</LanguageStandard>
+      <!-- protocol/ code uses try/catch + iostreams (C4530 under /WX otherwise). -->
+      <ExceptionHandling>Sync</ExceptionHandling>
       <PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <!-- ../../../protocol lets Internal.h/Queue.cpp #include protocol
            headers by the same relative path tools/t2touchid/main.cpp uses

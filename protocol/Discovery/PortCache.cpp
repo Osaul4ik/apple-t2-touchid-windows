@@ -7,8 +7,12 @@
 // value per adapter and a human being may well want to `type` the file
 // while debugging a discovery issue.
 #include "PortCache.h"
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #include <string>
 #include <vector>

@@ -27,6 +27,7 @@
 #include <wdf.h>
 #include <strsafe.h>
 #include <winbio_types.h>
+#include <winbio_err.h>   // WINBIO_E_* HRESULTs (not pulled in by winbio_types.h)
 #include <winbio_ioctl.h>
 
 // Protocol libraries (protocol/T2TouchIdProtocol.vcxproj). Plain C++, no

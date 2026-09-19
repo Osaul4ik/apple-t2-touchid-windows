@@ -329,9 +329,9 @@ jobs:
   #     build/PREfast result can't stop SepVaultGui/T2SepBootstrap from being
   #     built and uploaded by `ci`.
   #
-  # Standalone .vcxproj (not in T2TouchId.sln), so no vcpkg/libplist needed -
-  # the skeleton links no protocol code yet. When VerificationEngine gets wired
-  # in, this job will need the same vcpkg bootstrap `ci` does.
+  # Standalone .vcxproj (not in T2TouchId.sln). It now compiles protocol/
+  # (VerificationEngine -> BridgeXpc -> PlistPayload.cpp), so this job needs
+  # the same vcpkg/libplist bootstrap `ci` does.
   # ===========================================================================
   umdf:
     name: Build T2TouchIdBio UMDF (PREfast) + Package
@@ -416,6 +416,38 @@ jobs:
         Add-Content -Path $env:GITHUB_ENV -Value "DRIVER_VERSION=$driverVersion"
       shell: pwsh
 
+    # protocol/BridgeXpc/PlistPayload.cpp needs <plist/plist.h>; the UMDF
+    # vcxproj takes the location from VcpkgInstalledDir / PlistLibName.
+    - name: Bootstrap vcpkg
+      run: |
+        $ErrorActionPreference = "Stop"
+        git clone --depth 1 https://github.com/microsoft/vcpkg.git vcpkg
+        .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+      shell: pwsh
+
+    - name: Install libplist (vcpkg)
+      run: |
+        $ErrorActionPreference = "Stop"
+        .\vcpkg\vcpkg.exe install libplist:x64-windows
+        if ($LASTEXITCODE -ne 0) { Write-Error "vcpkg install libplist failed ($LASTEXITCODE)"; exit 1 }
+      shell: pwsh
+
+    - name: Locate libplist library file
+      run: |
+        $ErrorActionPreference = "Stop"
+        $libDir = "vcpkg\installed\x64-windows\lib"
+        $lib = Get-ChildItem -Path $libDir -Filter "*.lib" |
+          Where-Object { $_.Name -match "plist" -and $_.Name -notmatch "\+\+" } |
+          Select-Object -First 1
+        if (-not $lib) {
+          Write-Error "No plist .lib found under $libDir after vcpkg install."
+          exit 1
+        }
+        Write-Host "OK: found $($lib.Name)"
+        Add-Content -Path $env:GITHUB_ENV -Value "PLIST_LIB_NAME=$($lib.Name)"
+        Add-Content -Path $env:GITHUB_ENV -Value "VCPKG_INSTALLED_DIR=$PWD\vcpkg\installed\x64-windows"
+      shell: pwsh
+
     # Diagnostic: the first real compile showed the WBDI type names in
     # Queue.cpp were guessed from memory. Put the runner's own WinBio headers
     # into the log (collapsed group) and into the umdf-static-analysis-logs
@@ -468,6 +500,8 @@ jobs:
           /p:Configuration=$env:CONFIGURATION `
           /p:Platform=$env:PLATFORM `
           /p:WindowsTargetPlatformVersion=10.0.26100.0 `
+          /p:VcpkgInstalledDir=$env:VCPKG_INSTALLED_DIR `
+          /p:PlistLibName=$env:PLIST_LIB_NAME `
           /p:RunCodeAnalysis=true `
           /p:EnableCppCoreCheck=true `
           /p:CodeAnalysisTreatWarningsAsErrors=$env:CA_TREAT_WARNINGS_AS_ERRORS `
