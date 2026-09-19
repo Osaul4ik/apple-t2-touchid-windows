@@ -603,6 +603,36 @@ jobs:
         Add-Content -Path $env:GITHUB_ENV -Value "CAT_PATH=$packageDir\$env:UMDF_NAME.cat"
       shell: pwsh
 
+    # T2TouchIdBio.dll imports plist-2.0.dll (+ libxml2/zlib/iconv/... from
+    # vcpkg). Without them in the driver package WUDFHost cannot load the
+    # driver and the node ends up in Code 31 / C0000001. Copy every vcpkg
+    # runtime DLL next to the driver and list them in the INF (SourceDisksFiles
+    # + UMDriverCopy) so they land in the driver store beside T2TouchIdBio.dll
+    # and are covered by the catalog. Must run BEFORE StampInf/Inf2Cat.
+    - name: Bundle libplist runtime DLLs into the package + INF
+      run: |
+        $ErrorActionPreference = "Stop"
+        $binDir = Join-Path $env:VCPKG_INSTALLED_DIR "bin"
+        $dlls = @(Get-ChildItem -Path $binDir -Filter "*.dll" -ErrorAction SilentlyContinue)
+        if ($dlls.Count -eq 0) { Write-Error "No runtime DLLs under $binDir"; exit 1 }
+        if (-not ($dlls | Where-Object { $_.Name -match 'plist' })) { Write-Error "plist DLL not found under $binDir"; exit 1 }
+        foreach ($d in $dlls) { Copy-Item -Path $d.FullName -Destination $env:PACKAGE_DIR -Force }
+
+        $srcLines  = ($dlls | ForEach-Object { "$($_.Name) = 1,," }) -join "`r`n"
+        $copyLines = ($dlls | ForEach-Object { $_.Name }) -join "`r`n"
+
+        $infFull = (Resolve-Path $env:INF_PATH).Path
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        $inf  = [System.IO.File]::ReadAllText($infFull)
+        $inf2 = [regex]::Replace($inf, '(?m)^\[SourceDisksFiles\][ \t]*(?=\r?$)', "[SourceDisksFiles]`r`n$srcLines")
+        $inf2 = [regex]::Replace($inf2, '(?m)^\[UMDriverCopy\][ \t]*(?=\r?$)', "[UMDriverCopy]`r`n$copyLines")
+        if ($inf2 -eq $inf -or $inf2 -notmatch [regex]::Escape($dlls[0].Name)) { Write-Error "INF was not patched with the runtime DLLs."; exit 1 }
+        [System.IO.File]::WriteAllText($infFull, $inf2, $utf8)
+
+        Write-Host "OK: bundled runtime DLLs and patched INF:"
+        $dlls | ForEach-Object { Write-Host "  - $($_.Name)" }
+      shell: pwsh
+
     - name: Stamp INF (architecture / date / version / UMDF)
       run: |
         $ErrorActionPreference = "Stop"
@@ -654,7 +684,10 @@ jobs:
           $bytes = [Convert]::FromBase64String($env:SIGN_CERT_PFX)
           [IO.File]::WriteAllBytes($pfxPath, $bytes)
 
-          foreach ($target in @($env:DLL_PATH, (Join-Path $env:PACKAGE_DIR "$env:ENGINE_NAME.dll"), $env:CAT_PATH)) {
+          # Every DLL in the package (driver, engine adapter, bundled libplist
+          # runtime) + the catalog.
+          $dllTargets = @(Get-ChildItem -Path $env:PACKAGE_DIR -Filter "*.dll" | ForEach-Object { $_.FullName })
+          foreach ($target in ($dllTargets + @($env:CAT_PATH))) {
             & "$env:SIGNTOOL_PATH" sign /v /fd SHA256 /f "$pfxPath" /p "$env:SIGN_CERT_PASSWORD" `
               /tr http://timestamp.digicert.com /td SHA256 "$target"
             if ($LASTEXITCODE -ne 0) { Write-Error "Signing $target failed (exit code $LASTEXITCODE)."; exit 1 }
