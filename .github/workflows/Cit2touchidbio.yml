@@ -92,12 +92,26 @@ jobs:
       shell: pwsh
 
     # =========================================================================
-    # Publish a self-contained win-x64 output so the uploaded artifact
-    # actually runs on a target machine without a .NET 8 runtime install,
-    # matching how the driver/tool packages from the other T2TouchId
-    # workflows are meant to be dropped onto real hardware.
+    # Two publish flavors, since they trade off differently and there's no
+    # single right answer for every target machine:
+    #
+    #   full - self-contained + PublishSingleFile. Runs on any machine with
+    #          no .NET install at all, at the cost of bundling the entire
+    #          .NET 8 + WPF runtime into the one .exe (tens of MB - that's
+    #          what makes it "big", not bloat in SepVaultGui's own code).
+    #
+    #   min  - framework-dependent (no --self-contained, no
+    #          PublishSingleFile). Just SepVaultGui's own small
+    #          exe+DLLs; needs the .NET 8 Desktop Runtime already installed
+    #          on the target machine to run.
+    #
+    # Both get built whenever the .NET 8 SDK step above succeeded (it's what
+    # "бібліотеки встановлені" means here - the SDK/workload used to publish,
+    # not something conditional on the runner), and both are uploaded as
+    # separate artifacts so whoever grabs the build picks whichever fits the
+    # machine they're installing on.
     # =========================================================================
-    - name: Publish SepVaultGui (self-contained win-x64)
+    - name: Publish SepVaultGui (full, self-contained win-x64)
       run: |
         $ErrorActionPreference = "Stop"
         dotnet publish "$env:GUI_PROJECT" `
@@ -105,14 +119,32 @@ jobs:
           -r win-x64 `
           --self-contained true `
           -p:PublishSingleFile=true `
-          -o artifacts\SepVaultGui
+          -o artifacts\SepVaultGui-full
 
-        $exePath = "artifacts\SepVaultGui\$env:GUI_ASSEMBLY_NAME.exe"
+        $exePath = "artifacts\SepVaultGui-full\$env:GUI_ASSEMBLY_NAME.exe"
         if (-not (Test-Path $exePath)) {
           Write-Error "Expected published binary not found: $exePath"
           exit 1
         }
-        Write-Host "OK: published $exePath"
+        $sizeMb = [Math]::Round((Get-Item $exePath).Length / 1MB, 1)
+        Write-Host "OK: published $exePath ($sizeMb MB, self-contained runtime bundled in)"
+      shell: pwsh
+
+    - name: Publish SepVaultGui (min, framework-dependent)
+      run: |
+        $ErrorActionPreference = "Stop"
+        dotnet publish "$env:GUI_PROJECT" `
+          -c $env:CONFIGURATION `
+          --self-contained false `
+          -o artifacts\SepVaultGui-min
+
+        $exePath = "artifacts\SepVaultGui-min\$env:GUI_ASSEMBLY_NAME.exe"
+        if (-not (Test-Path $exePath)) {
+          Write-Error "Expected published binary not found: $exePath"
+          exit 1
+        }
+        $sizeMb = [Math]::Round((Get-Item $exePath).Length / 1MB, 1)
+        Write-Host "OK: published $exePath ($sizeMb MB, requires .NET 8 Desktop Runtime on target)"
       shell: pwsh
 
     # =========================================================================
@@ -209,11 +241,18 @@ jobs:
         Get-ChildItem $packageDir | ForEach-Object { Write-Host "  - $($_.Name)" }
       shell: pwsh
 
-    - name: Upload SepVaultGui package
+    - name: Upload SepVaultGui package (full, self-contained)
       uses: actions/upload-artifact@v4
       with:
-        name: SepVaultGui-${{ github.sha }}
-        path: artifacts/SepVaultGui
+        name: SepVaultGui-full-${{ github.sha }}
+        path: artifacts/SepVaultGui-full
+        if-no-files-found: error
+
+    - name: Upload SepVaultGui package (min, framework-dependent)
+      uses: actions/upload-artifact@v4
+      with:
+        name: SepVaultGui-min-${{ github.sha }}
+        path: artifacts/SepVaultGui-min
         if-no-files-found: error
 
     - name: Upload T2SepBootstrap package
