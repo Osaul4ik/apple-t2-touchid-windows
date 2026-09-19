@@ -790,10 +790,22 @@ T2NcmMiniportRestart(
 
     if (context->BulkInPipe == NULL || context->BulkOutPipe == NULL)
     {
-        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2Ncm: restart requested with no bulk pipes — the control plane "
-            "did not come back up\n"));
-        return NDIS_STATUS_FAILURE;
+        // The control plane did not come up. T2NcmPowerArmHardware is
+        // where "is the device actually ready yet" gets decided — it
+        // owns its own bounded wait-for-readiness on the one control
+        // transfer that can genuinely still be settling on a cold boot
+        // (GET_NTB_PARAMETERS). Restart itself makes exactly one call
+        // and takes whatever answer comes back; it does not loop.
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
+            "T2Ncm: restart requested with no bulk pipes — re-arming\n"));
+
+        status = T2NcmPowerArmHardware(context);
+        if (!NT_SUCCESS(status))
+        {
+            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+                "T2Ncm: restart — re-arm failed 0x%08X\n", status));
+            return NDIS_STATUS_FAILURE;
+        }
     }
 
     // Open the gate BEFORE arming the reader: a read completion that
@@ -817,6 +829,13 @@ T2NcmMiniportRestart(
     if (!NT_SUCCESS(status))
     {
         InterlockedExchange(&context->DataPathRunning, 0);
+
+        // Log the REAL status here instead of only the generic value
+        // returned to NDIS below — this is what actually shows up as
+        // the adapter's problem code (e.g. STATUS_NOT_SUPPORTED /
+        // 0xC00000BB), and the previous version of this function
+        // discarded it entirely, making the Device Manager / Event
+        // Viewer code impossible to trace back to a specific call.
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
             "T2Ncm: RX engine did not start on restart (0x%08X)\n", status));
         return NDIS_STATUS_FAILURE;

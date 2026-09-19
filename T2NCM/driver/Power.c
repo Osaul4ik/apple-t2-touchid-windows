@@ -8,6 +8,113 @@
 #include "NcmProtocol.h"
 #include "NcmRx.h"
 
+// ---------------------------------------------------------------------
+// Cold-boot readiness wait for GET_NTB_PARAMETERS.
+//
+// On real hardware the T2's NCM control plane can still be settling
+// when this runs right after a from-cold MiniportInitializeEx —
+// bridgeOS/SEP have their own bring-up sequence that isn't synchronized
+// with when Windows decides the USB function is enumerated. There is no
+// notification for "the NCM function has finished initializing"; the
+// CDC-NCM spec's interrupt-pipe notifications (NETWORK_CONNECTION etc.,
+// read by the separate T2NcmCtrl.sys on MI_00) are about physical link
+// state, not this. The only real signal is the answer to the request
+// itself, so waiting for readiness here necessarily means asking again —
+// the difference from a blind loop is WHERE that asking happens (this
+// one call, not the whole Restart/re-arm sequence) and THAT it only
+// re-asks when the failure actually looks like "not ready yet".
+//
+// A transient status is a low-level USB condition consistent with a
+// function that hasn't attached to the endpoint yet — STALL/timeout/not-
+// ready style failures the class request can hit before bridgeOS has
+// wired the NCM handler up. STATUS_DEVICE_PROTOCOL_ERROR is deliberately
+// EXCLUDED: that means the device answered with a well-formed but
+// nonsensical response (T2NcmGetNtbParameters already validated it), which
+// is a real incompatibility, not a timing race — retrying it would just
+// burn the whole budget for nothing.
+static
+BOOLEAN
+T2NcmIsTransientArmStatus(
+    _In_ NTSTATUS Status
+    )
+{
+    switch (Status)
+    {
+    case STATUS_IO_TIMEOUT:
+    case STATUS_DEVICE_NOT_READY:
+    case STATUS_DEVICE_BUSY:
+    case STATUS_DEVICE_DATA_ERROR:
+    case STATUS_UNSUCCESSFUL:      // generic STALL/PID-error mapping
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
+#define T2NCM_ARM_READY_BUDGET_MS      800
+#define T2NCM_ARM_READY_INITIAL_MS     20
+#define T2NCM_ARM_READY_MAX_STEP_MS    150
+
+static
+NTSTATUS
+T2NcmGetNtbParametersWaitReady(
+    _In_  PT2NCM_DEVICE_CONTEXT   DeviceContext,
+    _Out_ PT2NCM_NTB_PARAMETERS   Parameters
+    )
+{
+    NTSTATUS status;
+    ULONG elapsedMs = 0;
+    ULONG stepMs = T2NCM_ARM_READY_INITIAL_MS;
+    ULONG attempt = 0;
+
+    for (;;)
+    {
+        attempt++;
+        status = T2NcmGetNtbParameters(DeviceContext, Parameters);
+        if (NT_SUCCESS(status))
+        {
+            if (attempt > 1)
+            {
+                T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
+                    "T2Ncm: GET_NTB_PARAMETERS succeeded after %lu attempt(s), "
+                    "~%lu ms of waiting for the control plane to settle\n",
+                    attempt, elapsedMs));
+            }
+            return STATUS_SUCCESS;
+        }
+
+        if (!T2NcmIsTransientArmStatus(status) ||
+            elapsedMs + stepMs > T2NCM_ARM_READY_BUDGET_MS)
+        {
+            // Either a real (non-timing) failure, or the budget is
+            // spent — stop asking and let the caller treat this as a
+            // genuine failure rather than retrying forever.
+            if (attempt > 1)
+            {
+                T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+                    "T2Ncm: GET_NTB_PARAMETERS gave up after %lu attempt(s) "
+                    "(~%lu ms), last status 0x%08X\n",
+                    attempt, elapsedMs, status));
+            }
+            return status;
+        }
+
+        {
+            LARGE_INTEGER delay;
+
+            delay.QuadPart = -((LONGLONG)stepMs * 10000);
+            KeDelayExecutionThread(KernelMode, FALSE, &delay);
+        }
+
+        elapsedMs += stepMs;
+        stepMs *= 2;
+        if (stepMs > T2NCM_ARM_READY_MAX_STEP_MS)
+        {
+            stepMs = T2NCM_ARM_READY_MAX_STEP_MS;
+        }
+    }
+}
+
 NTSTATUS
 T2NcmPowerArmHardware(
     _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
@@ -30,6 +137,20 @@ T2NcmPowerArmHardware(
     // A failed fast re-arm falls back to the full slow path below on the
     // NEXT arm attempt (see the Unwind block) rather than retrying here,
     // so this function never loops.
+    // Defensive: any re-arm (fast or slow path below) is about to call
+    // WdfUsbInterfaceSelectSetting, which hands back BRAND NEW pipe
+    // objects — the old WDFUSBPIPE handles this device's continuous
+    // reader (if one is still configured against them) become invalid
+    // the moment that happens. T2NcmRxStart's own RxStarted flag is only
+    // cleared by MiniportPause -> T2NcmRxStop, so a second arm reachable
+    // without an intervening Pause (a stray/duplicate D0 power
+    // indication, a retry from MiniportRestart, a surprise-removal
+    // recovery path, etc.) would otherwise leave the reader silently
+    // orphaned on a pipe that no longer exists rather than reconfigured
+    // on the new one. T2NcmRxStop is idempotent, so this costs nothing
+    // on the normal path where nothing was running.
+    T2NcmRxStop(DeviceContext);
+
     if (DeviceContext->NtbParametersCached)
     {
         status = T2NcmUsbActivateDataInterface(DeviceContext);
@@ -85,7 +206,7 @@ T2NcmPowerArmHardware(
     // NIC whose MAC changes across S3 is a worse failure than a stale
     // one. MiniportInitializeEx owns that read; see NdisMiniport.c.
 
-    status = T2NcmGetNtbParameters(DeviceContext, &ntbParams);
+    status = T2NcmGetNtbParametersWaitReady(DeviceContext, &ntbParams);
     if (!NT_SUCCESS(status))
     {
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,

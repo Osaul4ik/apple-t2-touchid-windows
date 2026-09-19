@@ -65,10 +65,38 @@ longer starts the data path — that single change is the inversion in
 practice.
 
 **`MiniportRestart`** is the only thing that sets `DataPathRunning` and
-starts the bulk-IN reader. It refuses if the recorded power state is not
-D0 or if the bulk pipes are missing, because either would mean the model
+starts the bulk-IN reader. It refuses outright — a single attempt, no
+loop — if the recorded power state is not D0, if a re-arm it triggers
+fails, or if `T2NcmRxStart` fails, because any of those means the model
 has been broken somewhere upstream and a loud failure beats silent USB
 errors.
+
+If the bulk pipes are missing, it calls `T2NcmPowerArmHardware` once and
+takes whatever answer comes back. The actual "is the device ready yet"
+question is answered one layer down, inside `T2NcmPowerArmHardware`,
+around the single control transfer where a real cold-boot timing issue
+would show up: `GET_NTB_PARAMETERS`. Real cold-boot hardware showed the
+T2's NCM control plane can still be settling right when NDIS calls
+Restart immediately after a from-cold `MiniportInitializeEx` — bridgeOS/
+SEP bring-up isn't synchronized with when Windows decides the USB
+function is enumerated, and there is no notification for "the NCM
+function is done initializing" (the CDC interrupt-pipe notifications
+read on MI_00 by the separate `T2NcmCtrl.sys` are about physical link
+state, not this). The observed symptom was Code 43 on MI_01 that a
+manual Disable/Enable always cleared — which only differs from what NDIS
+already did in going through a full `MiniportHaltEx` +
+`MiniportInitializeEx` first, buying the device more time.
+
+`T2NcmGetNtbParametersWaitReady` (Power.c) re-issues GET_NTB_PARAMETERS
+with exponential backoff (20 ms doubling to 150 ms, an ~800 ms total
+budget) but **only** when the failure looks like a timing race — a
+STALL/timeout/not-ready style status — never for
+`STATUS_DEVICE_PROTOCOL_ERROR`, which means the device answered with a
+well-formed but wrong response and is a real incompatibility, not
+something waiting helps with. Nothing else in the arm sequence
+(negotiation, SET_NTB_INPUT_SIZE, the alt-1 switch) retries — this one
+request is the only point that has actually been observed racing
+against bridgeOS on real hardware.
 
 **`MiniportPause`** closes the gate first, then stops the reader, then
 drains. Both orders of the first two steps "work"; only this one closes
