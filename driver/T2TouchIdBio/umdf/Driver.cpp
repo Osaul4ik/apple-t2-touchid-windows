@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Driver.cpp - DriverEntry + EvtDeviceAdd for the WBDI UMDF skeleton.
+// initguid.h must come BEFORE the header that DEFINE_GUIDs
+// GUID_DEVINTERFACE_BIOMETRIC_READER (winbio_ioctl.h, pulled in by
+// Internal.h): without INITGUID that header only *declares* the GUID and the
+// link fails with LNK2001. Exactly one .cpp of the driver does this; a second
+// one would be harmless (DECLSPEC_SELECTANY) but pointless.
+#include <initguid.h>
 #include "Internal.h"
 
 void T2BioLog(_In_z_ const char* fmt, ...)
