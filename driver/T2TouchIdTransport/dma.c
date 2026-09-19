@@ -108,6 +108,12 @@ T2DmaAllocateOolBuffers(_In_ PT2_DEVICE_CONTEXT Ctx)
     RtlZeroMemory(Ctx->OolInVa, T2_SEP_OOL_SIZE);
     RtlZeroMemory(Ctx->OolOutVa, T2_SEP_OOL_SIZE);
 
+    // Write the zeros back to memory now, before SEP is told these
+    // addresses. Otherwise the buffers stay dirty in the CPU cache and a
+    // later clflush of OOL_OUT could write those zeros over a SEP reply.
+    T2AksFlushForDevice(Ctx->OolInVa, T2_SEP_OOL_SIZE);
+    T2AksFlushForDevice(Ctx->OolOutVa, T2_SEP_OOL_SIZE);
+
     return STATUS_SUCCESS;
 }
 

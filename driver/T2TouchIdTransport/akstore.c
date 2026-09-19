@@ -160,7 +160,13 @@ T2AksDumpWire(_In_reads_bytes_(Length) PUCHAR Message, _In_ SIZE_T Length, _In_ 
 // Flush CPU write-back caches for [Va, Va+Length) so device DMA sees the
 // data. Common-buffer memory is WB; without this SEP may read stale zeros.
 // Uses clflush (x86/x64); KeMemoryBarrier alone is not sufficient.
-static VOID
+//
+// clflush WRITES BACK a dirty line before invalidating it. So this is only
+// a safe "invalidate" for device->CPU reads if the lines are CLEAN: any
+// line the CPU dirtied (zeroing, in-place digest) and did not flush before
+// SEP wrote to it would be written back over SEP's data. Callers must not
+// leave OUT-buffer lines dirty across an exchange.
+VOID
 T2AksFlushForDevice(_In_reads_bytes_(Length) PVOID Va, _In_ SIZE_T Length)
 {
     PUCHAR p = (PUCHAR)Va;
@@ -243,7 +249,13 @@ T2AksExchange(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
         Ctx->OolInRegistered, Ctx->OolOutRegistered, Ctx->OolSepMayKnowAddress));
 
     RtlZeroMemory(inBase, T2_SEP_OOL_SIZE);
-    RtlZeroMemory(outBase, T2_SEP_OOL_SIZE);
+    // OOL_OUT is deliberately NOT zeroed here. Zeroing 16 KiB would leave
+    // every line dirty in the CPU cache; the post-reply clflush would then
+    // write those zeros back over SEP's reply on a non-coherent path. OUT
+    // starts each exchange clean: dma.c flushes it once after its initial
+    // zero, and this function flushes exactly the lines it reads/dirties.
+    // Only replyWireLength bytes are ever consumed, so stale bytes past
+    // that are never read.
 
     // Always V2 — matches Linux t2_aks_exchange_locked / t2-aks-tool ioctl
     // path (proven for capabilities on real hardware). Combined with
@@ -371,9 +383,6 @@ T2AksExchange(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
         return STATUS_SUCCESS;
     }
 
-    // Device -> CPU: invalidate cache so we observe SEP's write to OOL_OUT.
-    T2AksFlushForDevice(outBase, T2_SEP_OOL_SIZE);
-
     // replyWireLength==0: SEP posted a mailbox ack with no OOL payload
     // (seen for get_device_state with handle=0 — endpoint alive, no body).
     if (replyWireLength == 0) {
@@ -402,6 +411,11 @@ T2AksExchange(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
             "(expect >=%u, <=%u)\n", replyWireLength, (UINT32)T2_AKS_V2_WIRE_SIZE, T2_SEP_OOL_SIZE));
         return STATUS_DEVICE_PROTOCOL_ERROR;
     }
+
+    // Device -> CPU: invalidate cache so we observe SEP's write to OOL_OUT.
+    // Only the reply itself (replyWireLength, already bounds-checked above
+    // so this can never run past the 16 KiB buffer) is ever read.
+    T2AksFlushForDevice(outBase, replyWireLength);
 
     // Dump OOL_OUT for diagnostic ops so we can verify digest/body.
     if (Operation == T2AksOpGetCapabilities || Operation == T2AksOpGetDeviceState) {
@@ -439,6 +453,11 @@ T2AksExchange(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
         }
         RtlSecureZeroMemory(expected, sizeof(expected));
     }
+    // The digest field of OOL_OUT was just modified in place (zeroed, then
+    // rewritten by T2AksDigest), leaving that cache line dirty. Write it
+    // back now, while SEP is not writing, so a later invalidate cannot
+    // clobber the next reply's header with this stale line.
+    T2AksFlushForDevice(outBase, sizeof(UINT32) + 16);
     if (!NT_SUCCESS(status)) {
         return status;
     }

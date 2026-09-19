@@ -342,6 +342,7 @@ NTSTATUS T2EnablePciBusMaster(_In_ WDFDEVICE Device);
 // akstore.c
 BOOLEAN T2AksOperationAllowed(_In_ UINT8 Operation);
 NTSTATUS T2AksDigest(_Inout_updates_bytes_(Length) PUCHAR Message, _In_ SIZE_T Length);
+VOID T2AksFlushForDevice(_In_reads_bytes_(Length) PVOID Va, _In_ SIZE_T Length);
 // SepStatus is always written (0 on entry-guaranteed success paths, the raw
 // signed SEP status byte otherwise) whenever this function returns
 // STATUS_SUCCESS. A STATUS_SUCCESS + nonzero *SepStatus means the exchange
