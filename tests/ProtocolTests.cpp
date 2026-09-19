@@ -110,10 +110,15 @@ static void TestMatchResult_WrongEmbeddedType() {
 }
 
 static void TestMatchResult_TooShort() {
+    // A match_result event shorter than kMinMatchResultEventBytes has
+    // nothing to scan for a UUID. Per MatchResult.h/.cpp (VERIFIED FROM
+    // SOURCE against bridge-xpc-probe.py's summarize_event/
+    // verdict_from_result), this is a definite NoMatch, not Malformed —
+    // Malformed is reserved for embeddedType != kEmbeddedTypeMatchResult.
     std::vector<uint8_t> payload(biometrickit::kMinMatchResultEventBytes - 1, 0);
     auto ids = std::vector<biometrickit::IdentityRecordV1>{MakeIdentity(501, 0xAA)};
     auto r = biometrickit::ParseMatchResult(biometrickit::kEmbeddedTypeMatchResult, payload, ids);
-    CHECK(r.outcome == biometrickit::MatchOutcome::Malformed);
+    CHECK(r.outcome == biometrickit::MatchOutcome::NoMatch);
 }
 
 static void TestMatchResult_NoEnrolledIdentities_IsNoMatchNotError() {
