@@ -94,3 +94,4 @@ first and publishing it under a free license.
 GPL-2.0-only. See `LICENSE`. Protocol facts (not code) were derived from
 analysis of [jmurth1234/t2-touchid-linux](https://github.com/jmurth1234/t2-touchid-linux)
 — see `NOTICE.md` and `docs/linux-reference-analysis.md`.
+
