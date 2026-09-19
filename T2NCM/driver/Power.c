@@ -358,12 +358,7 @@ T2NcmPowerSetDeviceState(
     // the honest state to report from the diagnostic surface while
     // suspended — NcmReady would claim a negotiated NTB geometry that no
     // longer describes anything.
-    WdfSpinLockAcquire(DeviceContext->StateLock);
-    if (DeviceContext->State != T2NcmStateReleased)
-    {
-        DeviceContext->State = T2NcmStatePrepared;
-    }
-    WdfSpinLockRelease(DeviceContext->StateLock);
+    (VOID)T2NcmTrySetStateUnless(DeviceContext, T2NcmStateReleased, T2NcmStatePrepared);
 
     T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
         "T2Ncm: quiesced for low-power state %u (MI_01 parked on alt %u)\n",

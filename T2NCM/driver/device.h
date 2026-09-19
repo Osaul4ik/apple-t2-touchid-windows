@@ -46,6 +46,28 @@ T2NcmTrySetState(
     _In_ T2NCM_LIFECYCLE_STATE NewState
     );
 
+// Unconditional variant — sets NewState regardless of current state.
+// Only for transitions that are genuinely allowed from anywhere (see
+// Device.c). Do not reach for this instead of fixing an ExpectedCurrent
+// that does not match; that is what T2NcmTrySetState's "not taken" trace
+// is for.
+VOID
+T2NcmForceSetState(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext,
+    _In_ T2NCM_LIFECYCLE_STATE NewState
+    );
+
+// Sets NewState unless the current state equals Forbidden. For paths
+// with more than one legal predecessor state where the one thing that
+// must never happen is overwriting a specific terminal/guard state (see
+// Device.c).
+BOOLEAN
+T2NcmTrySetStateUnless(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext,
+    _In_ T2NCM_LIFECYCLE_STATE Forbidden,
+    _In_ T2NCM_LIFECYCLE_STATE NewState
+    );
+
 // Returns TRUE if USB I/O may currently be submitted (i.e. the hardware
 // is armed and we are not in Stopping/Released/Created/Prepared). This
 // is a HARDWARE readiness question, not a data-path one — whether frames

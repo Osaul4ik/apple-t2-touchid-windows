@@ -680,9 +680,7 @@ T2NcmMiniportHaltEx(
     T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
         "T2Ncm: MiniportHaltEx (action=%u)\n", (ULONG)HaltAction));
 
-    WdfSpinLockAcquire(context->StateLock);
-    context->State = T2NcmStateStopping;
-    WdfSpinLockRelease(context->StateLock);
+    T2NcmForceSetState(context, T2NcmStateStopping);
 
     // NDIS guarantees the adapter is already paused here, but a
     // surprise removal can reach halt through paths where that is less
@@ -698,9 +696,7 @@ T2NcmMiniportHaltEx(
     T2NcmRxFreeResources(context);
     T2NcmUsbReleaseHardware(context);
 
-    WdfSpinLockAcquire(context->StateLock);
-    context->State = T2NcmStateReleased;
-    WdfSpinLockRelease(context->StateLock);
+    T2NcmForceSetState(context, T2NcmStateReleased);
 
     context->MiniportAdapterHandle = NULL;
 
@@ -734,24 +730,14 @@ T2NcmMiniportPause(
     // reader has stopped but an in-flight completion still indicates.
     InterlockedExchange(&context->DataPathRunning, 0);
 
-    WdfSpinLockAcquire(context->StateLock);
-    if (context->State == T2NcmStateRunning)
-    {
-        context->State = T2NcmStateStopping;
-    }
-    WdfSpinLockRelease(context->StateLock);
+    (VOID)T2NcmTrySetState(context, T2NcmStateRunning, T2NcmStateStopping);
 
     T2NcmRxStop(context);
     T2NcmWaitForDrain(context);
 
     // Back to NdisRegistered: the adapter still exists and the hardware
     // is still armed, it is just not moving frames.
-    WdfSpinLockAcquire(context->StateLock);
-    if (context->State == T2NcmStateStopping)
-    {
-        context->State = T2NcmStateNdisRegistered;
-    }
-    WdfSpinLockRelease(context->StateLock);
+    (VOID)T2NcmTrySetState(context, T2NcmStateStopping, T2NcmStateNdisRegistered);
 
     // Synchronous completion. Returning NDIS_STATUS_PENDING would mean
     // calling NdisMPauseComplete later, and there is nothing here that

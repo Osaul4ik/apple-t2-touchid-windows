@@ -54,6 +54,73 @@ T2NcmTrySetState(
     return ok;
 }
 
+// Unconditional variant of T2NcmTrySetState, for the two transitions that
+// are deliberately allowed from ANY current state: MiniportHaltEx must be
+// able to tear down from a partially-initialized or error state, not just
+// from the one state the normal lifecycle would predict. Still goes
+// through the same lock and the same trace-log shape as the guarded
+// version, so every state change in this driver is traceable the same
+// way — see the contract comment on T2NcmTrySetState in Device.h.
+VOID
+T2NcmForceSetState(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext,
+    _In_ T2NCM_LIFECYCLE_STATE NewState
+    )
+{
+    T2NCM_LIFECYCLE_STATE previous;
+
+    WdfSpinLockAcquire(DeviceContext->StateLock);
+    previous = DeviceContext->State;
+    DeviceContext->State = NewState;
+    WdfSpinLockRelease(DeviceContext->StateLock);
+
+    T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_TRACE_LEVEL,
+        "T2Ncm: state %s -> %s (forced)\n",
+        T2NcmStateName(previous), T2NcmStateName(NewState)));
+}
+
+// Sets NewState unless the current state is exactly Forbidden, in which
+// case it is left alone. Used by the low-power quiesce path: it needs to
+// drop back to Prepared from whatever state it was running in (there is
+// no single "expected" predecessor, so T2NcmTrySetState's equality check
+// does not fit), but must never resurrect an already-Released adapter if
+// a stray/late power indication arrives after MiniportHaltEx. Same lock
+// and trace-log shape as T2NcmTrySetState/T2NcmForceSetState.
+BOOLEAN
+T2NcmTrySetStateUnless(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext,
+    _In_ T2NCM_LIFECYCLE_STATE Forbidden,
+    _In_ T2NCM_LIFECYCLE_STATE NewState
+    )
+{
+    T2NCM_LIFECYCLE_STATE previous;
+    BOOLEAN ok;
+
+    WdfSpinLockAcquire(DeviceContext->StateLock);
+    previous = DeviceContext->State;
+    ok = (previous != Forbidden);
+    if (ok)
+    {
+        DeviceContext->State = NewState;
+    }
+    WdfSpinLockRelease(DeviceContext->StateLock);
+
+    if (ok)
+    {
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_TRACE_LEVEL,
+            "T2Ncm: state %s -> %s\n",
+            T2NcmStateName(previous), T2NcmStateName(NewState)));
+    }
+    else
+    {
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_TRACE_LEVEL,
+            "T2Ncm: transition to %s from %s not taken (forbidden state)\n",
+            T2NcmStateName(NewState), T2NcmStateName(previous)));
+    }
+
+    return ok;
+}
+
 BOOLEAN
 T2NcmIsIoAllowed(
     _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
