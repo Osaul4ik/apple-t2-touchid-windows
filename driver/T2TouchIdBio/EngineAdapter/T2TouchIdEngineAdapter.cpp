@@ -8,6 +8,19 @@
 // as its engine, so this DLL has to exist, export WbioQueryEngineInterface
 // and survive Attach. Nothing here talks to the SEP yet.
 //
+// STAGE 1b: the first cut advertised WINBIO_ENGINE_INTERFACE_VERSION_1 with
+// Size covering only the V1 tail (through ControlUnitPrivileged). WBF's
+// adapter-integrity check rejects that on Windows 10/11 -
+// WINBIO_E_ADAPTER_INTEGRITY_FAILURE (0x8009803d), logged as Event 1109/
+// 0x80070002 same as a missing DLL - because winbio_adapter.h requires
+// VERSION_3 or VERSION_4 from Windows 10 onward (Windows 7 was the only
+// VERSION_1 target). Fixed by advertising VERSION_3 and implementing the
+// V2.0/V3.0 members winbio_adapter.h adds after ControlUnitPrivileged
+// (NotifyPowerChange, Reserved_1, then PipelineInit through
+// SetAccountPolicy) - all of them, not just the lifecycle ones, since a
+// null entry WBF decides to call would crash wbiosrvc rather than fail
+// cleanly. See the interface-table comment below for exactly which.
+//
 // Fail-closed rule (design doc 5): no callback may ever report a match. Every
 // matching / enrollment entry point returns E_NOTIMPL with its outputs zeroed
 // until the VerificationEngine wiring exists. A wrong "success" here would be
@@ -401,17 +414,209 @@ HRESULT WINAPI EngineControlUnitPrivileged(
 }
 
 // ---------------------------------------------------------------------------
-// Interface table: V1.0 members only, in the order winbio_adapter.h declares
-// them. The struct is larger in this SDK (V2..V6 tail, zero-filled) but the
-// interface version we advertise is 1, so Size covers exactly the V1 part
-// (what a Windows 7 SDK build of this adapter would have reported). If WBF
-// rejects V1 on this Windows build, the Operational log says so and the next
-// step is V3 (PipelineInit/Activate/QueryExtendedInfo, ...).
+// V2.0 - power notification. Informational only; nothing here depends on
+// power state yet, so just observe and succeed.
+// ---------------------------------------------------------------------------
+HRESULT WINAPI EngineNotifyPowerChange(
+    _Inout_ PWINBIO_PIPELINE Pipeline,
+    _In_ ULONG PowerEventType)
+{
+    Trace("NotifyPowerChange", Pipeline);
+    UNREFERENCED_PARAMETER(PowerEventType);
+    return ARGUMENT_PRESENT(Pipeline) ? S_OK : E_POINTER;
+}
+
+// Reserved_1 is documented as "reserved, must be set to NULL" - it is not a
+// callback slot to implement, so no EngineReserved1 function exists; the
+// interface table below assigns the field nullptr directly.
+
+// ---------------------------------------------------------------------------
+// V3.0 - pipeline lifecycle. WBF aborts unit activation/configuration on
+// any non-S_OK from these (per winbio_adapter.h), and there is no deferred
+// work to do yet, so they succeed unconditionally once Pipeline is present.
+// ---------------------------------------------------------------------------
+HRESULT WINAPI EnginePipelineInit(_Inout_ PWINBIO_PIPELINE Pipeline)
+{
+    Trace("PipelineInit", Pipeline);
+    return ARGUMENT_PRESENT(Pipeline) ? S_OK : E_POINTER;
+}
+
+HRESULT WINAPI EnginePipelineCleanup(_Inout_ PWINBIO_PIPELINE Pipeline)
+{
+    Trace("PipelineCleanup", Pipeline);
+    return ARGUMENT_PRESENT(Pipeline) ? S_OK : E_POINTER;
+}
+
+HRESULT WINAPI EngineActivate(_Inout_ PWINBIO_PIPELINE Pipeline)
+{
+    Trace("Activate", Pipeline);
+    return ARGUMENT_PRESENT(Pipeline) ? S_OK : E_POINTER;
+}
+
+HRESULT WINAPI EngineDeactivate(_Inout_ PWINBIO_PIPELINE Pipeline)
+{
+    Trace("Deactivate", Pipeline);
+    return ARGUMENT_PRESENT(Pipeline) ? S_OK : E_POINTER;
+}
+
+// QueryExtendedInfo is called once during unit configuration (and again on
+// WinBioGetProperty(WINBIO_PROPERTY_EXTENDED_ENGINE_INFO)); winbio_adapter.h
+// lists only E_POINTER/E_INVALIDARG as valid failures, so - unlike the
+// matching path - this one must succeed for the unit to come up.
+HRESULT WINAPI EngineQueryExtendedInfo(
+    _Inout_ PWINBIO_PIPELINE Pipeline,
+    _Out_writes_bytes_(EngineInfoSize) PWINBIO_EXTENDED_ENGINE_INFO EngineInfo,
+    _In_ SIZE_T EngineInfoSize)
+{
+    Trace("QueryExtendedInfo", Pipeline);
+    if (!ARGUMENT_PRESENT(Pipeline) || !ARGUMENT_PRESENT(EngineInfo)) {
+        return E_POINTER;
+    }
+    if (EngineInfoSize < sizeof(WINBIO_EXTENDED_ENGINE_INFO)) {
+        return E_INVALIDARG;
+    }
+    RtlZeroMemory(EngineInfo, sizeof(*EngineInfo));
+    EngineInfo->GenericEngineCapabilities = 0; // no iterative-improvement / spoof-detection claims yet
+    EngineInfo->Factor = WINBIO_TYPE_FINGERPRINT; // matches Queue.cpp's SensorType
+    // Specific.Fingerprint.Capabilities and EnrollmentRequirements stay zeroed
+    // (least-assumption placeholder) until enrollment (stage 3) defines real
+    // sample-coverage requirements.
+    return S_OK;
+}
+
+// IdentifyAll is the multi-person "who is in camera frame" callback for
+// presence-style factors (design doc's sensor is WINBIO_TYPE_FINGERPRINT,
+// single-subject); WBF should never call this for us, so fail closed like
+// the rest of the unimplemented matching path rather than fabricate presences.
+HRESULT WINAPI EngineIdentifyAll(
+    _Inout_ PWINBIO_PIPELINE Pipeline,
+    _Out_ PSIZE_T PresenceCount,
+    _Out_ PWINBIO_PRESENCE* PresenceArray)
+{
+    Trace("IdentifyAll", Pipeline);
+    if (ARGUMENT_PRESENT(PresenceCount)) { *PresenceCount = 0; }
+    if (ARGUMENT_PRESENT(PresenceArray)) { *PresenceArray = nullptr; }
+    return E_NOTIMPL;
+}
+
+HRESULT WINAPI EngineSetEnrollmentSelector(
+    _Inout_ PWINBIO_PIPELINE Pipeline,
+    _In_ ULONGLONG SelectorValue)
+{
+    Trace("SetEnrollmentSelector", Pipeline);
+    UNREFERENCED_PARAMETER(SelectorValue); // single-subject sensor, nothing to select
+    return ARGUMENT_PRESENT(Pipeline) ? S_OK : E_POINTER;
+}
+
+// Unreachable in practice: WBF only calls this right after a successful
+// EngineAdapterCreateEnrollment, and CreateEnrollment above always returns
+// E_NOTIMPL until stage 3. Kept fail-closed for the same reason as the rest
+// of the enrollment path.
+HRESULT WINAPI EngineSetEnrollmentParameters(
+    _Inout_ PWINBIO_PIPELINE Pipeline,
+    _In_ PWINBIO_EXTENDED_ENROLLMENT_PARAMETERS Parameters)
+{
+    Trace("SetEnrollmentParameters", Pipeline);
+    UNREFERENCED_PARAMETER(Parameters);
+    return E_NOTIMPL;
+}
+
+// No enrollment is ever in progress (CreateEnrollment always fails), so per
+// winbio_adapter.h this reports "not currently enrolling" and still
+// succeeds - returning an error here is not one of the documented outcomes.
+HRESULT WINAPI EngineQueryExtendedEnrollmentStatus(
+    _Inout_ PWINBIO_PIPELINE Pipeline,
+    _Out_writes_bytes_(EnrollmentStatusSize) PWINBIO_EXTENDED_ENROLLMENT_STATUS EnrollmentStatus,
+    _In_ SIZE_T EnrollmentStatusSize)
+{
+    Trace("QueryExtendedEnrollmentStatus", Pipeline);
+    if (!ARGUMENT_PRESENT(Pipeline) || !ARGUMENT_PRESENT(EnrollmentStatus)) {
+        return E_POINTER;
+    }
+    if (EnrollmentStatusSize < sizeof(WINBIO_EXTENDED_ENROLLMENT_STATUS)) {
+        return E_INVALIDARG;
+    }
+    RtlZeroMemory(EnrollmentStatus, sizeof(*EnrollmentStatus));
+    EnrollmentStatus->TemplateStatus = WINBIO_E_INVALID_OPERATION;
+    EnrollmentStatus->Factor = WINBIO_TYPE_FINGERPRINT;
+    return S_OK;
+}
+
+// No private in-memory template cache exists, so there is nothing to
+// invalidate; this is not a matching decision, just cache-lifecycle
+// bookkeeping, so it succeeds unconditionally.
+HRESULT WINAPI EngineRefreshCache(_Inout_ PWINBIO_PIPELINE Pipeline)
+{
+    Trace("RefreshCache", Pipeline);
+    return ARGUMENT_PRESENT(Pipeline) ? S_OK : E_POINTER;
+}
+
+// E_NOTIMPL is the documented "no dynamic calibration needed" answer (WBF
+// converts it to S_OK internally) - not a fail-closed workaround.
+HRESULT WINAPI EngineSelectCalibrationFormat(
+    _Inout_ PWINBIO_PIPELINE Pipeline,
+    _In_reads_(FormatCount) PWINBIO_UUID FormatArray,
+    _In_ SIZE_T FormatCount,
+    _Out_ PWINBIO_UUID SelectedFormat,
+    _Out_ PSIZE_T MaxBufferSize)
+{
+    Trace("SelectCalibrationFormat", Pipeline);
+    UNREFERENCED_PARAMETER(FormatArray);
+    UNREFERENCED_PARAMETER(FormatCount);
+    if (ARGUMENT_PRESENT(SelectedFormat)) { RtlZeroMemory(SelectedFormat, sizeof(*SelectedFormat)); }
+    if (ARGUMENT_PRESENT(MaxBufferSize))  { *MaxBufferSize = 0; }
+    return E_NOTIMPL;
+}
+
+// Unreachable given SelectCalibrationFormat's E_NOTIMPL above - WBF only
+// runs the dynamic-calibration loop (and calls this) if calibration was
+// selected. Kept as a fail-closed stub for the same integrity reason as the
+// other V3 members: a null entry here would crash wbiosrvc if ever called.
+HRESULT WINAPI EngineQueryCalibrationData(
+    _Inout_ PWINBIO_PIPELINE Pipeline,
+    _Out_ PBOOLEAN DiscardAndRepeatCapture,
+    _Out_writes_bytes_to_(MaxBufferSize, *CalibrationBufferSize) PUCHAR CalibrationBuffer,
+    _Out_ PSIZE_T CalibrationBufferSize,
+    _In_ SIZE_T MaxBufferSize)
+{
+    Trace("QueryCalibrationData", Pipeline);
+    UNREFERENCED_PARAMETER(CalibrationBuffer);
+    UNREFERENCED_PARAMETER(MaxBufferSize);
+    if (ARGUMENT_PRESENT(DiscardAndRepeatCapture)) { *DiscardAndRepeatCapture = FALSE; }
+    if (ARGUMENT_PRESENT(CalibrationBufferSize))   { *CalibrationBufferSize = 0; }
+    return E_NOTIMPL;
+}
+
+// Anti-spoof policy intake, not a matching decision (winbio_adapter.h: "errors
+// returned by the method are logged but ignored"). Called on every unit
+// activation, so it has to be a real S_OK, not a stub that errors.
+HRESULT WINAPI EngineSetAccountPolicy(
+    _Inout_ PWINBIO_PIPELINE Pipeline,
+    _In_reads_(PolicyItemCount) PWINBIO_ACCOUNT_POLICY PolicyItemArray,
+    _In_ SIZE_T PolicyItemCount)
+{
+    Trace("SetAccountPolicy", Pipeline);
+    UNREFERENCED_PARAMETER(PolicyItemArray);
+    UNREFERENCED_PARAMETER(PolicyItemCount);
+    return ARGUMENT_PRESENT(Pipeline) ? S_OK : E_POINTER;
+}
+
+// ---------------------------------------------------------------------------
+// Interface table: VERSION_3, populated through SetAccountPolicy - every
+// member winbio_adapter.h adds up to and including V3.0 (Windows 10). Size
+// is sizeof(WINBIO_ENGINE_INTERFACE) per the MSDN Size field docs ("set this
+// value to the size of the WINBIO_ENGINE_INTERFACE structure"), not just the
+// V3 tail: WBF gates on Version to decide which members it may call, so the
+// V4+ tail (CreateKey, IdentifyFeatureSetSecure, ...) can stay zero-filled -
+// aggregate init below leaves every member after SetAccountPolicy at
+// nullptr automatically. Advertising VERSION_1 with Size covering only
+// through ControlUnitPrivileged is exactly what WBF rejected as
+// WINBIO_E_ADAPTER_INTEGRITY_FAILURE on this Windows build.
 // ---------------------------------------------------------------------------
 WINBIO_ENGINE_INTERFACE g_EngineInterface = {
-    WINBIO_ENGINE_INTERFACE_VERSION_1,
+    WINBIO_ENGINE_INTERFACE_VERSION_3,
     WINBIO_ADAPTER_TYPE_ENGINE,
-    offsetof(WINBIO_ENGINE_INTERFACE, ControlUnitPrivileged) + sizeof(PIBIO_ENGINE_CONTROL_UNIT_PRIVILEGED_FN),
+    sizeof(WINBIO_ENGINE_INTERFACE),
     kAdapterId,
 
     EngineAttach,
@@ -434,7 +639,26 @@ WINBIO_ENGINE_INTERFACE g_EngineInterface = {
     EngineCommitEnrollment,
     EngineDiscardEnrollment,
     EngineControlUnit,
-    EngineControlUnitPrivileged
+    EngineControlUnitPrivileged,
+
+    // V2.0 (Windows 8+)
+    EngineNotifyPowerChange,
+    nullptr, // Reserved_1 - documented as "reserved, must be set to NULL"
+
+    // V3.0 (Windows 10+)
+    EnginePipelineInit,
+    EnginePipelineCleanup,
+    EngineActivate,
+    EngineDeactivate,
+    EngineQueryExtendedInfo,
+    EngineIdentifyAll,
+    EngineSetEnrollmentSelector,
+    EngineSetEnrollmentParameters,
+    EngineQueryExtendedEnrollmentStatus,
+    EngineRefreshCache,
+    EngineSelectCalibrationFormat,
+    EngineQueryCalibrationData,
+    EngineSetAccountPolicy
 };
 
 } // namespace
