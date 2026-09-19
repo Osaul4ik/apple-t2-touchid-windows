@@ -25,12 +25,16 @@ PnpLockdown = 1
 
 [SourceDisksFiles]
 T2TouchIdBio.dll = 1,,
+T2TouchIdEngineAdapter.dll = 1,,
 
 [DestinationDirs]
 UMDriverCopy = 13
+; Engine adapter is loaded by wbiosrvc by file name from System32\WinBioPlugIns
+; (same layout as the Microsoft WBDI sample INF: DIRID 11 = System32).
+WinBioEngineAdapterCopy = 11,WinBioPlugIns
 
 [T2TouchIdBio_Install.NT]
-CopyFiles = UMDriverCopy
+CopyFiles = UMDriverCopy, WinBioEngineAdapterCopy
 
 [T2TouchIdBio_Install.NT.HW]
 AddReg = T2TouchIdBio_HwAddReg, T2TouchIdBio_PlugInAddReg, T2TouchIdBio_DatabaseAddReg
@@ -46,9 +50,10 @@ HKR,,Exclusive,0x00010001,1
 ; Without these two sections WBF has no unit configuration for the device and
 ; Settings -> Sign-in options reports "no compatible devices" even though the
 ; device node is healthy. Sensor + storage adapters are the in-box ones; the
-; engine adapter is OURS and DOES NOT EXIST YET (design doc 7.4) - until
-; T2TouchIdEngineAdapter.dll is built and copied to System32\WinBioPlugIns the
-; unit cannot load, and the Biometrics/Operational event log will say why.
+; engine adapter is OURS (driver\T2TouchIdBio\EngineAdapter, design doc 7.4)
+; and is copied to System32\WinBioPlugIns by [WinBioEngineAdapterCopy] below.
+; Missing/unloadable engine DLL = the unit cannot be configured and WBF logs
+; Event 1109 in Biometrics/Operational (0x80070002 when the file is absent).
 ; No SystemWakeEnabled/DeviceIdle* keys from the sample: they are for real USB
 ; sensors; this is a virtual root device.
 [T2TouchIdBio_PlugInAddReg]
@@ -91,6 +96,9 @@ ServiceBinary      = %13%\T2TouchIdBio.dll
 
 [UMDriverCopy]
 T2TouchIdBio.dll
+
+[WinBioEngineAdapterCopy]
+T2TouchIdEngineAdapter.dll
 
 [Strings]
 ; Unique per vendor database (docs: do not reuse the sample GUID).

@@ -3,28 +3,17 @@
 #include "Internal.h"
 
 // ---------------------------------------------------------------------------
-// VERIFY AGAINST THE WDK HEADERS (winbio_types.h / winbio_ioctl.h).
-// This skeleton was written without a WDK at hand. Every WinBio type/constant
-// name below is from memory of the WBDI docs / WudfBioUsbSample; the aliases
-// are grouped here so that a wrong name is a one-line fix.
+// Type names below were checked against winbio_ioctl.h / winbio_types.h of
+// Windows Kits 10.0.26100.0 (the CI "Dump WinBio WBDI headers" artifact).
 // ---------------------------------------------------------------------------
 using T2BioSensorAttributes = WINBIO_SENSOR_ATTRIBUTES;   // out of GET_ATTRIBUTES
 
-// CI (first real compile): WINBIO_SENSOR_STATUS_DATA does not exist, and
-// WINBIO_SENSOR_STATUS is (as far as I know) the ULONG typedef used by the
-// WINBIO_SENSOR_* constants, so the real struct name is still unknown.
-// TEMPORARY local mirror of the layout I believe WBDI uses for this IOCTL
-// (PayloadSize, WinBioHresult, SensorStatus, VendorStatus). Do NOT install a
-// build with this until the "Dump WinBio WBDI headers" step in
-// Cit2touchidbio.yml has been checked: replace this struct with the header's
-// own type and delete the static_assert.
-struct T2BioSensorStatusOut {
-    ULONG   PayloadSize;
-    HRESULT WinBioHresult;
-    ULONG   SensorStatus;
-    ULONG   VendorStatus;
-};
-static_assert(sizeof(T2BioSensorStatusOut) == 16, "verify against winbio_ioctl.h");
+// GET_SENSOR_STATUS OUT payload is WINBIO_DIAGNOSTICS (winbio_ioctl.h, Windows
+// Kits 10.0.26100.0): { DWORD PayloadSize; HRESULT WinBioHresult;
+// WINBIO_SENSOR_STATUS SensorStatus; WINBIO_DATA VendorDiagnostics; }.
+// The former local mirror (16 bytes) was wrong: the real struct also carries
+// the WINBIO_DATA tail, so PayloadSize has to be sizeof(WINBIO_DIAGNOSTICS).
+using T2BioDiagnostics = WINBIO_DIAGNOSTICS;
 
 namespace {
 
@@ -63,28 +52,54 @@ void FillAttributes(T2BioSensorAttributes& a)
     a.SupportedFormat[0].Type  = WINBIO_ANSI_381_FORMAT_TYPE;
 }
 
+// WBDI size-probe convention (Microsoft WudfBioUsbSample, Device.cpp
+// OnGetAttributes / OnGetSensorStatus; the sample was removed from
+// Windows-driver-samples master in 2024, last present in c73af47~1):
+//   - output buffer missing or smaller than a DWORD: fail with E_INVALIDARG
+//     semantics (here STATUS_INVALID_PARAMETER),
+//   - output buffer smaller than the payload: write the REQUIRED size into
+//     PayloadSize, complete with SUCCESS and Information = sizeof(DWORD);
+//     the caller then re-issues with a buffer of PayloadSize bytes.
+// The previous code asked WdfRequestRetrieveOutputBuffer for the full payload
+// size up front, so a small-buffer probe would have failed with
+// STATUS_BUFFER_TOO_SMALL instead of reporting the required size.
+template <typename Payload>
+Payload* RetrieveProbedPayload(_In_ WDFREQUEST Request, _Out_ bool* fitsFully)
+{
+    *fitsFully = false;
+    Payload* out = nullptr;
+    size_t outLen = 0;
+    const NTSTATUS status = WdfRequestRetrieveOutputBuffer(
+        Request, sizeof(DWORD), reinterpret_cast<PVOID*>(&out), &outLen);
+    if (!NT_SUCCESS(status) || out == nullptr) {
+        WdfRequestComplete(Request, NT_SUCCESS(status) ? STATUS_INVALID_PARAMETER : status);
+        return nullptr;
+    }
+    if (outLen < sizeof(Payload)) {
+        out->PayloadSize = static_cast<DWORD>(sizeof(Payload)); // required size, first member of both payloads
+        WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, sizeof(DWORD));
+        return nullptr;
+    }
+    *fitsFully = true;
+    return out;
+}
+
 void HandleGetAttributes(_In_ WDFREQUEST Request)
 {
-    T2BioSensorAttributes* out = nullptr;
-    const NTSTATUS status = WdfRequestRetrieveOutputBuffer(
-        Request, sizeof(T2BioSensorAttributes), reinterpret_cast<PVOID*>(&out), nullptr);
-    if (!NT_SUCCESS(status)) {
-        // TODO(verify): WBDI's "buffer too small" convention (PayloadSize /
-        // Information semantics) - compare with WudfBioUsbSample Device.cpp.
-        WdfRequestCompleteWithInformation(Request, status, sizeof(T2BioSensorAttributes));
-        return;
+    bool fits = false;
+    T2BioSensorAttributes* out = RetrieveProbedPayload<T2BioSensorAttributes>(Request, &fits);
+    if (!fits) {
+        return; // already completed (error or size probe)
     }
     FillAttributes(*out);
-    WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, sizeof(T2BioSensorAttributes));
+    WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, out->PayloadSize);
 }
 
 void HandleGetSensorStatus(_In_ WDFREQUEST Request)
 {
-    T2BioSensorStatusOut* out = nullptr;
-    const NTSTATUS status = WdfRequestRetrieveOutputBuffer(
-        Request, sizeof(T2BioSensorStatusOut), reinterpret_cast<PVOID*>(&out), nullptr);
-    if (!NT_SUCCESS(status)) {
-        WdfRequestCompleteWithInformation(Request, status, sizeof(T2BioSensorStatusOut));
+    bool fits = false;
+    T2BioDiagnostics* out = RetrieveProbedPayload<T2BioDiagnostics>(Request, &fits);
+    if (!fits) {
         return;
     }
     RtlZeroMemory(out, sizeof(*out));
@@ -94,8 +109,8 @@ void HandleGetSensorStatus(_In_ WDFREQUEST Request)
     // open GUID_DEVINTERFACE_T2TOUCHID_TRANSPORT, IOCTL_T2_GET_STATUS, and
     // Global\T2SepReady from T2SepBootstrap.
     out->SensorStatus  = WINBIO_SENSOR_READY;
-    out->VendorStatus  = 0;
-    WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, sizeof(*out));
+    out->VendorDiagnostics.Size = 0;
+    WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, out->PayloadSize);
 }
 
 } // namespace

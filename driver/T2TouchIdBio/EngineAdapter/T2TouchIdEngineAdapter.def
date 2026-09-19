@@ -1,0 +1,4 @@
+LIBRARY	T2TouchIdEngineAdapter
+
+EXPORTS
+    WbioQueryEngineInterface
