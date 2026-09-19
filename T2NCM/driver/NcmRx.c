@@ -649,6 +649,7 @@ T2NcmRxStart(
     WDF_USB_PIPE_INFORMATION pipeInfo;
     ULONG maxPacketSize;
     ULONG readerBufferSize;
+    BOOLEAN reused;
     NTSTATUS status;
 
     if (DeviceContext->RxStarted)
@@ -714,6 +715,13 @@ T2NcmRxStart(
     // re-arm — see driver.h and Power.c).
     if (!DeviceContext->RxReaderConfigured)
     {
+        reused = FALSE;
+
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
+            "T2Ncm: T2NcmRxStart configuring continuous reader on a new "
+            "pipe object (ntbMax=%lu, bufferSize=%lu, maxPacketSize=%lu)\n",
+            DeviceContext->NtbInMaxSize, readerBufferSize, maxPacketSize));
+
         WDF_USB_CONTINUOUS_READER_CONFIG_INIT(
             &readerConfig,
             T2NcmEvtRxReadComplete,
@@ -735,6 +743,14 @@ T2NcmRxStart(
 
         DeviceContext->RxReaderConfigured = TRUE;
     }
+    else
+    {
+        reused = TRUE;
+
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
+            "T2Ncm: T2NcmRxStart reusing existing reader config on the same "
+            "pipe object (Pause/Restart cycle) — WdfIoTargetStart only\n"));
+    }
 
     status = WdfIoTargetStart(WdfUsbTargetPipeGetIoTarget(DeviceContext->BulkInPipe));
     if (!NT_SUCCESS(status))
@@ -748,9 +764,9 @@ T2NcmRxStart(
 
     T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
         "T2Ncm: RX continuous reader started (ntbMax=%lu, bufferSize=%lu, "
-        "maxPacketSize=%lu, pendingReads=%u)\n",
+        "maxPacketSize=%lu, pendingReads=%u, reused=%u)\n",
         DeviceContext->NtbInMaxSize, readerBufferSize, maxPacketSize,
-        T2NCM_RX_PENDING_READS));
+        T2NCM_RX_PENDING_READS, (ULONG)reused));
 
     return STATUS_SUCCESS;
 }
