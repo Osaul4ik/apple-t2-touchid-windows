@@ -89,8 +89,8 @@ bool WriteEntries(const std::string& path,
     if (path.empty()) return false;
     std::ofstream out(path, std::ios::trunc);
     if (!out.is_open()) return false;
-    out << "# t2touchid port cache — last known-good BiometricKit BridgeXPC\n"
-           "# port per T2 adapter (keyed by MAC). Safe to delete; the tool\n"
+    out << "# t2touchid port cache - last known-good BiometricKit BridgeXPC\n"
+           "# port[,RemoteXPC port] per T2 adapter (keyed by MAC). Safe to delete; the tool\n"
            "# just falls back to a full port scan next run.\n";
     for (const auto& kv : entries) {
         out << kv.first << "=" << kv.second << "\n";
@@ -100,7 +100,7 @@ bool WriteEntries(const std::string& path,
 
 } // namespace
 
-bool LoadCachedPort(const NcmEndpoint& endpoint, uint16_t* outPort) {
+bool LoadCachedPort(const NcmEndpoint& endpoint, uint16_t* outPort, uint16_t* outRsdPort) {
     if (!endpoint.hasMac) return false; // no stable key to look up
     std::string path = CacheFilePath();
     if (path.empty()) return false;
@@ -109,20 +109,34 @@ bool LoadCachedPort(const NcmEndpoint& endpoint, uint16_t* outPort) {
     auto entries = ReadEntries(path);
     for (const auto& kv : entries) {
         if (kv.first != key) continue;
+        // Value is "<servicePort>" (legacy) or "<servicePort>,<rsdPort>".
+        std::string first = kv.second;
+        std::string second;
+        size_t comma = kv.second.find(',');
+        if (comma != std::string::npos) {
+            first = Trim(kv.second.substr(0, comma));
+            second = Trim(kv.second.substr(comma + 1));
+        }
         int value = 0;
         try {
-            value = std::stoi(kv.second);
+            value = std::stoi(first);
         } catch (...) {
-            return false; // corrupt entry — treat as no cache, not a crash
+            return false; // corrupt entry - treat as no cache, not a crash
         }
         if (value <= 0 || value > 65535) return false;
+        int rsd = 0;
+        if (!second.empty()) {
+            try { rsd = std::stoi(second); } catch (...) { rsd = 0; }
+            if (rsd <= 0 || rsd > 65535) rsd = 0;
+        }
         if (outPort) *outPort = static_cast<uint16_t>(value);
+        if (outRsdPort) *outRsdPort = static_cast<uint16_t>(rsd);
         return true;
     }
     return false;
 }
 
-void SaveCachedPort(const NcmEndpoint& endpoint, uint16_t port) {
+void SaveCachedPort(const NcmEndpoint& endpoint, uint16_t port, uint16_t rsdPort) {
     if (!endpoint.hasMac) return; // nothing stable to key this entry on
     if (port == 0) return;
 
@@ -137,6 +151,7 @@ void SaveCachedPort(const NcmEndpoint& endpoint, uint16_t port) {
 
     std::string key = FormatMacKey(endpoint.mac);
     std::string value = std::to_string(port);
+    if (rsdPort != 0) value += "," + std::to_string(rsdPort);
 
     auto entries = ReadEntries(path);
     bool updated = false;
