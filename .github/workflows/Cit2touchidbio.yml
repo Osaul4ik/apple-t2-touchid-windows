@@ -422,7 +422,7 @@ jobs:
         $outDir = Join-Path $env:GITHUB_WORKSPACE "umdf-analysis-logs\wdk-headers"
         New-Item -ItemType Directory -Path $outDir -Force | Out-Null
 
-        foreach ($name in 'winbio_ioctl.h', 'winbio_types.h') {
+        foreach ($name in 'winbio_ioctl.h', 'winbio_types.h', 'winbio_adapter.h') {
           $f = Get-ChildItem -Path $inc -Filter $name -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $f) { Write-Host "::warning::$name not found under $inc"; continue }
           Copy-Item -Path $f.FullName -Destination $outDir -Force

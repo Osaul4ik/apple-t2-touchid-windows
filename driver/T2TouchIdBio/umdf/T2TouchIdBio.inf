@@ -33,13 +33,42 @@ UMDriverCopy = 13
 CopyFiles = UMDriverCopy
 
 [T2TouchIdBio_Install.NT.HW]
-AddReg = T2TouchIdBio_HwAddReg
+AddReg = T2TouchIdBio_HwAddReg, T2TouchIdBio_PlugInAddReg, T2TouchIdBio_DatabaseAddReg
 
 [T2TouchIdBio_HwAddReg]
 ; ACL and exclusivity from the "installing a biometric driver" docs, as
 ; recorded in design doc 7.2.
+HKR,,DeviceCharacteristics,0x00010001,0x0100
 HKR,,Security,,"D:P(A;;GA;;;BA)(A;;GA;;;SY)"
 HKR,,Exclusive,0x00010001,1
+
+; WBF biometric unit (Microsoft "Installing a Biometric Driver", steps 4-5).
+; Without these two sections WBF has no unit configuration for the device and
+; Settings -> Sign-in options reports "no compatible devices" even though the
+; device node is healthy. Sensor + storage adapters are the in-box ones; the
+; engine adapter is OURS and DOES NOT EXIST YET (design doc 7.4) - until
+; T2TouchIdEngineAdapter.dll is built and copied to System32\WinBioPlugIns the
+; unit cannot load, and the Biometrics/Operational event log will say why.
+; No SystemWakeEnabled/DeviceIdle* keys from the sample: they are for real USB
+; sensors; this is a virtual root device.
+[T2TouchIdBio_PlugInAddReg]
+HKR,WinBio\Configurations,DefaultConfiguration,,"0"
+HKR,WinBio\Configurations\0,SensorMode,0x00010001,1
+HKR,WinBio\Configurations\0,SystemSensor,0x00010001,1
+HKR,WinBio\Configurations\0,SensorAdapterBinary,,"WinBioSensorAdapter.dll"
+HKR,WinBio\Configurations\0,EngineAdapterBinary,,"T2TouchIdEngineAdapter.dll"
+HKR,WinBio\Configurations\0,StorageAdapterBinary,,"WinBioStorageAdapter.dll"
+HKR,WinBio\Configurations\0,DatabaseId,,"%DatabaseId%"
+
+[T2TouchIdBio_DatabaseAddReg]
+HKLM,"System\CurrentControlSet\Services\WbioSrvc\Databases\{%DatabaseId%}",BiometricType,0x00010001,0x00000008
+HKLM,"System\CurrentControlSet\Services\WbioSrvc\Databases\{%DatabaseId%}",Attributes,0x00010001,0x00000001
+HKLM,"System\CurrentControlSet\Services\WbioSrvc\Databases\{%DatabaseId%}",Format,,"00000000-0000-0000-0000-000000000000"
+HKLM,"System\CurrentControlSet\Services\WbioSrvc\Databases\{%DatabaseId%}",InitialSize,0x00010001,0x00000020
+HKLM,"System\CurrentControlSet\Services\WbioSrvc\Databases\{%DatabaseId%}",AutoCreate,0x00010001,0x00000001
+HKLM,"System\CurrentControlSet\Services\WbioSrvc\Databases\{%DatabaseId%}",AutoName,0x00010001,0x00000001
+HKLM,"System\CurrentControlSet\Services\WbioSrvc\Databases\{%DatabaseId%}",FilePath,,""
+HKLM,"System\CurrentControlSet\Services\WbioSrvc\Databases\{%DatabaseId%}",ConnectionString,,""
 
 [T2TouchIdBio_Install.NT.Services]
 AddService = WUDFRd,0x000001fa,WUDFRD_ServiceInstall
@@ -64,6 +93,8 @@ ServiceBinary      = %13%\T2TouchIdBio.dll
 T2TouchIdBio.dll
 
 [Strings]
+; Unique per vendor database (docs: do not reuse the sample GUID).
+DatabaseId                = "B039A555-3EEC-475A-ABBD-3AA5C5F550DA"
 ManufacturerName          = "Osaul4ik"
 DiskName                  = "T2TouchIdBio Installation Disk"
 T2TouchIdBio.DeviceDesc   = "Apple T2 Touch ID (Windows Hello sensor)"

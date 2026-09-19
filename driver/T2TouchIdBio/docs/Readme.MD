@@ -1,36 +1,64 @@
-# T2SepBootstrap
+# T2TouchIdBio (UMDF 2, WBDI) — мінімальний скелет
 
-Реалізує design doc §9.2. Читає `C:\ProgramData\T2TouchId\sep-vault.bin`
-(пише його `tools/SepVaultGui`) і виконує
-`register-ool → load-keybag → set-system-keybag → unlock → unlock`
-через `protocol/AppleKeyStore::Client` — без запуску `t2touchid.exe`,
-без пароля в argv.
+Реалізує «наступний практичний крок» з `../docs/Windows-hello-design.MD` §8:
+відповідає лише на `IOCTL_BIOMETRIC_GET_ATTRIBUTES` та
+`IOCTL_BIOMETRIC_GET_SENSOR_STATUS`, щоб зняти головний ризик §2 (чи бачить
+WinBio UMDF-драйвер без WHQL) **до** підключення `VerificationEngine`.
 
-## Проєкт у Visual Studio
+**Статус: не збиралося і не запускалося.** Код написано без WDK під рукою.
+Назви типів/констант WinBio зібрано в `Queue.cpp` (блок `VERIFY AGAINST THE
+WDK HEADERS`) — очікуйте 1–2 ітерації правок після першої збірки.
 
-Ще не додано `.vcxproj` — простіше створити його в IDE (Console App,
-Character Set = Not Set, підключити `protocol/AppleKeyStore` як залежний
-проєкт або додати `Client.cpp`/`Client.h` напряму в Sources), ніж
-відтворювати GUID/toolset-специфічний XML вручну. Лінкер: `crypt32.lib`
-(уже через `#pragma comment`), `advapi32.lib` (SCM API — зазвичай і так у
-default libs).
+Не додано в `T2TouchId.sln`: `Cit2touchid.yml` і `BuildT2TouchId.yml`
+збирають весь `.sln`, тож необкатаний UMDF-проєкт зламав би працюючий CI.
 
-## Встановлення (test-signing режим, той самий, що й для
-`T2TouchIdTransport.sys`)
+## Збірка
 
 ```
-sc create T2SepBootstrap binPath= "C:\Path\To\T2SepBootstrap.exe" start= auto
-sc failure T2SepBootstrap reset= 0 actions= ""   REM явно НЕ restart-on-failure — див. §9.2/файл .cpp
-sc start T2SepBootstrap
+msbuild driver\T2TouchIdBio\Umdf\T2TouchIdBio.vcxproj /p:Configuration=Release /p:Platform=x64
 ```
 
-Діагностика: `C:\ProgramData\T2TouchId\bootstrap.log`.
+Пакет (INF не в проєкті — як і в `T2TouchIdTransport`):
 
-## Відкрито (не в цьому проході)
+```
+copy Umdf\T2TouchIdBio.inf  <out>\
+stampinf -f <out>\T2TouchIdBio.inf -d * -a amd64 -u 2.15.0 -v *
+inf2cat /driver:<out> /os:10_x64
+signtool sign ...   (test-сертифікат, як для T2TouchIdTransport)
+```
 
-- Реальний Windows Event Log source замість файлового логу.
-- Cancel-токен у `VerificationEngine::Verify()` для сценарію екрану
-  блокування (design doc §9.4) — цей сервіс лише готує SEP, самого
-  verify-виклику Hello тут немає.
-- WBDI UMDF-скелет (design doc §2/§7.1) — досі найризикованіший
-  неперевірений крок, не залежить від цього сервісу і не блокується ним.
+`-u 2.15.0` має збігатися з `UMDF_VERSION_MINOR` у `.vcxproj`.
+
+## Встановлення і перевірка (test-signing)
+
+```
+devcon install T2TouchIdBio.inf root\T2TouchIdBio
+```
+
+`pnputil /add-driver` сам пристрій НЕ створює (INF root-enumerated: у логу
+`setupapi.dev.log` буде `Unable to find any matching devices`) — вузол треба
+створити явно. Без devcon/WDK на цільовій машині:
+
+```
+powershell -ExecutionPolicy Bypass -File Install-T2TouchIdBio.ps1
+```
+
+(адмін-консоль, з папки зі штампованим пакетом `.inf`+`.dll`+`.cat`).
+
+1. Device Manager → клас **Biometric devices** → пристрій без Code 31/39/43.
+2. DebugView (Capture Global Win32): рядки `T2TouchIdBio: IOCTL 0x...`.
+3. Event Viewer → Applications and Services Logs → Microsoft → Windows →
+   Biometrics → Operational: чи завантажила WBF сенсор.
+4. Settings → Accounts → Sign-in options: чи з'явився Fingerprint recognition.
+
+Якщо (4) не працює лише через відсутність WHQL/підпису для SystemSensor —
+це і є ризик з design doc §2, і тоді план зсувається на KMDF+WSK.
+
+## Далі
+
+1. `CAPTURE_DATA` → `Connection::Connect()` + `VerificationEngine::Verify()`
+   з cancel-токеном (§3, §9.4).
+2. `GET_SENSOR_STATUS` за реальним станом: `IOCTL_T2_GET_STATUS` +
+   `Global\T2SepReady` (§3, §9.2).
+3. Vendor-формат BIR замість плейсхолдера ANSI-381 у `GET_ATTRIBUTES` (§5).
+4. Storage/Engine adapter (§7.3–7.4).
