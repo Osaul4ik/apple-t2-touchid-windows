@@ -198,9 +198,9 @@ HRESULT MapVerifyOutcomeToHresult(VerifyOutcome outcome)
     case VerifyOutcome::RejectedByDevice:         return WINBIO_E_DEVICE_FAILURE;
     case VerifyOutcome::Busy:                     return WINBIO_E_DATA_COLLECTION_IN_PROGRESS;
     case VerifyOutcome::UnstableIdentityInventory: return WINBIO_E_DEVICE_FAILURE;
-    case VerifyOutcome::Malformed:                return WINBIO_E_UNKNOWN_ERROR;
+    case VerifyOutcome::Malformed:                return E_FAIL;
     }
-    return WINBIO_E_UNKNOWN_ERROR;
+    return E_FAIL;
 }
 
 // Completes the request with a WINBIO_CAPTURE_DATA whose CaptureData blob is
@@ -294,13 +294,9 @@ void HandleCaptureEnroll(_In_ WDFREQUEST Request)
         // identity list is not "enrolled", never silently accepted.
         T2BioLog("CAPTURE_DATA(enroll): SEP has no identity for macosUserId=%u (found %u total)",
                  static_cast<unsigned>(kDefaultMacosUserId), static_cast<unsigned>(identities.size()));
-        // WINBIO_E_UNKNOWN_ERROR, not a more specific "no such ID" code:
-        // winbio_err.h wasn't available to cross-check an exact symbol name
-        // for that case (unlike the six codes in design doc 5's table,
-        // which all came from a real CI header dump - see Queue.cpp's top
-        // comment). If winbio_err.h turns out to define e.g.
-        // WINBIO_E_UNKNOWN_ID, prefer that here once confirmed.
-        CompleteCaptureData(Request, WINBIO_E_UNKNOWN_ERROR, WINBIO_SENSOR_READY, 0, {});
+        // WINBIO_E_UNKNOWN_ID (winbio_err.h): the requested identity is not
+        // among the identities the SEP reports.
+        CompleteCaptureData(Request, WINBIO_E_UNKNOWN_ID, WINBIO_SENSOR_READY, 0, {});
         return;
     }
 
