@@ -13,6 +13,61 @@ namespace t2::biometrickit {
 
 using namespace std::chrono;
 
+namespace {
+
+bool Uuid16IsZero(const uint8_t* p) {
+    for (int i = 0; i < 16; i++) {
+        if (p[i] != 0) return false;
+    }
+    return true;
+}
+
+// Port of t2_fprint_match_gate._global_records: walk 40-byte
+// global_identity_record_v1_t values, reject zero-UUID / duplicates /
+// non-built-in group on the configured user, collect the leading 20-byte
+// identity_record_v1_t of each configured entry.
+bool ConfiguredGlobalIdentities(const std::vector<uint8_t>& globalRaw,
+                                uint32_t appleUserId,
+                                std::vector<std::array<uint8_t, 20>>* outConfigured) {
+    outConfigured->clear();
+    if (globalRaw.size() % 40 != 0) return false;
+    std::vector<std::array<uint8_t, 20>> seen;
+    for (size_t off = 0; off < globalRaw.size(); off += 40) {
+        std::array<uint8_t, 20> identity{};
+        std::memcpy(identity.data(), globalRaw.data() + off, 20);
+        if (Uuid16IsZero(identity.data() + 4)) return false;
+        for (const auto& s : seen) {
+            if (s == identity) return false;
+        }
+        seen.push_back(identity);
+        uint32_t userId = 0;
+        std::memcpy(&userId, identity.data(), 4);
+        if (userId != appleUserId) continue;
+        uint32_t groupType = 0;
+        std::memcpy(&groupType, globalRaw.data() + off + 20, 4);
+        if (groupType != 0 && groupType != 1) return false;
+        if (!Uuid16IsZero(globalRaw.data() + off + 24)) return false;
+        outConfigured->push_back(identity);
+    }
+    return true;
+}
+
+bool SamePerUserSet(std::vector<std::array<uint8_t, 20>> configured,
+                    const std::vector<IdentityRecordV1>& perUser) {
+    std::vector<std::array<uint8_t, 20>> live;
+    live.reserve(perUser.size());
+    for (const auto& rec : perUser) {
+        std::array<uint8_t, 20> raw{};
+        std::memcpy(raw.data(), &rec, 20);
+        live.push_back(raw);
+    }
+    std::sort(configured.begin(), configured.end());
+    std::sort(live.begin(), live.end());
+    return configured == live;
+}
+
+} // namespace
+
 // Exact port of jmurth1234/t2-touchid-linux:
 //   src/t2-biometric-ready.sh warm_up()
 //   src/t2-fprintd.py T2Backend._run_probe() prefix
@@ -142,28 +197,72 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
         return VerifyOutcome::Malformed;
     }
 
-    // 18.09.2026: REMOVED. The 0x51->0x42->0x51 stability gate that used
-    // to live here belongs to a DIFFERENT code path — the
-    // finger-selection production flow (t2_fprint_match_gate.prepare/
-    // prepare_all), reached only via --match-finger-name /
-    // --resolve-any-finger-name / --resolve-any-identity-slot on the
-    // Linux reference, which this project's CLI has no equivalent of and
-    // has never sent. The bare `bridge-xpc-probe.py --match-seconds`
-    // path this project actually compares against goes straight from the
-    // single --identity-list read to `biometric_command(sock, 4, ...)` —
-    // no 0x51, no repeated 0x42. VERIFIED FROM SOURCE: prepare_all's
-    // per_user_records is the same first-read bytes either way (it only
-    // adds a local-Catacomb name-resolution check, no record filtering),
-    // so this project's own StartMatch payload was already correct with
-    // or without the gate — the gate only added 4 extra commands and
-    // real round-trip time that the actual thing being compared against
-    // never sent. Identities from the single --identity-list read above
-    // (RunLinuxReadySequence) go straight into StartMatch below.
+    // LINUX PARITY (docs/linux-reference-analysis.md §7, 16.09.2026 entry):
+    // t2-fprintd.py's verify_fprint() — the real path every normal "any
+    // finger" unlock takes (resolve_any_finger=True whenever
+    // requested_finger == "any") — always runs 0x42 -> 0x51 -> 0x42 -> 0x51
+    // (t2_fprint_match_gate.prepare_slots/prepare_all) before StartMatch,
+    // and fails closed if the first/repeat snapshot of either command
+    // disagrees. The bare bridge-xpc-probe.py --match-seconds CLI (no
+    // --resolve-any-finger-name) skips this gate, but that is not the
+    // code path fprintd's production unlock uses, so it is not the one
+    // this driver should imitate. Identities sent to StartMatch are the
+    // FIRST 0x42 read, never the repeat — the repeat and both 0x51 reads
+    // exist only to prove the live inventory is stable.
     T2_LOG("verify",
-           L"proceeding straight to StartMatch with the %zu identities from "
-           L"the single --identity-list read (%zuB raw) - bare "
-           L"bridge-xpc-probe.py --match-seconds parity, no extra commands",
+           L"LINUX unlock-parity gate: verifying identity inventory is stable "
+           L"(0x42 done, now 0x51 -> 0x42 -> 0x51) before StartMatch (%zu identities, %zuB raw)",
            identities.size(), firstUserRaw.size());
+
+    auto readGlobalIdentityList = [&](std::vector<uint8_t>* outRaw) -> bool {
+        auto globalCmd = EncodeBmCommand(Command::GlobalIdentityList, /*version=*/1, /*value=*/0);
+        return conn->SendBiometricCommand(globalCmd, kGlobalIdentityListOutputCapacity, outRaw,
+                                           config_.ioTimeout);
+    };
+    auto readUserIdentityList = [&](std::vector<uint8_t>* outRaw) -> bool {
+        std::vector<uint8_t> idReq(4);
+        std::memcpy(idReq.data(), &config_.macosUserId, 4);
+        auto idCmd = EncodeBmCommand(Command::IdentityList, /*version=*/1, /*value=*/0, idReq);
+        return conn->SendBiometricCommand(idCmd, kIdentityListOutputCapacity, outRaw, config_.ioTimeout);
+    };
+
+    std::vector<uint8_t> firstGlobalRaw, repeatUserRaw, repeatGlobalRaw;
+    if (!readGlobalIdentityList(&firstGlobalRaw)) {
+        T2_LOG("verify", L"GlobalIdentityList (cmd 0x51, first read) failed");
+        return VerifyOutcome::TransportError;
+    }
+    if (!readUserIdentityList(&repeatUserRaw)) {
+        T2_LOG("verify", L"IdentityList (cmd 0x42, repeat read) failed");
+        return VerifyOutcome::TransportError;
+    }
+    if (!readGlobalIdentityList(&repeatGlobalRaw)) {
+        T2_LOG("verify", L"GlobalIdentityList (cmd 0x51, repeat read) failed");
+        return VerifyOutcome::TransportError;
+    }
+
+    std::vector<std::array<uint8_t, 20>> configuredFirst, configuredRepeat;
+    if (!ConfiguredGlobalIdentities(firstGlobalRaw, config_.macosUserId, &configuredFirst) ||
+        !ConfiguredGlobalIdentities(repeatGlobalRaw, config_.macosUserId, &configuredRepeat)) {
+        T2_LOG("verify", L"global identity-list malformed (zero-UUID, duplicate, or "
+               L"non-built-in group entry) — fail-closed, refusing StartMatch");
+        return VerifyOutcome::UnstableIdentityInventory;
+    }
+    std::vector<IdentityRecordV1> repeatIdentities;
+    if (!ParseIdentityList(repeatUserRaw, &repeatIdentities)) {
+        T2_LOG("verify", L"repeat IdentityList reply malformed (%zuB, not a multiple of 20) — "
+               L"fail-closed, refusing StartMatch", repeatUserRaw.size());
+        return VerifyOutcome::UnstableIdentityInventory;
+    }
+    std::sort(configuredFirst.begin(), configuredFirst.end());
+    std::sort(configuredRepeat.begin(), configuredRepeat.end());
+    if (configuredFirst != configuredRepeat || !SamePerUserSet(configuredFirst, identities) ||
+        !SamePerUserSet(configuredRepeat, repeatIdentities)) {
+        T2_LOG("verify", L"live identity inventory is unstable (first/repeat 0x42 or 0x51 "
+               L"snapshot disagreed) — fail-closed, refusing StartMatch");
+        return VerifyOutcome::UnstableIdentityInventory;
+    }
+    T2_LOG("verify", L"identity inventory stable across 0x42->0x51->0x42->0x51 (%zu configured)",
+           configuredFirst.size());
 
     std::vector<uint8_t> reply;
     // Kept for the CancelGuard below (post-match cleanup on every exit
@@ -194,15 +293,16 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     // ENROLLMENT auth parsing — unrelated to StartMatch or to these four
     // opcodes. So there is now a Linux-sourced reason to doubt the
     // entitlement-gap theory specifically, not just an absence of evidence
-    // for it. This driver goes straight from --identity-list to
-    // StartMatch — exactly what t2-fprintd.py/bridge-xpc-probe.py's real
-    // --timed-match path does (VERIFIED FROM SOURCE:
-    // biometric_command(sock, 4, data=match_data) is the very next call
-    // after --identity-list, no Cancel, no wait, nothing else between).
-    // config_.skipResetSensor/skipLoadCalibration also now default to
-    // false for the same reason: Linux's warm_up always sends both;
-    // skipping them was a macOS-capture-only assumption with the same
-    // lack of confirmation as the sequence just removed.
+    // for it. This driver now does the identity-list-stable check above
+    // and then goes STRAIGHT to StartMatch — exactly what
+    // t2-fprintd.py/bridge-xpc-probe.py's real --timed-match path does
+    // (VERIFIED FROM SOURCE: biometric_command(sock, 4, data=match_data) is
+    // the very next call after the identity/stability gate, no Cancel, no
+    // wait, nothing else between). config_.skipResetSensor/
+    // skipLoadCalibration also now default to false for the same reason:
+    // Linux's warm_up always sends both; skipping them was a macOS-capture-
+    // only assumption with the same lack of confirmation as the sequence
+    // just removed.
 
     // start match (cmd 4) — Linux counted default: II60x + count + records
     // (132 B for 3 identities). Override with --match-layout inline|padded.
@@ -216,8 +316,9 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     // `match_reply, events = biometric_command(sock, 4, data=match_data)`.
     // This project's pendingEvents_ is shared across every
     // SendBiometricCommand/GetFdrCalibration call on this connection
-    // (ResetSensor, warm-up Cancel, LoadCalibration, IdentityList), so
-    // without this clear, WaitForEvent() below hands the match-session loop
+    // (ResetSensor, warm-up Cancel, LoadCalibration, both IdentityList and
+    // GlobalIdentityList reads for the stability gate above), so without
+    // this clear, WaitForEvent() below hands the match-session loop
     // whatever leftover events those warm-up calls happened to observe -
     // confirmed on the 16.09.2026 hardware capture, where the match
     // session's first two logged events (80 MatchingCancelled, unnamed 94)
@@ -339,21 +440,13 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
             *outMatchedUuid = mr.matchedIdentityUuid;
             break;
         } else if (mr.outcome == MatchOutcome::NoMatch) {
-            T2_LOG("verify",
-                   eventData.size() < kMinMatchResultEventBytes
-                       ? L"match_result outcome=NO_MATCH (body=%zuB, shorter than min=%zuB — "
-                         L"treated as definite no-match per Linux reference, not a wait state)"
-                       : L"match_result outcome=NO_MATCH (no enrolled UUID found in event, body=%zuB min=%zuB)",
-                   eventData.size(), kMinMatchResultEventBytes);
+            T2_LOG("verify", L"match_result outcome=NO_MATCH (no enrolled UUID found in event)");
             outcome = VerifyOutcome::NoMatch;
             break;
         }
-        // mr.outcome == MatchOutcome::Malformed is unreachable here: this
-        // call site only invokes ParseMatchResult after the caller's own
-        // `embeddedType != kEmbeddedTypeMatchResult` check above already
-        // `continue`d for anything else. Kept as a silent no-op (loop just
-        // continues) rather than an assert, since Malformed's only purpose
-        // is defensive robustness against a future call-site change.
+        T2_LOG("verify", L"match_result outcome=MALFORMED body=%zuB (min required=%zuB) — "
+               L"still waiting, not treated as NO_MATCH",
+               eventData.size(), kMinMatchResultEventBytes);
     }
 
     // REMOVED (17.09.2026): no longer relabels Timeout as NoImageCaptured.
