@@ -62,7 +62,7 @@ has real hardware results as of 30.08.2026:
 | RemoteXPC discovery **Confirmed on hardware**
 | BridgeXPC | **Confirmed on hardware**
 | BiometricKit / real MATCH-NO_MATCH | **Confirmed on hardware**
-| WindowsHello | working
+| WindowsHello | work in progress
 
 
 ## Building
