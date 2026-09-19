@@ -65,7 +65,6 @@ env:
   DOTNET_VERSION: '8.0.x'
   CONFIGURATION: Release
   PLATFORM: x64
-  CA_TREAT_WARNINGS_AS_ERRORS: false
 
 jobs:
   ci:
@@ -361,6 +360,38 @@ jobs:
         Write-Host "==> DriverVer: $driverDate,$driverVersion"
         Add-Content -Path $env:GITHUB_ENV -Value "DRIVER_DATE=$driverDate"
         Add-Content -Path $env:GITHUB_ENV -Value "DRIVER_VERSION=$driverVersion"
+      shell: pwsh
+
+    # Diagnostic: the first real compile showed the WBDI type names in
+    # Queue.cpp were guessed from memory. Put the runner's own WinBio headers
+    # into the log (collapsed group) and into the umdf-static-analysis-logs
+    # artifact, so names/layouts are read from the source of truth.
+    - name: Dump WinBio WBDI headers (diagnostic)
+      run: |
+        $ErrorActionPreference = "Stop"
+        $inc    = "C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0"
+        $outDir = Join-Path $env:GITHUB_WORKSPACE "umdf-analysis-logs\wdk-headers"
+        New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+
+        foreach ($name in 'winbio_ioctl.h', 'winbio_types.h') {
+          $f = Get-ChildItem -Path $inc -Filter $name -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $f) { Write-Host "::warning::$name not found under $inc"; continue }
+          Copy-Item -Path $f.FullName -Destination $outDir -Force
+          Write-Host "==> copied $($f.FullName)"
+        }
+
+        $ioctl = Join-Path $outDir "winbio_ioctl.h"
+        if (Test-Path $ioctl) {
+          Write-Host "::group::SENSOR_STATUS-related lines in winbio_ioctl.h (with context)"
+          Select-String -Path $ioctl -Pattern 'SENSOR_STATUS' -Context 12,12 | ForEach-Object { $_.ToString() }
+          Write-Host "::endgroup::"
+        }
+        $types = Join-Path $outDir "winbio_types.h"
+        if (Test-Path $types) {
+          Write-Host "::group::WINBIO_SENSOR_STATUS / WINBIO_SENSOR_READY in winbio_types.h"
+          Select-String -Path $types -Pattern 'WINBIO_SENSOR_STATUS|WINBIO_SENSOR_READY' | ForEach-Object { $_.ToString() }
+          Write-Host "::endgroup::"
+        }
       shell: pwsh
 
     # =====================================================================

@@ -9,7 +9,22 @@
 // are grouped here so that a wrong name is a one-line fix.
 // ---------------------------------------------------------------------------
 using T2BioSensorAttributes = WINBIO_SENSOR_ATTRIBUTES;   // out of GET_ATTRIBUTES
-using T2BioSensorStatusOut  = WINBIO_SENSOR_STATUS_DATA;  // out of GET_SENSOR_STATUS (name UNSURE)
+
+// CI (first real compile): WINBIO_SENSOR_STATUS_DATA does not exist, and
+// WINBIO_SENSOR_STATUS is (as far as I know) the ULONG typedef used by the
+// WINBIO_SENSOR_* constants, so the real struct name is still unknown.
+// TEMPORARY local mirror of the layout I believe WBDI uses for this IOCTL
+// (PayloadSize, WinBioHresult, SensorStatus, VendorStatus). Do NOT install a
+// build with this until the "Dump WinBio WBDI headers" step in
+// Cit2touchidbio.yml has been checked: replace this struct with the header's
+// own type and delete the static_assert.
+struct T2BioSensorStatusOut {
+    ULONG   PayloadSize;
+    HRESULT WinBioHresult;
+    ULONG   SensorStatus;
+    ULONG   VendorStatus;
+};
+static_assert(sizeof(T2BioSensorStatusOut) == 16, "verify against winbio_ioctl.h");
 
 namespace {
 
