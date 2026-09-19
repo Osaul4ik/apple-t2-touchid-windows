@@ -353,6 +353,45 @@ static int CmdDeviceState(Client& client, int64_t handle, uint32_t selector) {
 
 
 
+// Cache fast-path shared by `network` and DiscoverBiometricKitBridge.
+//
+// IMPORTANT: what PortCache stores is the BridgeXPC *service* port - the
+// raw-TCP port the T2 advertises inside its RemoteXPC (HTTP/2) peer record -
+// NOT the HTTP/2 port the scan finds. It therefore has to be verified by a
+// direct BridgeXPC HELO handshake. Running ProbeServiceOnPort (HTTP/2 + RSD)
+// against it can never succeed, which used to make every cache hit look
+// "stale" and forced a full scan on every run.
+//
+// On success `conn` is connected (HELO done) and *outPort is the cached port.
+static bool TryCachedBridgePort(const t2::discovery::NcmEndpoint& ep,
+                                t2::bridgexpc::Connection* conn,
+                                uint16_t* outPort) {
+    using namespace t2::discovery;
+    using namespace t2::bridgexpc;
+
+    uint16_t cachedPort = 0;
+    if (!LoadCachedPort(ep, &cachedPort)) return false;
+
+    ConnectResult cr = ConnectResult::ConnectFailed;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        cr = conn->Connect(ep.peerLinkLocal, ep.ifIndex, cachedPort,
+                            std::chrono::milliseconds(1500));
+        if (cr == ConnectResult::Ok) {
+            *outPort = cachedPort;
+            return true;
+        }
+        // ConnectFailed = nothing listening (RST/unreachable) -> port is
+        // really gone, no point retrying. Anything else (HELO timeout /
+        // malformed) can be the bridge still busy tearing down the previous
+        // client's session - give it one short retry.
+        if (cr == ConnectResult::ConnectFailed) break;
+        Sleep(200);
+    }
+    std::wcout << L"cached port " << cachedPort
+               << L" did not answer as BridgeXPC (T2 rebooted?) - falling back to full scan.\n";
+    return false;
+}
+
 static int CmdNetwork(int argc, wchar_t* argv[]) {
     using namespace t2::discovery;
 
@@ -455,36 +494,25 @@ static int CmdNetwork(int argc, wchar_t* argv[]) {
     // Cache-first, same policy as DiscoverBiometricKitBridge (used by
     // identities/verify/warmup): the BridgeXPC port doesn't move within a
     // boot/session, so try the last known-good port for this adapter
-    // before paying for a 16384-port scan. Still re-verified over
-    // RemoteXPC before being trusted — a stale/wrong entry just falls
+    // before paying for a 16384-port scan. Verified by a live BridgeXPC
+    // HELO (see TryCachedBridgePort) - a stale/wrong entry just falls
     // through to the full scan below, never a false "found".
-    uint16_t cachedPort = 0;
-    if (LoadCachedPort(ep, &cachedPort)) {
-        uint16_t verifiedPort = 0;
-        if (ProbeServiceOnPort(ep, cachedPort, kServiceName, kCheckTimeout, &verifiedPort)) {
-            using namespace t2::bridgexpc;
-            Connection bridge;
-            ConnectResult cr = bridge.Connect(ep.peerLinkLocal, ep.ifIndex, verifiedPort,
-                                               std::chrono::milliseconds(2000));
-            if (cr == ConnectResult::Ok) {
-                int64_t bridgeVersion = 0;
-                if (bridge.GetBridgeVersion(&bridgeVersion, std::chrono::milliseconds(2000))) {
-                    std::wcout << L"BiometricKit BridgeXPC port: " << verifiedPort
-                               << L"  (cached — skipped port scan)\n";
-                    std::wcout << L"BridgeXPC verified: HELO OK, bridge version="
-                               << bridgeVersion << L"\n";
-                    return 0;
-                }
-                std::wcout << L"cached port " << cachedPort
-                           << L" verified but getBridgeVersion failed - falling back to full scan.\n";
-            } else {
-                std::wcout << L"cached port " << cachedPort
-                           << L" verified over RemoteXPC but BridgeXPC HELO failed - "
-                              L"falling back to full scan.\n";
+    {
+        using namespace t2::bridgexpc;
+        Connection cachedBridge;
+        uint16_t cachedPort = 0;
+        if (TryCachedBridgePort(ep, &cachedBridge, &cachedPort)) {
+            int64_t bridgeVersion = 0;
+            if (cachedBridge.GetBridgeVersion(&bridgeVersion, std::chrono::milliseconds(2000))) {
+                std::wcout << L"BiometricKit BridgeXPC port: " << cachedPort
+                           << L"  (cached - skipped port scan)\n";
+                std::wcout << L"BridgeXPC verified: HELO OK, bridge version="
+                           << bridgeVersion << L"\n";
+                return 0;
             }
-        } else {
             std::wcout << L"cached port " << cachedPort
-                       << L" is stale (T2 likely rebooted) - falling back to full scan.\n";
+                       << L" HELO OK but getBridgeVersion failed - falling back to full scan.\n";
+            cachedBridge.Close();
         }
     }
 
@@ -564,7 +592,7 @@ static int CmdNetwork(int argc, wchar_t* argv[]) {
               [](const PortCandidate& a, const PortCandidate& b) { return a.port < b.port; });
 
     std::wcout << L"candidates: tcp_open=" << nTcp << L"  http2_settings=" << nHttp2;
-    if (foundPort != 0) std::wcout << L"  (scan stopped early — BiometricKit already found)";
+    if (foundPort != 0) std::wcout << L"  (scan stopped early - BiometricKit already found)";
     std::wcout << L"\n";
     for (const auto& h : hits) {
         std::wcout << L"  port " << h.port;
@@ -733,29 +761,18 @@ static bool DiscoverBiometricKitBridge(int argc, wchar_t* argv[], int firstArgIn
     // pipeline below exists at all), but it does not move around within a
     // single boot/session — repeated `identities`/`verify`/`warmup` calls
     // against the same booted T2 keep hitting the same port. Try the
-    // cached port for this adapter first: one RemoteXPC probe, not a
-    // 16384-port scan. Still goes through the exact same
-    // ProbeServiceOnPort verification a scan hit would — a stale or wrong
-    // cache entry (T2 rebooted, different adapter, corrupted file) simply
-    // fails to verify and falls through to the real scan below, it can
-    // never produce a false "found".
-    uint16_t cachedPort = 0;
-    if (LoadCachedPort(ep, &cachedPort)) {
-        uint16_t verifiedPort = 0;
-        if (ProbeServiceOnPort(ep, cachedPort, kServiceName, kCheckTimeout, &verifiedPort)) {
-            ConnectResult cr = outConn->Connect(ep.peerLinkLocal, ep.ifIndex, verifiedPort,
-                                                 std::chrono::milliseconds(2000));
-            if (cr == ConnectResult::Ok) {
-                std::wcout << L"BiometricKit BridgeXPC port: " << verifiedPort
-                           << L"  (cached — skipped port scan)\n";
-                return true;
-            }
-            std::wcout << L"cached port " << cachedPort
-                       << L" verified over RemoteXPC but BridgeXPC HELO failed - "
-                          L"falling back to full scan.\n";
-        } else {
-            std::wcout << L"cached port " << cachedPort
-                       << L" is stale (T2 likely rebooted) - falling back to full scan.\n";
+    // cached port for this adapter first: one BridgeXPC HELO, not a
+    // 16384-port scan. The cached value is the BridgeXPC (raw TCP) service
+    // port, so it is verified by the HELO handshake itself, not by RemoteXPC.
+    // A stale or wrong cache entry (T2 rebooted, different adapter,
+    // corrupted file) simply fails the handshake and falls through to the
+    // real scan below, it can never produce a false "found".
+    {
+        uint16_t cachedPort = 0;
+        if (TryCachedBridgePort(ep, outConn, &cachedPort)) {
+            std::wcout << L"BiometricKit BridgeXPC port: " << cachedPort
+                       << L"  (cached - skipped port scan)\n";
+            return true;
         }
     }
 
@@ -817,11 +834,11 @@ static bool DiscoverBiometricKitBridge(int argc, wchar_t* argv[], int firstArgIn
         }
         if (http2Count == 0) {
             std::wcout << L"no HTTP/2 candidates (attempt " << (attempt + 1)
-                       << L", timeout " << opt.connectTimeoutMs << L"ms) — retrying...\n";
+                       << L", timeout " << opt.connectTimeoutMs << L"ms) - retrying...\n";
         } else {
             std::wcout << L"BiometricKit service not advertised by any of " << http2Count
                        << L" HTTP/2 candidate(s) (attempt " << (attempt + 1)
-                       << L") — retrying...\n";
+                       << L") - retrying...\n";
         }
     }
     if (foundPort == 0) {

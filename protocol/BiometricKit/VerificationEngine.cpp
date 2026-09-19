@@ -244,12 +244,12 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     if (!ConfiguredGlobalIdentities(firstGlobalRaw, config_.macosUserId, &configuredFirst) ||
         !ConfiguredGlobalIdentities(repeatGlobalRaw, config_.macosUserId, &configuredRepeat)) {
         T2_LOG("verify", L"global identity-list malformed (zero-UUID, duplicate, or "
-               L"non-built-in group entry) — fail-closed, refusing StartMatch");
+               L"non-built-in group entry) - fail-closed, refusing StartMatch");
         return VerifyOutcome::UnstableIdentityInventory;
     }
     std::vector<IdentityRecordV1> repeatIdentities;
     if (!ParseIdentityList(repeatUserRaw, &repeatIdentities)) {
-        T2_LOG("verify", L"repeat IdentityList reply malformed (%zuB, not a multiple of 20) — "
+        T2_LOG("verify", L"repeat IdentityList reply malformed (%zuB, not a multiple of 20) - "
                L"fail-closed, refusing StartMatch", repeatUserRaw.size());
         return VerifyOutcome::UnstableIdentityInventory;
     }
@@ -258,7 +258,7 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     if (configuredFirst != configuredRepeat || !SamePerUserSet(configuredFirst, identities) ||
         !SamePerUserSet(configuredRepeat, repeatIdentities)) {
         T2_LOG("verify", L"live identity inventory is unstable (first/repeat 0x42 or 0x51 "
-               L"snapshot disagreed) — fail-closed, refusing StartMatch");
+               L"snapshot disagreed) - fail-closed, refusing StartMatch");
         return VerifyOutcome::UnstableIdentityInventory;
     }
     T2_LOG("verify", L"identity inventory stable across 0x42->0x51->0x42->0x51 (%zu configured)",
@@ -444,7 +444,7 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
             outcome = VerifyOutcome::NoMatch;
             break;
         }
-        T2_LOG("verify", L"match_result outcome=MALFORMED body=%zuB (min required=%zuB) — "
+        T2_LOG("verify", L"match_result outcome=MALFORMED body=%zuB (min required=%zuB) - "
                L"still waiting, not treated as NO_MATCH",
                eventData.size(), kMinMatchResultEventBytes);
     }
