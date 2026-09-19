@@ -318,8 +318,15 @@ T2NcmPowerSetDeviceState(
         status = T2NcmPowerArmHardware(DeviceContext);
         if (NT_SUCCESS(status))
         {
-            (void)T2NcmTrySetState(DeviceContext, T2NcmStatePrepared, T2NcmStateNcmReady);
-            (void)T2NcmTrySetState(DeviceContext, T2NcmStateUsbReady, T2NcmStateNcmReady);
+            // Post-suspend state can be Prepared (a fresh cold-boot-style
+            // re-negotiation) or UsbReady (nothing dropped the negotiated
+            // NTB parameters) - try the more common Prepared case first
+            // and only fall back if it didn't match, same reasoning as
+            // MiniportRestart's NdisRegistered/NcmReady pair.
+            if (!T2NcmTrySetState(DeviceContext, T2NcmStatePrepared, T2NcmStateNcmReady))
+            {
+                (void)T2NcmTrySetState(DeviceContext, T2NcmStateUsbReady, T2NcmStateNcmReady);
+            }
         }
         else
         {

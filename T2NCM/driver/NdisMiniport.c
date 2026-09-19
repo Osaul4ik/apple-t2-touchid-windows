@@ -841,8 +841,17 @@ T2NcmMiniportRestart(
         return NDIS_STATUS_FAILURE;
     }
 
-    (VOID)T2NcmTrySetState(context, T2NcmStateNdisRegistered, T2NcmStateRunning);
-    (VOID)T2NcmTrySetState(context, T2NcmStateNcmReady, T2NcmStateRunning);
+    // Restart can be reached with the lifecycle state sitting at either
+    // NdisRegistered (the normal path) or NcmReady (a fast re-arm on
+    // resume that never passed back through NdisRegistered) - try the
+    // common case first and only fall back to the other predecessor if
+    // it didn't match. Trying both unconditionally meant the second call
+    // was a guaranteed no-op every single time the first one succeeded,
+    // logging a spurious "not taken" trace line on every normal restart.
+    if (!T2NcmTrySetState(context, T2NcmStateNdisRegistered, T2NcmStateRunning))
+    {
+        (VOID)T2NcmTrySetState(context, T2NcmStateNcmReady, T2NcmStateRunning);
+    }
 
     return NDIS_STATUS_SUCCESS;
 }
