@@ -142,16 +142,13 @@ void HandleGetSensorStatus(_In_ WDFREQUEST Request)
 //
 //   - Section 9.4 (cancel-on-CancelIo, unbounded wait for the lock screen)
 //     IS implemented (EvtCaptureCancel/WdfRequestMarkCancelable below), and
-//     VerificationEngine::Verify() restarts the scan on a wrong-finger
-//     NO_MATCH instead of ending the capture, so a bad touch alone no
-//     longer completes this IOCTL. kCaptureMatchWindow is therefore a
-//     safety net, not the primary wait mechanism: it resets on every
-//     restart, so the effective wait is unbounded as long as either (a)
-//     touches (right or wrong) keep happening, or (b) Windows hasn't
-//     cancelled - matching "wait exactly as long as LogonUI is willing to
-//     wait". It only fires for real if the sensor goes completely silent
-//     (no touch, no cancel) for the whole window - a genuine hardware/idle
-//     stall, not normal lock-screen waiting.
+//     VerificationEngine::Verify() now waits with NO internal deadline at
+//     all whenever a cancelEvent is supplied (always true here) - a
+//     wrong-finger NO_MATCH restarts the scan immediately instead of ending
+//     the capture, and the wait otherwise ends only on a real Match or on
+//     Windows' own CancelIoEx. kCaptureMatchWindow below is therefore not a
+//     wait bound in normal operation at all; it only matters as a
+//     last-resort fallback if the cancelEvent itself failed to be created.
 //   - Section 4's multi-user case (several macOS fingers under different
 //     macosUserId on one T2) is not handled: kDefaultMacosUserId is the
 //     only identity this build ever asks the SEP about. Per design doc 4
@@ -179,13 +176,15 @@ using t2::biometrickit::IdentityRecordV1;
 // macOS user id was actually enrolled, until a real settings UI exists.
 constexpr uint32_t kDefaultMacosUserId = 501;
 
-// design doc §9.4's own recommendation for the safety-net bound ("кілька
-// хвилин" / a few minutes), not a per-touch wait: VerificationEngine::Verify()
-// resets this on every wrong-finger restart, so in normal use (any touches at
-// all, or an eventual cancel) this value is never reached. It only ends the
-// capture on genuine total silence - no touch, no cancel - for its full
-// duration, e.g. a stuck/disconnected sensor.
-constexpr std::chrono::seconds kCaptureMatchWindow{300};
+// No longer a "safety net" for the normal Hello wait: VerificationEngine::
+// Verify() now waits with NO deadline at all whenever cancelEvent is
+// non-null (the case here) - Windows alone decides when CAPTURE_DATA ends,
+// via CancelIoEx, per explicit design direction (§9.4). This constant only
+// still matters as a last-resort fallback bound for the (unexpected) case
+// where GetCaptureCancelEvent() returns null - e.g. the process-wide cancel
+// event failed to create at startup - so the capture does not wait forever
+// with no way to be cancelled at all in that specific failure mode.
+constexpr std::chrono::seconds kCaptureMatchWindow{60};
 
 // Only one CAPTURE_DATA may be in flight at a time (design doc 6, mirroring
 // VerificationEngine::IsBusy()'s existing single-session rule at the WBDI
@@ -497,8 +496,22 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
         // (Verify() polls the same event), but even if it raced and came
         // back some other way, Request is no longer ours to complete -
         // touching it again here would be a double-complete bug.
-        T2BioLog("CAPTURE_DATA(verify): cancelled, outcome=%d discarded (request already completed)",
-                 static_cast<int>(outcome));
+        if (outcome == VerifyOutcome::Match) {
+            // Real-hardware-observed (2026-09-20): Windows can call
+            // CancelIoEx on this very request at almost the same instant
+            // the SEP delivers a genuine match_result. WDF only allows one
+            // completion, so a successful touch is lost here - the user
+            // sees no reaction and has to touch again. Not recoverable at
+            // this layer (the request is already gone); flagged loudly so
+            // it reads as "a real fingerprint got dropped", not routine
+            // cancellation.
+            T2BioLog("CAPTURE_DATA(verify): *** genuine MATCH discarded - lost a race with "
+                     "Windows' own CancelIoEx on this request (request already completed "
+                     "as CANCELLED before we could report the match) ***");
+        } else {
+            T2BioLog("CAPTURE_DATA(verify): cancelled, outcome=%d discarded (request already completed)",
+                     static_cast<int>(outcome));
+        }
         return;
     }
 

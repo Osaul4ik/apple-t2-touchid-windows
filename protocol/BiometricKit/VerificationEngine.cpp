@@ -369,7 +369,22 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
         }
     } cancelGuard{conn, &cancelCmd, config_.ioTimeout};
 
-    auto deadline = steady_clock::now() + config_.matchWindow;
+    // design doc §9.4, per explicit direction: this component does not own
+    // the wait duration at all when Windows Hello is driving it (cancelEvent
+    // present) - Windows issues CAPTURE_DATA and we simply wait; a wrong
+    // finger restarts the scan immediately; the wait ends only on a real
+    // Match or on Windows' own cancel (login finished some other way,
+    // password fallback, session torn down). No self-imposed deadline, no
+    // "safety net" second-guessing that contract - if Windows fails to ever
+    // send a cancel, that is a bug to fix at that layer, not something to
+    // paper over here with an internal timeout (a prior attempt at exactly
+    // that safety net was observed, on real hardware, to do more harm than
+    // good: it kept g_captureBusy held for its full duration on a capture
+    // Windows had simply stopped caring about, delaying the next real
+    // capture). The CLI one-shot `verify` (no cancelEvent) is unaffected -
+    // it keeps its fixed config_.matchWindow deadline exactly as before.
+    constexpr auto kNoDeadline = steady_clock::time_point::max();
+    const auto deadline = cancelEvent ? kNoDeadline : (steady_clock::now() + config_.matchWindow);
     VerifyOutcome outcome = VerifyOutcome::Timeout; // default if loop exits via deadline
 
     size_t imagePipelineEvents = 0;
@@ -465,20 +480,20 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
                 // design doc §9.4: Windows, not this component, owns the
                 // overall wait — a wrong finger is not a reason to give up
                 // and complete the WBDI CAPTURE_DATA request. Restart the
-                // scan (fresh StartMatch) and keep waiting; only an actual
-                // cancel (password fallback, session end) or total silence
-                // for the whole safety-net window ends the wait. Without
-                // this, one bad touch used to end the entire capture and
-                // leave the sensor waiting for a WBF-issued re-poll that
-                // may never come, matching the "wrong finger, then correct
-                // finger does nothing" symptom this fixes.
+                // scan (fresh StartMatch) and keep waiting; only a real
+                // Match or an actual cancel (password fallback, session
+                // end, login succeeded some other way) ends the wait - no
+                // internal deadline of our own. Without this, one bad touch
+                // used to end the entire capture and leave the sensor
+                // waiting for a WBF-issued re-poll that may never come,
+                // matching the "wrong finger, then correct finger does
+                // nothing" symptom this fixes.
                 T2_LOG("verify",
                        L"match_result outcome=NO_MATCH (attempt #%zu) - wrong finger, "
-                       L"restarting scan; Windows controls the overall wait via cancelEvent",
+                       L"restarting scan immediately; Windows controls the wait, not us",
                        rejectedTouchAttempts);
                 std::vector<uint8_t> discard;
                 conn->SendBiometricCommand(cancelCmd, 0, &discard, config_.ioTimeout); // best-effort
-                deadline = steady_clock::now() + config_.matchWindow; // reset the safety net
                 if (!sendStartMatch()) {
                     outcome = VerifyOutcome::TransportError;
                     break;
