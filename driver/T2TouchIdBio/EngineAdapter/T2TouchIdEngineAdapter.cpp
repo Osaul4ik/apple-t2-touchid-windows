@@ -21,10 +21,23 @@
 // null entry WBF decides to call would crash wbiosrvc rather than fail
 // cleanly. See the interface-table comment below for exactly which.
 //
-// Fail-closed rule (design doc 5): no callback may ever report a match. Every
-// matching / enrollment entry point returns E_NOTIMPL with its outputs zeroed
-// until the VerificationEngine wiring exists. A wrong "success" here would be
-// a login bypass, a wrong "not implemented" is only a missing feature.
+// STAGE 2/3 (this revision): sample handling, verify/identify and enrollment.
+// The SEP does the actual fingerprint match; what reaches this adapter is a
+// WINBIO_BIR whose Vendor Data Block carries t2::biometrickit::T2VendorSamplePayload
+// (VendorWire.h): the fail-closed VerifyOutcome plus macosUserId. An enrolled
+// record is {macosUserId} stored through WBF's storage adapter (design doc 4).
+//
+// Fail-closed rules (design doc 5) - a wrong "success" here is a login bypass,
+// a wrong "no match" is only an annoyance:
+//   * a match is reported only from a sample that AcceptSampleData parsed
+//     strictly, whose Outcome is Match, whose Kind is a real touch
+//     (EnrollConfirm samples - no touch - can only complete an enrollment),
+//     and whose macosUserId equals the enrolled record's;
+//   * a sample is consumed by the first operation that uses it and dropped by
+//     ClearContext, so an old verdict can never be replayed;
+//   * two enrolled records for the same macosUserId (ambiguous identity) fail
+//     the identify instead of guessing an account;
+//   * every storage/parse failure ends as UNKNOWN_ID / BAD_CAPTURE, never Match.
 //
 // Every callback writes one line to the debugger (DebugView, "Capture Global
 // Win32"; wbiosrvc is a normal service process). That trace is the point of
@@ -48,6 +61,14 @@
 #endif
 
 #include <winbio_adapter.h>
+#include <winbio_err.h>
+
+#ifndef WINBIO_I_MORE_DATA
+#define WINBIO_I_MORE_DATA ((HRESULT)0x00090001L)   // winbio_err.h; guarded in case the SDK spells it differently
+#endif
+
+#include <cstring>
+#include "../WbdiBir.h"
 
 // ---------------------------------------------------------------------------
 // Private per-pipeline context. winbio_adapter.h only forward-declares
@@ -56,6 +77,19 @@
 struct _WINIBIO_ENGINE_CONTEXT {
     ULONG Signature;      // 'T2EC', catches a foreign / stale EngineContext
     ULONG CallCount;      // number of callbacks seen on this pipeline (trace only)
+
+    // The last sample accepted by AcceptSampleData. Consumed (cleared) by the
+    // operation that uses it and by ClearContext.
+    BOOLEAN SampleValid;
+    UCHAR   SamplePurpose;      // WINBIO_BIR_PURPOSE as WBF passed it
+    UCHAR   SampleKind;         // t2::biometrickit::kSampleKind*
+    ULONG   SampleOutcome;      // wire VerifyOutcome
+    ULONG   SampleMacosUserId;
+
+    // Enrollment in progress (CreateEnrollment .. CommitEnrollment/Discard).
+    BOOLEAN EnrollActive;
+    BOOLEAN EnrollReady;        // one accepted EnrollConfirm sample is all this sensor needs
+    ULONG   EnrollMacosUserId;
 };
 static const ULONG kContextSignature = 0x43453254; // "T2EC" little-endian
 
@@ -129,6 +163,152 @@ void ZeroIdentity(_Out_ PWINBIO_IDENTITY identity)
     }
 }
 
+PWINIBIO_ENGINE_CONTEXT GetContext(_In_opt_ PWINBIO_PIPELINE pipeline)
+{
+    if (pipeline == nullptr) {
+        return nullptr;
+    }
+    PWINIBIO_ENGINE_CONTEXT ctx = pipeline->EngineContext;
+    return (ctx != nullptr && ctx->Signature == kContextSignature) ? ctx : nullptr;
+}
+
+void ClearSample(_Inout_ PWINIBIO_ENGINE_CONTEXT ctx)
+{
+    ctx->SampleValid = FALSE;
+    ctx->SamplePurpose = 0;
+    ctx->SampleKind = 0;
+    ctx->SampleOutcome = t2::biometrickit::kWireOutcomeInvalid;
+    ctx->SampleMacosUserId = 0;
+}
+
+void ResetEnrollment(_Inout_ PWINIBIO_ENGINE_CONTEXT ctx)
+{
+    ctx->EnrollActive = FALSE;
+    ctx->EnrollReady = FALSE;
+    ctx->EnrollMacosUserId = 0;
+}
+
+const UCHAR kEnrollPurposes = WINBIO_PURPOSE_ENROLL | WINBIO_PURPOSE_ENROLL_FOR_VERIFICATION |
+                              WINBIO_PURPOSE_ENROLL_FOR_IDENTIFICATION;
+const UCHAR kMatchPurposes  = WINBIO_PURPOSE_VERIFY | WINBIO_PURPOSE_IDENTIFY;
+
+// A sample that proves a real touch matched: what verify/identify may act on.
+bool SampleIsTouchMatch(const _WINIBIO_ENGINE_CONTEXT& ctx)
+{
+    return ctx.SampleValid &&
+           ctx.SampleKind == t2::biometrickit::kSampleKindVerify &&
+           ctx.SampleOutcome == t2::biometrickit::kWireOutcomeMatch &&
+           (ctx.SamplePurpose & kMatchPurposes) != 0 &&
+           (ctx.SamplePurpose & kEnrollPurposes) == 0;
+}
+
+// The no-touch sample that completes an enrollment. Never usable for matching.
+bool SampleIsEnrollConfirm(const _WINIBIO_ENGINE_CONTEXT& ctx)
+{
+    return ctx.SampleValid &&
+           ctx.SampleKind == t2::biometrickit::kSampleKindEnrollConfirm &&
+           ctx.SampleOutcome == t2::biometrickit::kWireOutcomeMatch &&
+           (ctx.SamplePurpose & kEnrollPurposes) != 0;
+}
+
+// The stored "template": no biometric data, just which macOS user the SEP
+// verifies for this Windows identity (design doc 4).
+#pragma pack(push, 1)
+struct T2EnrolledTemplateV1 {
+    ULONG Version;
+    ULONG MacosUserId;
+    UCHAR Reserved[8];
+};
+#pragma pack(pop)
+static_assert(sizeof(T2EnrolledTemplateV1) == 16, "stored template layout must stay stable");
+const ULONG kTemplateVersion = 1;
+
+bool ReadTemplate(const WINBIO_STORAGE_RECORD& record, _Out_ ULONG* macosUserId)
+{
+    *macosUserId = 0;
+    if (record.TemplateBlob == nullptr || record.TemplateBlobSize < sizeof(T2EnrolledTemplateV1)) {
+        return false;
+    }
+    T2EnrolledTemplateV1 t{};
+    std::memcpy(&t, record.TemplateBlob, sizeof(t));
+    if (t.Version != kTemplateVersion) {
+        return false;
+    }
+    *macosUserId = t.MacosUserId;
+    return true;
+}
+
+// Selects the records to look at and returns how many there are.
+//   subject != nullptr : the records of that identity/subfactor (verify)
+//   subject == nullptr : every record (identify, duplicate check)
+HRESULT OpenRecordSet(_Inout_ PWINBIO_PIPELINE pipeline, _In_opt_ PWINBIO_IDENTITY subject,
+                      WINBIO_BIOMETRIC_SUBTYPE subFactor, _Out_ SIZE_T* count)
+{
+    *count = 0;
+    HRESULT hr;
+    if (subject != nullptr) {
+        hr = WbioStorageQueryBySubject(pipeline, subject, subFactor);
+        EngLog("     storage QueryBySubject hr=0x%08lx", static_cast<unsigned long>(hr));
+    } else {
+        hr = WbioStorageQueryByContent(pipeline, subFactor, nullptr, 0);
+        EngLog("     storage QueryByContent(all) hr=0x%08lx", static_cast<unsigned long>(hr));
+        if (FAILED(hr)) {
+            WINBIO_IDENTITY wildcard{};
+            wildcard.Type = WINBIO_ID_TYPE_WILDCARD;
+            wildcard.Value.Wildcard = WINBIO_IDENTITY_WILDCARD;
+            hr = WbioStorageQueryBySubject(pipeline, &wildcard, subFactor);
+            EngLog("     storage QueryBySubject(wildcard) hr=0x%08lx", static_cast<unsigned long>(hr));
+        }
+    }
+    if (FAILED(hr)) {
+        return hr;
+    }
+    hr = WbioStorageGetRecordCount(pipeline, count);
+    EngLog("     storage GetRecordCount hr=0x%08lx count=%llu", static_cast<unsigned long>(hr),
+           static_cast<unsigned long long>(*count));
+    if (FAILED(hr)) {
+        *count = 0;
+    }
+    return hr;
+}
+
+// Walks the current record set. fn(record) returns true to stop. The record's
+// memory belongs to the storage adapter and is valid only until the next
+// storage call, so fn must copy what it keeps.
+template <typename Fn>
+void ForEachRecord(_Inout_ PWINBIO_PIPELINE pipeline, SIZE_T count, Fn&& fn)
+{
+    for (SIZE_T i = 0; i < count; ++i) {
+        HRESULT hr = (i == 0) ? WbioStorageFirstRecord(pipeline) : WbioStorageNextRecord(pipeline);
+        if (FAILED(hr)) {
+            EngLog("     storage %s record hr=0x%08lx (index %llu) - stopping", i == 0 ? "First" : "Next",
+                   static_cast<unsigned long>(hr), static_cast<unsigned long long>(i));
+            return;
+        }
+        WINBIO_STORAGE_RECORD record{};
+        hr = WbioStorageGetCurrentRecord(pipeline, &record);
+        if (FAILED(hr)) {
+            EngLog("     storage GetCurrentRecord hr=0x%08lx (index %llu) - stopping",
+                   static_cast<unsigned long>(hr), static_cast<unsigned long long>(i));
+            return;
+        }
+        if (fn(record)) {
+            return;
+        }
+    }
+}
+
+void ZeroMatchOutputs(_Out_opt_ PUCHAR* payload, _Out_opt_ PSIZE_T payloadSize,
+                      _Out_opt_ PUCHAR* hash, _Out_opt_ PSIZE_T hashSize,
+                      _Out_opt_ PWINBIO_REJECT_DETAIL reject)
+{
+    if (ARGUMENT_PRESENT(payload))     { *payload = nullptr; }
+    if (ARGUMENT_PRESENT(payloadSize)) { *payloadSize = 0; }
+    if (ARGUMENT_PRESENT(hash))        { *hash = nullptr; }
+    if (ARGUMENT_PRESENT(hashSize))    { *hashSize = 0; }
+    if (ARGUMENT_PRESENT(reject))      { *reject = 0; }
+}
+
 // ---------------------------------------------------------------------------
 // Lifetime
 // ---------------------------------------------------------------------------
@@ -174,8 +354,16 @@ HRESULT WINAPI EngineDetach(_Inout_ PWINBIO_PIPELINE Pipeline)
 HRESULT WINAPI EngineClearContext(_Inout_ PWINBIO_PIPELINE Pipeline)
 {
     Trace("ClearContext", Pipeline);
-    // No sample / feature set / enrollment is held yet, nothing to clear.
-    return TraceRet("ClearContext", ARGUMENT_PRESENT(Pipeline) ? S_OK : E_POINTER);
+    PWINIBIO_ENGINE_CONTEXT ctx = GetContext(Pipeline);
+    if (ctx == nullptr) {
+        return TraceRet("ClearContext", E_POINTER);
+    }
+    // Drops the pending sample so an old verdict can never be reused. The
+    // enrollment state is kept: WBF may clear the context between the capture
+    // and the commit of one enrollment; CreateEnrollment / DiscardEnrollment /
+    // CommitEnrollment are what reset it.
+    ClearSample(ctx);
+    return TraceRet("ClearContext", S_OK);
 }
 
 // ---------------------------------------------------------------------------
@@ -258,8 +446,24 @@ HRESULT WINAPI EngineQuerySampleHint(
 }
 
 // ---------------------------------------------------------------------------
-// Sample / match path - fail closed until stage 2 (VerificationEngine).
+// Sample path. WBF's sensor adapter hands the BIR the driver returned to
+// AcceptSampleData; the matching operations (Verify/Identify) and the
+// enrollment operations then consume it. See the file header for the rules.
 // ---------------------------------------------------------------------------
+void TraceBirHead(_In_reads_bytes_(size) const void* data, SIZE_T size)
+{
+    const SIZE_T n = size < 48 ? size : 48;
+    char hex[48 * 2 + 1] = {};
+    static const char digits[] = "0123456789abcdef";
+    const UCHAR* bytes = static_cast<const UCHAR*>(data);
+    for (SIZE_T i = 0; i < n; ++i) {
+        hex[i * 2]     = digits[bytes[i] >> 4];
+        hex[i * 2 + 1] = digits[bytes[i] & 0x0f];
+    }
+    EngLog("     sample head (%llu of %llu bytes): %s", static_cast<unsigned long long>(n),
+           static_cast<unsigned long long>(size), hex);
+}
+
 HRESULT WINAPI EngineAcceptSampleData(
     _Inout_ PWINBIO_PIPELINE Pipeline,
     _In_reads_bytes_(SampleSize) PWINBIO_BIR SampleBuffer,
@@ -269,13 +473,45 @@ HRESULT WINAPI EngineAcceptSampleData(
 {
     Trace("AcceptSampleData", Pipeline);
     EngLog("     sampleSize=%llu purpose=0x%02x", static_cast<unsigned long long>(SampleSize), static_cast<unsigned>(Purpose));
-    UNREFERENCED_PARAMETER(SampleBuffer);
-    UNREFERENCED_PARAMETER(SampleSize);
-    UNREFERENCED_PARAMETER(Purpose);
     if (ARGUMENT_PRESENT(RejectDetail)) {
         *RejectDetail = 0;
     }
-    return TraceRet("AcceptSampleData", E_NOTIMPL);
+    PWINIBIO_ENGINE_CONTEXT ctx = GetContext(Pipeline);
+    if (ctx == nullptr || !ARGUMENT_PRESENT(SampleBuffer)) {
+        return TraceRet("AcceptSampleData", E_POINTER);
+    }
+    ClearSample(ctx);   // a new sample always replaces the previous one
+
+    t2::wbdi::ParsedVendorBir bir;
+    if (!t2::wbdi::ParseVendorBir(SampleBuffer, SampleSize, &bir)) {
+        EngLog("     BIR rejected: malformed (not the WINBIO_BIR + vendor block the driver builds)");
+        TraceBirHead(SampleBuffer, SampleSize);
+        return TraceRet("AcceptSampleData", WINBIO_E_BAD_CAPTURE);
+    }
+    t2::biometrickit::T2VendorSamplePayload payload;
+    if (!t2::biometrickit::DeserializeVendorPayload(bir.Payload, bir.PayloadSize, &payload)) {
+        EngLog("     vendor payload rejected: bad size/version/fields (payloadSize=%llu)",
+               static_cast<unsigned long long>(bir.PayloadSize));
+        TraceBirHead(SampleBuffer, SampleSize);
+        return TraceRet("AcceptSampleData", WINBIO_E_BAD_CAPTURE);
+    }
+    EngLog("     BIR ok: headerPurpose=0x%02x headerFlags=0x%02x outcome=%lu kind=%u macosUserId=%lu",
+           static_cast<unsigned>(bir.Purpose), static_cast<unsigned>(bir.Flags),
+           static_cast<unsigned long>(payload.Outcome), static_cast<unsigned>(payload.Kind),
+           static_cast<unsigned long>(payload.MacosUserId));
+    if (payload.Outcome != t2::biometrickit::kWireOutcomeMatch) {
+        // The driver only ever sends a sample for a Match; anything else here
+        // is not something to build a verdict on.
+        EngLog("     outcome is not Match - refusing the sample");
+        return TraceRet("AcceptSampleData", WINBIO_E_BAD_CAPTURE);
+    }
+
+    ctx->SampleValid = TRUE;
+    ctx->SamplePurpose = Purpose;
+    ctx->SampleKind = payload.Kind;
+    ctx->SampleOutcome = payload.Outcome;
+    ctx->SampleMacosUserId = payload.MacosUserId;
+    return TraceRet("AcceptSampleData", S_OK);
 }
 
 HRESULT WINAPI EngineExportEngineData(
@@ -287,11 +523,16 @@ HRESULT WINAPI EngineExportEngineData(
     Trace("ExportEngineData", Pipeline);
     EngLog("     flags=0x%02x", static_cast<unsigned>(Flags));
     UNREFERENCED_PARAMETER(Flags);
+    // No feature set / template that could be exported exists: the SEP owns
+    // the biometric data and never hands it out.
     if (ARGUMENT_PRESENT(SampleBuffer)) { *SampleBuffer = nullptr; }
     if (ARGUMENT_PRESENT(SampleSize))   { *SampleSize = 0; }
     return TraceRet("ExportEngineData", E_NOTIMPL);
 }
 
+// ---------------------------------------------------------------------------
+// Verify / identify.
+// ---------------------------------------------------------------------------
 HRESULT WINAPI EngineVerifyFeatureSet(
     _Inout_ PWINBIO_PIPELINE Pipeline,
     _In_ PWINBIO_IDENTITY Identity,
@@ -305,15 +546,40 @@ HRESULT WINAPI EngineVerifyFeatureSet(
 {
     Trace("VerifyFeatureSet", Pipeline);
     EngLog("     subFactor=0x%02x", static_cast<unsigned>(SubFactor));
-    UNREFERENCED_PARAMETER(Identity);
-    UNREFERENCED_PARAMETER(SubFactor);
-    if (ARGUMENT_PRESENT(Match))           { *Match = FALSE; }   // never a match
-    if (ARGUMENT_PRESENT(PayloadBlob))     { *PayloadBlob = nullptr; }
-    if (ARGUMENT_PRESENT(PayloadBlobSize)) { *PayloadBlobSize = 0; }
-    if (ARGUMENT_PRESENT(HashValue))       { *HashValue = nullptr; }
-    if (ARGUMENT_PRESENT(HashSize))        { *HashSize = 0; }
-    if (ARGUMENT_PRESENT(RejectDetail))    { *RejectDetail = 0; }
-    return TraceRet("VerifyFeatureSet", E_NOTIMPL);
+    if (ARGUMENT_PRESENT(Match)) { *Match = FALSE; }   // never a match unless proven below
+    ZeroMatchOutputs(PayloadBlob, PayloadBlobSize, HashValue, HashSize, RejectDetail);
+
+    PWINIBIO_ENGINE_CONTEXT ctx = GetContext(Pipeline);
+    if (ctx == nullptr || !ARGUMENT_PRESENT(Identity) || !ARGUMENT_PRESENT(Match)) {
+        return TraceRet("VerifyFeatureSet", E_POINTER);
+    }
+    const bool touchMatch = SampleIsTouchMatch(*ctx);
+    const ULONG sampleUser = ctx->SampleMacosUserId;
+    ClearSample(ctx);   // consumed: this sample can never authorize a second operation
+    if (!touchMatch) {
+        EngLog("     no acceptable touch-match sample pending -> fail closed");
+        return TraceRet("VerifyFeatureSet", WINBIO_E_INVALID_OPERATION);
+    }
+
+    SIZE_T count = 0;
+    const HRESULT qhr = OpenRecordSet(Pipeline, Identity, SubFactor, &count);
+    if (FAILED(qhr) || count == 0) {
+        EngLog("     no enrolled record for this identity/subfactor");
+        return TraceRet("VerifyFeatureSet", WINBIO_E_UNKNOWN_ID);
+    }
+    bool matched = false;
+    ForEachRecord(Pipeline, count, [&](const WINBIO_STORAGE_RECORD& record) {
+        ULONG enrolledUser = 0;
+        if (ReadTemplate(record, &enrolledUser) && enrolledUser == sampleUser) {
+            matched = true;
+            return true;
+        }
+        return false;
+    });
+    EngLog("     verify: sample macosUserId=%lu -> %s", static_cast<unsigned long>(sampleUser),
+           matched ? "MATCH" : "no match");
+    *Match = matched ? TRUE : FALSE;
+    return TraceRet("VerifyFeatureSet", S_OK);
 }
 
 HRESULT WINAPI EngineIdentifyFeatureSet(
@@ -328,23 +594,79 @@ HRESULT WINAPI EngineIdentifyFeatureSet(
 {
     Trace("IdentifyFeatureSet", Pipeline);
     ZeroIdentity(Identity);
-    if (ARGUMENT_PRESENT(SubFactor))       { *SubFactor = 0; }
-    if (ARGUMENT_PRESENT(PayloadBlob))     { *PayloadBlob = nullptr; }
-    if (ARGUMENT_PRESENT(PayloadBlobSize)) { *PayloadBlobSize = 0; }
-    if (ARGUMENT_PRESENT(HashValue))       { *HashValue = nullptr; }
-    if (ARGUMENT_PRESENT(HashSize))        { *HashSize = 0; }
-    if (ARGUMENT_PRESENT(RejectDetail))    { *RejectDetail = 0; }
-    return TraceRet("IdentifyFeatureSet", E_NOTIMPL);
+    if (ARGUMENT_PRESENT(SubFactor)) { *SubFactor = 0; }
+    ZeroMatchOutputs(PayloadBlob, PayloadBlobSize, HashValue, HashSize, RejectDetail);
+
+    PWINIBIO_ENGINE_CONTEXT ctx = GetContext(Pipeline);
+    if (ctx == nullptr || !ARGUMENT_PRESENT(Identity) || !ARGUMENT_PRESENT(SubFactor)) {
+        return TraceRet("IdentifyFeatureSet", E_POINTER);
+    }
+    const bool touchMatch = SampleIsTouchMatch(*ctx);
+    const ULONG sampleUser = ctx->SampleMacosUserId;
+    ClearSample(ctx);   // consumed
+    if (!touchMatch) {
+        EngLog("     no acceptable touch-match sample pending -> fail closed");
+        return TraceRet("IdentifyFeatureSet", WINBIO_E_INVALID_OPERATION);
+    }
+
+    SIZE_T count = 0;
+    const HRESULT qhr = OpenRecordSet(Pipeline, nullptr, WINBIO_SUBTYPE_ANY, &count);
+    if (FAILED(qhr) || count == 0) {
+        // Also the normal answer while nobody is enrolled yet (the check
+        // Settings runs before it starts an enrollment).
+        EngLog("     no enrolled records -> UNKNOWN_ID");
+        return TraceRet("IdentifyFeatureSet", WINBIO_E_UNKNOWN_ID);
+    }
+
+    ULONG matches = 0;
+    WINBIO_IDENTITY found{};
+    WINBIO_BIOMETRIC_SUBTYPE foundSub = 0;
+    ForEachRecord(Pipeline, count, [&](const WINBIO_STORAGE_RECORD& record) {
+        ULONG enrolledUser = 0;
+        if (ReadTemplate(record, &enrolledUser) && enrolledUser == sampleUser && record.Identity != nullptr) {
+            if (matches == 0) {
+                found = *record.Identity;     // copy now: the record's memory dies at the next storage call
+                foundSub = record.SubFactor;
+            }
+            ++matches;
+        }
+        return false;   // scan all: a second match means the identity is ambiguous
+    });
+
+    if (matches == 0) {
+        EngLog("     identify: macosUserId=%lu is not enrolled -> UNKNOWN_ID", static_cast<unsigned long>(sampleUser));
+        return TraceRet("IdentifyFeatureSet", WINBIO_E_UNKNOWN_ID);
+    }
+    if (matches > 1) {
+        // Two Windows identities enrolled against the same macOS user: the SEP
+        // cannot tell them apart, so guessing an account would be a login bypass.
+        EngLog("     identify: %lu records share macosUserId=%lu -> ambiguous, failing closed",
+               matches, static_cast<unsigned long>(sampleUser));
+        return TraceRet("IdentifyFeatureSet", WINBIO_E_UNKNOWN_ID);
+    }
+    *Identity = found;
+    *SubFactor = foundSub;
+    EngLog("     identify: macosUserId=%lu -> enrolled identity (type %lu)",
+           static_cast<unsigned long>(sampleUser), static_cast<unsigned long>(found.Type));
+    return TraceRet("IdentifyFeatureSet", S_OK);
 }
 
 // ---------------------------------------------------------------------------
-// Enrollment - stage 3 (design doc 4: "enroll" = confirm the SEP identity list
-// for macosUserId and store {macosUserId, matchedUuid}, no raw data).
+// Enrollment (design doc 4): "enroll" = the driver confirmed the SEP has an
+// identity for macosUserId (EnrollConfirm sample, no touch), and the record
+// stored through WBF's storage adapter is {macosUserId}. One sample completes it.
 // ---------------------------------------------------------------------------
 HRESULT WINAPI EngineCreateEnrollment(_Inout_ PWINBIO_PIPELINE Pipeline)
 {
     Trace("CreateEnrollment", Pipeline);
-    return TraceRet("CreateEnrollment", E_NOTIMPL);
+    PWINIBIO_ENGINE_CONTEXT ctx = GetContext(Pipeline);
+    if (ctx == nullptr) {
+        return TraceRet("CreateEnrollment", E_POINTER);
+    }
+    ResetEnrollment(ctx);      // an abandoned earlier enrollment is simply replaced
+    ClearSample(ctx);
+    ctx->EnrollActive = TRUE;
+    return TraceRet("CreateEnrollment", S_OK);
 }
 
 HRESULT WINAPI EngineUpdateEnrollment(
@@ -353,7 +675,24 @@ HRESULT WINAPI EngineUpdateEnrollment(
 {
     Trace("UpdateEnrollment", Pipeline);
     if (ARGUMENT_PRESENT(RejectDetail)) { *RejectDetail = 0; }
-    return TraceRet("UpdateEnrollment", E_NOTIMPL);
+    PWINIBIO_ENGINE_CONTEXT ctx = GetContext(Pipeline);
+    if (ctx == nullptr) {
+        return TraceRet("UpdateEnrollment", E_POINTER);
+    }
+    if (!ctx->EnrollActive) {
+        return TraceRet("UpdateEnrollment", WINBIO_E_INVALID_OPERATION);
+    }
+    const bool confirm = SampleIsEnrollConfirm(*ctx);
+    const ULONG sampleUser = ctx->SampleMacosUserId;
+    ClearSample(ctx);
+    if (!confirm) {
+        EngLog("     no EnrollConfirm sample pending -> BAD_CAPTURE");
+        return TraceRet("UpdateEnrollment", WINBIO_E_BAD_CAPTURE);
+    }
+    ctx->EnrollMacosUserId = sampleUser;
+    ctx->EnrollReady = TRUE;
+    EngLog("     enrollment ready for macosUserId=%lu", static_cast<unsigned long>(sampleUser));
+    return TraceRet("UpdateEnrollment", S_OK);   // S_OK = complete, no more samples needed
 }
 
 HRESULT WINAPI EngineGetEnrollmentStatus(
@@ -362,7 +701,14 @@ HRESULT WINAPI EngineGetEnrollmentStatus(
 {
     Trace("GetEnrollmentStatus", Pipeline);
     if (ARGUMENT_PRESENT(RejectDetail)) { *RejectDetail = 0; }
-    return TraceRet("GetEnrollmentStatus", E_NOTIMPL);
+    PWINIBIO_ENGINE_CONTEXT ctx = GetContext(Pipeline);
+    if (ctx == nullptr) {
+        return TraceRet("GetEnrollmentStatus", E_POINTER);
+    }
+    if (!ctx->EnrollActive) {
+        return TraceRet("GetEnrollmentStatus", WINBIO_E_INVALID_OPERATION);
+    }
+    return TraceRet("GetEnrollmentStatus", ctx->EnrollReady ? S_OK : WINBIO_I_MORE_DATA);
 }
 
 HRESULT WINAPI EngineGetEnrollmentHash(
@@ -371,6 +717,7 @@ HRESULT WINAPI EngineGetEnrollmentHash(
     _Out_ PSIZE_T HashSize)
 {
     Trace("GetEnrollmentHash", Pipeline);
+    // No hash algorithm is ever offered (QueryHashAlgorithms reports none).
     if (ARGUMENT_PRESENT(HashValue)) { *HashValue = nullptr; }
     if (ARGUMENT_PRESENT(HashSize))  { *HashSize = 0; }
     return TraceRet("GetEnrollmentHash", E_NOTIMPL);
@@ -386,7 +733,35 @@ HRESULT WINAPI EngineCheckForDuplicate(
     ZeroIdentity(Identity);
     if (ARGUMENT_PRESENT(SubFactor)) { *SubFactor = 0; }
     if (ARGUMENT_PRESENT(Duplicate)) { *Duplicate = FALSE; }
-    return TraceRet("CheckForDuplicate", E_NOTIMPL);
+    PWINIBIO_ENGINE_CONTEXT ctx = GetContext(Pipeline);
+    if (ctx == nullptr || !ARGUMENT_PRESENT(Identity) || !ARGUMENT_PRESENT(SubFactor) ||
+        !ARGUMENT_PRESENT(Duplicate)) {
+        return TraceRet("CheckForDuplicate", E_POINTER);
+    }
+    if (!ctx->EnrollActive || !ctx->EnrollReady) {
+        return TraceRet("CheckForDuplicate", WINBIO_E_INVALID_OPERATION);
+    }
+
+    SIZE_T count = 0;
+    const HRESULT qhr = OpenRecordSet(Pipeline, nullptr, WINBIO_SUBTYPE_ANY, &count);
+    if (FAILED(qhr) || count == 0) {
+        EngLog("     nothing enrolled yet -> not a duplicate");
+        return TraceRet("CheckForDuplicate", S_OK);
+    }
+    const ULONG enrolling = ctx->EnrollMacosUserId;
+    ForEachRecord(Pipeline, count, [&](const WINBIO_STORAGE_RECORD& record) {
+        ULONG enrolledUser = 0;
+        if (ReadTemplate(record, &enrolledUser) && enrolledUser == enrolling && record.Identity != nullptr) {
+            *Identity = *record.Identity;
+            *SubFactor = record.SubFactor;
+            *Duplicate = TRUE;
+            return true;
+        }
+        return false;
+    });
+    EngLog("     duplicate check for macosUserId=%lu -> %s", static_cast<unsigned long>(enrolling),
+           *Duplicate ? "DUPLICATE" : "unique");
+    return TraceRet("CheckForDuplicate", S_OK);
 }
 
 HRESULT WINAPI EngineCommitEnrollment(
@@ -398,17 +773,47 @@ HRESULT WINAPI EngineCommitEnrollment(
 {
     Trace("CommitEnrollment", Pipeline);
     EngLog("     subFactor=0x%02x payloadSize=%llu", static_cast<unsigned>(SubFactor), static_cast<unsigned long long>(PayloadBlobSize));
-    UNREFERENCED_PARAMETER(Identity);
-    UNREFERENCED_PARAMETER(SubFactor);
-    UNREFERENCED_PARAMETER(PayloadBlob);
-    UNREFERENCED_PARAMETER(PayloadBlobSize);
-    return TraceRet("CommitEnrollment", E_NOTIMPL);
+    PWINIBIO_ENGINE_CONTEXT ctx = GetContext(Pipeline);
+    if (ctx == nullptr || !ARGUMENT_PRESENT(Identity)) {
+        return TraceRet("CommitEnrollment", E_POINTER);
+    }
+    if (!ctx->EnrollActive || !ctx->EnrollReady) {
+        EngLog("     no completed enrollment to commit");
+        return TraceRet("CommitEnrollment", WINBIO_E_INVALID_OPERATION);
+    }
+
+    T2EnrolledTemplateV1 tmpl{};
+    tmpl.Version = kTemplateVersion;
+    tmpl.MacosUserId = ctx->EnrollMacosUserId;
+
+    WINBIO_STORAGE_RECORD record{};
+    record.Identity = Identity;
+    record.SubFactor = SubFactor;
+    record.IndexVector = nullptr;          // QueryIndexVectorSize reports 0
+    record.IndexElementCount = 0;
+    record.TemplateBlob = reinterpret_cast<PUCHAR>(&tmpl);
+    record.TemplateBlobSize = sizeof(tmpl);
+    record.PayloadBlob = PayloadBlob;
+    record.PayloadBlobSize = PayloadBlobSize;
+
+    const HRESULT hr = WbioStorageAddRecord(Pipeline, &record);
+    EngLog("     storage AddRecord hr=0x%08lx (identity type %lu, macosUserId=%lu)", static_cast<unsigned long>(hr),
+           static_cast<unsigned long>(Identity->Type), static_cast<unsigned long>(tmpl.MacosUserId));
+    if (SUCCEEDED(hr)) {
+        ResetEnrollment(ctx);
+    }
+    return TraceRet("CommitEnrollment", hr);
 }
 
 HRESULT WINAPI EngineDiscardEnrollment(_Inout_ PWINBIO_PIPELINE Pipeline)
 {
     Trace("DiscardEnrollment", Pipeline);
-    return TraceRet("DiscardEnrollment", S_OK); // nothing is ever created, so discarding is trivially done
+    PWINIBIO_ENGINE_CONTEXT ctx = GetContext(Pipeline);
+    if (ctx != nullptr) {
+        ResetEnrollment(ctx);
+        ClearSample(ctx);
+    }
+    return TraceRet("DiscardEnrollment", ARGUMENT_PRESENT(Pipeline) ? S_OK : E_POINTER);
 }
 
 // ---------------------------------------------------------------------------
@@ -530,9 +935,10 @@ HRESULT WINAPI EngineQueryExtendedInfo(
     RtlZeroMemory(EngineInfo, sizeof(*EngineInfo));
     EngineInfo->GenericEngineCapabilities = 0; // no iterative-improvement / spoof-detection claims yet
     EngineInfo->Factor = WINBIO_TYPE_FINGERPRINT; // matches Queue.cpp's SensorType
-    // Specific.Fingerprint.Capabilities and EnrollmentRequirements stay zeroed
-    // (least-assumption placeholder) until enrollment (stage 3) defines real
-    // sample-coverage requirements.
+    // Enrollment needs exactly one sample (the driver's EnrollConfirm); the
+    // positional requirements (center/edges) do not apply - the SEP has no
+    // image to cover.
+    EngineInfo->Specific.Fingerprint.EnrollmentRequirements.GeneralSamples = 1;
     return TraceRet("QueryExtendedInfo", S_OK);
 }
 
@@ -571,8 +977,12 @@ HRESULT WINAPI EngineSetEnrollmentParameters(
 {
     Trace("SetEnrollmentParameters", Pipeline);
     EngLog("     parameters=%p", static_cast<const void*>(Parameters));
-    UNREFERENCED_PARAMETER(Parameters);
-    return TraceRet("SetEnrollmentParameters", E_NOTIMPL);
+    UNREFERENCED_PARAMETER(Parameters);   // tunes sample requirements for other factors; nothing to tune here
+    PWINIBIO_ENGINE_CONTEXT ctx = GetContext(Pipeline);
+    if (ctx == nullptr) {
+        return TraceRet("SetEnrollmentParameters", E_POINTER);
+    }
+    return TraceRet("SetEnrollmentParameters", ctx->EnrollActive ? S_OK : WINBIO_E_INVALID_OPERATION);
 }
 
 // No enrollment is ever in progress (CreateEnrollment always fails), so per
@@ -592,8 +1002,17 @@ HRESULT WINAPI EngineQueryExtendedEnrollmentStatus(
         return TraceRet("QueryExtendedEnrollmentStatus", E_INVALIDARG);
     }
     RtlZeroMemory(EnrollmentStatus, sizeof(*EnrollmentStatus));
-    EnrollmentStatus->TemplateStatus = WINBIO_E_INVALID_OPERATION;
     EnrollmentStatus->Factor = WINBIO_TYPE_FINGERPRINT;
+    PWINIBIO_ENGINE_CONTEXT ctx = GetContext(Pipeline);
+    if (ctx != nullptr && ctx->EnrollActive) {
+        EnrollmentStatus->TemplateStatus = ctx->EnrollReady ? S_OK : WINBIO_I_MORE_DATA;
+        EnrollmentStatus->PercentComplete = ctx->EnrollReady ? 100 : 0;
+        EnrollmentStatus->Specific.Fingerprint.GeneralSamples = ctx->EnrollReady ? 0 : 1;   // samples still needed
+    } else {
+        EnrollmentStatus->TemplateStatus = WINBIO_E_INVALID_OPERATION;   // not enrolling
+    }
+    EngLog("     templateStatus=0x%08lx percent=%lu", static_cast<unsigned long>(EnrollmentStatus->TemplateStatus),
+           static_cast<unsigned long>(EnrollmentStatus->PercentComplete));
     return TraceRet("QueryExtendedEnrollmentStatus", S_OK);
 }
 

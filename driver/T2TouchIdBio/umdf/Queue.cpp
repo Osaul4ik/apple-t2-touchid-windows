@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Queue.cpp - WBDI IOCTL dispatch.
 #include "Internal.h"
+#include "../WbdiBir.h"
 #include <atomic>
+#include <mutex>
 #include <optional>
 #include <array>
 #include <algorithm>
@@ -191,6 +193,42 @@ struct CaptureBusyGuard {
     }
 };
 
+// Which capture a CAPTURE_DATA request asked for; also what the returned BIR
+// header echoes back.
+struct CaptureKey {
+    WINBIO_BIR_PURPOSE Purpose = 0;
+    WINBIO_BIR_DATA_FLAGS Flags = 0;
+};
+thread_local CaptureKey t_captureKey;   // set by HandleCaptureData for the request in flight on this thread
+
+// WBF's WBDI sensor adapter sends CAPTURE_DATA twice: first with a tiny
+// output buffer (the size probe - the log showed out=4), then again with a
+// buffer of the size the driver reported. The capture itself (a SEP touch)
+// must run only ONCE, so the result of the first call is parked here and the
+// retry is answered from it. Rules that keep this from ever replaying an old
+// verdict: the entry lives 2 s, is consumed only by a request with the same
+// purpose/flags whose output buffer is actually large enough (i.e. a real
+// retry, not a fresh probe), is dropped on delivery, and RESET clears it.
+constexpr ULONGLONG kCachedCaptureTtlMs = 2000;
+
+struct CachedCapture {
+    bool Valid = false;
+    ULONGLONG StoredAtMs = 0;
+    CaptureKey Key;
+    HRESULT Hr = S_OK;
+    WINBIO_SENSOR_STATUS SensorStatus = WINBIO_SENSOR_READY;
+    WINBIO_REJECT_DETAIL Reject = 0;
+    std::vector<uint8_t> Payload;
+};
+std::mutex g_cachedCaptureLock;
+CachedCapture g_cachedCapture;
+
+void ClearCachedCapture()
+{
+    std::lock_guard<std::mutex> lock(g_cachedCaptureLock);
+    g_cachedCapture = CachedCapture{};
+}
+
 HRESULT MapVerifyOutcomeToHresult(VerifyOutcome outcome)
 {
     // Design doc 5's table. Nothing here ever maps a transport/protocol
@@ -237,10 +275,21 @@ void CompleteCaptureData(_In_ WDFREQUEST Request, HRESULT winBioHresult,
         T2BioLog("  CAPTURE_DATA size probe: have=%llu need=%llu -> WBF will retry",
                  static_cast<unsigned long long>(outLen), static_cast<unsigned long long>(needed));
         out->PayloadSize = static_cast<DWORD>(needed);
+        {
+            std::lock_guard<std::mutex> lock(g_cachedCaptureLock);
+            g_cachedCapture.Valid = true;
+            g_cachedCapture.StoredAtMs = GetTickCount64();
+            g_cachedCapture.Key = t_captureKey;
+            g_cachedCapture.Hr = winBioHresult;
+            g_cachedCapture.SensorStatus = sensorStatus;
+            g_cachedCapture.Reject = rejectDetail;
+            g_cachedCapture.Payload = payload;
+        }
         WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, sizeof(DWORD));
         return;
     }
 
+    ClearCachedCapture();   // delivered below: nothing may be replayed after this
     RtlZeroMemory(out, needed);
     out->PayloadSize = static_cast<DWORD>(needed);
     out->WinBioHresult = winBioHresult;
@@ -250,7 +299,53 @@ void CompleteCaptureData(_In_ WDFREQUEST Request, HRESULT winBioHresult,
     if (!payload.empty()) {
         RtlCopyMemory(out->CaptureData.Data, payload.data(), payload.size());
     }
+    T2BioLog("  CAPTURE_DATA delivered: %llu bytes (winBioHresult=0x%08x)",
+             static_cast<unsigned long long>(needed), static_cast<unsigned>(winBioHresult));
     WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, static_cast<ULONG_PTR>(needed));
+}
+
+// Answers the retry that follows a size probe from the parked result. Returns
+// false (cache dropped if it is stale or this is not a real retry) when the
+// request has to run a fresh capture.
+bool TryCompleteFromCachedCapture(_In_ WDFREQUEST Request, const CaptureKey& key)
+{
+    CachedCapture cached;
+    {
+        std::lock_guard<std::mutex> lock(g_cachedCaptureLock);
+        if (!g_cachedCapture.Valid) {
+            return false;
+        }
+        const bool fresh = (GetTickCount64() - g_cachedCapture.StoredAtMs) <= kCachedCaptureTtlMs;
+        const bool sameKey = g_cachedCapture.Key.Purpose == key.Purpose &&
+                             g_cachedCapture.Key.Flags == key.Flags;
+        if (!fresh || !sameKey) {
+            T2BioLog("  CAPTURE_DATA: dropping parked result (fresh=%d sameKey=%d)",
+                     fresh ? 1 : 0, sameKey ? 1 : 0);
+            g_cachedCapture = CachedCapture{};
+            return false;
+        }
+        cached = g_cachedCapture;
+    }
+
+    const size_t needed = offsetof(WINBIO_CAPTURE_DATA, CaptureData) + offsetof(WINBIO_DATA, Data) +
+                          cached.Payload.size();
+    PWINBIO_CAPTURE_DATA out = nullptr;
+    size_t outLen = 0;
+    const NTSTATUS status = WdfRequestRetrieveOutputBuffer(
+        Request, sizeof(DWORD), reinterpret_cast<PVOID*>(&out), &outLen);
+    if (!NT_SUCCESS(status) || out == nullptr || outLen < needed) {
+        // Another size probe (or a broken buffer), not the retry: the parked
+        // verdict must not be reused for it.
+        T2BioLog("  CAPTURE_DATA: buffer too small for the parked result (have=%llu need=%llu) -> new capture",
+                 static_cast<unsigned long long>(outLen), static_cast<unsigned long long>(needed));
+        ClearCachedCapture();
+        return false;
+    }
+
+    T2BioLog("  CAPTURE_DATA: answering the size-probe retry from the parked result");
+    t_captureKey = key;
+    CompleteCaptureData(Request, cached.Hr, cached.SensorStatus, cached.Reject, cached.Payload);
+    return true;
 }
 
 // Shared connect step for both purposes below. Returns false (and has
@@ -281,7 +376,7 @@ bool ConnectForCapture(t2::bridgexpc::Connection* outConn)
 // The vendor payload carries no matchedUuid (WarmUp doesn't match anything);
 // the Storage adapter (not yet written - design doc 7 item 3) is what would
 // actually persist {macosUserId} as this account's "template" record.
-void HandleCaptureEnroll(_In_ WDFREQUEST Request)
+void HandleCaptureEnroll(_In_ WDFREQUEST Request, const CaptureKey& key)
 {
     T2BioLog("CAPTURE_DATA(enroll): begin, macosUserId=%u", static_cast<unsigned>(kDefaultMacosUserId));
     t2::bridgexpc::Connection conn;
@@ -315,16 +410,21 @@ void HandleCaptureEnroll(_In_ WDFREQUEST Request)
     }
 
     T2BioLog("CAPTURE_DATA(enroll): confirmed identity for macosUserId=%u", kDefaultMacosUserId);
+    // Kind=EnrollConfirm: no touch happened, so the engine adapter accepts
+    // this sample only in UpdateEnrollment and never for verify/identify.
     std::vector<uint8_t> payload = t2::biometrickit::SerializeVendorPayload(
         VerifyOutcome::Match /* "confirmed", not a fingerprint match - see comment above */,
-        kDefaultMacosUserId, std::nullopt);
-    CompleteCaptureData(Request, S_OK, WINBIO_SENSOR_READY, 0, payload);
+        kDefaultMacosUserId, std::nullopt, t2::biometrickit::kSampleKindEnrollConfirm);
+    const std::vector<uint8_t> bir = t2::wbdi::BuildVendorBir(key.Purpose, key.Flags, payload);
+    T2BioLog("CAPTURE_DATA(enroll): BIR built, %llu bytes (vendor payload %llu)",
+             static_cast<unsigned long long>(bir.size()), static_cast<unsigned long long>(payload.size()));
+    CompleteCaptureData(Request, S_OK, WINBIO_SENSOR_READY, 0, bir);
 }
 
 // PURPOSE_VERIFY: the real per-touch path. Runs the full
 // VerificationEngine::Verify() sequence and maps its fail-closed
 // VerifyOutcome straight onto the WinBioHresult this IOCTL completes with.
-void HandleCaptureVerify(_In_ WDFREQUEST Request)
+void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
 {
     T2BioLog("CAPTURE_DATA(verify): begin, macosUserId=%u, window=%llds",
              static_cast<unsigned>(kDefaultMacosUserId),
@@ -350,9 +450,17 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request)
          outcome == VerifyOutcome::UnstableIdentityInventory)
             ? WINBIO_SENSOR_FAILURE
             : WINBIO_SENSOR_READY;
-    std::vector<uint8_t> payload = t2::biometrickit::SerializeVendorPayload(
-        outcome, kDefaultMacosUserId, matchedUuid);
-    CompleteCaptureData(Request, hr, sensorStatus, 0, payload);
+    // A sample goes to WBF only for a real Match; every other outcome completes
+    // with its error HRESULT and no data (fail-closed: no BIR to misread).
+    std::vector<uint8_t> bir;
+    if (outcome == VerifyOutcome::Match) {
+        const std::vector<uint8_t> payload = t2::biometrickit::SerializeVendorPayload(
+            outcome, kDefaultMacosUserId, matchedUuid, t2::biometrickit::kSampleKindVerify);
+        bir = t2::wbdi::BuildVendorBir(key.Purpose, key.Flags, payload);
+        T2BioLog("CAPTURE_DATA(verify): BIR built, %llu bytes (vendor payload %llu)",
+                 static_cast<unsigned long long>(bir.size()), static_cast<unsigned long long>(payload.size()));
+    }
+    CompleteCaptureData(Request, hr, sensorStatus, 0, bir);
 }
 
 void HandleCaptureData(_In_ WDFREQUEST Request)
@@ -373,6 +481,14 @@ void HandleCaptureData(_In_ WDFREQUEST Request)
              static_cast<unsigned>(in->Purpose), static_cast<unsigned>(in->Flags),
              static_cast<unsigned>(in->Format.Owner), static_cast<unsigned>(in->Format.Type));
 
+    CaptureKey key;
+    key.Purpose = in->Purpose;
+    key.Flags = in->Flags;
+    if (TryCompleteFromCachedCapture(Request, key)) {
+        return;
+    }
+    t_captureKey = key;
+
     CaptureBusyGuard guard;
     if (!guard.acquired) {
         T2BioLog("CAPTURE_DATA: another capture is already in flight -> DATA_COLLECTION_IN_PROGRESS");
@@ -386,18 +502,22 @@ void HandleCaptureData(_In_ WDFREQUEST Request)
 
     switch (in->Purpose) {
     case WINBIO_PURPOSE_VERIFY:
-        HandleCaptureVerify(Request);
+    case WINBIO_PURPOSE_IDENTIFY:
+        // WBF's own flows use IDENTIFY (Windows Hello sign-in, and the check
+        // Settings runs before an enrollment), not only VERIFY. For this
+        // sensor both are the same 1:1 SEP verification for macosUserId; the
+        // engine adapter turns the match into an identity from the enrolled
+        // records, so IDENTIFY does not mean the SEP searches other users.
+        HandleCaptureVerify(Request, key);
         return;
     case WINBIO_PURPOSE_ENROLL:
     case WINBIO_PURPOSE_ENROLL_FOR_VERIFICATION:
     case WINBIO_PURPOSE_ENROLL_FOR_IDENTIFICATION:
-        HandleCaptureEnroll(Request);
+        HandleCaptureEnroll(Request, key);
         return;
     default:
-        // IDENTIFY / AUDIT / NO_PURPOSE_AVAILABLE: this sensor only ever
-        // advertises WINBIO_CAPABILITY_SENSOR for 1:1 verify (design doc 3),
-        // never identify - a request for anything else is a WBF/engine
-        // config mismatch, not something to guess an answer for.
+        // AUDIT / NO_PURPOSE_AVAILABLE: a request for anything else is a
+        // WBF/engine config mismatch, not something to guess an answer for.
         T2BioLog("CAPTURE_DATA: unsupported purpose 0x%02x -> E_NOTIMPL", static_cast<unsigned>(in->Purpose));
         CompleteCaptureData(Request, E_NOTIMPL, WINBIO_SENSOR_FAILURE, 0, {});
         return;
@@ -416,6 +536,7 @@ const char* IoctlName(ULONG code)
     case IOCTL_BIOMETRIC_CALIBRATE:        return "CALIBRATE";
     case IOCTL_BIOMETRIC_GET_SENSOR_STATUS:return "GET_SENSOR_STATUS";
     case IOCTL_BIOMETRIC_CAPTURE_DATA:     return "CAPTURE_DATA";
+    case IOCTL_BIOMETRIC_GET_PRIVATE_SENSOR_TYPE: return "GET_PRIVATE_SENSOR_TYPE (optional)";
     default:                               return "(unsupported)";
     }
 }
@@ -445,7 +566,8 @@ extern "C" VOID T2BioEvtIoDeviceControl(_In_ WDFQUEUE Queue,
 
     case IOCTL_BIOMETRIC_RESET:
         // No sensor state to reset yet.
-        T2BioLog("  RESET -> STATUS_SUCCESS (no state)");
+        ClearCachedCapture();
+        T2BioLog("  RESET -> STATUS_SUCCESS (parked capture result dropped)");
         WdfRequestComplete(Request, STATUS_SUCCESS);
         return;
 
