@@ -196,12 +196,19 @@ std::atomic<bool> g_captureBusy{false};
 // (hardware log: Match → complete → new CAPTURE begin within 15–30 ms). The
 // second is not a second finger touch — framework double-check. Answer #1
 // with a real SEP Match, arm a one-shot replay, answer #2 with the same
-// result (no connect / StartMatch / cancel-poll). After consume, the next
-// CAPTURE is a real verify again. No wall-clock TTL: the contract is
-// "real + one replay", matching the stable WBF pair.
+// result (no connect / StartMatch / cancel-poll).
+//
+// After the pair, WBF often issues a *third* CAPTURE that would StartMatch
+// and sit in WaitForEvent (log: replay complete → CAPTURE begin → connect →
+// StartMatch). That held g_captureBusy so Win+L waited on CancelIoEx unwind
+// (~seconds), and a finger touch during that window matched while lock was
+// in progress (lock+unlock). suppressPostPairArm answers that third CAPTURE
+// immediately with READY / no sample so the sensor is not armed until the
+// next real need (lock screen, later unlock).
 struct RecentMatchCache {
     std::mutex mu;
     bool pendingReplay = false;
+    bool suppressPostPairArm = false; // one-shot: skip sensor after pair done
     std::optional<std::array<uint8_t, 16>> matchedUuid;
 };
 RecentMatchCache g_recentMatch;
@@ -211,14 +218,27 @@ void ArmMatchReplay(const std::optional<std::array<uint8_t, 16>>& uuid)
     std::lock_guard<std::mutex> lock(g_recentMatch.mu);
     g_recentMatch.matchedUuid = uuid;
     g_recentMatch.pendingReplay = true;
+    g_recentMatch.suppressPostPairArm = false;
 }
 
+// Returns true and fills *outUuid for the 2nd CAPTURE of the pair. Also arms
+// suppressPostPairArm so the following CAPTURE does not StartMatch.
 bool ConsumeMatchReplay(std::optional<std::array<uint8_t, 16>>* outUuid)
 {
     std::lock_guard<std::mutex> lock(g_recentMatch.mu);
     if (!g_recentMatch.pendingReplay) return false;
     *outUuid = g_recentMatch.matchedUuid;
     g_recentMatch.pendingReplay = false;
+    g_recentMatch.suppressPostPairArm = true;
+    return true;
+}
+
+// True once after a completed pair: caller should complete READY without SEP.
+bool ConsumePostPairArmSuppress()
+{
+    std::lock_guard<std::mutex> lock(g_recentMatch.mu);
+    if (!g_recentMatch.suppressPostPairArm) return false;
+    g_recentMatch.suppressPostPairArm = false;
     return true;
 }
 
@@ -226,6 +246,7 @@ void ClearMatchReplay()
 {
     std::lock_guard<std::mutex> lock(g_recentMatch.mu);
     g_recentMatch.pendingReplay = false;
+    g_recentMatch.suppressPostPairArm = false;
 }
 
 struct CaptureBusyGuard {
@@ -575,6 +596,15 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
             CompleteCaptureData(Request, S_OK, WINBIO_SENSOR_ACCEPT, 0, bir);
             return;
         }
+    }
+
+    // Fast path: third CAPTURE right after the unlock pair. Do not StartMatch —
+    // that was holding the sensor and blocking Win+L (see struct comment).
+    if (ConsumePostPairArmSuppress()) {
+        T2BioLog("CAPTURE_DATA(verify): post-pair arm suppressed - READY, no sensor session "
+                 "(avoids holding capture across Win+L)");
+        CompleteCaptureData(Request, WINBIO_E_NO_MATCH, WINBIO_SENSOR_READY, 0, {});
+        return;
     }
 
     // design doc §9.4: register this specific request as cancelable BEFORE

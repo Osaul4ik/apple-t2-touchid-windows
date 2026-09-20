@@ -378,15 +378,25 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     // Milestone 2B §11: from here on the StartMatch IPC itself succeeded,
     // so a match session may now be live on the device regardless of what
     // happens next. CancelMatch must be attempted on every exit path.
+    //
+    // IMPORTANT (20.09.2026 hardware): do NOT use config_.ioTimeout (5s) here.
+    // Cancel is best-effort teardown. With the 5s timeout, a slow/unresponsive
+    // BridgeXPC reply held the Verify() stack (and therefore g_captureBusy in
+    // Queue.cpp) for up to 5 seconds after Windows had already CancelIoEx'd
+    // the CAPTURE_DATA — observed as "unlock works, then Win+L takes 5–10s
+    // before the lock screen actually responds / re-arms the sensor". A short
+    // timeout is enough to send the 0x0c frame; if the peer does not answer,
+    // the Connection destructor closes the socket and the next CAPTURE starts
+    // clean. Same bound is used on the NoMatch restart path below.
+    constexpr std::chrono::milliseconds kCancelBestEffortTimeout{300};
     struct CancelGuard {
         bridgexpc::Connection* conn;
         const std::vector<uint8_t>* cancelCmd;
-        std::chrono::milliseconds ioTimeout;
         ~CancelGuard() {
             std::vector<uint8_t> discard;
-            conn->SendBiometricCommand(*cancelCmd, 0, &discard, ioTimeout); // best-effort
+            conn->SendBiometricCommand(*cancelCmd, 0, &discard, kCancelBestEffortTimeout);
         }
-    } cancelGuard{conn, &cancelCmd, config_.ioTimeout};
+    } cancelGuard{conn, &cancelCmd};
 
     // design doc §9.4, per explicit direction: this component does not own
     // the wait duration at all when Windows Hello is driving it (cancelEvent
@@ -526,7 +536,9 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
                        L"restarting scan immediately; Windows controls the wait, not us",
                        rejectedTouchAttempts);
                 std::vector<uint8_t> discard;
-                conn->SendBiometricCommand(cancelCmd, 0, &discard, config_.ioTimeout); // best-effort
+                // Same short bound as CancelGuard: a 5s cancel here would stall
+                // the wrong-finger → re-arm path and feel like a hung sensor.
+                conn->SendBiometricCommand(cancelCmd, 0, &discard, kCancelBestEffortTimeout);
                 if (!sendStartMatch()) {
                     outcome = VerifyOutcome::TransportError;
                     break;
