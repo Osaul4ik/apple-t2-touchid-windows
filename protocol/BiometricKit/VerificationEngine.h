@@ -17,6 +17,14 @@ enum class VerifyOutcome {
     RejectedByDevice,     // start-match command itself was rejected (word[0]!=0) — never silent success
     Malformed,
     Busy,                 // Milestone 2 §23: only one active session allowed
+    Cancelled,             // design doc §9.4: cancelEvent fired (Windows called
+                          // CancelIoEx on the pending WBDI request, e.g. LogonUI
+                          // ending the session on a password-fallback login) —
+                          // distinct from Timeout so Queue.cpp can complete the
+                          // IOCTL with WINBIO_E_CANCELED instead of
+                          // WINBIO_E_BAD_CAPTURE, and so g_captureBusy is freed
+                          // on a cancel signal rather than only ever on the full
+                          // matchWindow elapsing
     UnstableIdentityInventory, // port of Linux FprintMatchGateError("live identity
                           // inventory is unstable"): first/repeat 0x42 or 0x51 snapshot
                           // disagreed — fail-closed, StartMatch never sent
@@ -121,8 +129,19 @@ public:
     // identity list -> start match -> event loop -> verdict -> cancel/stop
     // -> disconnect. Every step's failure maps to a fail-closed outcome;
     // nothing here ever converts a transport success into an implicit MATCH.
+    //
+    // cancelEvent (design doc §9.4): optional, defaults to nullptr so the
+    // CLI's one-shot `verify` (fixed matchWindow, no external cancel
+    // source) is unaffected. When the WBDI caller (Queue.cpp) has one — an
+    // event it signals from its WdfRequestMarkCancelable cancel routine —
+    // it is forwarded to every Connection::WaitForEvent call in the match
+    // loop below. Only the event-loop wait is covered; RunLinuxReadySequence
+    // (reset/load-calibration/identity-list, all short fixed-timeout
+    // request/reply round-trips, not the long touch-and-wait) is not, same
+    // scope the design doc itself describes for this mechanism.
     VerifyOutcome Verify(bridgexpc::Connection* conn,
-                         std::optional<std::array<uint8_t, 16>>* outMatchedUuid);
+                         std::optional<std::array<uint8_t, 16>>* outMatchedUuid,
+                         HANDLE cancelEvent = nullptr);
 
 private:
     // Shared prefix of WarmUp and Verify. Byte-identical to the Linux

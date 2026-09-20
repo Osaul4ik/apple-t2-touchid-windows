@@ -175,7 +175,8 @@ bool VerificationEngine::WarmUp(bridgexpc::Connection* conn,
 }
 
 VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
-                                          std::optional<std::array<uint8_t, 16>>* outMatchedUuid) {
+                                          std::optional<std::array<uint8_t, 16>>* outMatchedUuid,
+                                          HANDLE cancelEvent) {
     if (busy_) {
         return VerifyOutcome::Busy;
     }
@@ -370,7 +371,19 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
 
     while (steady_clock::now() < deadline) {
         std::vector<uint8_t> eventPayload;
-        if (!conn->WaitForEvent(&eventPayload, deadline)) {
+        if (!conn->WaitForEvent(&eventPayload, deadline, cancelEvent)) {
+            // design doc §9.4: distinguish "cancelEvent fired" from a plain
+            // deadline/transport WaitForEvent failure, so the caller
+            // (Queue.cpp) completes the IOCTL with WINBIO_E_CANCELED and —
+            // more importantly for the bug this fixes — so this loop exits
+            // within one kCancelPollSlice of the cancel instead of only
+            // ever on the full matchWindow, freeing g_captureBusy for the
+            // very next touch. WaitForSingleObject with a 0 timeout here is
+            // just a poll (mirrors the same check inside WaitForEvent) —
+            // not a second, independent wait.
+            if (cancelEvent && WaitForSingleObject(cancelEvent, 0) == WAIT_OBJECT_0) {
+                outcome = VerifyOutcome::Cancelled;
+            }
             break;
         }
 

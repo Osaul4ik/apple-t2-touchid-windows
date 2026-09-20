@@ -199,6 +199,48 @@ struct CaptureBusyGuard {
     }
 };
 
+// design doc §9.4 / §10: one process-wide manual-reset event, mirroring
+// g_captureBusy's own "only one CAPTURE_DATA in flight" simplification —
+// there is at most one outstanding capture to cancel, so one event is
+// enough; a per-request event would only matter once this driver ever
+// allows concurrent captures, which it explicitly does not (comment above).
+// Lazily created on first use (function-local static is thread-safe init,
+// same guarantee WdfRequestComplete/etc. rely on for one-time WDF setup
+// elsewhere in this file) rather than from DriverEntry, so this file stays
+// self-contained and doesn't need a new Driver.cpp touchpoint.
+HANDLE GetCaptureCancelEvent()
+{
+    static HANDLE h = CreateEventW(nullptr, /*bManualReset=*/TRUE, /*bInitialState=*/FALSE, nullptr);
+    return h; // CreateEventW failure -> nullptr; every caller already treats
+              // a null/unsignaled HANDLE as "no cancel support this boot"
+              // (WaitForSingleObject/SetEvent on NULL just fail, harmlessly)
+              // rather than crash, so this isn't checked here.
+}
+
+// EVT_WDF_REQUEST_CANCEL for the in-flight CAPTURE_DATA request. WDF invokes
+// this when Windows calls CancelIoEx on the pending IOCTL — per design doc
+// §9.4, that is exactly what happens when a password-fallback login (or any
+// other credential provider) ends the LogonUI session while our biometric
+// tile is still waiting on a touch: WinBio cancels every outstanding async
+// credential-provider operation, ours included. This is standard WDF
+// cancel-routine contract, not something this driver invents: once called,
+// THIS routine now owns completing Request — HandleCaptureVerify's own
+// WdfRequestUnmarkCancelable call (see below) is how it finds out that
+// happened and must not touch Request again.
+VOID EvtCaptureCancel(_In_ WDFREQUEST Request)
+{
+    T2BioLog("CAPTURE_DATA: EvtCaptureCancel fired (Windows called CancelIoEx)");
+    HANDLE cancelEvent = GetCaptureCancelEvent();
+    if (cancelEvent) {
+        SetEvent(cancelEvent); // wakes the blocked Verify()/WaitForEvent() loop
+                                // within kCancelPollSlice (Connection.cpp)
+    }
+    // WdfRequestComplete here, not CompleteCaptureData: WBDI's own contract
+    // for a cancelled request is STATUS_CANCELLED at the WDF layer, not a
+    // WINBIO_CAPTURE_DATA payload — there is no capture result to report.
+    WdfRequestComplete(Request, STATUS_CANCELLED);
+}
+
 // Which capture a CAPTURE_DATA request asked for; also what the returned BIR
 // header echoes back.
 struct CaptureKey {
@@ -235,6 +277,10 @@ HRESULT MapVerifyOutcomeToHresult(VerifyOutcome outcome)
     case VerifyOutcome::Busy:                     return WINBIO_E_DATA_COLLECTION_IN_PROGRESS;
     case VerifyOutcome::UnstableIdentityInventory: return WINBIO_E_DEVICE_FAILURE;
     case VerifyOutcome::Malformed:                return E_FAIL;
+    // design doc §9.4: Windows called CancelIoEx on the pending CAPTURE_DATA
+    // (see EvtCaptureCancel below) — this is the outcome that used to be
+    // unreachable because nothing ever signaled g_captureCancelEvent.
+    case VerifyOutcome::Cancelled:                return WINBIO_E_CANCELED;
     }
     return E_FAIL;
 }
@@ -403,8 +449,30 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
     T2BioLog("CAPTURE_DATA(verify): begin, macosUserId=%u, window=%llds",
              static_cast<unsigned>(kDefaultMacosUserId),
              static_cast<long long>(kCaptureMatchWindow.count()));
+
+    // design doc §9.4: register this specific request as cancelable BEFORE
+    // doing anything that can block (Connect included — a cancel arriving
+    // during discovery/connect should still complete the IOCTL promptly,
+    // even though today only the Verify() event-loop wait actually watches
+    // cancelEvent; see the header comment on VerificationEngine::Verify).
+    // ResetEvent first: this is a process-wide, reused-across-sessions
+    // event (GetCaptureCancelEvent's own comment), so a stale signal left
+    // over from the PREVIOUS capture's cancellation must not immediately
+    // cancel this brand-new one.
+    HANDLE cancelEvent = GetCaptureCancelEvent();
+    if (cancelEvent) {
+        ResetEvent(cancelEvent);
+    }
+    WdfRequestMarkCancelable(Request, EvtCaptureCancel);
+
     t2::bridgexpc::Connection conn;
     if (!ConnectForCapture(&conn)) {
+        if (WdfRequestUnmarkCancelable(Request) == STATUS_CANCELLED) {
+            // EvtCaptureCancel already fired and completed Request
+            // (STATUS_CANCELLED) for us - it is no longer ours to touch.
+            T2BioLog("CAPTURE_DATA(verify): cancelled during connect");
+            return;
+        }
         CompleteCaptureData(Request, WINBIO_E_DEVICE_FAILURE, WINBIO_SENSOR_FAILURE, 0, {});
         return;
     }
@@ -414,7 +482,18 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
     cfg.matchWindow = kCaptureMatchWindow;
     VerificationEngine engine(cfg);
     std::optional<std::array<uint8_t, 16>> matchedUuid;
-    const VerifyOutcome outcome = engine.Verify(&conn, &matchedUuid);
+    const VerifyOutcome outcome = engine.Verify(&conn, &matchedUuid, cancelEvent);
+
+    if (WdfRequestUnmarkCancelable(Request) == STATUS_CANCELLED) {
+        // Same reasoning as the connect-phase check above: Request is
+        // already completed. outcome is almost certainly Cancelled too
+        // (Verify() polls the same event), but even if it raced and came
+        // back some other way, Request is no longer ours to complete -
+        // touching it again here would be a double-complete bug.
+        T2BioLog("CAPTURE_DATA(verify): cancelled, outcome=%d discarded (request already completed)",
+                 static_cast<int>(outcome));
+        return;
+    }
 
     const HRESULT hr = MapVerifyOutcomeToHresult(outcome);
     T2BioLog("CAPTURE_DATA(verify): outcome=%d -> hresult=0x%08x", static_cast<int>(outcome),

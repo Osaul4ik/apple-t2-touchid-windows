@@ -5,6 +5,7 @@
 #include <ws2tcpip.h>
 #include <rpc.h>
 #include <cctype>
+#include <algorithm>  // std::min, kCancelPollSlice clamp (design doc §9.4)
 #pragma comment(lib, "Ws2_32.lib")
 #pragma comment(lib, "Rpcrt4.lib")
 
@@ -538,9 +539,30 @@ size_t Connection::DiscardPendingEvents() {
     return n;
 }
 
+// design doc §9.4: how long a signaled cancelEvent can be left unnoticed
+// while WaitForEvent is blocked inside ReadFrame. Small enough that a
+// CancelIoEx-driven unlock (Win+L, or LogonUI completing a password
+// fallback) frees g_captureBusy (Queue.cpp) fast enough for the very next
+// CAPTURE_DATA — the actual bug this is fixing — well under the second;
+// large enough not to turn an idle "waiting for a finger" session into a
+// busy-poll. Not tied to kCaptureMatchWindow — that one bounds the whole
+// session, this one bounds cancel latency within it.
+static constexpr std::chrono::milliseconds kCancelPollSlice{200};
+
 bool Connection::WaitForEvent(std::vector<uint8_t>* outEventPayload,
-                               std::chrono::steady_clock::time_point deadline) {
+                               std::chrono::steady_clock::time_point deadline,
+                               HANDLE cancelEvent) {
     for (;;) {
+        // Checked at the TOP of every iteration — including before the
+        // very first ReadFrame — so a cancel that arrives while this
+        // socket's previous recv() was already unblocked by a real SEP
+        // event (i.e. we're back here deciding whether to read again) is
+        // seen without waiting for one more slice.
+        if (cancelEvent && WaitForSingleObject(cancelEvent, 0) == WAIT_OBJECT_0) {
+            T2_LOG("waitForEvent", L"cancelEvent signaled, giving up (design doc §9.4)");
+            return false;
+        }
+
         // LINUX PARITY FIX: drain events already observed (and acked) by
         // SendBiometricCommand/GetFdrCalibration before blocking on a new
         // ReadFrame. This is what actually closes the parity gap with the
@@ -564,12 +586,24 @@ bool Connection::WaitForEvent(std::vector<uint8_t>* outEventPayload,
             return false;
         }
         auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+        // Clamp to the poll slice only when there's actually a cancelEvent
+        // to poll for; without one this is byte-identical to the previous
+        // behavior (CLI `verify`, which never passes cancelEvent, still
+        // waits the real `remaining` in one ReadFrame call).
+        const auto readTimeout = cancelEvent ? std::min(remaining, kCancelPollSlice) : remaining;
 
         RawFrame frame;
-        if (!ReadFrame(&frame, remaining)) {
-            T2_LOG("waitForEvent", L"ReadFrame failed/timed out, %lldms remained",
-                   static_cast<long long>(remaining.count()));
-            return false;
+        if (!ReadFrame(&frame, readTimeout)) {
+            // A slice timing out is expected/silent noise while polling for
+            // cancellation (WSAETIMEDOUT every ~200ms is not a transport
+            // failure) — only log+fail here when this was the real,
+            // un-clamped deadline, i.e. no cancelEvent was in play.
+            if (!cancelEvent) {
+                T2_LOG("waitForEvent", L"ReadFrame failed/timed out, %lldms remained",
+                       static_cast<long long>(remaining.count()));
+                return false;
+            }
+            continue; // slice elapsed with no data — loop back, re-check cancelEvent and deadline
         }
         if (frame.type != FrameType::Message) continue; // ignore stray HELO-typed noise, keep waiting
 

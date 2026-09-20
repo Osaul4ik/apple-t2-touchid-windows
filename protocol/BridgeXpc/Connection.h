@@ -72,8 +72,26 @@ public:
     // false on timeout, malformed frame, or connection loss — the caller
     // (BiometricKit verify engine) must treat false as fail-closed, never
     // as an implicit NO_MATCH signal by itself (see MatchResult.h).
+    //
+    // cancelEvent (design doc §9.4 "Таймаут CAPTURE_DATA і скасування"):
+    // optional, defaults to nullptr (existing CLI behavior — wait for the
+    // full deadline, unchanged). When non-null, the wait is sliced into
+    // kCancelPollSlice chunks and cancelEvent is polled between them; a
+    // signaled event makes WaitForEvent return false almost immediately
+    // instead of blocking up to `deadline`. This is a deliberate
+    // approximation of "wait on the SEP event and the cancel HANDLE at
+    // once": the underlying SOCKET is a plain blocking socket (Milestone 1
+    // reasoning, see Connect()'s SO_RCVTIMEO use), so a single recv() call
+    // cannot be interrupted mid-flight by a Win32 event the way an
+    // overlapped I/O WaitForMultipleObjects could. Bounding recv()'s own
+    // timeout to the poll slice keeps a real SEP event from starving the
+    // cancel check, at the cost of adding up to one slice of latency to
+    // cancellation — see the constant's own comment in Connection.cpp for
+    // why that trade is acceptable here (freeing g_captureBusy is what
+    // actually matters, not sub-100ms cancel latency).
     bool WaitForEvent(std::vector<uint8_t>* outEventPayload,
-                       std::chrono::steady_clock::time_point deadline);
+                       std::chrono::steady_clock::time_point deadline,
+                       HANDLE cancelEvent = nullptr);
 
     // Discard events retained during LoadCalibration / identity warm-up
     // BEFORE StartMatch is issued. Linux keeps load_calibration_events
