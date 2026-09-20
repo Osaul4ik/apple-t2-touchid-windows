@@ -95,6 +95,55 @@ Payload* RetrieveProbedPayload(_In_ WDFREQUEST Request, _Out_ bool* fitsFully)
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// WINBIO_SENSOR_ACCEPT after a capture.
+//
+// WDK (WINBIO_CAPTURE_DATA / WINBIO_SENSOR_STATUS): ACCEPT means "the sensor
+// just successfully completed a capture operation ... only returned
+// immediately after a capture operation; the sensor then returns to READY".
+// WBF's sensor adapter learns that a sample was taken by asking the sensor,
+// i.e. by the GET_SENSOR_STATUS it sends right after CAPTURE_DATA completes
+// (an independent WBDI + engine adapter developer reports the same ordering:
+// CAPTURE_DATA, CAPTURE_DATA, GET_SENSOR_STATUS, then AcceptSampleData - and
+// had to make GET_SENSOR_STATUS return ACCEPT exactly once after a capture to
+// get there; Microsoft Q&A 318028). Reporting ACCEPT only inside the
+// CAPTURE_DATA payload is not enough: the hardware trace showed
+// CAPTURE_DATA(ACCEPT, 444 B BIR) -> ClearContext -> GET_SENSOR_STATUS=READY
+// -> CAPTURE_DATA again, with AcceptSampleData never called.
+//
+// So a delivered sample arms a one-shot flag; the next GET_SENSOR_STATUS
+// reports ACCEPT and disarms it (READY afterwards). The flag expires so a
+// sample nobody asked about cannot make an unrelated later poll claim ACCEPT.
+// ---------------------------------------------------------------------------
+constexpr ULONGLONG kAcceptStatusTtlMs = 5000;
+std::mutex g_acceptStatusLock;
+bool       g_acceptStatusArmed = false;
+ULONGLONG  g_acceptStatusArmedAtMs = 0;
+
+void ArmAcceptStatus()
+{
+    std::lock_guard<std::mutex> lock(g_acceptStatusLock);
+    g_acceptStatusArmed = true;
+    g_acceptStatusArmedAtMs = GetTickCount64();
+}
+
+void DisarmAcceptStatus()
+{
+    std::lock_guard<std::mutex> lock(g_acceptStatusLock);
+    g_acceptStatusArmed = false;
+}
+
+// True exactly once per armed sample (and only while it is fresh).
+bool ConsumeAcceptStatus()
+{
+    std::lock_guard<std::mutex> lock(g_acceptStatusLock);
+    if (!g_acceptStatusArmed) {
+        return false;
+    }
+    g_acceptStatusArmed = false;
+    return (GetTickCount64() - g_acceptStatusArmedAtMs) <= kAcceptStatusTtlMs;
+}
+
 void HandleGetAttributes(_In_ WDFREQUEST Request)
 {
     bool fits = false;
@@ -117,12 +166,15 @@ void HandleGetSensorStatus(_In_ WDFREQUEST Request)
     RtlZeroMemory(out, sizeof(*out));
     out->PayloadSize   = sizeof(*out);
     out->WinBioHresult = S_OK;
-    // Always READY for the skeleton. Real logic (design doc 3) later:
-    // open GUID_DEVINTERFACE_T2TOUCHID_TRANSPORT, IOCTL_T2_GET_STATUS, and
-    // Global\T2SepReady from T2SepBootstrap.
-    out->SensorStatus  = WINBIO_SENSOR_READY;
+    // READY, except for the one poll right after a delivered capture, which
+    // must say ACCEPT (see the ACCEPT block above). Real readiness logic
+    // (design doc 3) later: open GUID_DEVINTERFACE_T2TOUCHID_TRANSPORT,
+    // IOCTL_T2_GET_STATUS, and Global\T2SepReady from T2SepBootstrap.
+    const bool accept = ConsumeAcceptStatus();
+    out->SensorStatus  = accept ? WINBIO_SENSOR_ACCEPT : WINBIO_SENSOR_READY;
     out->VendorDiagnostics.Size = 0;
-    T2BioLog("  GET_SENSOR_STATUS ok sensorStatus=%d (READY)", static_cast<int>(out->SensorStatus));
+    T2BioLog("  GET_SENSOR_STATUS ok sensorStatus=%d (%s)", static_cast<int>(out->SensorStatus),
+             accept ? "ACCEPT: one-shot after a delivered sample" : "READY");
     WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, out->PayloadSize);
 }
 
@@ -199,34 +251,21 @@ struct CaptureKey {
     WINBIO_BIR_PURPOSE Purpose = 0;
     WINBIO_BIR_DATA_FLAGS Flags = 0;
 };
-thread_local CaptureKey t_captureKey;   // set by HandleCaptureData for the request in flight on this thread
 
-// WBF's WBDI sensor adapter sends CAPTURE_DATA twice: first with a tiny
-// output buffer (the size probe - the log showed out=4), then again with a
-// buffer of the size the driver reported. The capture itself (a SEP touch)
-// must run only ONCE, so the result of the first call is parked here and the
-// retry is answered from it. Rules that keep this from ever replaying an old
-// verdict: the entry lives 2 s, is consumed only by a request with the same
-// purpose/flags whose output buffer is actually large enough (i.e. a real
-// retry, not a fresh probe), is dropped on delivery, and RESET clears it.
-constexpr ULONGLONG kCachedCaptureTtlMs = 2000;
-
-struct CachedCapture {
-    bool Valid = false;
-    ULONGLONG StoredAtMs = 0;
-    CaptureKey Key;
-    HRESULT Hr = S_OK;
-    WINBIO_SENSOR_STATUS SensorStatus = WINBIO_SENSOR_READY;
-    WINBIO_REJECT_DETAIL Reject = 0;
-    std::vector<uint8_t> Payload;
-};
-std::mutex g_cachedCaptureLock;
-CachedCapture g_cachedCapture;
-
-void ClearCachedCapture()
+// WBDI size-probe convention for CAPTURE_DATA (WDK, IOCTL_BIOMETRIC_CAPTURE_DATA):
+// "If the driver receives a DWORD-sized output buffer, the driver must
+// immediately return the buffer size necessary to complete the operation."
+// The probe therefore must NOT start a capture and must not block. The earlier
+// revision ran the whole SEP touch on the probe and parked the verdict for the
+// retry; that made the probe take seconds (WBF expects it instantly) and is the
+// wrong contract. The real request - the one whose buffer is large enough -
+// is the one that waits for the touch, exactly like Microsoft's sample
+// (WudfBioUsbSample: probe -> PayloadSize, immediately; capture -> pending).
+// The size is constant: the vendor payload has a fixed layout, so the largest
+// possible reply (a Match BIR) is known up front.
+size_t CaptureDataHeaderBytes()
 {
-    std::lock_guard<std::mutex> lock(g_cachedCaptureLock);
-    g_cachedCapture = CachedCapture{};
+    return offsetof(WINBIO_CAPTURE_DATA, CaptureData) + offsetof(WINBIO_DATA, Data);
 }
 
 HRESULT MapVerifyOutcomeToHresult(VerifyOutcome outcome)
@@ -272,24 +311,17 @@ void CompleteCaptureData(_In_ WDFREQUEST Request, HRESULT winBioHresult,
         return;
     }
     if (outLen < needed) {
-        T2BioLog("  CAPTURE_DATA size probe: have=%llu need=%llu -> WBF will retry",
+        // Should not happen: the probe reported the maximum size, so a
+        // well-behaved caller's buffer already fits every reply. Fall back to
+        // the size-report answer instead of writing past the buffer; the
+        // result of this capture is dropped (never replayed later).
+        T2BioLog("  CAPTURE_DATA: buffer too small for the result (have=%llu need=%llu) -> reporting required size",
                  static_cast<unsigned long long>(outLen), static_cast<unsigned long long>(needed));
         out->PayloadSize = static_cast<DWORD>(needed);
-        {
-            std::lock_guard<std::mutex> lock(g_cachedCaptureLock);
-            g_cachedCapture.Valid = true;
-            g_cachedCapture.StoredAtMs = GetTickCount64();
-            g_cachedCapture.Key = t_captureKey;
-            g_cachedCapture.Hr = winBioHresult;
-            g_cachedCapture.SensorStatus = sensorStatus;
-            g_cachedCapture.Reject = rejectDetail;
-            g_cachedCapture.Payload = payload;
-        }
         WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, sizeof(DWORD));
         return;
     }
 
-    ClearCachedCapture();   // delivered below: nothing may be replayed after this
     RtlZeroMemory(out, needed);
     out->PayloadSize = static_cast<DWORD>(needed);
     out->WinBioHresult = winBioHresult;
@@ -311,51 +343,13 @@ void CompleteCaptureData(_In_ WDFREQUEST Request, HRESULT winBioHresult,
     }
     T2BioLog("  CAPTURE_DATA delivered: %llu bytes (winBioHresult=0x%08x)",
              static_cast<unsigned long long>(needed), static_cast<unsigned>(winBioHresult));
+    if (SUCCEEDED(winBioHresult) && sensorStatus == WINBIO_SENSOR_ACCEPT) {
+        // The next GET_SENSOR_STATUS must say ACCEPT (block near the top of this
+        // file) - armed BEFORE the completion so it cannot lose the race with
+        // WBF's follow-up poll.
+        ArmAcceptStatus();
+    }
     WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, static_cast<ULONG_PTR>(needed));
-}
-
-// Answers the retry that follows a size probe from the parked result. Returns
-// false (cache dropped if it is stale or this is not a real retry) when the
-// request has to run a fresh capture.
-bool TryCompleteFromCachedCapture(_In_ WDFREQUEST Request, const CaptureKey& key)
-{
-    CachedCapture cached;
-    {
-        std::lock_guard<std::mutex> lock(g_cachedCaptureLock);
-        if (!g_cachedCapture.Valid) {
-            return false;
-        }
-        const bool fresh = (GetTickCount64() - g_cachedCapture.StoredAtMs) <= kCachedCaptureTtlMs;
-        const bool sameKey = g_cachedCapture.Key.Purpose == key.Purpose &&
-                             g_cachedCapture.Key.Flags == key.Flags;
-        if (!fresh || !sameKey) {
-            T2BioLog("  CAPTURE_DATA: dropping parked result (fresh=%d sameKey=%d)",
-                     fresh ? 1 : 0, sameKey ? 1 : 0);
-            g_cachedCapture = CachedCapture{};
-            return false;
-        }
-        cached = g_cachedCapture;
-    }
-
-    const size_t needed = offsetof(WINBIO_CAPTURE_DATA, CaptureData) + offsetof(WINBIO_DATA, Data) +
-                          cached.Payload.size();
-    PWINBIO_CAPTURE_DATA out = nullptr;
-    size_t outLen = 0;
-    const NTSTATUS status = WdfRequestRetrieveOutputBuffer(
-        Request, sizeof(DWORD), reinterpret_cast<PVOID*>(&out), &outLen);
-    if (!NT_SUCCESS(status) || out == nullptr || outLen < needed) {
-        // Another size probe (or a broken buffer), not the retry: the parked
-        // verdict must not be reused for it.
-        T2BioLog("  CAPTURE_DATA: buffer too small for the parked result (have=%llu need=%llu) -> new capture",
-                 static_cast<unsigned long long>(outLen), static_cast<unsigned long long>(needed));
-        ClearCachedCapture();
-        return false;
-    }
-
-    T2BioLog("  CAPTURE_DATA: answering the size-probe retry from the parked result");
-    t_captureKey = key;
-    CompleteCaptureData(Request, cached.Hr, cached.SensorStatus, cached.Reject, cached.Payload);
-    return true;
 }
 
 // Shared connect step for both purposes below. Returns false (and has
@@ -518,10 +512,29 @@ void HandleCaptureData(_In_ WDFREQUEST Request)
     CaptureKey key;
     key.Purpose = in->Purpose;
     key.Flags = in->Flags;
-    if (TryCompleteFromCachedCapture(Request, key)) {
-        return;
+
+    // Size probe: answer at once, no capture, no busy-slot (see the
+    // size-probe note above CaptureDataHeaderBytes()).
+    {
+        const size_t maxReply = CaptureDataHeaderBytes() +
+            t2::wbdi::VendorBirSize(sizeof(t2::biometrickit::T2VendorSamplePayload), LoadBirOptions());
+        PWINBIO_CAPTURE_DATA probeOut = nullptr;
+        size_t probeLen = 0;
+        const NTSTATUS pst = WdfRequestRetrieveOutputBuffer(
+            Request, sizeof(DWORD), reinterpret_cast<PVOID*>(&probeOut), &probeLen);
+        if (!NT_SUCCESS(pst) || probeOut == nullptr) {
+            T2BioLog("CAPTURE_DATA: output buffer unusable (status=0x%08x) -> completing with error", pst);
+            WdfRequestComplete(Request, NT_SUCCESS(pst) ? STATUS_INVALID_PARAMETER : pst);
+            return;
+        }
+        if (probeLen < maxReply) {
+            T2BioLog("  CAPTURE_DATA size probe: have=%llu need=%llu -> answering immediately, no capture",
+                     static_cast<unsigned long long>(probeLen), static_cast<unsigned long long>(maxReply));
+            probeOut->PayloadSize = static_cast<DWORD>(maxReply);
+            WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, sizeof(DWORD));
+            return;
+        }
     }
-    t_captureKey = key;
 
     CaptureBusyGuard guard;
     if (!guard.acquired) {
@@ -600,8 +613,8 @@ extern "C" VOID T2BioEvtIoDeviceControl(_In_ WDFQUEUE Queue,
 
     case IOCTL_BIOMETRIC_RESET:
         // No sensor state to reset yet.
-        ClearCachedCapture();
-        T2BioLog("  RESET -> STATUS_SUCCESS (parked capture result dropped)");
+        DisarmAcceptStatus();
+        T2BioLog("  RESET -> STATUS_SUCCESS (pending ACCEPT status dropped)");
         WdfRequestComplete(Request, STATUS_SUCCESS);
         return;
 

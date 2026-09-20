@@ -310,3 +310,67 @@ resume з сну (S3/modern standby) — процес служби просто 
   DPAPI-ключ з реєстрового кубла" — це вже поза межами того, що ми тут
   вирішуємо (§9.3), просто фіксую, що додаткового шару це не додає, якщо
   диск не зашифрований BitLocker'ом.
+
+## 11. WBDI-контракт, який виявився обов'язковим (2026-09-20)
+
+Знахідки з апаратного логу (`CAPTURE_DATA` → MATCH → WBF знову шле
+`CAPTURE_DATA`, `AcceptSampleData` у движку не викликається) і з документації
+WDK. Це причина, чому «Add fingerprint» у Settings нічого не робило: SEP
+матчив, але семпл не доходив до engine adapter.
+
+1. **`GET_SENSOR_STATUS` після capture має повернути `WINBIO_SENSOR_ACCEPT`
+   один раз.** WDK: ACCEPT — «сенсор щойно успішно завершив capture; тільки
+   одразу після capture; далі повертається в READY». Sensor adapter WBF
+   питає статус сенсора одразу після завершення `CAPTURE_DATA`; побачивши
+   READY, вважає, що семпла немає, робить `ClearContext` і запускає capture
+   заново (це і є цикл у логу). `SensorStatus=ACCEPT` лише всередині
+   `WINBIO_CAPTURE_DATA` недостатньо (перевірено логом: `sensorStatus=1` у
+   payload, а `GET_SENSOR_STATUS` = READY → цикл). Реалізація: успішна
+   доставка семпла зводить one-shot прапор (TTL 5 с), перший наступний
+   `GET_SENSOR_STATUS` віддає ACCEPT і скидає його; `RESET` теж скидає.
+2. **Size-probe у `CAPTURE_DATA` (вихідний буфер = DWORD) має відповідати
+   негайно, без capture.** WDK: «If the driver receives a DWORD-sized output
+   buffer, the driver must immediately return the buffer size necessary».
+   Попередня версія виконувала весь SEP-touch на probe-запиті і «паркувала»
+   результат для повтору. Тепер probe повертає фіксований максимальний
+   розмір (заголовок + BIR з payload фіксованого розміру = 444 Б) за
+   мілісекунди, а справжній запит (з буфером ≥ 444) чекає на дотик.
+
+Очікуваний лог після виправлення (DebugView, фільтр `T2TouchId*`):
+
+```
+T2TouchIdBio:   IOCTL CAPTURE_DATA in=32 out=4
+T2TouchIdBio:   CAPTURE_DATA size probe: have=4 need=444 -> answering immediately, no capture
+T2TouchIdBio:   IOCTL CAPTURE_DATA in=32 out=444        <- ця чекає на дотик
+T2TouchIdBio:   CAPTURE_DATA(verify): ... outcome=0 -> hresult=0x00000000
+T2TouchIdBio:   GET_SENSOR_STATUS ok sensorStatus=1 (ACCEPT: one-shot ...)
+T2TouchIdEngine: -> AcceptSampleData                    <- раніше не з'являвся
+T2TouchIdEngine: -> IdentifyFeatureSet                  <- UNKNOWN_ID, поки нічого не enrolled: норма
+```
+
+Якщо після `sensorStatus=1 (ACCEPT…)` `AcceptSampleData` усе ще немає — наступний
+підозрюваний сам BIR (`HKLM\SOFTWARE\T2TouchIdBio\BirVariant` = 0..3, див.
+`WbdiBir.h`).
+
+### 11.1 Де насправді живуть GUID відбитків (і чому не в `user.kb`)
+
+`user.kb` — це AppleKeyStore keybag (VERS 5): UUID самого keybag, `USID`
+(UUID користувача), `GRID` та 11 записів класів ключів (CLAS 1–3, 5–12; у
+кожного свій UUID і `WPKY` — обгорнутий ключ) + `SIGN`. UUID ідентичностей
+відбитків (ті, що SEP віддає в identity list, `f5010000 e9c0425c-…`) у цьому
+файлі **відсутні**: вони приходять від BiometricKit під час роботи
+(команда 0x42 — список, `match_result` — UUID того, що доторкнувся). Отже
+enrollment у Windows не повинен нічого брати з `user.kb`; vault
+(`sep-vault.bin`) потрібен лише для розблокування SEP.
+
+### 11.2 Рекомендований enrollment (наступний крок, ще не реалізовано)
+
+Зараз `HandleCaptureEnroll` без дотику підтверджує лише наявність identity для
+`macosUserId`, а шаблон у WBF Storage = `{macosUserId}`. Краще прив'язувати
+Windows-акаунт до **конкретного пальця**: під час enroll робити реальний
+`Verify()` (дотик), брати `matchedUuid` і зберігати шаблон
+`{macosUserId, fingerUuid}`; verify/identify порівнюють обидва поля,
+`CheckForDuplicate` = той самий `fingerUuid` уже є. Виграш: (а) різні
+Windows-акаунти → різні пальці одного macOS-користувача (зараз це
+`ambiguous` → fail-closed); (б) enroll неможливий без фізичної присутності
+пальця. Робити після того, як §11 п.1–2 підтвердяться на залізі.
