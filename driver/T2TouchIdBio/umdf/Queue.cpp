@@ -428,7 +428,11 @@ void HandleCaptureEnroll(_In_ WDFREQUEST Request, const CaptureKey& key)
     const std::vector<uint8_t> bir = t2::wbdi::BuildVendorBir(key.Purpose, key.Flags, payload);
     T2BioLog("CAPTURE_DATA(enroll): BIR built, %llu bytes (vendor payload %llu)",
              static_cast<unsigned long long>(bir.size()), static_cast<unsigned long long>(payload.size()));
-    CompleteCaptureData(Request, S_OK, WINBIO_SENSOR_READY, 0, bir);
+    // WBDI (winbio_ioctl.h / IOCTL_BIOMETRIC_CAPTURE_DATA): a delivered sample is
+    // reported with SensorStatus = WINBIO_SENSOR_ACCEPT. With READY (3) the hardware
+    // log showed WBF re-issuing CAPTURE_DATA in a loop and never calling the engine's
+    // AcceptSampleData (hypothesis: READY reads as "no accepted sample"; unverified).
+    CompleteCaptureData(Request, S_OK, WINBIO_SENSOR_ACCEPT, 0, bir);
 }
 
 // PURPOSE_VERIFY: the real per-touch path. Runs the full
@@ -455,11 +459,13 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
     const HRESULT hr = MapVerifyOutcomeToHresult(outcome);
     T2BioLog("CAPTURE_DATA(verify): outcome=%d -> hresult=0x%08x", static_cast<int>(outcome),
              static_cast<unsigned>(hr));
+    // ACCEPT only for a delivered sample (a real Match); see the note in
+    // HandleCaptureEnroll. Failures stay FAILURE, everything else READY.
     const WINBIO_SENSOR_STATUS sensorStatus =
         (outcome == VerifyOutcome::TransportError || outcome == VerifyOutcome::RejectedByDevice ||
          outcome == VerifyOutcome::UnstableIdentityInventory)
             ? WINBIO_SENSOR_FAILURE
-            : WINBIO_SENSOR_READY;
+            : (outcome == VerifyOutcome::Match ? WINBIO_SENSOR_ACCEPT : WINBIO_SENSOR_READY);
     // A sample goes to WBF only for a real Match; every other outcome completes
     // with its error HRESULT and no data (fail-closed: no BIR to misread).
     std::vector<uint8_t> bir;
