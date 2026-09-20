@@ -299,6 +299,16 @@ void CompleteCaptureData(_In_ WDFREQUEST Request, HRESULT winBioHresult,
     if (!payload.empty()) {
         RtlCopyMemory(out->CaptureData.Data, payload.data(), payload.size());
     }
+    {
+        // Diagnostic: exact head of what WBF's sensor adapter receives.
+        char hex[96 * 2 + 1] = {};
+        static const char digits[] = "0123456789abcdef";
+        const size_t n = needed < 96 ? needed : 96;
+        const UCHAR* b = reinterpret_cast<const UCHAR*>(out);
+        for (size_t i = 0; i < n; ++i) { hex[i * 2] = digits[b[i] >> 4]; hex[i * 2 + 1] = digits[b[i] & 0x0f]; }
+        T2BioLog("  CAPTURE_DATA head (%llu of %llu bytes): %s", static_cast<unsigned long long>(n),
+                 static_cast<unsigned long long>(needed), hex);
+    }
     T2BioLog("  CAPTURE_DATA delivered: %llu bytes (winBioHresult=0x%08x)",
              static_cast<unsigned long long>(needed), static_cast<unsigned>(winBioHresult));
     WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, static_cast<ULONG_PTR>(needed));

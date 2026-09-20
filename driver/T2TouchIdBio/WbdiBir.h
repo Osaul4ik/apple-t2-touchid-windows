@@ -59,7 +59,10 @@ inline std::vector<uint8_t> BuildVendorBir(WINBIO_BIR_PURPOSE purpose,
         WINBIO_BIR_FIELD_QUALITY);
     header.HeaderVersion       = WINBIO_CBEFF_HEADER_VERSION;
     header.PatronHeaderVersion = WINBIO_PATRON_HEADER_VERSION;
-    header.DataFlags   = flags;
+    // winbio_types.h: WINBIO_DATA_FLAG_OPTION_MASK_PRESENT is "always '1'" in a
+    // BIR header. WBF's capture request carries only RAW (0x20), so echoing it
+    // verbatim produced a header that violates that rule.
+    header.DataFlags   = static_cast<WINBIO_BIR_DATA_FLAGS>(flags | WINBIO_DATA_FLAG_OPTION_MASK_PRESENT);
     header.Type        = WINBIO_TYPE_FINGERPRINT;
     header.Purpose     = purpose;
     header.DataQuality = WINBIO_DATA_QUALITY_NOT_SUPPORTED;
