@@ -265,9 +265,9 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     T2_LOG("verify", L"identity inventory stable across 0x42->0x51->0x42->0x51 (%zu configured)",
            configuredFirst.size());
 
-    std::vector<uint8_t> reply;
     // Kept for the CancelGuard below (post-match cleanup on every exit
-    // path) — unrelated to the removed pre-match sequence.
+    // path), and now also reused directly on each NO_MATCH restart —
+    // unrelated to the removed pre-match sequence.
     auto cancelCmd = EncodeBmCommand(Command::Cancel, 1, 0);
 
     // REVERTED (16.09.2026): the macOS-log-derived pre-match sequence that
@@ -329,23 +329,30 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     // Events queued during StartMatch's OWN SendBiometricCommand call just
     // below are unaffected - they land in pendingEvents_ after this point,
     // same as the reference's own per-call `events` for cmd 4.
-    const size_t discardedPreMatchEvents = conn->DiscardPendingEvents();
-    if (discardedPreMatchEvents > 0) {
+    // Sends (or re-sends) StartMatch for one attempt. Broken out of the
+    // original single call so a bad touch (NO_MATCH) can restart a fresh
+    // match session below without duplicating this block.
+    auto sendStartMatch = [&]() -> bool {
+        const size_t discardedPreMatchEvents = conn->DiscardPendingEvents();
+        if (discardedPreMatchEvents > 0) {
+            T2_LOG("verify",
+                   L"discarded %zu pre-StartMatch event(s) accumulated since the last "
+                   L"attempt (Linux never attributes these to the match session)",
+                   discardedPreMatchEvents);
+        }
+        auto matchInitData = EncodeMatchInitData(config_.matchFlags, config_.macosUserId,
+                                                  identities, config_.matchLayout);
         T2_LOG("verify",
-               L"discarded %zu pre-StartMatch event(s) accumulated during warm-up "
-               L"(Linux never attributes these to the match session)",
-               discardedPreMatchEvents);
-    }
+               L"start match LINUX 1:1: layout=%s payload=%zuB flags=%u (Linux counted for %zu identities expects %zuB)",
+               MatchIdentityLayoutName(config_.matchLayout), matchInitData.size(),
+               config_.matchFlags, identities.size(),
+               sizeof(MatchInitDataV1) + sizeof(uint32_t) + identities.size() * sizeof(IdentityRecordV1));
+        auto startCmd = EncodeBmCommand(Command::StartMatch, 1, 0, matchInitData);
+        std::vector<uint8_t> startReply;
+        return conn->SendBiometricCommand(startCmd, 0, &startReply, config_.ioTimeout);
+    };
 
-    auto matchInitData = EncodeMatchInitData(config_.matchFlags, config_.macosUserId,
-                                              identities, config_.matchLayout);
-    T2_LOG("verify",
-           L"start match LINUX 1:1: layout=%s payload=%zuB flags=%u (Linux counted for %zu identities expects %zuB)",
-           MatchIdentityLayoutName(config_.matchLayout), matchInitData.size(),
-           config_.matchFlags, identities.size(),
-           sizeof(MatchInitDataV1) + sizeof(uint32_t) + identities.size() * sizeof(IdentityRecordV1));
-    auto startCmd = EncodeBmCommand(Command::StartMatch, 1, 0, matchInitData);
-    if (!conn->SendBiometricCommand(startCmd, 0, &reply, config_.ioTimeout)) {
+    if (!sendStartMatch()) {
         return VerifyOutcome::TransportError;
     }
 
@@ -368,6 +375,7 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     size_t imagePipelineEvents = 0;
     size_t unnamedStatusEvents = 0;
     size_t fingerTouchCycles = 0;
+    size_t rejectedTouchAttempts = 0;
 
     while (steady_clock::now() < deadline) {
         std::vector<uint8_t> eventPayload;
@@ -452,6 +460,33 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
             *outMatchedUuid = mr.matchedIdentityUuid;
             break;
         } else if (mr.outcome == MatchOutcome::NoMatch) {
+            rejectedTouchAttempts++;
+            if (cancelEvent) {
+                // design doc §9.4: Windows, not this component, owns the
+                // overall wait — a wrong finger is not a reason to give up
+                // and complete the WBDI CAPTURE_DATA request. Restart the
+                // scan (fresh StartMatch) and keep waiting; only an actual
+                // cancel (password fallback, session end) or total silence
+                // for the whole safety-net window ends the wait. Without
+                // this, one bad touch used to end the entire capture and
+                // leave the sensor waiting for a WBF-issued re-poll that
+                // may never come, matching the "wrong finger, then correct
+                // finger does nothing" symptom this fixes.
+                T2_LOG("verify",
+                       L"match_result outcome=NO_MATCH (attempt #%zu) - wrong finger, "
+                       L"restarting scan; Windows controls the overall wait via cancelEvent",
+                       rejectedTouchAttempts);
+                std::vector<uint8_t> discard;
+                conn->SendBiometricCommand(cancelCmd, 0, &discard, config_.ioTimeout); // best-effort
+                deadline = steady_clock::now() + config_.matchWindow; // reset the safety net
+                if (!sendStartMatch()) {
+                    outcome = VerifyOutcome::TransportError;
+                    break;
+                }
+                continue;
+            }
+            // CLI one-shot verify (no cancelEvent): unchanged behavior -
+            // a single NO_MATCH ends this verify() call.
             T2_LOG("verify", L"match_result outcome=NO_MATCH (no enrolled UUID found in event)");
             outcome = VerifyOutcome::NoMatch;
             break;
@@ -468,8 +503,8 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     // session-summary diagnostics.
     T2_LOG("verify",
            L"session summary: finger_touch_cycles=%zu image_pipeline_events=%zu unnamed_status_events=%zu "
-           L"layout=%s flags=%u reset=%s cal=%s outcome=%d",
-           fingerTouchCycles, imagePipelineEvents, unnamedStatusEvents,
+           L"rejected_touch_attempts=%zu layout=%s flags=%u reset=%s cal=%s outcome=%d",
+           fingerTouchCycles, imagePipelineEvents, unnamedStatusEvents, rejectedTouchAttempts,
            MatchIdentityLayoutName(config_.matchLayout), config_.matchFlags,
            config_.skipResetSensor ? L"skip" : L"yes",
            config_.skipLoadCalibration ? L"skip" : L"yes",

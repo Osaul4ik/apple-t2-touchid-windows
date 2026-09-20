@@ -141,13 +141,17 @@ void HandleGetSensorStatus(_In_ WDFREQUEST Request)
 // over (matching this project's own fail-closed / no-guessing style):
 //
 //   - Section 9.4 (cancel-on-CancelIo, unbounded wait for the lock screen)
-//     is NOT implemented here. This handler blocks the dispatching thread
-//     for up to kCaptureMatchWindow and then gives up - it does not yet
-//     register an IWDFIoRequest cancel callback, so a Windows-initiated
-//     CancelIo on a pending request will not be observed early. The queue
-//     is parallel-dispatch (Driver.cpp), so this only blocks ONE request's
-//     worker at a time, not the whole device, but it is still a real
-//     divergence from "wait exactly as long as LogonUI is willing to wait".
+//     IS implemented (EvtCaptureCancel/WdfRequestMarkCancelable below), and
+//     VerificationEngine::Verify() restarts the scan on a wrong-finger
+//     NO_MATCH instead of ending the capture, so a bad touch alone no
+//     longer completes this IOCTL. kCaptureMatchWindow is therefore a
+//     safety net, not the primary wait mechanism: it resets on every
+//     restart, so the effective wait is unbounded as long as either (a)
+//     touches (right or wrong) keep happening, or (b) Windows hasn't
+//     cancelled - matching "wait exactly as long as LogonUI is willing to
+//     wait". It only fires for real if the sensor goes completely silent
+//     (no touch, no cancel) for the whole window - a genuine hardware/idle
+//     stall, not normal lock-screen waiting.
 //   - Section 4's multi-user case (several macOS fingers under different
 //     macosUserId on one T2) is not handled: kDefaultMacosUserId is the
 //     only identity this build ever asks the SEP about. Per design doc 4
@@ -175,10 +179,13 @@ using t2::biometrickit::IdentityRecordV1;
 // macOS user id was actually enrolled, until a real settings UI exists.
 constexpr uint32_t kDefaultMacosUserId = 501;
 
-// Stopgap for design doc 9.4 (see file-header comment above): longer than
-// the CLI's one-shot 20s default so a Settings enroll/verify click isn't cut
-// off mid-gesture, but still bounded, unlike a real LogonUI-driven wait.
-constexpr std::chrono::seconds kCaptureMatchWindow{45};
+// design doc §9.4's own recommendation for the safety-net bound ("кілька
+// хвилин" / a few minutes), not a per-touch wait: VerificationEngine::Verify()
+// resets this on every wrong-finger restart, so in normal use (any touches at
+// all, or an eventual cancel) this value is never reached. It only ends the
+// capture on genuine total silence - no touch, no cancel - for its full
+// duration, e.g. a stuck/disconnected sensor.
+constexpr std::chrono::seconds kCaptureMatchWindow{300};
 
 // Only one CAPTURE_DATA may be in flight at a time (design doc 6, mirroring
 // VerificationEngine::IsBusy()'s existing single-session rule at the WBDI
