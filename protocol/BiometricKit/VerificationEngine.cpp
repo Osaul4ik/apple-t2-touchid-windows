@@ -183,6 +183,17 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     busy_ = true;
     struct BusyGuard { bool* b; ~BusyGuard() { *b = false; } } guard{&busy_};
 
+    // 20.09.2026: the caller (Queue.cpp) can be cancelled by Windows while it
+    // is still discovering/connecting (a multi-second window). If that
+    // already happened, do not spend another ~0.3s on reset-sensor /
+    // load-calibration / identity reads (and then StartMatch + Cancel) for a
+    // request Windows no longer wants - return at once so the capture slot
+    // is free for the request that replaced it.
+    if (cancelEvent && bridgexpc::Connection::IsEventSignaled(cancelEvent)) {
+        T2_LOG("verify", L"cancel already signaled before warm-up - not starting a session");
+        return VerifyOutcome::Cancelled;
+    }
+
     // Same prefix Linux fprintd sends on the verify connection
     // (--initialize --reset-sensor --cancel-operation --load-calibration
     // --identity-list) AFTER t2-biometric-ready already did it once on a
@@ -352,6 +363,14 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
         return conn->SendBiometricCommand(startCmd, 0, &startReply, config_.ioTimeout);
     };
 
+    // Same reasoning as the check at the top: a cancel that landed during the
+    // ~0.3s warm-up must not still arm the sensor (StartMatch) only to Cancel
+    // it a moment later.
+    if (cancelEvent && bridgexpc::Connection::IsEventSignaled(cancelEvent)) {
+        T2_LOG("verify", L"cancel signaled during warm-up - skipping StartMatch");
+        return VerifyOutcome::Cancelled;
+    }
+
     if (!sendStartMatch()) {
         return VerifyOutcome::TransportError;
     }
@@ -412,6 +431,14 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
             // not a second, independent wait.
             if (cancelEvent && bridgexpc::Connection::IsEventSignaled(cancelEvent)) {
                 outcome = VerifyOutcome::Cancelled;
+            } else if (conn->ConnectionLost()) {
+                // 20.09.2026: the BridgeXPC TCP session died under us (peer
+                // closed/reset). That is a transport failure, not an
+                // ordinary "no touch before the deadline" Timeout - report
+                // it as such so Queue.cpp can open a fresh session instead
+                // of completing the request as BAD_CAPTURE.
+                T2_LOG("verify", L"BridgeXPC connection lost while waiting for a touch");
+                outcome = VerifyOutcome::TransportError;
             }
             break;
         }

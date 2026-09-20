@@ -112,6 +112,7 @@ static std::vector<uint8_t> BuildClientHeloBody(int64_t bridgeXpcVersion) {
 
 ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned long interfaceIndex,
                                    uint16_t port, std::chrono::milliseconds connectTimeout) {
+    connectionLost_ = false;
     socket_ = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
     if (socket_ == INVALID_SOCKET) {
         T2_LOG("connect", L"socket() failed, WSAGetLastError=%d", WSAGetLastError());
@@ -605,17 +606,35 @@ bool Connection::WaitForEvent(std::vector<uint8_t>* outEventPayload,
                                       : remaining;
 
         RawFrame frame;
-        if (!ReadFrame(&frame, readTimeout)) {
-            // A slice timing out is expected/silent noise while polling for
-            // cancellation (WSAETIMEDOUT every ~200ms is not a transport
-            // failure) — only log+fail here when this was the real,
-            // un-clamped deadline, i.e. no cancelEvent was in play.
-            if (!cancelEvent) {
-                T2_LOG("waitForEvent", L"ReadFrame failed/timed out, %lldms remained",
-                       static_cast<long long>(remaining.count()));
-                return false;
+        ReadFailure why = ReadFailure::None;
+        if (!ReadFrame(&frame, readTimeout, &why, /*quietIdleTimeout=*/cancelEvent != nullptr)) {
+            if (why == ReadFailure::IdleTimeout) {
+                // A slice timing out with zero bytes read is expected/silent
+                // noise while polling for cancellation (WSAETIMEDOUT every
+                // ~200ms is not a transport failure) — only log+fail here
+                // when this was the real, un-clamped deadline, i.e. no
+                // cancelEvent was in play.
+                if (!cancelEvent) {
+                    T2_LOG("waitForEvent", L"ReadFrame failed/timed out, %lldms remained",
+                           static_cast<long long>(remaining.count()));
+                    return false;
+                }
+                continue; // slice elapsed with no data — loop back, re-check cancelEvent and deadline
             }
-            continue; // slice elapsed with no data — loop back, re-check cancelEvent and deadline
+            // FIX (20.09.2026): this used to be a bare `continue` for EVERY
+            // ReadFrame failure whenever a cancelEvent was in play. A peer
+            // that closed/reset the TCP session (recv() -> 0 or
+            // WSAECONNRESET) returns IMMEDIATELY, so the loop spun at 100%
+            // CPU forever (no deadline is used with a cancelEvent) logging
+            // one line per iteration, holding the single capture slot until
+            // Windows happened to cancel. A dead or torn stream can never
+            // deliver a match_result again: fail closed and let the caller
+            // decide (reconnect, or complete the request with an error).
+            connectionLost_ = true;
+            T2_LOG("waitForEvent",
+                   L"connection lost while waiting for an event (peer closed/reset or "
+                   L"torn frame) - giving up instead of retrying on a dead socket");
+            return false;
         }
         if (frame.type != FrameType::Message) continue; // ignore stray HELO-typed noise, keep waiting
 
@@ -662,21 +681,51 @@ bool Connection::AcknowledgeEvent(const std::string& requestId) {
     return WriteFrame(FrameType::Message, ack);
 }
 
-bool Connection::ReadFrame(RawFrame* out, std::chrono::milliseconds timeout) {
+// Once the FIRST byte of a frame has arrived the rest of it is already in
+// flight, so the remaining recv()s get at least this long no matter how
+// short the caller's `timeout` was. WaitForEvent() polls with a 200ms slice
+// only to re-check its cancel event; without this a slice that happened to
+// expire in the middle of a frame (e.g. the 3KB match_result) dropped the
+// bytes already read and left the stream desynchronized (the next call then
+// parsed body bytes as a frame header).
+static constexpr std::chrono::milliseconds kFrameTailTimeout{3000};
+
+bool Connection::ReadFrame(RawFrame* out, std::chrono::milliseconds timeout,
+                            ReadFailure* why, bool quietIdleTimeout) {
+    if (why) *why = ReadFailure::None;
     SetSocketTimeout(socket_, SO_RCVTIMEO, timeout);
 
     uint8_t headerBuf[16];
     size_t got = 0;
+    bool tailTimeoutSet = false;
     while (got < sizeof(headerBuf)) {
         int n = recv(socket_, reinterpret_cast<char*>(headerBuf) + got,
                       static_cast<int>(sizeof(headerBuf) - got), 0);
         if (n <= 0) {
+            const int wsaErr = (n < 0) ? WSAGetLastError() : 0;
+            const bool timedOut = (n < 0) && (wsaErr == WSAETIMEDOUT || wsaErr == WSAEWOULDBLOCK);
+            if (timedOut && got == 0) {
+                // Nothing of a new frame arrived: the stream is still in sync.
+                if (why) *why = ReadFailure::IdleTimeout;
+                if (!quietIdleTimeout) {
+                    T2_LOG("readFrame", L"header recv failed after %zu/%zuB, n=%d, "
+                           "WSAGetLastError=%d (0=timeout/closed cleanly)",
+                           got, sizeof(headerBuf), n, wsaErr);
+                }
+                return false;
+            }
             T2_LOG("readFrame", L"header recv failed after %zu/%zuB, n=%d, "
                    "WSAGetLastError=%d (0=timeout/closed cleanly)",
-                   got, sizeof(headerBuf), n, WSAGetLastError());
-            return false; // timeout, reset, or EOF: fail closed
+                   got, sizeof(headerBuf), n, wsaErr);
+            if (why) *why = (n == 0) ? ReadFailure::Closed : ReadFailure::Error;
+            return false; // reset, EOF, or a frame torn mid-header: fail closed
         }
         got += static_cast<size_t>(n);
+        if (!tailTimeoutSet) {
+            tailTimeoutSet = true;
+            SetSocketTimeout(socket_, SO_RCVTIMEO,
+                             timeout < kFrameTailTimeout ? kFrameTailTimeout : timeout);
+        }
     }
 
     FrameHeader hdr;
@@ -684,6 +733,7 @@ bool Connection::ReadFrame(RawFrame* out, std::chrono::milliseconds timeout) {
     if (pr != ParseResult::Ok) {
         T2_LOG("readFrame", L"ParseFrameHeader failed, result=%d, header=%s",
                static_cast<int>(pr), HexDump(std::vector<uint8_t>(headerBuf, headerBuf + 16)).c_str());
+        if (why) *why = ReadFailure::Error;
         return false;
     }
 
@@ -696,7 +746,8 @@ bool Connection::ReadFrame(RawFrame* out, std::chrono::milliseconds timeout) {
             T2_LOG("readFrame", L"body recv failed after %zu/%lluB, n=%d, "
                    "WSAGetLastError=%d (frameType=%u)",
                    bodyGot, static_cast<unsigned long long>(hdr.bodyLength), n,
-                   WSAGetLastError(), hdr.frameType);
+                   (n < 0) ? WSAGetLastError() : 0, hdr.frameType);
+            if (why) *why = (n == 0) ? ReadFailure::Closed : ReadFailure::Error;
             return false;
         }
         bodyGot += static_cast<size_t>(n);

@@ -193,10 +193,16 @@ constexpr std::chrono::seconds kCaptureMatchWindow{60};
 std::atomic<bool> g_captureBusy{false};
 
 struct CaptureBusyGuard {
-    bool acquired;
-    CaptureBusyGuard() {
-        bool expected = false;
-        acquired = g_captureBusy.compare_exchange_strong(expected, true);
+    bool acquired = false;
+    CaptureBusyGuard() { TryAcquire(); }
+    // Idempotent: also used to keep retrying while a cancelled predecessor
+    // unwinds (WaitForCancelledPredecessor below).
+    bool TryAcquire() {
+        if (!acquired) {
+            bool expected = false;
+            acquired = g_captureBusy.compare_exchange_strong(expected, true);
+        }
+        return acquired;
     }
     ~CaptureBusyGuard() {
         if (acquired) {
@@ -245,6 +251,58 @@ VOID EvtCaptureCancel(_In_ WDFREQUEST Request)
     // for a cancelled request is STATUS_CANCELLED at the WDF layer, not a
     // WINBIO_CAPTURE_DATA payload — there is no capture result to report.
     WdfRequestComplete(Request, STATUS_CANCELLED);
+}
+
+enum class SlotWait { Acquired, StillBusy, RequestCancelled };
+
+// Upper bound for how long a NEW CAPTURE_DATA waits for a CANCELLED
+// predecessor to hand back the single capture slot. The predecessor's WDF
+// request is already completed (EvtCaptureCancel does that at once), but its
+// worker thread is still unwinding - worst case it is inside the port scan
+// (~4s when the discovery cache is cold) - and WBF re-issues CAPTURE_DATA
+// within a few milliseconds of the cancel (hardware log: 12ms after the
+// cancel, 1-7ms after every completed identify).
+constexpr ULONGLONG kPredecessorUnwindWaitMs = 8000;
+
+// 20.09.2026: WBF cancels the in-session identify and immediately starts the
+// lock-screen one (or vice versa). Before this, that second request lost the
+// race for g_captureBusy whenever the first worker had not finished unwinding
+// yet and was answered WINBIO_E_DATA_COLLECTION_IN_PROGRESS / SENSOR_BUSY -
+// a hard failure of the very request Windows needs to be serviced right after
+// a lock/unlock. Only applies when the in-flight capture really was
+// cancelled (its cancel event is set); a genuinely concurrent second capture
+// still gets BUSY at once, exactly as before.
+SlotWait WaitForCancelledPredecessor(_In_ WDFREQUEST Request, CaptureBusyGuard& guard)
+{
+    HANDLE cancelEvent = GetCaptureCancelEvent();
+    if (!t2::bridgexpc::Connection::IsEventSignaled(cancelEvent)) {
+        return SlotWait::StillBusy;
+    }
+    T2BioLog("CAPTURE_DATA: previous capture was cancelled and is still unwinding - waiting for "
+             "it (max %llu ms) instead of failing with DATA_COLLECTION_IN_PROGRESS",
+             static_cast<unsigned long long>(kPredecessorUnwindWaitMs));
+
+    // This request can be cancelled while it waits too.
+    WdfRequestMarkCancelable(Request, EvtCaptureCancel);
+    SlotWait result = SlotWait::StillBusy;
+    const ULONGLONG start = GetTickCount64();
+    while (GetTickCount64() - start < kPredecessorUnwindWaitMs) {
+        if (guard.TryAcquire()) {
+            result = SlotWait::Acquired;
+            break;
+        }
+        Sleep(10);
+    }
+    if (WdfRequestUnmarkCancelable(Request) == STATUS_CANCELLED) {
+        // EvtCaptureCancel already completed Request; if we did get the slot
+        // the caller's CaptureBusyGuard releases it on return.
+        T2BioLog("CAPTURE_DATA: cancelled while waiting for the previous capture to unwind");
+        return SlotWait::RequestCancelled;
+    }
+    T2BioLog("CAPTURE_DATA: predecessor wait finished after %llu ms (%s)",
+             static_cast<unsigned long long>(GetTickCount64() - start),
+             result == SlotWait::Acquired ? "slot acquired" : "still busy");
+    return result;
 }
 
 // Which capture a CAPTURE_DATA request asked for; also what the returned BIR
@@ -358,16 +416,27 @@ void CompleteCaptureData(_In_ WDFREQUEST Request, HRESULT winBioHresult,
 // verdict, because "couldn't ask the SEP" is not an answer from the SEP.
 bool ConnectForCapture(t2::bridgexpc::Connection* outConn)
 {
+    // Timings: on the 20.09.2026 hardware log this step alone was a constant
+    // ~3.8s per CAPTURE_DATA (full port scan, cache never hit), during which
+    // the sensor is not armed and a touch is silently lost.
+    const ULONGLONG t0 = GetTickCount64();
     t2::discovery::NcmEndpoint ep;
     if (!t2::discovery::PickDefaultT2Endpoint(&ep)) {
         T2BioLog("CAPTURE_DATA: no T2 NCM adapter found");
         return false;
     }
+    const ULONGLONG t1 = GetTickCount64();
     if (!t2::discovery::ConnectToBiometricKitBridge(ep, outConn)) {
-        T2BioLog("CAPTURE_DATA: BiometricKit BridgeXPC discovery/connect failed");
+        T2BioLog("CAPTURE_DATA: BiometricKit BridgeXPC discovery/connect failed "
+                 "(endpoint lookup %llu ms, discovery+connect %llu ms)",
+                 static_cast<unsigned long long>(t1 - t0),
+                 static_cast<unsigned long long>(GetTickCount64() - t1));
         return false;
     }
-    T2BioLog("CAPTURE_DATA: connected to BiometricKit BridgeXPC");
+    T2BioLog("CAPTURE_DATA: connected to BiometricKit BridgeXPC "
+             "(endpoint lookup %llu ms, discovery+connect %llu ms)",
+             static_cast<unsigned long long>(t1 - t0),
+             static_cast<unsigned long long>(GetTickCount64() - t1));
     return true;
 }
 
@@ -471,24 +540,44 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
     }
     WdfRequestMarkCancelable(Request, EvtCaptureCancel);
 
-    t2::bridgexpc::Connection conn;
-    if (!ConnectForCapture(&conn)) {
-        if (WdfRequestUnmarkCancelable(Request) == STATUS_CANCELLED) {
-            // EvtCaptureCancel already fired and completed Request
-            // (STATUS_CANCELLED) for us - it is no longer ours to touch.
-            T2BioLog("CAPTURE_DATA(verify): cancelled during connect");
-            return;
-        }
-        CompleteCaptureData(Request, WINBIO_E_DEVICE_FAILURE, WINBIO_SENSOR_FAILURE, 0, {});
-        return;
-    }
-
     VerifyConfig cfg;
     cfg.macosUserId = kDefaultMacosUserId;
     cfg.matchWindow = kCaptureMatchWindow;
-    VerificationEngine engine(cfg);
     std::optional<std::array<uint8_t, 16>> matchedUuid;
-    const VerifyOutcome outcome = engine.Verify(&conn, &matchedUuid, cancelEvent);
+    VerifyOutcome outcome = VerifyOutcome::TransportError;   // also what a failed connect completes as
+
+    // 20.09.2026: this request is supposed to stay pending until a touch or
+    // Windows' own CancelIoEx (design doc 9.4). If the T2 drops the TCP
+    // session while we wait (Connection::ConnectionLost()), reopen it and
+    // re-arm instead of failing the whole request - a fresh StartMatch
+    // still needs a fresh touch, so nothing is ever carried over from the
+    // dead session. Only a genuinely lost connection is retried (not a
+    // command timeout, not a failed connect), and never after a cancel.
+    constexpr int kMaxSessionAttempts = 3;
+    for (int attempt = 1; attempt <= kMaxSessionAttempts; ++attempt) {
+        t2::bridgexpc::Connection conn;
+        if (!ConnectForCapture(&conn)) {
+            outcome = VerifyOutcome::TransportError;   // completed as DEVICE_FAILURE below (or dropped if cancelled)
+            break;
+        }
+        if (t2::bridgexpc::Connection::IsEventSignaled(cancelEvent)) {
+            // Windows cancelled us while we were still discovering/connecting;
+            // do not touch the T2 at all for a request nobody wants any more.
+            T2BioLog("CAPTURE_DATA(verify): cancelled during connect - not starting a session");
+            outcome = VerifyOutcome::Cancelled;
+            break;
+        }
+        VerificationEngine engine(cfg);
+        matchedUuid.reset();
+        outcome = engine.Verify(&conn, &matchedUuid, cancelEvent);
+        if (outcome != VerifyOutcome::TransportError || !conn.ConnectionLost() ||
+            t2::bridgexpc::Connection::IsEventSignaled(cancelEvent)) {
+            break;
+        }
+        T2BioLog("CAPTURE_DATA(verify): BridgeXPC session dropped while waiting (attempt %d of %d) - reconnecting",
+                 attempt, kMaxSessionAttempts);
+        Sleep(200);
+    }
 
     if (WdfRequestUnmarkCancelable(Request) == STATUS_CANCELLED) {
         // Same reasoning as the connect-phase check above: Request is
@@ -584,6 +673,16 @@ void HandleCaptureData(_In_ WDFREQUEST Request)
     }
 
     CaptureBusyGuard guard;
+    if (!guard.acquired) {
+        switch (WaitForCancelledPredecessor(Request, guard)) {
+        case SlotWait::Acquired:
+            break;                     // predecessor finished unwinding: carry on normally
+        case SlotWait::RequestCancelled:
+            return;                    // Request was already completed by EvtCaptureCancel
+        case SlotWait::StillBusy:
+            break;                     // fall through to the BUSY answer below
+        }
+    }
     if (!guard.acquired) {
         T2BioLog("CAPTURE_DATA: another capture is already in flight -> DATA_COLLECTION_IN_PROGRESS");
         // Mirrors VerificationEngine::IsBusy()'s existing rule, at the WBDI

@@ -22,9 +22,30 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <map>
+#include <mutex>
 
 namespace t2::discovery {
 namespace {
+
+// 20.09.2026: process-lifetime cache, consulted BEFORE the file below.
+//
+// Why it exists: the file cache lives under %LOCALAPPDATA%, which for the
+// UMDF host (WUDFHost.exe, LocalService, sandboxed) is either unset or not
+// writable, and the failure is silent by design. Hardware log evidence: every
+// single CAPTURE_DATA in one WUDFHost process paid a constant ~3.8s between
+// "CAPTURE_DATA: begin" and the BridgeXPC HELO (a full 16k-port scan), and no
+// "connect() to port ... failed" line ever appeared - i.e. the cached-port
+// fast path was never even attempted. The WUDFHost process outlives every
+// capture, so a plain static map is enough to make every capture after the
+// first skip the scan. Like the file, it is only a hint: the caller still
+// verifies the port with a live HELO and falls back to a scan on any miss.
+struct MemPorts { uint16_t port = 0; uint16_t rsd = 0; };
+std::mutex g_memMu;
+std::map<std::string, MemPorts>& MemCache() {
+    static std::map<std::string, MemPorts> m;
+    return m;
+}
 
 std::string FormatMacKey(const unsigned char mac[6]) {
     char buf[18];
@@ -46,16 +67,29 @@ std::string ToUpperAscii(std::string s) {
     return s;
 }
 
-// Returns "" if %LOCALAPPDATA% isn't set (extremely unlikely on real
-// Windows, but this is a cache, not a requirement — callers treat "" as
-// "caching unavailable" and fall straight back to a real scan).
+// 20.09.2026: the cache now lives in %ProgramData%\\t2touchid (machine-wide),
+// not %LOCALAPPDATA%. The UMDF driver host (WUDFHost, LocalService) has a
+// different/absent per-user profile than the interactive user running the
+// CLI, so a per-user cache was never shared with (or usable by) the driver
+// and every CAPTURE_DATA fell back to a full port scan. Returns "" if
+// neither variable is set - callers then just scan.
 std::string CacheDir() {
     char buf[MAX_PATH];
-    DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", buf, MAX_PATH);
+    DWORD n = GetEnvironmentVariableA("ProgramData", buf, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) n = GetEnvironmentVariableA("ALLUSERSPROFILE", buf, MAX_PATH);
     if (n == 0 || n >= MAX_PATH) return "";
     std::string dir = buf;
     dir += "\\t2touchid";
     return dir;
+}
+
+// Old per-user location, still read (never written) so an existing CLI
+// cache keeps working until the new file is populated.
+std::string LegacyCacheFilePath() {
+    char buf[MAX_PATH];
+    DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", buf, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return "";
+    return std::string(buf) + "\\t2touchid\\portcache.ini";
 }
 
 std::string CacheFilePath() {
@@ -106,11 +140,23 @@ bool WriteEntries(const std::string& path,
 
 bool LoadCachedPort(const NcmEndpoint& endpoint, uint16_t* outPort, uint16_t* outRsdPort) {
     if (!endpoint.hasMac) return false; // no stable key to look up
-    std::string path = CacheFilePath();
-    if (path.empty()) return false;
+
+    {
+        std::lock_guard<std::mutex> lock(g_memMu);
+        auto it = MemCache().find(FormatMacKey(endpoint.mac));
+        if (it != MemCache().end() && it->second.port != 0) {
+            if (outPort) *outPort = it->second.port;
+            if (outRsdPort) *outRsdPort = it->second.rsd;
+            return true;
+        }
+    }
 
     std::string key = FormatMacKey(endpoint.mac);
-    auto entries = ReadEntries(path);
+    auto entries = ReadEntries(CacheFilePath());          // new machine-wide file first
+    {
+        auto legacy = ReadEntries(LegacyCacheFilePath()); // then the old per-user one
+        entries.insert(entries.end(), legacy.begin(), legacy.end());
+    }
     for (const auto& kv : entries) {
         if (kv.first != key) continue;
         // Value is "<servicePort>" (legacy) or "<servicePort>,<rsdPort>".
@@ -143,6 +189,15 @@ bool LoadCachedPort(const NcmEndpoint& endpoint, uint16_t* outPort, uint16_t* ou
 void SaveCachedPort(const NcmEndpoint& endpoint, uint16_t port, uint16_t rsdPort) {
     if (!endpoint.hasMac) return; // nothing stable to key this entry on
     if (port == 0) return;
+
+    {
+        // Always remember it for this process, even if the file below can't
+        // be written (see the note on g_memMu).
+        std::lock_guard<std::mutex> lock(g_memMu);
+        MemPorts& m = MemCache()[FormatMacKey(endpoint.mac)];
+        m.port = port;
+        m.rsd = rsdPort;
+    }
 
     std::string dir = CacheDir();
     if (dir.empty()) return;

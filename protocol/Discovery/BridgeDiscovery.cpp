@@ -6,6 +6,7 @@
 #include "PortCache.h"
 #include "PortScan.h"
 #include "RemoteXpc.h"
+#include "../BridgeXpc/Log.h"
 #include <atomic>
 #include <mutex>
 #include <thread>
@@ -30,15 +31,24 @@ bool TryCachedBridgePort(const NcmEndpoint& ep, t2::bridgexpc::Connection* conn,
 
     uint16_t svcPort = 0, rsdPort = 0;
     if (!LoadCachedPort(ep, &svcPort, &rsdPort)) {
+        // 20.09.2026 diagnostics: a miss here means the caller falls through
+        // to the full port scan (seconds). Logging it makes "every capture
+        // pays the scan" visible in the DebugView capture instead of having
+        // to be inferred from timestamps.
+        T2_LOG("discovery", L"no cached BridgeXPC port for this adapter - full port scan follows");
         return false;
     }
 
     ConnectResult crA = conn->Connect(ep.peerLinkLocal, ep.ifIndex, svcPort,
                                        std::chrono::milliseconds(1500));
     if (crA == ConnectResult::Ok) {
+        T2_LOG("discovery", L"cached port %u answered with HELO - no scan needed",
+               static_cast<unsigned>(svcPort));
         *outPort = svcPort;
         return true;
     }
+    T2_LOG("discovery", L"cached port %u (rsd %u) did not answer, ConnectResult=%d",
+           static_cast<unsigned>(svcPort), static_cast<unsigned>(rsdPort), static_cast<int>(crA));
 
     if (rsdPort != 0) {
         uint16_t advertised = 0;
@@ -134,6 +144,7 @@ bool ConnectToBiometricKitBridge(const NcmEndpoint& endpoint, t2::bridgexpc::Con
 
     uint16_t foundPort = 0;
     uint16_t foundRsdPort = 0;
+    const ULONGLONG scanStartMs = GetTickCount64();
     const unsigned timeoutsMs[] = {20, 60};
     constexpr unsigned kAttempts = sizeof(timeoutsMs) / sizeof(timeoutsMs[0]);
     for (unsigned attempt = 0; attempt < kAttempts; ++attempt) {
@@ -150,6 +161,9 @@ bool ConnectToBiometricKitBridge(const NcmEndpoint& endpoint, t2::bridgexpc::Con
             break;
         }
     }
+    T2_LOG("discovery", L"full port scan finished in %llu ms, found port %u",
+           static_cast<unsigned long long>(GetTickCount64() - scanStartMs),
+           static_cast<unsigned>(foundPort));
     if (foundPort == 0) {
         return false;
     }

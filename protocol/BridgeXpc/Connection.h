@@ -122,10 +122,32 @@ public:
         return h != nullptr && WaitForSingleObject(h, 0) == 0;
     }
 
+    // True once WaitForEvent() saw a HARD receive failure on this connection
+    // (peer closed/reset the TCP session, or a frame was torn/malformed) as
+    // opposed to a plain "nothing arrived yet" poll timeout. A lost
+    // connection can never deliver a match_result again, so callers must
+    // stop waiting on it (and may open a fresh connection) instead of
+    // treating it like an idle wait. Cleared by Connect().
+    bool ConnectionLost() const { return connectionLost_; }
+
 private:
     SOCKET socket_ = INVALID_SOCKET;
+    bool connectionLost_ = false;
 
-    bool ReadFrame(RawFrame* out, std::chrono::milliseconds timeout);
+    // Why ReadFrame() returned false. IdleTimeout = SO_RCVTIMEO expired
+    // with ZERO bytes of a new frame received (the stream is still in sync,
+    // simply nothing to read yet); everything else means the stream is dead
+    // or desynchronized and must not be read from again as if nothing
+    // happened.
+    enum class ReadFailure { None, IdleTimeout, Closed, Error };
+
+    // quietIdleTimeout: WaitForEvent() polls with a short SO_RCVTIMEO slice
+    // (kCancelPollSlice) purely so it can re-check its cancel event, so an
+    // idle-slice timeout there is expected every slice and must not be
+    // logged (it used to flood the log at 5 lines/second for as long as the
+    // sensor sat waiting for a finger).
+    bool ReadFrame(RawFrame* out, std::chrono::milliseconds timeout,
+                   ReadFailure* why = nullptr, bool quietIdleTimeout = false);
     bool WriteFrame(FrameType type, const std::vector<uint8_t>& body);
     bool AcknowledgeEvent(const std::string& requestId);
     // Same event-before-reply loop as SendBiometricCommand/GetFdr:
