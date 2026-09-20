@@ -383,7 +383,13 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     // Windows had simply stopped caring about, delaying the next real
     // capture). The CLI one-shot `verify` (no cancelEvent) is unaffected -
     // it keeps its fixed config_.matchWindow deadline exactly as before.
-    constexpr auto kNoDeadline = steady_clock::time_point::max();
+    // Parenthesize the call so <windows.h>'s function-like `max(a,b)` macro
+    // (this TU is deliberately built without NOMINMAX - see Connection.cpp
+    // for why) never sees `max(` as a token and tries to expand it; that is
+    // exactly what produced warning C4003 / errors C2589,C2059,C2737,C3536
+    // here (the same class of bug Connection.cpp's ReadFrame clamp already
+    // works around for std::min).
+    constexpr auto kNoDeadline = (steady_clock::time_point::max)();
     const auto deadline = cancelEvent ? kNoDeadline : (steady_clock::now() + config_.matchWindow);
     VerifyOutcome outcome = VerifyOutcome::Timeout; // default if loop exits via deadline
 
