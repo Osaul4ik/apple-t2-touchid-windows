@@ -192,6 +192,42 @@ constexpr std::chrono::seconds kCaptureMatchWindow{60};
 // than one worker thread at once).
 std::atomic<bool> g_captureBusy{false};
 
+// 20.09.2026: WBF issues exactly TWO CAPTURE_DATA verify requests per unlock
+// (hardware log: Match → complete → new CAPTURE begin within 15–30 ms). The
+// second is not a second finger touch — framework double-check. Answer #1
+// with a real SEP Match, arm a one-shot replay, answer #2 with the same
+// result (no connect / StartMatch / cancel-poll). After consume, the next
+// CAPTURE is a real verify again. No wall-clock TTL: the contract is
+// "real + one replay", matching the stable WBF pair.
+struct RecentMatchCache {
+    std::mutex mu;
+    bool pendingReplay = false;
+    std::optional<std::array<uint8_t, 16>> matchedUuid;
+};
+RecentMatchCache g_recentMatch;
+
+void ArmMatchReplay(const std::optional<std::array<uint8_t, 16>>& uuid)
+{
+    std::lock_guard<std::mutex> lock(g_recentMatch.mu);
+    g_recentMatch.matchedUuid = uuid;
+    g_recentMatch.pendingReplay = true;
+}
+
+bool ConsumeMatchReplay(std::optional<std::array<uint8_t, 16>>* outUuid)
+{
+    std::lock_guard<std::mutex> lock(g_recentMatch.mu);
+    if (!g_recentMatch.pendingReplay) return false;
+    *outUuid = g_recentMatch.matchedUuid;
+    g_recentMatch.pendingReplay = false;
+    return true;
+}
+
+void ClearMatchReplay()
+{
+    std::lock_guard<std::mutex> lock(g_recentMatch.mu);
+    g_recentMatch.pendingReplay = false;
+}
+
 struct CaptureBusyGuard {
     bool acquired = false;
     CaptureBusyGuard() { TryAcquire(); }
@@ -525,6 +561,22 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
              static_cast<unsigned>(kDefaultMacosUserId),
              static_cast<long long>(kCaptureMatchWindow.count()));
 
+    // Fast path: second CAPTURE of the WBF pair. Real Match already armed a
+    // one-shot replay — return the same result, no sensor session.
+    {
+        std::optional<std::array<uint8_t, 16>> replayUuid;
+        if (ConsumeMatchReplay(&replayUuid)) {
+            T2BioLog("CAPTURE_DATA(verify): replaying Match (WBF 2nd CAPTURE of pair) - no sensor session");
+            const std::vector<uint8_t> payload = t2::biometrickit::SerializeVendorPayload(
+                VerifyOutcome::Match, kDefaultMacosUserId, replayUuid,
+                t2::biometrickit::kSampleKindVerify);
+            const std::vector<uint8_t> bir =
+                t2::wbdi::BuildVendorBir(key.Purpose, key.Flags, payload, LoadBirOptions());
+            CompleteCaptureData(Request, S_OK, WINBIO_SENSOR_ACCEPT, 0, bir);
+            return;
+        }
+    }
+
     // design doc §9.4: register this specific request as cancelable BEFORE
     // doing anything that can block (Connect included — a cancel arriving
     // during discovery/connect should still complete the IOCTL promptly,
@@ -593,13 +645,17 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
             // sees no reaction and has to touch again. Not recoverable at
             // this layer (the request is already gone); flagged loudly so
             // it reads as "a real fingerprint got dropped", not routine
-            // cancellation.
+            // cancellation. Still stash the Match so a CAPTURE that arrives
+            // a few ms later (the usual WBF double-shot) can replay it.
             T2BioLog("CAPTURE_DATA(verify): *** genuine MATCH discarded - lost a race with "
                      "Windows' own CancelIoEx on this request (request already completed "
                      "as CANCELLED before we could report the match) ***");
+            // Arm replay so the usual immediate 2nd CAPTURE still gets the Match.
+            ArmMatchReplay(matchedUuid);
         } else {
             T2BioLog("CAPTURE_DATA(verify): cancelled, outcome=%d discarded (request already completed)",
                      static_cast<int>(outcome));
+            ClearMatchReplay();
         }
         return;
     }
@@ -623,6 +679,9 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
         bir = t2::wbdi::BuildVendorBir(key.Purpose, key.Flags, payload, LoadBirOptions());
         T2BioLog("CAPTURE_DATA(verify): BIR built, %llu bytes (vendor payload %llu)",
                  static_cast<unsigned long long>(bir.size()), static_cast<unsigned long long>(payload.size()));
+        ArmMatchReplay(matchedUuid); // next CAPTURE = 2nd of the WBF pair
+    } else {
+        ClearMatchReplay();
     }
     CompleteCaptureData(Request, hr, sensorStatus, 0, bir);
 }
