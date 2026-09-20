@@ -15,6 +15,13 @@ using namespace std::chrono;
 
 namespace {
 
+// CancelMatch after StartMatch is best-effort teardown only. Must not use
+// VerifyConfig::ioTimeout (5s): a slow BridgeXPC reply held g_captureBusy
+// for seconds after CancelIoEx (Win+L delay). File-scope so CancelGuard's
+// destructor can see it — MSVC C2326 rejects a function-local constexpr
+// from a local-class member function.
+constexpr std::chrono::milliseconds kCancelBestEffortTimeout{300};
+
 bool Uuid16IsZero(const uint8_t* p) {
     for (int i = 0; i < 16; i++) {
         if (p[i] != 0) return false;
@@ -380,15 +387,8 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     // happens next. CancelMatch must be attempted on every exit path.
     //
     // IMPORTANT (20.09.2026 hardware): do NOT use config_.ioTimeout (5s) here.
-    // Cancel is best-effort teardown. With the 5s timeout, a slow/unresponsive
-    // BridgeXPC reply held the Verify() stack (and therefore g_captureBusy in
-    // Queue.cpp) for up to 5 seconds after Windows had already CancelIoEx'd
-    // the CAPTURE_DATA — observed as "unlock works, then Win+L takes 5–10s
-    // before the lock screen actually responds / re-arms the sensor". A short
-    // timeout is enough to send the 0x0c frame; if the peer does not answer,
-    // the Connection destructor closes the socket and the next CAPTURE starts
-    // clean. Same bound is used on the NoMatch restart path below.
-    constexpr std::chrono::milliseconds kCancelBestEffortTimeout{300};
+    // Cancel is best-effort teardown — see kCancelBestEffortTimeout above.
+    // Same bound is used on the NoMatch restart path below.
     struct CancelGuard {
         bridgexpc::Connection* conn;
         const std::vector<uint8_t>* cancelCmd;
