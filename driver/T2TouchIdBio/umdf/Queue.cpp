@@ -645,18 +645,24 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
             // sees no reaction and has to touch again. Not recoverable at
             // this layer (the request is already gone); flagged loudly so
             // it reads as "a real fingerprint got dropped", not routine
-            // cancellation. Still stash the Match so a CAPTURE that arrives
-            // a few ms later (the usual WBF double-shot) can replay it.
+            // cancellation.
+            //
+            // Do NOT ArmMatchReplay here. CancelIoEx on a Match is typical of
+            // Win+L / session teardown, not of WBF's post-unlock double CAPTURE.
+            // Arming replay after cancel made the *next* CAPTURE (lock-screen
+            // arm) complete as Match immediately — lock hung ~10s or
+            // lock+auto-unlock when the user touched the sensor (2026-09-20 log:
+            // MATCH discarded → cancel → "replaying Match" → Identify OK →
+            // another CAPTURE waiting on the sensor).
             T2BioLog("CAPTURE_DATA(verify): *** genuine MATCH discarded - lost a race with "
                      "Windows' own CancelIoEx on this request (request already completed "
                      "as CANCELLED before we could report the match) ***");
-            // Arm replay so the usual immediate 2nd CAPTURE still gets the Match.
-            ArmMatchReplay(matchedUuid);
         } else {
             T2BioLog("CAPTURE_DATA(verify): cancelled, outcome=%d discarded (request already completed)",
                      static_cast<int>(outcome));
-            ClearMatchReplay();
         }
+        // Any cancel ends the "real + one replay" pair; next CAPTURE must verify.
+        ClearMatchReplay();
         return;
     }
 
