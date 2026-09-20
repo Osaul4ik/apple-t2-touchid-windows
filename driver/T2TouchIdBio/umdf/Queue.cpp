@@ -377,6 +377,24 @@ bool ConnectForCapture(t2::bridgexpc::Connection* outConn)
     return true;
 }
 
+// A/B switch for the BIR layout (see WbdiBir.h BirOptions). Read on every capture so a
+// registry edit takes effect without a rebuild. Missing value = shipped default (3).
+//   HKLM\SOFTWARE\T2TouchIdBio\BirVariant  (REG_DWORD)
+//     bit 0: add WINBIO_DATA_FLAG_OPTION_MASK_PRESENT to the BIR header flags
+//     bit 1: include the placeholder ANSI-381 standard block
+t2::wbdi::BirOptions LoadBirOptions()
+{
+    DWORD variant = 3;
+    DWORD cb = sizeof(variant);
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\T2TouchIdBio", L"BirVariant",
+                     RRF_RT_REG_DWORD, nullptr, &variant, &cb) != ERROR_SUCCESS) {
+        variant = 3;
+    }
+    T2BioLog("  BIR layout variant=%u (bit0=option-mask flag, bit1=ANSI-381 block)",
+             static_cast<unsigned>(variant));
+    return t2::wbdi::BirOptionsFromVariant(variant);
+}
+
 // PURPOSE_ENROLL / _ENROLL_FOR_VERIFICATION / _ENROLL_FOR_IDENTIFICATION
 // (design doc 4): does NOT collect a new biometric sample. Runs the same
 // WarmUp() identity-list read the CLI's `warmup`/`identities` commands use
@@ -425,7 +443,7 @@ void HandleCaptureEnroll(_In_ WDFREQUEST Request, const CaptureKey& key)
     std::vector<uint8_t> payload = t2::biometrickit::SerializeVendorPayload(
         VerifyOutcome::Match /* "confirmed", not a fingerprint match - see comment above */,
         kDefaultMacosUserId, std::nullopt, t2::biometrickit::kSampleKindEnrollConfirm);
-    const std::vector<uint8_t> bir = t2::wbdi::BuildVendorBir(key.Purpose, key.Flags, payload);
+    const std::vector<uint8_t> bir = t2::wbdi::BuildVendorBir(key.Purpose, key.Flags, payload, LoadBirOptions());
     T2BioLog("CAPTURE_DATA(enroll): BIR built, %llu bytes (vendor payload %llu)",
              static_cast<unsigned long long>(bir.size()), static_cast<unsigned long long>(payload.size()));
     // WBDI (winbio_ioctl.h / IOCTL_BIOMETRIC_CAPTURE_DATA): a delivered sample is
@@ -472,7 +490,7 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
     if (outcome == VerifyOutcome::Match) {
         const std::vector<uint8_t> payload = t2::biometrickit::SerializeVendorPayload(
             outcome, kDefaultMacosUserId, matchedUuid, t2::biometrickit::kSampleKindVerify);
-        bir = t2::wbdi::BuildVendorBir(key.Purpose, key.Flags, payload);
+        bir = t2::wbdi::BuildVendorBir(key.Purpose, key.Flags, payload, LoadBirOptions());
         T2BioLog("CAPTURE_DATA(verify): BIR built, %llu bytes (vendor payload %llu)",
                  static_cast<unsigned long long>(bir.size()), static_cast<unsigned long long>(payload.size()));
     }

@@ -84,29 +84,52 @@ inline std::vector<uint8_t> BuildPlaceholderAnsi381()
     return out;
 }
 
+// Experiment switches for the BIR layout. WBF's in-box sensor adapter is closed
+// source and its acceptance rules for a returned BIR are not documented, so the
+// driver reads these from HKLM\SOFTWARE\T2TouchIdBio\BirVariant (bit 0 / bit 1)
+// and they can be A/B-tested without a rebuild. The defaults are the layout the
+// project ships.
+struct BirOptions {
+    bool OptionMaskBit  = true;   // header DataFlags |= WINBIO_DATA_FLAG_OPTION_MASK_PRESENT
+    bool StandardBlock  = true;   // include the placeholder ANSI-381 block
+};
+
+inline BirOptions BirOptionsFromVariant(unsigned variant)
+{
+    BirOptions o;
+    o.OptionMaskBit = (variant & 0x1) != 0;
+    o.StandardBlock = (variant & 0x2) != 0;
+    return o;
+}
+
 // Size of the BIR BuildVendorBir() produces for a payload of `payloadSize`.
-inline size_t VendorBirSize(size_t payloadSize)
+inline size_t VendorBirSize(size_t payloadSize, const BirOptions& opt = BirOptions())
 {
     const size_t standardOffset = Align8(sizeof(WINBIO_BIR) + sizeof(WINBIO_BIR_HEADER));
-    const size_t vendorOffset   = Align8(standardOffset + PlaceholderAnsi381Size());
+    const size_t standardSize   = opt.StandardBlock ? PlaceholderAnsi381Size() : 0;
+    const size_t vendorOffset   = Align8(standardOffset + standardSize);
     return Align8(vendorOffset + payloadSize);
 }
 
 inline std::vector<uint8_t> BuildVendorBir(WINBIO_BIR_PURPOSE purpose,
                                            WINBIO_BIR_DATA_FLAGS flags,
-                                           const std::vector<uint8_t>& payload)
+                                           const std::vector<uint8_t>& payload,
+                                           const BirOptions& opt = BirOptions())
 {
     const size_t headerOffset   = sizeof(WINBIO_BIR);
     const size_t standardOffset = Align8(headerOffset + sizeof(WINBIO_BIR_HEADER));
-    const std::vector<uint8_t> standard = BuildPlaceholderAnsi381();
+    const std::vector<uint8_t> standard = opt.StandardBlock ? BuildPlaceholderAnsi381()
+                                                            : std::vector<uint8_t>();
     const size_t vendorOffset   = Align8(standardOffset + standard.size());
-    std::vector<uint8_t> out(VendorBirSize(payload.size()), 0);
+    std::vector<uint8_t> out(VendorBirSize(payload.size(), opt), 0);
 
     WINBIO_BIR bir{};
     bir.HeaderBlock.Size   = static_cast<ULONG>(sizeof(WINBIO_BIR_HEADER));
     bir.HeaderBlock.Offset = static_cast<ULONG>(headerOffset);
-    bir.StandardDataBlock.Size   = static_cast<ULONG>(standard.size());
-    bir.StandardDataBlock.Offset = static_cast<ULONG>(standardOffset);
+    if (!standard.empty()) {
+        bir.StandardDataBlock.Size   = static_cast<ULONG>(standard.size());
+        bir.StandardDataBlock.Offset = static_cast<ULONG>(standardOffset);
+    }
     bir.VendorDataBlock.Size   = static_cast<ULONG>(payload.size());
     bir.VendorDataBlock.Offset = static_cast<ULONG>(vendorOffset);
     // SignatureBlock stays {0,0}.
@@ -121,17 +144,23 @@ inline std::vector<uint8_t> BuildVendorBir(WINBIO_BIR_PURPOSE purpose,
     // winbio_types.h: WINBIO_DATA_FLAG_OPTION_MASK_PRESENT is "always '1'" in a
     // BIR header. WBF's capture request carries only RAW (0x20), so echoing it
     // verbatim produced a header that violates that rule.
-    header.DataFlags   = static_cast<WINBIO_BIR_DATA_FLAGS>(flags | WINBIO_DATA_FLAG_OPTION_MASK_PRESENT);
+    header.DataFlags   = opt.OptionMaskBit
+        ? static_cast<WINBIO_BIR_DATA_FLAGS>(flags | WINBIO_DATA_FLAG_OPTION_MASK_PRESENT)
+        : flags;
     header.Type        = WINBIO_TYPE_FINGERPRINT;
     header.Purpose     = purpose;
     header.DataQuality = WINBIO_DATA_QUALITY_NOT_SUPPORTED;
-    // Format of the Standard Data Block (the placeholder above).
-    header.BiometricDataFormat.Owner = WINBIO_ANSI_381_FORMAT_OWNER;
-    header.BiometricDataFormat.Type  = WINBIO_ANSI_381_FORMAT_TYPE;
+    if (!standard.empty()) {
+        // Format of the Standard Data Block (the placeholder above).
+        header.BiometricDataFormat.Owner = WINBIO_ANSI_381_FORMAT_OWNER;
+        header.BiometricDataFormat.Type  = WINBIO_ANSI_381_FORMAT_TYPE;
+    }
 
     std::memcpy(out.data(), &bir, sizeof(bir));
     std::memcpy(out.data() + headerOffset, &header, sizeof(header));
-    std::memcpy(out.data() + standardOffset, standard.data(), standard.size());
+    if (!standard.empty()) {
+        std::memcpy(out.data() + standardOffset, standard.data(), standard.size());
+    }
     if (!payload.empty()) {
         std::memcpy(out.data() + vendorOffset, payload.data(), payload.size());
     }
