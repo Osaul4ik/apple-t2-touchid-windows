@@ -315,19 +315,15 @@ resume з сну (S3/modern standby) — процес служби просто 
 
 Знахідки з апаратного логу (`CAPTURE_DATA` → MATCH → WBF знову шле
 `CAPTURE_DATA`, `AcceptSampleData` у движку не викликається) і з документації
-WDK. Це причина, чому «Add fingerprint» у Settings нічого не робило: SEP
-матчив, але семпл не доходив до engine adapter.
+WDK. Після виправлення п.2 семпл дійшов до engine adapter
+(`AcceptSampleData` → `IdentifyFeatureSet` → `UNKNOWN_ID` → `CreateEnrollment`).
 
-1. **`GET_SENSOR_STATUS` після capture має повернути `WINBIO_SENSOR_ACCEPT`
-   один раз.** WDK: ACCEPT — «сенсор щойно успішно завершив capture; тільки
-   одразу після capture; далі повертається в READY». Sensor adapter WBF
-   питає статус сенсора одразу після завершення `CAPTURE_DATA`; побачивши
-   READY, вважає, що семпла немає, робить `ClearContext` і запускає capture
-   заново (це і є цикл у логу). `SensorStatus=ACCEPT` лише всередині
-   `WINBIO_CAPTURE_DATA` недостатньо (перевірено логом: `sensorStatus=1` у
-   payload, а `GET_SENSOR_STATUS` = READY → цикл). Реалізація: успішна
-   доставка семпла зводить one-shot прапор (TTL 5 с), перший наступний
-   `GET_SENSOR_STATUS` віддає ACCEPT і скидає його; `RESET` теж скидає.
+1. **Сам семпл має нести `SensorStatus=ACCEPT`** (у `WINBIO_CAPTURE_DATA`), а
+   `GET_SENSOR_STATUS` завжди відповідає READY. Гіпотеза «ACCEPT one-shot у
+   `GET_SENSOR_STATUS`» перевірена на залізі і **відхилена**: `AcceptSampleData`
+   виклик іде відразу після завершення capture, без опитування статусу, а
+   one-shot «просочився» в опитування перед наступним capture (enrollment) і
+   WBF більше не слав `CAPTURE_DATA`.
 2. **Size-probe у `CAPTURE_DATA` (вихідний буфер = DWORD) має відповідати
    негайно, без capture.** WDK: «If the driver receives a DWORD-sized output
    buffer, the driver must immediately return the buffer size necessary».
@@ -343,12 +339,11 @@ T2TouchIdBio:   IOCTL CAPTURE_DATA in=32 out=4
 T2TouchIdBio:   CAPTURE_DATA size probe: have=4 need=444 -> answering immediately, no capture
 T2TouchIdBio:   IOCTL CAPTURE_DATA in=32 out=444        <- ця чекає на дотик
 T2TouchIdBio:   CAPTURE_DATA(verify): ... outcome=0 -> hresult=0x00000000
-T2TouchIdBio:   GET_SENSOR_STATUS ok sensorStatus=1 (ACCEPT: one-shot ...)
 T2TouchIdEngine: -> AcceptSampleData                    <- раніше не з'являвся
 T2TouchIdEngine: -> IdentifyFeatureSet                  <- UNKNOWN_ID, поки нічого не enrolled: норма
 ```
 
-Якщо після `sensorStatus=1 (ACCEPT…)` `AcceptSampleData` усе ще немає — наступний
+Якщо `AcceptSampleData` усе ще немає — наступний
 підозрюваний сам BIR (`HKLM\SOFTWARE\T2TouchIdBio\BirVariant` = 0..3, див.
 `WbdiBir.h`).
 

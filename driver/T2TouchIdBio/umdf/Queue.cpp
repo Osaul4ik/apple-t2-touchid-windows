@@ -95,55 +95,6 @@ Payload* RetrieveProbedPayload(_In_ WDFREQUEST Request, _Out_ bool* fitsFully)
     return out;
 }
 
-// ---------------------------------------------------------------------------
-// WINBIO_SENSOR_ACCEPT after a capture.
-//
-// WDK (WINBIO_CAPTURE_DATA / WINBIO_SENSOR_STATUS): ACCEPT means "the sensor
-// just successfully completed a capture operation ... only returned
-// immediately after a capture operation; the sensor then returns to READY".
-// WBF's sensor adapter learns that a sample was taken by asking the sensor,
-// i.e. by the GET_SENSOR_STATUS it sends right after CAPTURE_DATA completes
-// (an independent WBDI + engine adapter developer reports the same ordering:
-// CAPTURE_DATA, CAPTURE_DATA, GET_SENSOR_STATUS, then AcceptSampleData - and
-// had to make GET_SENSOR_STATUS return ACCEPT exactly once after a capture to
-// get there; Microsoft Q&A 318028). Reporting ACCEPT only inside the
-// CAPTURE_DATA payload is not enough: the hardware trace showed
-// CAPTURE_DATA(ACCEPT, 444 B BIR) -> ClearContext -> GET_SENSOR_STATUS=READY
-// -> CAPTURE_DATA again, with AcceptSampleData never called.
-//
-// So a delivered sample arms a one-shot flag; the next GET_SENSOR_STATUS
-// reports ACCEPT and disarms it (READY afterwards). The flag expires so a
-// sample nobody asked about cannot make an unrelated later poll claim ACCEPT.
-// ---------------------------------------------------------------------------
-constexpr ULONGLONG kAcceptStatusTtlMs = 5000;
-std::mutex g_acceptStatusLock;
-bool       g_acceptStatusArmed = false;
-ULONGLONG  g_acceptStatusArmedAtMs = 0;
-
-void ArmAcceptStatus()
-{
-    std::lock_guard<std::mutex> lock(g_acceptStatusLock);
-    g_acceptStatusArmed = true;
-    g_acceptStatusArmedAtMs = GetTickCount64();
-}
-
-void DisarmAcceptStatus()
-{
-    std::lock_guard<std::mutex> lock(g_acceptStatusLock);
-    g_acceptStatusArmed = false;
-}
-
-// True exactly once per armed sample (and only while it is fresh).
-bool ConsumeAcceptStatus()
-{
-    std::lock_guard<std::mutex> lock(g_acceptStatusLock);
-    if (!g_acceptStatusArmed) {
-        return false;
-    }
-    g_acceptStatusArmed = false;
-    return (GetTickCount64() - g_acceptStatusArmedAtMs) <= kAcceptStatusTtlMs;
-}
-
 void HandleGetAttributes(_In_ WDFREQUEST Request)
 {
     bool fits = false;
@@ -166,15 +117,18 @@ void HandleGetSensorStatus(_In_ WDFREQUEST Request)
     RtlZeroMemory(out, sizeof(*out));
     out->PayloadSize   = sizeof(*out);
     out->WinBioHresult = S_OK;
-    // READY, except for the one poll right after a delivered capture, which
-    // must say ACCEPT (see the ACCEPT block above). Real readiness logic
-    // (design doc 3) later: open GUID_DEVINTERFACE_T2TOUCHID_TRANSPORT,
-    // IOCTL_T2_GET_STATUS, and Global\T2SepReady from T2SepBootstrap.
-    const bool accept = ConsumeAcceptStatus();
-    out->SensorStatus  = accept ? WINBIO_SENSOR_ACCEPT : WINBIO_SENSOR_READY;
+    // Always READY. Do NOT report ACCEPT here: a one-shot ACCEPT armed by a
+    // delivered sample was tried (2026-09-20) and leaked into the poll WBF
+    // makes before the NEXT capture (enrollment), which then never sent it.
+    // The trace showed AcceptSampleData firing straight after the capture
+    // completed, with no status poll in between - the sample's own
+    // SensorStatus=ACCEPT in the CAPTURE_DATA payload is what counts.
+    // Real readiness logic (design doc 3) later:
+    // open GUID_DEVINTERFACE_T2TOUCHID_TRANSPORT, IOCTL_T2_GET_STATUS, and
+    // Global\T2SepReady from T2SepBootstrap.
+    out->SensorStatus  = WINBIO_SENSOR_READY;
     out->VendorDiagnostics.Size = 0;
-    T2BioLog("  GET_SENSOR_STATUS ok sensorStatus=%d (%s)", static_cast<int>(out->SensorStatus),
-             accept ? "ACCEPT: one-shot after a delivered sample" : "READY");
+    T2BioLog("  GET_SENSOR_STATUS ok sensorStatus=%d (READY)", static_cast<int>(out->SensorStatus));
     WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, out->PayloadSize);
 }
 
@@ -343,12 +297,6 @@ void CompleteCaptureData(_In_ WDFREQUEST Request, HRESULT winBioHresult,
     }
     T2BioLog("  CAPTURE_DATA delivered: %llu bytes (winBioHresult=0x%08x)",
              static_cast<unsigned long long>(needed), static_cast<unsigned>(winBioHresult));
-    if (SUCCEEDED(winBioHresult) && sensorStatus == WINBIO_SENSOR_ACCEPT) {
-        // The next GET_SENSOR_STATUS must say ACCEPT (block near the top of this
-        // file) - armed BEFORE the completion so it cannot lose the race with
-        // WBF's follow-up poll.
-        ArmAcceptStatus();
-    }
     WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, static_cast<ULONG_PTR>(needed));
 }
 
@@ -613,8 +561,7 @@ extern "C" VOID T2BioEvtIoDeviceControl(_In_ WDFQUEUE Queue,
 
     case IOCTL_BIOMETRIC_RESET:
         // No sensor state to reset yet.
-        DisarmAcceptStatus();
-        T2BioLog("  RESET -> STATUS_SUCCESS (pending ACCEPT status dropped)");
+        T2BioLog("  RESET -> STATUS_SUCCESS");
         WdfRequestComplete(Request, STATUS_SUCCESS);
         return;
 
