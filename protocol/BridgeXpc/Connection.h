@@ -104,6 +104,24 @@ public:
 
     void Close();
 
+    // Windows.h's WAIT_OBJECT_0 macro expands to (STATUS_WAIT_0 + 0), and
+    // STATUS_WAIT_0 is undeclared in this build (VERIFIED ON A REAL BUILD,
+    // not a guess: T2TouchIdBio.vcxproj compiles this file with
+    // UMDF_USING_NTSTATUS, which routes WDF status codes through
+    // <ntstatus.h>; to avoid that clashing with winnt.h's own small set of
+    // STATUS_* Win32 wait-macro definitions, this build leaves them
+    // undeclared — MSVC error C2065 'STATUS_WAIT_0': undeclared identifier
+    // at the WAIT_OBJECT_0 call site). A signaled WaitForSingleObject
+    // returns 0 by documented contract on every Windows version — that IS
+    // what WAIT_OBJECT_0 names — so comparing to 0 directly is exactly as
+    // correct, just without the macro this build can't use. Centralized
+    // here (rather than at each WaitForSingleObject call site in
+    // Connection.cpp / VerificationEngine.cpp) so the workaround and its
+    // rationale live in one place instead of being duplicated.
+    static bool IsEventSignaled(HANDLE h) {
+        return h != nullptr && WaitForSingleObject(h, 0) == 0;
+    }
+
 private:
     SOCKET socket_ = INVALID_SOCKET;
 

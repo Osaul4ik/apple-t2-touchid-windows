@@ -381,7 +381,7 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
             // very next touch. WaitForSingleObject with a 0 timeout here is
             // just a poll (mirrors the same check inside WaitForEvent) —
             // not a second, independent wait.
-            if (cancelEvent && WaitForSingleObject(cancelEvent, 0) == WAIT_OBJECT_0) {
+            if (cancelEvent && bridgexpc::Connection::IsEventSignaled(cancelEvent)) {
                 outcome = VerifyOutcome::Cancelled;
             }
             break;

@@ -5,7 +5,6 @@
 #include <ws2tcpip.h>
 #include <rpc.h>
 #include <cctype>
-#include <algorithm>  // std::min, kCancelPollSlice clamp (design doc §9.4)
 #pragma comment(lib, "Ws2_32.lib")
 #pragma comment(lib, "Rpcrt4.lib")
 
@@ -558,7 +557,7 @@ bool Connection::WaitForEvent(std::vector<uint8_t>* outEventPayload,
         // socket's previous recv() was already unblocked by a real SEP
         // event (i.e. we're back here deciding whether to read again) is
         // seen without waiting for one more slice.
-        if (cancelEvent && WaitForSingleObject(cancelEvent, 0) == WAIT_OBJECT_0) {
+        if (cancelEvent && Connection::IsEventSignaled(cancelEvent)) {
             T2_LOG("waitForEvent", L"cancelEvent signaled, giving up (design doc §9.4)");
             return false;
         }
@@ -590,7 +589,20 @@ bool Connection::WaitForEvent(std::vector<uint8_t>* outEventPayload,
         // to poll for; without one this is byte-identical to the previous
         // behavior (CLI `verify`, which never passes cancelEvent, still
         // waits the real `remaining` in one ReadFrame call).
-        const auto readTimeout = cancelEvent ? std::min(remaining, kCancelPollSlice) : remaining;
+        //
+        // Deliberately NOT std::min(remaining, kCancelPollSlice): this file
+        // is compiled without NOMINMAX (VERIFIED ON A REAL BUILD — MSVC
+        // error C2589/C2059/C2737/C3536 right at that call, all symptoms of
+        // <windows.h>'s own `min` function-like macro rewriting
+        // `std::min(` into `std::(...)`-garbage before the compiler ever
+        // sees the real std::min). A plain comparison sidesteps the macro
+        // entirely instead of adding #define NOMINMAX here, which would
+        // change every other TU that includes this header/TU pair across
+        // both the CLI and driver builds — a bigger blast radius than this
+        // fix needs.
+        const auto readTimeout = (cancelEvent && kCancelPollSlice < remaining)
+                                      ? kCancelPollSlice
+                                      : remaining;
 
         RawFrame frame;
         if (!ReadFrame(&frame, readTimeout)) {
