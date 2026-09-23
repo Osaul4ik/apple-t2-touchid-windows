@@ -14,11 +14,12 @@ name: CI Apple T2 TouchId (CodeQL + PREfast + Build + Package)
 #   NCM/            T2Ncm.sys, T2NcmCtrl.sys, 3x .inf, 3x .cat, checks/
 #   Bio/            T2TouchIdBio.dll, .inf, .cat, T2TouchIdEngineAdapter.dll
 #                   + libplist runtime dll, checks/
-#   SepVaultGui/    SepVaultGui.exe (self-contained single-file "Full"
-#                   publish - без окремої залежності від .NET runtime;
-#                   framework-dependent "Min" публікується ОКРЕМИМ
-#                   workflow-артефактом SepVaultGui-Min, у фінальний zip не
-#                   входить - у SEP/NCM/Bio/SepVaultGui нема сертифіката)
+#   SepVaultGui/    SepVaultGui.exe (framework-dependent "Min" publish -
+#                   потребує встановленого .NET 8 runtime на цільовій машині,
+#                   зате набагато менший розмір); self-contained single-file
+#                   "Full" публікується ОКРЕМИМ workflow-артефактом
+#                   SepVaultGui-Full, у фінальний zip не входить
+#                   (у SEP/NCM/Bio/SepVaultGui нема сертифіката)
 #   Inst/<CertCN>.cer  ОДИН сертифікат на весь пакет (реальне ім'я з нього
 #                   самого - Subject CN через GetNameInfo, не назва драйвера)
 #   InstallCert.bat файл-агностичний - шукає будь-який .cer у своїй папці (Inst/)
@@ -570,7 +571,8 @@ jobs:
       shell: pwsh
 
     # =====================================================================
-    # SepVaultGui - only "Full" (self-contained, single-file) 
+    # SepVaultGui - "Min" (framework-dependent) goes into the main package;
+    # "Full" (self-contained, single-file) is uploaded as a separate artifact
     # =====================================================================
     - name: "SepVaultGui: restore + build"
       run: |
@@ -600,11 +602,11 @@ jobs:
         Write-Host "OK: published $exePath"
       shell: pwsh
 
-    - name: Upload SepVaultGui Min (standalone, framework-dependent)
+    - name: Upload SepVaultGui Full (standalone, self-contained)
       uses: actions/upload-artifact@v4
       with:
-        name: SepVaultGui-Min-${{ env.DRIVER_VERSION }}
-        path: artifacts/SepVaultGui-min
+        name: SepVaultGui-Full-${{ env.DRIVER_VERSION }}
+        path: artifacts/SepVaultGui-full
         if-no-files-found: error
 
     # =====================================================================
@@ -805,13 +807,13 @@ jobs:
         Write-Host "OK: Bio CAT generated."
       shell: pwsh
 
-    - name: "SepVaultGui: stage Full build into final package"
+    - name: "SepVaultGui: stage Min build into final package"
       run: |
         $ErrorActionPreference = "Stop"
         $pkg = "final\SepVaultGui"
         New-Item -ItemType Directory -Path $pkg -Force | Out-Null
-        Copy-Item -Path "artifacts\SepVaultGui-full\*" -Destination $pkg -Recurse -Force
-        Write-Host "OK: staged SepVaultGui (Full, self-contained) into $pkg"
+        Copy-Item -Path "artifacts\SepVaultGui-min\*" -Destination $pkg -Recurse -Force
+        Write-Host "OK: staged SepVaultGui (Min, framework-dependent) into $pkg"
       shell: pwsh
 
     # =====================================================================
