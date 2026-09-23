@@ -21,6 +21,16 @@ env:
   PLATFORM: x64
   SIGN_CERT_PFX: ${{ secrets.CERT }}
   SIGN_CERT_PASSWORD: ${{ secrets.CERT_PWD }}
+  # T2SepBootstrap (Win32 service) and T2SepCoInstaller (its PnP co-installer
+  # DLL, see [T2TouchIdTransport_Device.NT.CoInstallers] in the INF) are both
+  # v143 projects already in T2TouchId.sln, so "Build full solution" below
+  # produces them for free - only SepVaultGui (a standalone .NET/WPF project,
+  # not in the .sln) needs its own dotnet steps.
+  BOOTSTRAP_PROJECT: T2SepBootstrap
+  COINSTALLER_NAME: T2SepCoInstaller
+  GUI_PROJECT: driver/T2TouchIdBio/Sepvaultgui.csproj
+  GUI_ASSEMBLY_NAME: SepVaultGui
+  DOTNET_VERSION: '8.0.x'
 
 # ===========================================================================
 # Той самий принцип, що й у CI (CodeQL + StaticAnalysis + Build) для
@@ -339,6 +349,58 @@ jobs:
       shell: pwsh
 
     # =====================================================================
+    # SepVaultGui (Sepvaultgui.csproj): a .NET 8 WPF project, standalone -
+    # not part of T2TouchId.sln, built with the .NET SDK directly. Moved
+    # here (was Cit2touchidbio.yml's `ci` job) so the one file the INF's
+    # [T2SepBootstrap_CopyFiles] actually expects - SepVaultGui.exe - is
+    # produced by the same job that packages the driver, instead of a
+    # separate path-filtered workflow whose artifact nobody wires in.
+    #
+    # Self-contained + PublishSingleFile only (the old "min" framework-
+    # dependent flavor is dropped here): the INF lists a single
+    # SepVaultGui.exe in [SourceDisksFiles] with no companion DLLs, which
+    # only the single-file build satisfies - "min" would need the .NET 8
+    # Desktop Runtime preinstalled on the target AND its own DLLs added to
+    # the INF, neither of which this package does. If the framework-
+    # dependent build is still wanted for local testing, that's a
+    # deliberate follow-up, not implied by this move.
+    # =====================================================================
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+
+    - name: Restore SepVaultGui
+      run: dotnet restore "$env:GUI_PROJECT"
+      shell: pwsh
+
+    - name: Build SepVaultGui
+      run: |
+        dotnet build "$env:GUI_PROJECT" `
+          --no-restore `
+          -c $env:CONFIGURATION
+      shell: pwsh
+
+    - name: Publish SepVaultGui (self-contained, single-file win-x64)
+      run: |
+        $ErrorActionPreference = "Stop"
+        dotnet publish "$env:GUI_PROJECT" `
+          -c $env:CONFIGURATION `
+          -r win-x64 `
+          --self-contained true `
+          -p:PublishSingleFile=true `
+          -o artifacts\SepVaultGui-full
+
+        $exePath = "artifacts\SepVaultGui-full\$env:GUI_ASSEMBLY_NAME.exe"
+        if (-not (Test-Path $exePath)) {
+          Write-Error "Expected published binary not found: $exePath"
+          exit 1
+        }
+        $sizeMb = [Math]::Round((Get-Item $exePath).Length / 1MB, 1)
+        Write-Host "OK: published $exePath ($sizeMb MB, self-contained runtime bundled in)"
+      shell: pwsh
+
+    # =====================================================================
     # Driver packaging: same StampInf / Inf2Cat / signtool sequence as the
     # reference project's CI, applied to the .sys already produced above.
     # =====================================================================
@@ -368,6 +430,41 @@ jobs:
         if (Test-Path $pdbPath) {
           Copy-Item -Path $pdbPath -Destination $packageDir -Force
         }
+
+        # T2SepCoInstaller.dll: referenced by [T2TouchIdTransport_Device.NT.
+        # CoInstallers] / [SourceDisksFiles] in the INF - Inf2Cat below needs
+        # it physically present in $packageDir to catalog it, same as the
+        # .sys. Built by the "Build full solution" step above (it's in
+        # T2TouchId.sln), so it's already on disk by this point.
+        $coinstallerPath = "build\$env:COINSTALLER_NAME\$env:PLATFORM\$env:CONFIGURATION\$env:COINSTALLER_NAME.dll"
+        if (-not (Test-Path $coinstallerPath)) {
+          Write-Error "Built co-installer not found: $coinstallerPath"
+          exit 1
+        }
+        Copy-Item -Path $coinstallerPath -Destination $packageDir -Force
+
+        # T2SepBootstrap.exe: also referenced by [SourceDisksFiles] /
+        # [T2SepBootstrap_CopyFiles], also already built by "Build full
+        # solution" above.
+        $bootstrapPath = "build\$env:BOOTSTRAP_PROJECT\$env:PLATFORM\$env:CONFIGURATION\$env:BOOTSTRAP_PROJECT.exe"
+        if (-not (Test-Path $bootstrapPath)) {
+          Write-Error "Built bootstrap exe not found: $bootstrapPath"
+          exit 1
+        }
+        Copy-Item -Path $bootstrapPath -Destination $packageDir -Force
+        $bootstrapPdb = "build\$env:BOOTSTRAP_PROJECT\$env:PLATFORM\$env:CONFIGURATION\$env:BOOTSTRAP_PROJECT.pdb"
+        if (Test-Path $bootstrapPdb) {
+          Copy-Item -Path $bootstrapPdb -Destination $packageDir -Force
+        }
+
+        # SepVaultGui.exe: same [SourceDisksFiles] entry, published above as
+        # a single self-contained file - nothing else to copy alongside it.
+        $guiPath = "artifacts\SepVaultGui-full\$env:GUI_ASSEMBLY_NAME.exe"
+        if (-not (Test-Path $guiPath)) {
+          Write-Error "Published SepVaultGui not found: $guiPath"
+          exit 1
+        }
+        Copy-Item -Path $guiPath -Destination $packageDir -Force
 
         Write-Host "OK: staged driver files:"
         Get-ChildItem $packageDir | ForEach-Object { Write-Host "  - $($_.Name)" }

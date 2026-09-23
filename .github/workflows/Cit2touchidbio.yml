@@ -1,33 +1,16 @@
-name: CI T2TouchIdBio (SepVaultGui + T2SepBootstrap + UMDF/PREfast)
+name: CI T2TouchIdBio (UMDF/PREfast)
 
-# T2TouchIdBio (driver/T2TouchIdBio) has two independent pieces:
-#
-#   - SepVaultGui (Sepvaultgui.csproj): a .NET 8 WPF project, standalone -
-#     not part of T2TouchId.sln, built with the .NET SDK directly.
-#
-#   - T2SepBootstrapService.cpp, now built through T2SepBootstrap.vcxproj
-#     (added to T2TouchId.sln alongside T2TouchIdProtocol/t2touchid/
-#     T2TouchIdTests). It links against T2TouchIdProtocol.lib via
-#     ProjectReference - same pattern as tools/t2touchid/t2touchid.vcxproj,
-#     which is why it needs the same vcpkg/libplist bootstrap those
-#     workflows already do.
-#
-# Only T2SepBootstrap (+ its protocol dependency) is targeted here, not the
-# whole T2TouchId.sln - that keeps this workflow WDK-free, since
-# T2TouchIdTransport (the KMDF driver, also in the .sln) is built and
-# packaged separately by Cit2touchid.yml / BuildT2TouchId.yml and needs the
-# WDK installed to do it. T2SepBootstrap and T2TouchIdProtocol are both
-# plain user-mode v143 projects and don't.
-#
-# Same conventions as those workflows otherwise: windows-2022, own
-# concurrency group, path-scoped triggers so this doesn't run on changes
-# unrelated to T2TouchIdBio.
-#
-# A second job, `umdf`, builds driver/T2TouchIdBio/Umdf (the WBDI UMDF 2
-# skeleton) with PREfast and packages it (StampInf/Inf2Cat/optional signing).
-# It installs the WDK on its own runner, so the first job (`ci`) stays
-# WDK-free, and a failure in the still-unbuilt UMDF skeleton cannot block the
-# SepVaultGui / T2SepBootstrap artifacts.
+# T2TouchIdBio (driver/T2TouchIdBio) used to also build+package SepVaultGui
+# (Sepvaultgui.csproj) and T2SepBootstrap (T2SepBootstrap.vcxproj, in
+# T2TouchId.sln) in a `ci` job here. That job has moved into Cit2touchid.yml,
+# so those two ship staged in the same artifacts\driver folder as
+# T2TouchIdTransport.sys (and T2SepCoInstaller.dll, its PnP co-installer),
+# instead of as separate SepVaultGui-*/T2SepBootstrap artifacts nobody wires
+# together. This workflow now only builds driver/T2TouchIdBio/Umdf (the WBDI
+# UMDF 2 skeleton) with PREfast and packages it (StampInf/Inf2Cat/optional
+# signing) - unrelated to the SEP transport driver, still WIP, and kept on
+# its own WDK-installing runner so a red PREfast result here can't block the
+# T2TouchIdTransport package.
 
 on:
   push:
@@ -58,280 +41,19 @@ permissions:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   SOLUTION: T2TouchId.sln
-  BOOTSTRAP_PROJECT: T2SepBootstrap
-  BOOTSTRAP_DIR: driver/T2TouchIdBio
-  GUI_PROJECT: driver/T2TouchIdBio/Sepvaultgui.csproj
-  GUI_ASSEMBLY_NAME: SepVaultGui
-  DOTNET_VERSION: '8.0.x'
   CONFIGURATION: Release
   PLATFORM: x64
 
 jobs:
-  ci:
-    name: Build SepVaultGui + T2SepBootstrap
-    runs-on: windows-2022
-    timeout-minutes: 45
-
-    steps:
-    - uses: actions/checkout@v4
-
-    # =========================================================================
-    # ORDER MATTERS: the native build runs BEFORE any dotnet command.
-    # Sepvaultgui.csproj and T2sepbootstrap.vcxproj share driver/T2TouchIdBio/;
-    # `dotnet restore/build` write obj\project.assets.json (net8.0-windows)
-    # there, and the vcxproj's legacy Microsoft.NuGet.targets then failed in
-    # ResolveNuGetPackageAssets ("Sequence contains no elements"). Building the
-    # vcxproj first means it never sees that file. (Directory.Build.props in
-    # that folder separates the two obj\ dirs as well; ResolveNuGetPackages=false
-    # on the msbuild line below is a third guard.)
-    # =========================================================================
-    # =========================================================================
-    # T2SepBootstrap.vcxproj links T2TouchIdProtocol.lib, which compiles
-    # BridgeXpc/PlistPayload.cpp - so it needs the same vcpkg libplist
-    # bootstrap as tools/t2touchid, even though T2SepBootstrapService.cpp
-    # itself never touches plist directly.
-    # =========================================================================
-    - name: Add MSBuild to PATH
-      uses: microsoft/setup-msbuild@v2
-
-    - name: Bootstrap vcpkg
-      run: |
-        $ErrorActionPreference = "Stop"
-        git clone --depth 1 https://github.com/microsoft/vcpkg.git vcpkg
-        .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
-      shell: pwsh
-
-    - name: Install libplist (vcpkg)
-      run: |
-        $ErrorActionPreference = "Stop"
-        .\vcpkg\vcpkg.exe install libplist:x64-windows
-      shell: pwsh
-
-    - name: Locate libplist library file
-      run: |
-        $ErrorActionPreference = "Stop"
-        $libDir = "vcpkg\installed\x64-windows\lib"
-        $lib = Get-ChildItem -Path $libDir -Filter "*.lib" |
-          Where-Object { $_.Name -match "plist" -and $_.Name -notmatch "\+\+" } |
-          Select-Object -First 1
-
-        if (-not $lib) {
-          Write-Error "No plist .lib found under $libDir after vcpkg install."
-          exit 1
-        }
-
-        Write-Host "OK: found $($lib.Name)"
-        Add-Content -Path $env:GITHUB_ENV -Value "PLIST_LIB_NAME=$($lib.Name)"
-        Add-Content -Path $env:GITHUB_ENV -Value "VCPKG_INSTALLED_DIR=$PWD\vcpkg\installed\x64-windows"
-      shell: pwsh
-
-    # =========================================================================
-    # Target only T2SepBootstrap within the solution, not the whole .sln:
-    # MSBuild then builds it plus its explicit ProjectReference
-    # (T2TouchIdProtocol), but never touches T2TouchIdTransport (the KMDF
-    # driver also in this .sln) - so no WDK install needed here. No
-    # WindowsTargetPlatformVersion pin either, unlike the driver workflows:
-    # that pin exists there to match exactly what those workflows'  WDK
-    # installer shipped, which doesn't apply to these plain v143 user-mode
-    # projects.
-    # =========================================================================
-    - name: Build T2SepBootstrap (+ T2TouchIdProtocol dependency)
-      run: |
-        msbuild $env:SOLUTION `
-          /t:$env:BOOTSTRAP_PROJECT `
-          /p:Configuration=$env:CONFIGURATION `
-          /p:Platform=$env:PLATFORM `
-          /p:VcpkgInstalledDir=$env:VCPKG_INSTALLED_DIR `
-          /p:PlistLibName=$env:PLIST_LIB_NAME `
-          /p:ResolveNuGetPackages=false `
-          /nologo /verbosity:minimal /clp:Summary
-      shell: pwsh
-
-    # Only on failure: list NuGet-ish files next to the vcxproj and re-run the
-    # same build at diagnostic verbosity, so the trigger of the legacy
-    # Microsoft.NuGet.targets error (which lock/assets file it reads and why)
-    # is in the artifact instead of being guessed.
-    - name: Diagnose T2SepBootstrap build failure (NuGet)
-      if: failure()
-      run: |
-        Write-Host "::group::Files under driver/T2TouchIdBio that NuGet could pick up"
-        Get-ChildItem -Path "driver/T2TouchIdBio" -Recurse -Force -File -ErrorAction SilentlyContinue |
-          Where-Object { $_.Name -match 'project(\.assets|\.lock)?\.json|nuget' -or $_.FullName -match '\\obj\\' } |
-          ForEach-Object { $_.FullName }
-        Write-Host "::endgroup::"
-
-        New-Item -ItemType Directory -Path "bootstrap-diag" -Force | Out-Null
-        $diagLog = Join-Path $PWD "bootstrap-diag\bootstrap-diag.log"
-        msbuild $env:SOLUTION `
-          /t:$env:BOOTSTRAP_PROJECT `
-          /p:Configuration=$env:CONFIGURATION `
-          /p:Platform=$env:PLATFORM `
-          /p:VcpkgInstalledDir=$env:VCPKG_INSTALLED_DIR `
-          /p:PlistLibName=$env:PLIST_LIB_NAME `
-          /nologo /clp:Summary "/flp:logfile=$diagLog;verbosity=diagnostic" | Out-Null
-
-        Write-Host "::group::ProjectLockFile / assets / lock references in the diagnostic log"
-        Select-String -Path $diagLog -Pattern 'ProjectLockFile|project\.assets\.json|project\.lock\.json|ResolveNuGetPackages' |
-          Select-Object -First 40 | ForEach-Object { $_.ToString() }
-        Write-Host "::endgroup::"
-      shell: pwsh
-
-    - name: Upload bootstrap diagnostic log
-      if: failure()
-      uses: actions/upload-artifact@v4
-      with:
-        name: bootstrap-diag-${{ github.sha }}
-        retention-days: 14
-        if-no-files-found: warn
-        path: bootstrap-diag/
-
-    - name: Stage T2SepBootstrap.exe + runtime DLLs
-      run: |
-        $ErrorActionPreference = "Stop"
-        $exePath = "build\$env:BOOTSTRAP_PROJECT\$env:PLATFORM\$env:CONFIGURATION\$env:BOOTSTRAP_PROJECT.exe"
-        if (-not (Test-Path $exePath)) {
-          Write-Error "Built exe not found: $exePath"
-          exit 1
-        }
-
-        $packageDir = "artifacts\T2SepBootstrap"
-        New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
-        Copy-Item -Path $exePath -Destination $packageDir -Force
-
-        $pdbPath = "build\$env:BOOTSTRAP_PROJECT\$env:PLATFORM\$env:CONFIGURATION\$env:BOOTSTRAP_PROJECT.pdb"
-        if (Test-Path $pdbPath) {
-          Copy-Item -Path $pdbPath -Destination $packageDir -Force
-        }
-
-        # Same dynamic-plist dependency as t2touchid.exe/T2TouchIdTests.exe:
-        # plist-2.0.lib is just the import lib for vcpkg's dynamically-built
-        # plist-2.0.dll - the actual DLL and its own dependencies
-        # (libxml2/zlib/liblzma/iconv) live in vcpkg's bin dir, not lib.
-        $vcpkgBinDir = Join-Path $env:VCPKG_INSTALLED_DIR "bin"
-        if (-not (Test-Path $vcpkgBinDir)) {
-          Write-Error "vcpkg bin dir not found: $vcpkgBinDir"
-          exit 1
-        }
-        Copy-Item -Path (Join-Path $vcpkgBinDir "*.dll") -Destination $packageDir -Force
-
-        Write-Host "OK: staged T2SepBootstrap.exe and its runtime DLLs:"
-        Get-ChildItem $packageDir | ForEach-Object { Write-Host "  - $($_.Name)" }
-      shell: pwsh
-
-    # =========================================================================
-    # SepVaultGui: net8.0-windows / UseWPF, plain SDK-style csproj, not in
-    # T2TouchId.sln. Built standalone with the .NET SDK - same reasoning as
-    # the other projects here, use the right tool for what's actually there
-    # instead of forcing everything through one build entry point.
-    # =========================================================================
-    - name: Setup .NET
-      uses: actions/setup-dotnet@v4
-      with:
-        dotnet-version: ${{ env.DOTNET_VERSION }}
-
-    - name: Restore SepVaultGui
-      run: dotnet restore "$env:GUI_PROJECT"
-      shell: pwsh
-
-    - name: Build SepVaultGui
-      run: |
-        dotnet build "$env:GUI_PROJECT" `
-          --no-restore `
-          -c $env:CONFIGURATION
-      shell: pwsh
-
-    # =========================================================================
-    # Two publish flavors, since they trade off differently and there's no
-    # single right answer for every target machine:
-    #
-    #   full - self-contained + PublishSingleFile. Runs on any machine with
-    #          no .NET install at all, at the cost of bundling the entire
-    #          .NET 8 + WPF runtime into the one .exe (tens of MB - that's
-    #          what makes it "big", not bloat in SepVaultGui's own code).
-    #
-    #   min  - framework-dependent (no --self-contained, no
-    #          PublishSingleFile). Just SepVaultGui's own small
-    #          exe+DLLs; needs the .NET 8 Desktop Runtime already installed
-    #          on the target machine to run.
-    #
-    # Both get built whenever the .NET 8 SDK step above succeeded (it's what
-    # "бібліотеки встановлені" means here - the SDK/workload used to publish,
-    # not something conditional on the runner), and both are uploaded as
-    # separate artifacts so whoever grabs the build picks whichever fits the
-    # machine they're installing on.
-    # =========================================================================
-    - name: Publish SepVaultGui (full, self-contained win-x64)
-      run: |
-        $ErrorActionPreference = "Stop"
-        dotnet publish "$env:GUI_PROJECT" `
-          -c $env:CONFIGURATION `
-          -r win-x64 `
-          --self-contained true `
-          -p:PublishSingleFile=true `
-          -o artifacts\SepVaultGui-full
-
-        $exePath = "artifacts\SepVaultGui-full\$env:GUI_ASSEMBLY_NAME.exe"
-        if (-not (Test-Path $exePath)) {
-          Write-Error "Expected published binary not found: $exePath"
-          exit 1
-        }
-        $sizeMb = [Math]::Round((Get-Item $exePath).Length / 1MB, 1)
-        Write-Host "OK: published $exePath ($sizeMb MB, self-contained runtime bundled in)"
-      shell: pwsh
-
-    - name: Publish SepVaultGui (min, framework-dependent)
-      run: |
-        $ErrorActionPreference = "Stop"
-        dotnet publish "$env:GUI_PROJECT" `
-          -c $env:CONFIGURATION `
-          --self-contained false `
-          -o artifacts\SepVaultGui-min
-
-        $exePath = "artifacts\SepVaultGui-min\$env:GUI_ASSEMBLY_NAME.exe"
-        if (-not (Test-Path $exePath)) {
-          Write-Error "Expected published binary not found: $exePath"
-          exit 1
-        }
-        $sizeMb = [Math]::Round((Get-Item $exePath).Length / 1MB, 1)
-        Write-Host "OK: published $exePath ($sizeMb MB, requires .NET 8 Desktop Runtime on target)"
-      shell: pwsh
-
-    - name: Upload SepVaultGui package (full, self-contained)
-      uses: actions/upload-artifact@v4
-      with:
-        name: SepVaultGui-full-${{ github.sha }}
-        path: artifacts/SepVaultGui-full
-        if-no-files-found: error
-
-    - name: Upload SepVaultGui package (min, framework-dependent)
-      uses: actions/upload-artifact@v4
-      with:
-        name: SepVaultGui-min-${{ github.sha }}
-        path: artifacts/SepVaultGui-min
-        if-no-files-found: error
-
-    - name: Upload T2SepBootstrap package
-      uses: actions/upload-artifact@v4
-      with:
-        name: T2SepBootstrap-${{ github.sha }}
-        path: artifacts/T2SepBootstrap
-        if-no-files-found: error
-
   # ===========================================================================
-  # Second, independent job: T2TouchIdBio UMDF 2 skeleton (WBDI) built with
-  # PREfast (/analyze via RunCodeAnalysis + EnableCppCoreCheck), same flags as
-  # the KMDF driver's build in Cit2touchid.yml.
-  #
-  # Why a separate job and not more steps in `ci` above:
-  #   - `ci` is deliberately WDK-free (SepVaultGui + T2SepBootstrap). UMDF needs
-  #     the WDK, so it gets its own runner and installs it there.
-  #   - the UMDF skeleton has not been compiled yet. As its own job a red
-  #     build/PREfast result can't stop SepVaultGui/T2SepBootstrap from being
-  #     built and uploaded by `ci`.
+  # T2TouchIdBio UMDF 2 skeleton (WBDI) built with PREfast (/analyze via
+  # RunCodeAnalysis + EnableCppCoreCheck), same flags as the KMDF driver's
+  # build in Cit2touchid.yml. The only job left in this workflow now that
+  # SepVaultGui/T2SepBootstrap build+package in Cit2touchid.yml instead.
   #
   # Standalone .vcxproj (not in T2TouchId.sln). It now compiles protocol/
-  # (VerificationEngine -> BridgeXpc -> PlistPayload.cpp), so this job needs
-  # the same vcpkg/libplist bootstrap `ci` does.
+  # (VerificationEngine -> BridgeXpc -> PlistPayload.cpp), so this job still
+  # needs its own vcpkg/libplist bootstrap below.
   # ===========================================================================
   umdf:
     name: Build T2TouchIdBio UMDF (PREfast) + Package
