@@ -1,0 +1,939 @@
+name: CI Apple T2 TouchId (CodeQL + PREfast + Build + Package)
+
+# ===========================================================================
+#apple-t2-touchid.zip:
+#   SEP/            T2TouchIdTransport.sys, .inf, .cat, T2SepBootstrap.exe,
+#                   T2SepCoInstaller.dll, t2touchid.exe + vcpkg runtime dll,
+#                   checks/
+#   NCM/            T2Ncm.sys, T2NcmCtrl.sys, 3x .inf, 3x .cat, checks/
+#   Bio/            T2TouchIdBio.dll, .inf, .cat, T2TouchIdEngineAdapter.dll
+#                   + libplist runtime dll, checks/
+#   SepVaultGui/    SepVaultGui.exe (self-contained single-file "Full"
+#                   publish - без окремої залежності від .NET runtime;
+#                   framework-dependent "Min" публікується ОКРЕМИМ
+#                   workflow-артефактом SepVaultGui-Min, у фінальний zip не
+#                   входить - у SEP/NCM/Bio/SepVaultGui нема сертифіката)
+#   <CertCN>.cer    ОДИН сертифікат на весь пакет (реальне ім'я з нього
+#                   самого - Subject CN через GetNameInfo, не назва драйвера)
+#   InstallCert.bat (з tools/, файл-агностичний - шукає будь-який .cer поруч)
+#
+# ===========================================================================
+
+on:
+  push:
+    branches: [ main, Dev_lifecycle, Hello_Prepare ]
+    paths:
+      - 'T2NCM/**'
+      - 'driver/**'
+      - 'protocol/**'
+      - 'tools/**'
+      - 'T2TouchId.sln'
+      - '.github/workflows/CiAppleT2TouchId.yml'
+  pull_request:
+    branches: [ main, Dev_lifecycle ]
+    paths:
+      - 'T2NCM/**'
+      - 'driver/**'
+      - 'protocol/**'
+      - 'tools/**'
+      - 'T2TouchId.sln'
+      - '.github/workflows/CiAppleT2TouchId.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ci-apple-t2-touchid-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  CONFIGURATION: Release
+  PLATFORM: x64
+  SOLUTION: T2TouchId.sln
+  SIGN_CERT_PFX: ${{ secrets.CERT }}
+  SIGN_CERT_PASSWORD: ${{ secrets.CERT_PWD }}
+
+  # --- NCM ---
+  NCM_DRIVER_DIR: T2NCM/driver
+  NCM_DRIVER_PROJECT: T2NCM/driver/T2Ncm.vcxproj
+  NCM_DRIVER_NAME: T2Ncm
+  NCM_CTRL_PROJECT: T2NCM/driver/T2NcmCtrl.vcxproj
+  NCM_CTRL_NAME: T2NcmCtrl
+
+  # --- SEP (T2TouchIdTransport + protocol/tool/tests) ---
+  SEP_DRIVER_DIR: driver/T2TouchIdTransport
+  SEP_DRIVER_PROJECT: driver/T2TouchIdTransport/T2TouchIdTransport.vcxproj
+  SEP_DRIVER_NAME: T2TouchIdTransport
+  SEP_BOOTSTRAP_PROJECT: T2SepBootstrap
+  SEP_COINSTALLER_NAME: T2SepCoInstaller
+
+  # --- Bio (UMDF) ---
+  BIO_UMDF_DIR: driver/T2TouchIdBio/Umdf
+  BIO_UMDF_PROJECT: driver/T2TouchIdBio/Umdf/T2TouchIdBio.vcxproj
+  BIO_UMDF_NAME: T2TouchIdBio
+  BIO_ENGINE_DIR: driver/T2TouchIdBio/EngineAdapter
+  BIO_ENGINE_PROJECT: driver/T2TouchIdBio/EngineAdapter/T2TouchIdEngineAdapter.vcxproj
+  BIO_ENGINE_NAME: T2TouchIdEngineAdapter
+  BIO_UMDF_STAMP_VERSION: 2.15.0
+
+  # --- SepVaultGui ---
+  GUI_PROJECT: driver/T2TouchIdBio/Sepvaultgui.csproj
+  GUI_ASSEMBLY_NAME: SepVaultGui
+  DOTNET_VERSION: '8.0.x'
+
+jobs:
+  ci:
+    name: CodeQL + PREfast + Build + Package (SEP, NCM, Bio, SepVaultGui)
+    runs-on: windows-2022
+    timeout-minutes: 120
+    env:
+      CODEQL_CLI_VERSION: 2.24.1
+      CODEQL_DRIVERS_PACK_VERSION: 1.8.2
+      CODEQL_CPP_QUERIES_PACK_VERSION: 0.0.4
+      CA_TREAT_WARNINGS_AS_ERRORS: true
+    outputs:
+      version: ${{ steps.setver.outputs.version }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Add MSBuild to PATH
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+
+    # =====================================================================
+    - name: Install WDK
+      run: |
+        $ErrorActionPreference = "Stop"
+        $wdkUrl = "https://go.microsoft.com/fwlink/?linkid=2085767"
+        $wdkInstaller = "$env:TEMP\wdksetup.exe"
+        Invoke-WebRequest -Uri $wdkUrl -OutFile $wdkInstaller
+        $proc = Start-Process -FilePath $wdkInstaller -ArgumentList "/quiet /norestart" -Wait -PassThru
+        $exitCode = $proc.ExitCode
+        if ($exitCode -ne 0 -and $exitCode -ne 3010) {
+          Write-Error "WDK installer exited with code $exitCode"
+          exit 1
+        }
+        Write-Host "OK: WDK installer exited with code $exitCode"
+      shell: pwsh
+
+    # =====================================================================
+    - name: Locate WDK tools (StampInf, InfVerif, Inf2Cat, SignTool)
+      run: |
+        $ErrorActionPreference = "Stop"
+        $roots = @(
+          "C:\Program Files (x86)\Windows Kits\10\bin",
+          "C:\Program Files (x86)\Windows Kits\10\Tools",
+          "C:\Program Files\Windows Kits\10\bin"
+        )
+        $needSign = ($env:SIGN_CERT_PFX -ne '' -and $env:SIGN_CERT_PASSWORD -ne '')
+        $tools = [ordered]@{
+          STAMPINF_PATH = @{ File = "StampInf.exe"; Required = $true }
+          INFVERIF_PATH = @{ File = "InfVerif.exe"; Required = $true }
+          INF2CAT_PATH  = @{ File = "Inf2Cat.exe";  Required = $true }
+          SIGNTOOL_PATH = @{ File = "signtool.exe"; Required = $needSign }
+        }
+        foreach ($entry in $tools.GetEnumerator()) {
+          $file = $entry.Value.File
+          $candidates = foreach ($root in $roots) {
+            if (Test-Path $root) {
+              Get-ChildItem -Path $root -Filter $file -Recurse -ErrorAction SilentlyContinue
+            }
+          }
+          $tool = $candidates | Where-Object { $_.FullName -match '\\x64\\' } | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $tool) { $tool = $candidates | Sort-Object FullName -Descending | Select-Object -First 1 }
+          if (-not $tool) {
+            if ($entry.Value.Required) {
+              Write-Error "$file was not found on this runner after the WDK install."
+              exit 1
+            }
+            Write-Host "SKIP: $file not found (not required - signing disabled)."
+            continue
+          }
+          Write-Host "OK: $file -> $($tool.FullName)"
+          Add-Content -Path $env:GITHUB_ENV -Value "$($entry.Key)=$($tool.FullName)"
+        }
+      shell: pwsh
+
+    # =====================================================================
+    - name: Bootstrap vcpkg
+      run: |
+        $ErrorActionPreference = "Stop"
+        git clone --depth 1 https://github.com/microsoft/vcpkg.git vcpkg
+        .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+      shell: pwsh
+
+    - name: Install libplist (vcpkg)
+      run: |
+        $ErrorActionPreference = "Stop"
+        .\vcpkg\vcpkg.exe install libplist:x64-windows
+        if ($LASTEXITCODE -ne 0) { Write-Error "vcpkg install libplist failed ($LASTEXITCODE)"; exit 1 }
+      shell: pwsh
+
+    - name: Locate libplist library file
+      run: |
+        $ErrorActionPreference = "Stop"
+        $libDir = "vcpkg\installed\x64-windows\lib"
+        $lib = Get-ChildItem -Path $libDir -Filter "*.lib" |
+          Where-Object { $_.Name -match "plist" -and $_.Name -notmatch "\+\+" } |
+          Select-Object -First 1
+        if (-not $lib) {
+          Write-Error "No plist .lib found under $libDir after vcpkg install."
+          exit 1
+        }
+        Write-Host "OK: found $($lib.Name)"
+        Add-Content -Path $env:GITHUB_ENV -Value "PLIST_LIB_NAME=$($lib.Name)"
+        Add-Content -Path $env:GITHUB_ENV -Value "VCPKG_INSTALLED_DIR=$PWD\vcpkg\installed\x64-windows"
+      shell: pwsh
+
+    # =====================================================================
+    - name: Download CodeQL CLI
+      run: |
+        $ErrorActionPreference = "Stop"
+        $url = "https://github.com/github/codeql-cli-binaries/releases/download/v$env:CODEQL_CLI_VERSION/codeql-win64.zip"
+        Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\codeql.zip"
+        Expand-Archive -Path "$env:TEMP\codeql.zip" -DestinationPath "$env:TEMP\codeql-home" -Force
+        $codeqlExe = Get-ChildItem -Path "$env:TEMP\codeql-home" -Filter "codeql.exe" -Recurse | Select-Object -First 1
+        if (-not $codeqlExe) {
+          Write-Error "codeql.exe not found after extraction."
+          exit 1
+        }
+        Add-Content -Path $env:GITHUB_ENV -Value "CODEQL_DIR=$($codeqlExe.DirectoryName)"
+      shell: pwsh
+
+    - name: Verify CodeQL install
+      run: |
+        & "$env:CODEQL_DIR\codeql.exe" --version
+      shell: pwsh
+
+    - name: Download windows-drivers query pack
+      run: |
+        & "$env:CODEQL_DIR\codeql.exe" pack download "microsoft/windows-drivers@$env:CODEQL_DRIVERS_PACK_VERSION"
+      shell: pwsh
+
+    - name: Download cpp-queries dependency pack
+      run: |
+        & "$env:CODEQL_DIR\codeql.exe" pack download "microsoft/cpp-queries@$env:CODEQL_CPP_QUERIES_PACK_VERSION"
+      shell: pwsh
+
+    # =====================================================================
+    - name: Compute driver version and date
+      id: setver
+      run: |
+        $ErrorActionPreference = "Stop"
+        $now = Get-Date
+        $driverDate    = $now.ToString("MM/dd/yyyy")
+        $driverVersion = "1.$($now.Year).$($now.ToString('MMdd')).$($now.ToString('HHmm'))"
+        Write-Host "==> Driver date (DriverVer date): $driverDate"
+        Write-Host "==> Driver version (DriverVer ver): $driverVersion"
+        Add-Content -Path $env:GITHUB_ENV -Value "DRIVER_DATE=$driverDate"
+        Add-Content -Path $env:GITHUB_ENV -Value "DRIVER_VERSION=$driverVersion"
+        Add-Content -Path $env:GITHUB_OUTPUT -Value "version=$driverVersion"
+      shell: pwsh
+
+    # =====================================================================
+    # NCM: Check 1
+    # =====================================================================
+
+    - name: "NCM: check INF <-> project consistency"
+      run: |
+        $ErrorActionPreference = "Stop"
+        $problems = New-Object System.Collections.Generic.List[string]
+
+        function Read-InfText([string]$path) {
+          if (-not (Test-Path $path)) { $script:problems.Add("Missing file: $path"); return "" }
+          $lines = Get-Content -Path $path | Where-Object { $_ -notmatch '^\s*;' } | ForEach-Object { $_ -replace '\s;.*$', '' }
+          return ($lines -join "`n")
+        }
+        function Read-Text([string]$path) {
+          if (-not (Test-Path $path)) { $script:problems.Add("Missing file: $path"); return "" }
+          return (Get-Content -Path $path -Raw)
+        }
+
+        $targets = @(
+          @{ Name = $env:NCM_DRIVER_NAME; Proj = $env:NCM_DRIVER_PROJECT; Inf = "T2NCM/apple-t2-ncm.inf";           Cat = "apple-t2-ncm.cat";           Wdf = $true },
+          @{ Name = $env:NCM_CTRL_NAME;   Proj = $env:NCM_CTRL_PROJECT;   Inf = "T2NCM/apple-t2-ncm-ctrl-stub.inf"; Cat = "apple-t2-ncm-ctrl-stub.cat"; Wdf = $true }
+        )
+
+        $hwids = @{}
+        foreach ($t in $targets) {
+          $name = $t.Name
+          $sys  = "$name.sys"
+          $proj = Read-Text $t.Proj
+          $inf  = Read-InfText $t.Inf
+          Write-Host "==> Checking $name ($($t.Proj) <-> $($t.Inf))"
+
+          $tn = [regex]::Match($proj, '<TargetName>\s*([^<\s]+)\s*</TargetName>').Groups[1].Value
+          if ($tn -ne $name) { $problems.Add("${name}: TargetName in vcxproj is '$tn', expected '$name'") }
+
+          $projDir = Split-Path -Parent $t.Proj
+          foreach ($m in [regex]::Matches($proj, '<ClCompile\s+Include="([^"]+)"')) {
+            $src = Join-Path $projDir $m.Groups[1].Value
+            if (-not (Test-Path $src)) { $problems.Add("${name}: source listed in vcxproj not found: $src") }
+          }
+
+          $sb = [regex]::Match($inf, '(?im)^\s*ServiceBinary\s*=\s*%12%\\(\S+)').Groups[1].Value
+          if ($sb -ne $sys) { $problems.Add("${name}: ServiceBinary in INF is '$sb', expected '$sys'") }
+
+          $sdf = [regex]::Match($inf, '(?ims)^\s*\[SourceDisksFiles[^\]]*\](.*?)(?=^\s*\[|\z)').Groups[1].Value
+          if ($sdf -notmatch ('(?im)^\s*' + [regex]::Escape($sys) + '\s*=')) {
+            $problems.Add("${name}: $sys is not listed in [SourceDisksFiles] of $($t.Inf)")
+          }
+
+          if ($t.Wdf) {
+            $maj = [regex]::Match($proj, '<KMDF_VERSION_MAJOR>\s*(\d+)\s*</KMDF_VERSION_MAJOR>').Groups[1].Value
+            $min = [regex]::Match($proj, '<KMDF_VERSION_MINOR>\s*(\d+)\s*</KMDF_VERSION_MINOR>').Groups[1].Value
+            $infKmdf = [regex]::Match($inf, '(?im)^\s*KmdfLibraryVersion\s*=\s*([\d.]+)').Groups[1].Value
+            if ("$maj.$min" -ne $infKmdf) {
+              $problems.Add("${name}: KMDF version mismatch - vcxproj $maj.$min vs INF KmdfLibraryVersion '$infKmdf'")
+            }
+          }
+
+          $cat = [regex]::Match($inf, '(?im)^\s*CatalogFile\s*=\s*(\S+)').Groups[1].Value
+          if ($cat -ne $t.Cat) { $problems.Add("${name}: CatalogFile is '$cat', expected '$($t.Cat)'") }
+
+          $hwids[$name] = @([regex]::Matches($inf, '(?i)USB\\VID_[0-9A-F]{4}&PID_[0-9A-F]{4}[0-9A-Z&_]*') | ForEach-Object { $_.Value.ToUpper() } | Sort-Object -Unique)
+          if ($hwids[$name].Count -eq 0) { $problems.Add("${name}: no USB\VID_xxxx&PID_xxxx hardware ID found in INF") }
+        }
+
+        foreach ($h in $hwids[$env:NCM_DRIVER_NAME]) { if ($h -notmatch '&MI_01') { $problems.Add("NCM INF HWID is not an &MI_01 child: $h") } }
+        foreach ($h in $hwids[$env:NCM_CTRL_NAME])   { if ($h -notmatch '&MI_00') { $problems.Add("CtrlStub INF HWID is not an &MI_00 child: $h") } }
+        $overlap = @($hwids[$env:NCM_DRIVER_NAME] | Where-Object { $hwids[$env:NCM_CTRL_NAME] -contains $_ })
+        if ($overlap.Count -gt 0) { $problems.Add("NCM and CtrlStub INFs bind the same HWID(s): $($overlap -join ', ')") }
+
+        $comp = Read-InfText "T2NCM/apple-t2-composite.inf"
+        $compCat = [regex]::Match($comp, '(?im)^\s*CatalogFile\s*=\s*(\S+)').Groups[1].Value
+        if ($compCat -ne "apple-t2-composite.cat") { $problems.Add("Composite: CatalogFile is '$compCat', expected 'apple-t2-composite.cat'") }
+
+        if ($problems.Count -gt 0) {
+          foreach ($p in $problems) { Write-Host "::error::$p" }
+          Write-Error "$($problems.Count) consistency problem(s) found."
+          exit 1
+        }
+        Write-Host "OK: INF <-> project consistency checks passed."
+      shell: pwsh
+
+    # =====================================================================
+    # NCM: Check 2
+    # =====================================================================
+    - name: "NCM: write traced build script"
+      run: |
+        $ErrorActionPreference = "Stop"
+        $script = Join-Path $env:RUNNER_TEMP "build-ncm.ps1"
+        $lines = @(
+          '$ErrorActionPreference = "Stop"',
+          '$failed = 0',
+          'foreach ($proj in @($env:NCM_DRIVER_PROJECT, $env:NCM_CTRL_PROJECT)) {',
+          '  $name = [IO.Path]::GetFileNameWithoutExtension($proj)',
+          '  $log  = Join-Path $env:GITHUB_WORKSPACE ("static-analysis-logs\build-ncm-" + $name + ".log")',
+          ('  msbuild $proj /t:rebuild /p:Configuration=$env:CONFIGURATION /p:Platform=$env:PLATFORM ' +
+            '/p:WindowsTargetPlatformVersion=10.0.26100.0 /p:RunCodeAnalysis=true /p:EnableCppCoreCheck=true ' +
+            '/p:CodeAnalysisTreatWarningsAsErrors=$env:CA_TREAT_WARNINGS_AS_ERRORS ' +
+            '/nologo /verbosity:normal /clp:Summary "/flp:logfile=$log;verbosity=normal"'),
+          '  if ($LASTEXITCODE -ne 0) { $failed = $LASTEXITCODE }',
+          '}',
+          'exit $failed'
+        )
+        Set-Content -Path $script -Value $lines -Encoding utf8
+        New-Item -ItemType Directory -Path (Join-Path $env:GITHUB_WORKSPACE "static-analysis-logs") -Force | Out-Null
+        Add-Content -Path $env:GITHUB_ENV -Value "NCM_TRACED_BUILD_SCRIPT=$script"
+      shell: pwsh
+
+    - name: "NCM: build CodeQL database"
+      run: |
+        $ErrorActionPreference = "Stop"
+        $dbPath = Join-Path $env:RUNNER_TEMP "codeql-db-ncm"
+        & "$env:CODEQL_DIR\codeql.exe" database create $dbPath `
+          --language=cpp --source-root=. `
+          --command="pwsh -NoProfile -NonInteractive -File $env:NCM_TRACED_BUILD_SCRIPT"
+        if ($LASTEXITCODE -ne 0) { Write-Error "NCM codeql database create failed (exit $LASTEXITCODE)."; exit 1 }
+        Add-Content -Path $env:GITHUB_ENV -Value "NCM_CODEQL_DB=$dbPath"
+      shell: pwsh
+
+    - name: "NCM: analyze mustrun.qls (informational)"
+      run: |
+        $ErrorActionPreference = "Stop"
+        $outDir = Join-Path $env:GITHUB_WORKSPACE "codeql-results\ncm"
+        New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+        & "$env:CODEQL_DIR\codeql.exe" database analyze "$env:NCM_CODEQL_DB" `
+          "microsoft/windows-drivers:windows-driver-suites/mustrun.qls" `
+          --format=sarifv2.1.0 --output="$outDir\codeql-mustrun.sarif"
+        if ($LASTEXITCODE -ne 0) { Write-Error "NCM mustrun analysis failed (exit $LASTEXITCODE)."; exit 1 }
+        Add-Content -Path $env:GITHUB_ENV -Value "NCM_SARIF_MUSTRUN=$outDir\codeql-mustrun.sarif"
+      shell: pwsh
+
+    - name: "NCM: analyze mustfix.qls (blocking)"
+      run: |
+        $ErrorActionPreference = "Stop"
+        $outDir = Join-Path $env:GITHUB_WORKSPACE "codeql-results\ncm"
+        $sarifPath = "$outDir\codeql-mustfix.sarif"
+        & "$env:CODEQL_DIR\codeql.exe" database analyze "$env:NCM_CODEQL_DB" `
+          "microsoft/windows-drivers:windows-driver-suites/mustfix.qls" `
+          --format=sarifv2.1.0 --output=$sarifPath
+        if ($LASTEXITCODE -ne 0) { Write-Error "NCM mustfix analysis failed (exit $LASTEXITCODE)."; exit 1 }
+        Add-Content -Path $env:GITHUB_ENV -Value "NCM_SARIF_MUSTFIX=$sarifPath"
+
+        $sarif = Get-Content -Path $sarifPath -Raw | ConvertFrom-Json
+        $resultCount = 0
+        foreach ($run in $sarif.runs) {
+          if (-not $run.results) { continue }
+          foreach ($r in $run.results) {
+            $resultCount++
+            $loc  = $r.locations | Select-Object -First 1
+            $uri  = $loc.physicalLocation.artifactLocation.uri
+            $line = $loc.physicalLocation.region.startLine
+            Write-Host "::error file=$uri,line=$line::[NCM][$($r.ruleId)] $($r.message.text)"
+          }
+        }
+        Write-Host "==> NCM mustfix.qls results: $resultCount"
+        if ($resultCount -gt 0) { Write-Error "$resultCount NCM Must-Fix defect(s) found - would FAIL the WHCP Static Tools Logo Test."; exit 1 }
+        Write-Host "OK: 0 NCM Must-Fix defects."
+      shell: pwsh
+
+    # =====================================================================
+    # SEP: CodeQL
+    # =====================================================================
+    - name: "SEP: build CodeQL database (with PREfast /analyze baked in)"
+      run: |
+        $ErrorActionPreference = "Stop"
+        $dbPath  = Join-Path $env:RUNNER_TEMP "codeql-db-sep"
+        $logDir  = Join-Path $env:GITHUB_WORKSPACE "static-analysis-logs"
+        New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+        $buildLog = Join-Path $logDir "build-sep.log"
+
+        $buildCmd = "msbuild /p:Configuration=$env:CONFIGURATION /p:Platform=$env:PLATFORM " +
+                    "/p:WindowsTargetPlatformVersion=10.0.26100.0 " +
+                    "/p:RunCodeAnalysis=true /p:EnableCppCoreCheck=true " +
+                    "/p:CodeAnalysisTreatWarningsAsErrors=$env:CA_TREAT_WARNINGS_AS_ERRORS " +
+                    "/nologo /verbosity:normal /clp:Summary " +
+                    "/flp:logfile=$buildLog;verbosity=normal " +
+                    "$env:SEP_DRIVER_PROJECT /t:rebuild"
+
+        & "$env:CODEQL_DIR\codeql.exe" database create $dbPath `
+          --language=cpp --source-root=. --command=$buildCmd
+        if ($LASTEXITCODE -ne 0) { Write-Error "SEP codeql database create failed (exit $LASTEXITCODE)."; exit 1 }
+        Add-Content -Path $env:GITHUB_ENV -Value "SEP_CODEQL_DB=$dbPath"
+      shell: pwsh
+
+    - name: "SEP: analyze mustrun.qls (informational)"
+      run: |
+        $ErrorActionPreference = "Stop"
+        $outDir = Join-Path $env:GITHUB_WORKSPACE "codeql-results\sep"
+        New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+        & "$env:CODEQL_DIR\codeql.exe" database analyze "$env:SEP_CODEQL_DB" `
+          "microsoft/windows-drivers:windows-driver-suites/mustrun.qls" `
+          --format=sarifv2.1.0 --output="$outDir\codeql-mustrun.sarif"
+        if ($LASTEXITCODE -ne 0) { Write-Error "SEP mustrun analysis failed (exit $LASTEXITCODE)."; exit 1 }
+        Add-Content -Path $env:GITHUB_ENV -Value "SEP_SARIF_MUSTRUN=$outDir\codeql-mustrun.sarif"
+      shell: pwsh
+
+    - name: "SEP: analyze mustfix.qls (blocking)"
+      run: |
+        $ErrorActionPreference = "Stop"
+        $outDir = Join-Path $env:GITHUB_WORKSPACE "codeql-results\sep"
+        $sarifPath = "$outDir\codeql-mustfix.sarif"
+        & "$env:CODEQL_DIR\codeql.exe" database analyze "$env:SEP_CODEQL_DB" `
+          "microsoft/windows-drivers:windows-driver-suites/mustfix.qls" `
+          --format=sarifv2.1.0 --output=$sarifPath
+        if ($LASTEXITCODE -ne 0) { Write-Error "SEP mustfix analysis failed (exit $LASTEXITCODE)."; exit 1 }
+        Add-Content -Path $env:GITHUB_ENV -Value "SEP_SARIF_MUSTFIX=$sarifPath"
+
+        $sarif = Get-Content -Path $sarifPath -Raw | ConvertFrom-Json
+        $resultCount = 0
+        foreach ($run in $sarif.runs) {
+          if ($run.results) { $resultCount += $run.results.Count }
+        }
+        Write-Host "==> SEP mustfix.qls results: $resultCount"
+        if ($resultCount -gt 0) { Write-Error "$resultCount SEP Must-Fix defect(s) found - would FAIL the WHCP Static Tools Logo Test."; exit 1 }
+        Write-Host "OK: 0 SEP Must-Fix defects."
+      shell: pwsh
+
+    - name: Upload CodeQL/PREfast logs and SARIF (NCM + SEP)
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: static-analysis-results-${{ env.DRIVER_VERSION }}
+        retention-days: 14
+        if-no-files-found: warn
+        path: |
+          static-analysis-logs/
+          codeql-results/
+
+    # =====================================================================
+    # Bio: T2TouchIdBio (UMDF) + T2TouchIdEngineAdapter, PREfast only
+    # =====================================================================
+    - name: "Bio: build UMDF driver (with PREfast /analyze)"
+      run: |
+        $ErrorActionPreference = "Stop"
+        $logDir   = Join-Path $env:GITHUB_WORKSPACE "umdf-analysis-logs"
+        New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+        $buildLog = Join-Path $logDir "build.log"
+
+        msbuild $env:BIO_UMDF_PROJECT `
+          /t:rebuild `
+          /p:Configuration=$env:CONFIGURATION `
+          /p:Platform=$env:PLATFORM `
+          /p:WindowsTargetPlatformVersion=10.0.26100.0 `
+          /p:VcpkgInstalledDir=$env:VCPKG_INSTALLED_DIR `
+          /p:PlistLibName=$env:PLIST_LIB_NAME `
+          /p:RunCodeAnalysis=true `
+          /p:EnableCppCoreCheck=true `
+          /p:CodeAnalysisTreatWarningsAsErrors=$env:CA_TREAT_WARNINGS_AS_ERRORS `
+          /nologo /verbosity:normal /clp:Summary `
+          "/flp:logfile=$buildLog;verbosity=normal"
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "msbuild (Bio UMDF + PREfast) failed with exit code $LASTEXITCODE."
+          exit 1
+        }
+        $ca = @(Select-String -Path $buildLog -Pattern 'warning C(6|28)\d{3}' -ErrorAction SilentlyContinue)
+        Write-Host "==> PREfast warnings in build log: $($ca.Count)"
+        Add-Content -Path $env:GITHUB_ENV -Value "BIO_PREFAST_WARNING_COUNT=$($ca.Count)"
+        Add-Content -Path $env:GITHUB_ENV -Value "BIO_LOG_DIR=$logDir"
+      shell: pwsh
+
+    - name: "Bio: build WBF engine adapter"
+      run: |
+        $ErrorActionPreference = "Stop"
+        $logDir = Join-Path $env:GITHUB_WORKSPACE "umdf-analysis-logs"
+        New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+        $engineLog = Join-Path $logDir "engine-build.log"
+
+        msbuild $env:BIO_ENGINE_PROJECT `
+          /t:rebuild `
+          /p:Configuration=$env:CONFIGURATION `
+          /p:Platform=$env:PLATFORM `
+          /p:WindowsTargetPlatformVersion=10.0.26100.0 `
+          /nologo /verbosity:normal /clp:Summary `
+          "/flp:logfile=$engineLog;verbosity=normal"
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "msbuild (Bio engine adapter) failed with exit code $LASTEXITCODE."
+          exit 1
+        }
+        $dll = "$env:BIO_ENGINE_DIR\build\$env:BIO_ENGINE_NAME\$env:PLATFORM\$env:CONFIGURATION\$env:BIO_ENGINE_NAME.dll"
+        if (-not (Test-Path $dll)) { Write-Error "Engine adapter dll not produced: $dll"; exit 1 }
+        $ascii = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($dll))
+        if (-not $ascii.Contains('WbioQueryEngineInterface')) {
+          Write-Error "WbioQueryEngineInterface is not exported by $dll"
+          exit 1
+        }
+        Write-Host "OK: Bio engine adapter built, WbioQueryEngineInterface exported."
+      shell: pwsh
+
+    - name: Upload Bio build/PREfast logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: bio-static-analysis-logs-${{ env.DRIVER_VERSION }}
+        retention-days: 14
+        if-no-files-found: warn
+        path: |
+          umdf-analysis-logs/
+          driver/T2TouchIdBio/Umdf/build/**/obj/*.nativecodeanalysis.xml
+
+    # =====================================================================
+    # Повний солюшн: протокол/тул/тести + T2SepBootstrap/T2SepCoInstaller
+    # =====================================================================
+    - name: "SEP: build full solution (protocol + tool + tests + bootstrap + coinstaller)"
+      run: |
+        msbuild $env:SOLUTION `
+          /p:Configuration=$env:CONFIGURATION `
+          /p:Platform=$env:PLATFORM `
+          /p:WindowsTargetPlatformVersion=10.0.26100.0 `
+          /p:VcpkgInstalledDir=$env:VCPKG_INSTALLED_DIR `
+          /p:PlistLibName=$env:PLIST_LIB_NAME `
+          /nologo /verbosity:minimal /clp:Summary
+      shell: pwsh
+
+    - name: "SEP: run T2TouchIdTests.exe"
+      run: |
+        $ErrorActionPreference = "Stop"
+        $exe = "build\T2TouchIdTests\$env:PLATFORM\$env:CONFIGURATION\T2TouchIdTests.exe"
+        if (-not (Test-Path $exe)) { Write-Error "Test binary not found: $exe"; exit 1 }
+        $vcpkgBinDir = Join-Path $env:VCPKG_INSTALLED_DIR "bin"
+        if (-not (Test-Path $vcpkgBinDir)) { Write-Error "vcpkg bin dir not found: $vcpkgBinDir"; exit 1 }
+        $env:PATH = "$vcpkgBinDir;$env:PATH"
+        & $exe
+        if ($LASTEXITCODE -ne 0) { Write-Error "T2TouchIdTests.exe reported failures (exit code $LASTEXITCODE)."; exit 1 }
+        Write-Host "OK: all tests passed."
+      shell: pwsh
+
+    # =====================================================================
+    # SepVaultGui - only "Full" (self-contained, single-file) 
+    # =====================================================================
+    - name: "SepVaultGui: restore + build"
+      run: |
+        dotnet restore "$env:GUI_PROJECT"
+        dotnet build "$env:GUI_PROJECT" --no-restore -c $env:CONFIGURATION
+      shell: pwsh
+
+    - name: "SepVaultGui: publish Full (self-contained, single-file win-x64)"
+      run: |
+        $ErrorActionPreference = "Stop"
+        dotnet publish "$env:GUI_PROJECT" `
+          -c $env:CONFIGURATION -r win-x64 --self-contained true `
+          -p:PublishSingleFile=true -o artifacts\SepVaultGui-full
+        $exePath = "artifacts\SepVaultGui-full\$env:GUI_ASSEMBLY_NAME.exe"
+        if (-not (Test-Path $exePath)) { Write-Error "Expected published binary not found: $exePath"; exit 1 }
+        Write-Host "OK: published $exePath"
+      shell: pwsh
+
+    - name: "SepVaultGui: publish Min (framework-dependent win-x64)"
+      run: |
+        $ErrorActionPreference = "Stop"
+        dotnet publish "$env:GUI_PROJECT" `
+          -c $env:CONFIGURATION -r win-x64 --self-contained false `
+          -o artifacts\SepVaultGui-min
+        $exePath = "artifacts\SepVaultGui-min\$env:GUI_ASSEMBLY_NAME.exe"
+        if (-not (Test-Path $exePath)) { Write-Error "Expected published binary not found: $exePath"; exit 1 }
+        Write-Host "OK: published $exePath"
+      shell: pwsh
+
+    - name: Upload SepVaultGui Min (standalone, framework-dependent)
+      uses: actions/upload-artifact@v4
+      with:
+        name: SepVaultGui-Min-${{ env.DRIVER_VERSION }}
+        path: artifacts/SepVaultGui-min
+        if-no-files-found: error
+
+    # =====================================================================
+    # Staging
+    # =====================================================================
+    - name: "NCM: stage package folder"
+      run: |
+        $ErrorActionPreference = "Stop"
+        $pkg = "final\NCM"
+        New-Item -ItemType Directory -Path $pkg -Force | Out-Null
+        foreach ($name in @($env:NCM_DRIVER_NAME, $env:NCM_CTRL_NAME)) {
+          $outDir = "$env:NCM_DRIVER_DIR\build\$name\$env:PLATFORM\$env:CONFIGURATION"
+          $sys = "$outDir\$name.sys"
+          if (-not (Test-Path $sys)) { Write-Error "Built .sys not found: $sys"; exit 1 }
+          if ((Get-Item $sys).Length -eq 0) { Write-Error "Built .sys is empty: $sys"; exit 1 }
+          Copy-Item -Path $sys -Destination $pkg -Force
+          $pdb = "$outDir\$name.pdb"
+          if (Test-Path $pdb) { Copy-Item -Path $pdb -Destination $pkg -Force }
+        }
+        foreach ($inf in @("apple-t2-ncm.inf", "apple-t2-ncm-ctrl-stub.inf", "apple-t2-composite.inf")) {
+          Copy-Item -Path (Join-Path "T2NCM" $inf) -Destination (Join-Path $pkg $inf) -Force
+        }
+        New-Item -ItemType Directory -Path (Join-Path $pkg "checks") -Force | Out-Null
+        Write-Host "OK: staged NCM package:"
+        Get-ChildItem $pkg | ForEach-Object { Write-Host "  - $($_.Name)" }
+      shell: pwsh
+
+    - name: "NCM: stamp INFs (date / version)"
+      run: |
+        $ErrorActionPreference = "Stop"
+        foreach ($inf in @("apple-t2-ncm.inf", "apple-t2-ncm-ctrl-stub.inf", "apple-t2-composite.inf")) {
+          $infPath = (Resolve-Path (Join-Path "final\NCM" $inf)).Path
+          & "$env:STAMPINF_PATH" -f "$infPath" -a amd64 -d "$env:DRIVER_DATE" -v "$env:DRIVER_VERSION"
+          if ($LASTEXITCODE -ne 0) { Write-Error "StampInf for $inf failed (exit $LASTEXITCODE)."; exit 1 }
+          $expected = "$env:DRIVER_DATE,$env:DRIVER_VERSION"
+          $stamped = (Get-Content -Path $infPath | Select-String -Pattern '^\s*DriverVer\s*=').Line
+          if ($stamped -notmatch [regex]::Escape($expected)) { Write-Error "$inf DriverVer was not stamped with '$expected'."; exit 1 }
+        }
+        Write-Host "OK: all NCM INFs stamped."
+      shell: pwsh
+
+    - name: "NCM: validate INFs (InfVerif)"
+      run: |
+        $ErrorActionPreference = "Stop"
+        $failed = @()
+        foreach ($inf in @("apple-t2-ncm.inf", "apple-t2-ncm-ctrl-stub.inf", "apple-t2-composite.inf")) {
+          $path = Join-Path "final\NCM" $inf
+          $out  = & "$env:INFVERIF_PATH" /v "$path" 2>&1
+          $code = $LASTEXITCODE
+          $out | ForEach-Object { Write-Host $_ }
+          $out | Set-Content -Path (Join-Path "final\NCM\checks" "infverif-$inf.txt") -Encoding utf8
+          if ($code -ne 0) { Write-Host "::error::InfVerif failed for $inf (exit $code)."; $failed += $inf }
+        }
+        if ($failed.Count -gt 0) { Write-Error "InfVerif failed for: $($failed -join ', ')"; exit 1 }
+        Write-Host "OK: InfVerif passed for all NCM INFs."
+      shell: pwsh
+
+    - name: "NCM: generate CATs (Inf2Cat)"
+      run: |
+        $ErrorActionPreference = "Stop"
+        $fullPkg = (Resolve-Path "final\NCM").Path
+        $out = & "$env:INF2CAT_PATH" /driver:"$fullPkg" /os:10_X64 /verbose 2>&1
+        $code = $LASTEXITCODE
+        $out | ForEach-Object { Write-Host $_ }
+        $out | Set-Content -Path (Join-Path "final\NCM\checks" "inf2cat.txt") -Encoding utf8
+        if ($code -ne 0) { Write-Error "Inf2Cat failed (exit $code)."; exit 1 }
+        foreach ($cat in @("apple-t2-ncm.cat", "apple-t2-ncm-ctrl-stub.cat", "apple-t2-composite.cat")) {
+          if (-not (Test-Path (Join-Path $fullPkg $cat))) { Write-Error "Inf2Cat did not produce $cat"; exit 1 }
+        }
+        Write-Host "OK: NCM CATs generated."
+      shell: pwsh
+
+    - name: "SEP: stage package folder"
+      run: |
+        $ErrorActionPreference = "Stop"
+        $pkg = "final\SEP"
+        New-Item -ItemType Directory -Path $pkg -Force | Out-Null
+
+        $buildOutDir = "$env:SEP_DRIVER_DIR\build\$env:SEP_DRIVER_NAME\$env:PLATFORM\$env:CONFIGURATION"
+        $sysPath     = "$buildOutDir\$env:SEP_DRIVER_NAME.sys"
+        $infSrcPath  = "$env:SEP_DRIVER_DIR\$env:SEP_DRIVER_NAME.inf"
+        if (-not (Test-Path $sysPath))    { Write-Error "Built .sys not found: $sysPath"; exit 1 }
+        if (-not (Test-Path $infSrcPath)) { Write-Error ".inf file not found: $infSrcPath"; exit 1 }
+
+        $coinstallerPath = "build\$env:SEP_COINSTALLER_NAME\$env:PLATFORM\$env:CONFIGURATION\$env:SEP_COINSTALLER_NAME.dll"
+        if (-not (Test-Path $coinstallerPath)) { Write-Error "Built co-installer not found: $coinstallerPath"; exit 1 }
+        $bootstrapPath = "build\$env:SEP_BOOTSTRAP_PROJECT\$env:PLATFORM\$env:CONFIGURATION\$env:SEP_BOOTSTRAP_PROJECT.exe"
+        if (-not (Test-Path $bootstrapPath)) { Write-Error "Built bootstrap exe not found: $bootstrapPath"; exit 1 }
+
+        Copy-Item -Path $sysPath -Destination $pkg -Force
+        Copy-Item -Path $infSrcPath -Destination $pkg -Force
+        $pdbPath = "$buildOutDir\$env:SEP_DRIVER_NAME.pdb"
+        if (Test-Path $pdbPath) { Copy-Item -Path $pdbPath -Destination $pkg -Force }
+        Copy-Item -Path $coinstallerPath -Destination $pkg -Force
+        Copy-Item -Path $bootstrapPath -Destination $pkg -Force
+        $bootstrapPdb = "build\$env:SEP_BOOTSTRAP_PROJECT\$env:PLATFORM\$env:CONFIGURATION\$env:SEP_BOOTSTRAP_PROJECT.pdb"
+        if (Test-Path $bootstrapPdb) { Copy-Item -Path $bootstrapPdb -Destination $pkg -Force }
+
+        $vcpkgBinDir = Join-Path $env:VCPKG_INSTALLED_DIR "bin"
+        Copy-Item -Path "build\t2touchid\$env:PLATFORM\$env:CONFIGURATION\t2touchid.exe" -Destination $pkg -Force
+        Copy-Item -Path (Join-Path $vcpkgBinDir "*.dll") -Destination $pkg -Force
+
+        New-Item -ItemType Directory -Path (Join-Path $pkg "checks") -Force | Out-Null
+        Write-Host "OK: staged SEP package:"
+        Get-ChildItem $pkg | ForEach-Object { Write-Host "  - $($_.Name)" }
+      shell: pwsh
+
+    - name: "SEP: stamp INF (KMDF 1.15)"
+      run: |
+        $ErrorActionPreference = "Stop"
+        $infPath = (Resolve-Path "final\SEP\$env:SEP_DRIVER_NAME.inf").Path
+        & "$env:STAMPINF_PATH" -f "$infPath" -a amd64 -d "$env:DRIVER_DATE" -v "$env:DRIVER_VERSION" -k 1.15
+        if ($LASTEXITCODE -ne 0) { Write-Error "StampInf failed (exit $LASTEXITCODE)."; exit 1 }
+        Write-Host "OK: SEP INF stamped."
+      shell: pwsh
+
+    - name: "SEP: generate CAT (Inf2Cat)"
+      run: |
+        $ErrorActionPreference = "Stop"
+        $pkg = (Resolve-Path "final\SEP").Path
+        & "$env:INF2CAT_PATH" /driver:"$pkg" /os:10_X64 /verbose
+        if ($LASTEXITCODE -ne 0) { Write-Error "Inf2Cat failed (exit $LASTEXITCODE)."; exit 1 }
+        if (-not (Test-Path "$pkg\$env:SEP_DRIVER_NAME.cat")) { Write-Error "Inf2Cat did not produce the SEP .cat"; exit 1 }
+        Write-Host "OK: SEP CAT generated."
+      shell: pwsh
+
+    - name: "Bio: stage package folder"
+      run: |
+        $ErrorActionPreference = "Stop"
+        $buildOutDir = "$env:BIO_UMDF_DIR\build\$env:BIO_UMDF_NAME\$env:PLATFORM\$env:CONFIGURATION"
+        $dllPath     = "$buildOutDir\$env:BIO_UMDF_NAME.dll"
+        $infSrcPath  = "$env:BIO_UMDF_DIR\$env:BIO_UMDF_NAME.inf"
+        $pkg = "final\Bio"
+
+        if (-not (Test-Path $dllPath))    { Write-Error "Built .dll not found: $dllPath"; exit 1 }
+        if (-not (Test-Path $infSrcPath)) { Write-Error ".inf file not found: $infSrcPath"; exit 1 }
+
+        New-Item -ItemType Directory -Path $pkg -Force | Out-Null
+        Copy-Item -Path $dllPath -Destination $pkg -Force
+        Copy-Item -Path $infSrcPath -Destination $pkg -Force
+        $pdbPath = "$buildOutDir\$env:BIO_UMDF_NAME.pdb"
+        if (Test-Path $pdbPath) { Copy-Item -Path $pdbPath -Destination $pkg -Force }
+
+        $engineOut = "$env:BIO_ENGINE_DIR\build\$env:BIO_ENGINE_NAME\$env:PLATFORM\$env:CONFIGURATION"
+        $engineDll = "$engineOut\$env:BIO_ENGINE_NAME.dll"
+        if (-not (Test-Path $engineDll)) { Write-Error "Built engine adapter not found: $engineDll"; exit 1 }
+        Copy-Item -Path $engineDll -Destination $pkg -Force
+        $enginePdb = "$engineOut\$env:BIO_ENGINE_NAME.pdb"
+        if (Test-Path $enginePdb) { Copy-Item -Path $enginePdb -Destination $pkg -Force }
+
+        New-Item -ItemType Directory -Path (Join-Path $pkg "checks") -Force | Out-Null
+        Add-Content -Path $env:GITHUB_ENV -Value "BIO_PACKAGE_DIR=$pkg"
+        Add-Content -Path $env:GITHUB_ENV -Value "BIO_INF_PATH=$pkg\$env:BIO_UMDF_NAME.inf"
+        Add-Content -Path $env:GITHUB_ENV -Value "BIO_CAT_PATH=$pkg\$env:BIO_UMDF_NAME.cat"
+        Write-Host "OK: staged Bio package:"
+        Get-ChildItem $pkg | ForEach-Object { Write-Host "  - $($_.Name)" }
+      shell: pwsh
+
+    - name: "Bio: bundle libplist runtime DLLs into package + INF"
+      run: |
+        $ErrorActionPreference = "Stop"
+        $binDir = Join-Path $env:VCPKG_INSTALLED_DIR "bin"
+        $dlls = @(Get-ChildItem -Path $binDir -Filter "*.dll" -ErrorAction SilentlyContinue)
+        if ($dlls.Count -eq 0) { Write-Error "No runtime DLLs under $binDir"; exit 1 }
+        if (-not ($dlls | Where-Object { $_.Name -match 'plist' })) { Write-Error "plist DLL not found under $binDir"; exit 1 }
+        foreach ($d in $dlls) { Copy-Item -Path $d.FullName -Destination $env:BIO_PACKAGE_DIR -Force }
+
+        $srcLines  = ($dlls | ForEach-Object { "$($_.Name) = 1,," }) -join "`r`n"
+        $copyLines = ($dlls | ForEach-Object { $_.Name }) -join "`r`n"
+
+        $infFull = (Resolve-Path $env:BIO_INF_PATH).Path
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        $inf  = [System.IO.File]::ReadAllText($infFull)
+        $inf2 = [regex]::Replace($inf, '(?m)^\[SourceDisksFiles\][ \t]*(?=\r?$)', "[SourceDisksFiles]`r`n$srcLines")
+        $inf2 = [regex]::Replace($inf2, '(?m)^\[UMDriverCopy\][ \t]*(?=\r?$)', "[UMDriverCopy]`r`n$copyLines")
+        if ($inf2 -eq $inf -or $inf2 -notmatch [regex]::Escape($dlls[0].Name)) { Write-Error "INF was not patched with the runtime DLLs."; exit 1 }
+        [System.IO.File]::WriteAllText($infFull, $inf2, $utf8)
+        Write-Host "OK: bundled runtime DLLs and patched Bio INF."
+      shell: pwsh
+
+    - name: "Bio: stamp INF (UMDF 2.15)"
+      run: |
+        $ErrorActionPreference = "Stop"
+        $infPath = (Resolve-Path $env:BIO_INF_PATH).Path
+        & "$env:STAMPINF_PATH" -f "$infPath" -a amd64 -d "$env:DRIVER_DATE" -v "$env:DRIVER_VERSION" -u "$env:BIO_UMDF_STAMP_VERSION"
+        if ($LASTEXITCODE -ne 0) { Write-Error "StampInf failed (exit $LASTEXITCODE)."; exit 1 }
+        if (Select-String -Path $infPath -Pattern '\$UMDFVERSION\$' -Quiet) { Write-Error 'INF still contains $UMDFVERSION$ after StampInf.'; exit 1 }
+        Write-Host "OK: Bio INF stamped."
+      shell: pwsh
+
+    - name: "Bio: generate CAT (Inf2Cat)"
+      run: |
+        $ErrorActionPreference = "Stop"
+        $fullPackageDir = (Resolve-Path $env:BIO_PACKAGE_DIR).Path
+        & "$env:INF2CAT_PATH" /driver:"$fullPackageDir" /os:10_X64 /verbose
+        if ($LASTEXITCODE -ne 0) { Write-Error "Inf2Cat failed (exit $LASTEXITCODE)."; exit 1 }
+        if (-not (Test-Path $env:BIO_CAT_PATH)) { Write-Error "Inf2Cat did not produce $env:BIO_CAT_PATH"; exit 1 }
+        Write-Host "OK: Bio CAT generated."
+      shell: pwsh
+
+    - name: "SepVaultGui: stage Full build into final package"
+      run: |
+        $ErrorActionPreference = "Stop"
+        $pkg = "final\SepVaultGui"
+        New-Item -ItemType Directory -Path $pkg -Force | Out-Null
+        Copy-Item -Path "artifacts\SepVaultGui-full\*" -Destination $pkg -Recurse -Force
+        Write-Host "OK: staged SepVaultGui (Full, self-contained) into $pkg"
+      shell: pwsh
+
+    # =====================================================================
+    # One sign
+    # =====================================================================
+    - name: "Sign everything with ONE certificate + export it once (real name)"
+      if: ${{ env.SIGN_CERT_PFX != '' && env.SIGN_CERT_PASSWORD != '' }}
+      run: |
+        $ErrorActionPreference = "Stop"
+        $pfxPath = Join-Path $env:TEMP "apple-t2-signcert.pfx"
+        try {
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:SIGN_CERT_PFX))
+
+          $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(
+            $pfxPath, $env:SIGN_CERT_PASSWORD,
+            [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable
+          )
+          $certName = $cert.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+          if ([string]::IsNullOrWhiteSpace($certName)) { $certName = "Certificate" }
+          $certFileName = (($certName -replace '[\\/:*?"<>|]', '_')).Trim()
+          $cerPath = "final\$certFileName.cer"
+          Add-Content -Path $env:GITHUB_ENV -Value "APPLE_T2_CERT_NAME=$certFileName"
+
+          $toSign = @(
+            "final\NCM\$env:NCM_DRIVER_NAME.sys", "final\NCM\$env:NCM_CTRL_NAME.sys",
+            "final\NCM\apple-t2-ncm.cat", "final\NCM\apple-t2-ncm-ctrl-stub.cat", "final\NCM\apple-t2-composite.cat",
+            "final\SEP\$env:SEP_DRIVER_NAME.sys", "final\SEP\$env:SEP_DRIVER_NAME.cat",
+            "final\SEP\$env:SEP_COINSTALLER_NAME.dll", "final\SEP\$env:SEP_BOOTSTRAP_PROJECT.exe"
+          )
+          $toSign += @(Get-ChildItem -Path "final\Bio" -Filter "*.dll" | ForEach-Object { $_.FullName })
+          $toSign += "final\Bio\$env:BIO_UMDF_NAME.cat"
+          $toSign += "final\SepVaultGui\$env:GUI_ASSEMBLY_NAME.exe"
+
+          foreach ($file in $toSign) {
+            if (-not (Test-Path $file)) { Write-Error "To-sign target not found: $file"; exit 1 }
+            & "$env:SIGNTOOL_PATH" sign /v /fd SHA256 /f "$pfxPath" /p "$env:SIGN_CERT_PASSWORD" `
+              /tr http://timestamp.digicert.com /td SHA256 "$file"
+            if ($LASTEXITCODE -ne 0) { Write-Error "Signing $file failed (exit $LASTEXITCODE)."; exit 1 }
+            Write-Host "OK: $file signed."
+          }
+
+          Export-Certificate -Cert $cert -FilePath $cerPath | Out-Null
+          Write-Host "OK: all files signed; single certificate exported as $certFileName.cer."
+        }
+        finally {
+          if (Test-Path $pfxPath) { Remove-Item -Path $pfxPath -Force }
+        }
+      shell: pwsh
+
+    - name: Warn if package is unsigned
+      if: ${{ env.SIGN_CERT_PFX == '' || env.SIGN_CERT_PASSWORD == '' }}
+      run: Write-Host "::warning::CERT/CERT_PWD secrets not set - SEP/NCM/Bio/SepVaultGui binaries are UNSIGNED. Target machine needs test-signing mode."
+      shell: pwsh
+
+    - name: Copy InstallCert.bat into the final package root
+      run: Copy-Item -Path "tools\InstallCert.bat" -Destination "final\InstallCert.bat" -Force
+      shell: pwsh
+
+    # =====================================================================
+    # checks/ SARIF (NCM/SEP), PREfast
+    # =====================================================================
+    - name: Bundle checks into each package folder
+      run: |
+        $ErrorActionPreference = "Stop"
+        function Get-SarifResultCount($path) {
+          if (-not (Test-Path $path)) { return 0 }
+          $sarif = Get-Content -Path $path -Raw | ConvertFrom-Json
+          $count = 0
+          foreach ($run in $sarif.runs) { if ($run.results) { $count += $run.results.Count } }
+          return $count
+        }
+        $signed = if ($env:SIGN_CERT_PFX -and $env:SIGN_CERT_PASSWORD) { "yes ($env:APPLE_T2_CERT_NAME.cer)" } else { "no - test-signing mode required on target machine" }
+
+        # NCM
+        Copy-Item -Path $env:NCM_SARIF_MUSTRUN -Destination "final\NCM\checks\codeql-mustrun.sarif" -Force
+        Copy-Item -Path $env:NCM_SARIF_MUSTFIX -Destination "final\NCM\checks\codeql-mustfix.sarif" -Force
+        Get-ChildItem -Path "static-analysis-logs" -Filter "build-ncm-*.log" -ErrorAction SilentlyContinue |
+          ForEach-Object { Copy-Item -Path $_.FullName -Destination (Join-Path "final\NCM\checks" ("prefast-" + $_.Name)) -Force }
+        @(
+          "Apple T2 NCM static-analysis summary",
+          "DriverVer: $env:DRIVER_VERSION ($env:DRIVER_DATE)",
+          "mustrun.qls: $(Get-SarifResultCount $env:NCM_SARIF_MUSTRUN) finding(s)",
+          "mustfix.qls: $(Get-SarifResultCount $env:NCM_SARIF_MUSTFIX) finding(s)",
+          "Signed: $signed"
+        ) | Set-Content -Path "final\NCM\checks\SUMMARY.txt" -Encoding utf8
+
+        # SEP
+        Copy-Item -Path $env:SEP_SARIF_MUSTRUN -Destination "final\SEP\checks\codeql-mustrun.sarif" -Force
+        Copy-Item -Path $env:SEP_SARIF_MUSTFIX -Destination "final\SEP\checks\codeql-mustfix.sarif" -Force
+        if (Test-Path "static-analysis-logs\build-sep.log") {
+          Copy-Item -Path "static-analysis-logs\build-sep.log" -Destination "final\SEP\checks\prefast-build-sep.log" -Force
+        }
+        @(
+          "T2TouchIdTransport (SEP) static-analysis summary",
+          "DriverVer: $env:DRIVER_VERSION ($env:DRIVER_DATE)",
+          "mustrun.qls: $(Get-SarifResultCount $env:SEP_SARIF_MUSTRUN) finding(s)",
+          "mustfix.qls: $(Get-SarifResultCount $env:SEP_SARIF_MUSTFIX) finding(s)",
+          "Tests: T2TouchIdTests.exe passed",
+          "Signed: $signed"
+        ) | Set-Content -Path "final\SEP\checks\SUMMARY.txt" -Encoding utf8
+
+        # Bio
+        if (Test-Path "umdf-analysis-logs\build.log") {
+          Copy-Item -Path "umdf-analysis-logs\build.log" -Destination "final\Bio\checks\prefast-build.log" -Force
+        }
+        @(
+          "T2TouchIdBio (UMDF) build summary",
+          "DriverVer: $env:DRIVER_VERSION ($env:DRIVER_DATE)",
+          "PREfast warnings in build log: $env:BIO_PREFAST_WARNING_COUNT",
+          "CodeQL: not run for this component yet (WIP)",
+          "Signed: $signed"
+        ) | Set-Content -Path "final\Bio\checks\SUMMARY.txt" -Encoding utf8
+
+        Write-Host "OK: checks/ bundled into NCM, SEP and Bio package folders."
+      shell: pwsh
+
+    # =====================================================================
+    - name: Create apple-t2-touchid.zip
+      run: |
+        $ErrorActionPreference = "Stop"
+        Get-ChildItem "final" | ForEach-Object { Write-Host "==> final\$($_.Name)" }
+        Compress-Archive -Path "final\*" -DestinationPath "apple-t2-touchid.zip" -Force
+        Write-Host "OK: apple-t2-touchid.zip created ($([Math]::Round((Get-Item 'apple-t2-touchid.zip').Length / 1MB, 1)) MB)"
+      shell: pwsh
+
+    - name: Upload apple-t2-touchid.zip
+      uses: actions/upload-artifact@v4
+      with:
+        name: apple-t2-touchid-${{ env.DRIVER_VERSION }}
+        path: apple-t2-touchid.zip
+        if-no-files-found: error
