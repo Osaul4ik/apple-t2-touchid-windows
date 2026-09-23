@@ -95,12 +95,21 @@ SepVaultGui.exe = 1,,
 ; would only revert to the older, non-driver-store install style, not
 ; fix anything.
 Drivers_Dir = 13
-; Co-installer DLL also goes in the driver-store folder (DIRID 13), same as
-; the .sys - PnP resolves an unqualified "file,entrypoint" CoInstallers32
-; value (no path) by looking in the driver package's own store folder
-; first, so this needs to be right next to T2TouchIdTransport.sys, not in
-; System32.
-T2SepCoInstaller_CopyFiles = 13
+; Co-installer DLL must go to %SystemRoot%\System32 (DIRID 11), NOT the
+; driver-store folder. This contradicts the assumption in the comment this
+; replaced: PnP's CoInstallers32 loader does not resolve an unqualified
+; "file,entrypoint" value against the driver package's own store folder -
+; it loads straight from System32 (observed directly in a real install log:
+; "Loading module 'C:\Windows\system32\T2SepCoInstaller.dll' failed. Error
+; 126: The specified module could not be found." even though the DLL had
+; been correctly staged into DriverStore\FileRepository\...). Microsoft's
+; own INF DDInstall.CoInstallers docs confirm this too: "All co-installer
+; files must be copied into the %SystemRoot%\system32 directory." Leaving
+; this on DIRID 13 means T2SepCoInstallerEntry never loads, so
+; EnsureBootstrapServiceInstalled() in T2SepCoInstaller.cpp never runs and
+; the T2SepBootstrap service is never created - which is exactly the "SEP
+; service didn't get installed, no T2 unlock at boot" symptom this fixes.
+T2SepCoInstaller_CopyFiles = 11
 ; DIRID 11 = %SystemRoot%\System32, subdirectory T2SepBootstrap - a plain
 ; filesystem location for the two ordinary user-mode binaries, deliberately
 ; NOT the driver store (see T2SepBootstrap_CopyFiles comment above).
