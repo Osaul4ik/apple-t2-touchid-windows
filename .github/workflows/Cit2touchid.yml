@@ -356,14 +356,18 @@ jobs:
     # produced by the same job that packages the driver, instead of a
     # separate path-filtered workflow whose artifact nobody wires in.
     #
-    # Self-contained + PublishSingleFile only (the old "min" framework-
-    # dependent flavor is dropped here): the INF lists a single
-    # SepVaultGui.exe in [SourceDisksFiles] with no companion DLLs, which
-    # only the single-file build satisfies - "min" would need the .NET 8
-    # Desktop Runtime preinstalled on the target AND its own DLLs added to
-    # the INF, neither of which this package does. If the framework-
-    # dependent build is still wanted for local testing, that's a
-    # deliberate follow-up, not implied by this move.
+    # Two publish flavors:
+    #   - Full (self-contained, single-file): goes into the driver package
+    #     (artifacts\driver), because the INF's [T2SepBootstrap_CopyFiles] /
+    #     [SourceDisksFiles] list a single SepVaultGui.exe with no companion
+    #     DLLs - only a self-contained single-file build satisfies that.
+    #   - Min (framework-dependent): NOT wired into the INF/driver package
+    #     (would need its .dll/.deps.json/.runtimeconfig.json added there
+    #     too, and the .NET 8 Desktop Runtime preinstalled on the target -
+    #     neither is true today). Published as its own, separate workflow
+    #     artifact (SepVaultGui-Min-<version>) purely for manual download by
+    #     anyone who already has the runtime installed and wants the smaller
+    #     download instead of the bundled-runtime Full build.
     # =====================================================================
     - name: Setup .NET
       uses: actions/setup-dotnet@v4
@@ -399,6 +403,40 @@ jobs:
         $sizeMb = [Math]::Round((Get-Item $exePath).Length / 1MB, 1)
         Write-Host "OK: published $exePath ($sizeMb MB, self-contained runtime bundled in)"
       shell: pwsh
+
+    # =====================================================================
+    # Min build - framework-dependent, NOT self-contained. Requires the
+    # target machine to already have the .NET 8 Desktop Runtime installed
+    # (https://dotnet.microsoft.com/download/dotnet/8.0 -> ".NET Desktop
+    # Runtime"); otherwise it refuses to launch with a "you must install
+    # .NET" prompt. Does not go into the driver package - see the comment
+    # above the Full publish step for why. Uploaded as its own artifact
+    # below instead.
+    # =====================================================================
+    - name: Publish SepVaultGui (framework-dependent win-x64) - Min
+      run: |
+        $ErrorActionPreference = "Stop"
+        dotnet publish "$env:GUI_PROJECT" `
+          -c $env:CONFIGURATION `
+          -r win-x64 `
+          --self-contained false `
+          -o artifacts\SepVaultGui-min
+
+        $exePath = "artifacts\SepVaultGui-min\$env:GUI_ASSEMBLY_NAME.exe"
+        if (-not (Test-Path $exePath)) {
+          Write-Error "Expected published binary not found: $exePath"
+          exit 1
+        }
+        $sizeMb = [Math]::Round((Get-Item $exePath).Length / 1MB, 1)
+        Write-Host "OK: published $exePath ($sizeMb MB, framework-dependent - needs .NET 8 Desktop Runtime on target)"
+      shell: pwsh
+
+    - name: Upload SepVaultGui Min (framework-dependent) artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: SepVaultGui-Min-${{ env.DRIVER_VERSION }}
+        path: artifacts\SepVaultGui-min
+        if-no-files-found: error
 
     # =====================================================================
     # Driver packaging: same StampInf / Inf2Cat / signtool sequence as the
