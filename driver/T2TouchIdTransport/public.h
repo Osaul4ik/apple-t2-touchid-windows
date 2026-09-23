@@ -10,6 +10,17 @@
 
 #include <initguid.h>
 
+// The IOCTL codes below use CTL_CODE / FILE_DEVICE_UNKNOWN / METHOD_BUFFERED /
+// FILE_*_ACCESS. Kernel mode gets them from ntddk.h (always included before
+// this header). In user mode they live in <winioctl.h>, which <windows.h>
+// only pulls in when WIN32_LEAN_AND_MEAN is NOT defined - and the UMDF
+// toolset defines it for every translation unit (T2TouchIdBio compiles
+// protocol/AppleKeyStore/Client.cpp, which is where that surfaced). Include
+// it here so the header does not depend on the includer's macros.
+#if !defined(_NTDDK_) && !defined(_WDMDDK_)
+#include <winioctl.h>
+#endif
+
 // {6E0F1A7C-6B7A-4E7A-9C6D-2C6B1E7F3A10}
 DEFINE_GUID(GUID_DEVINTERFACE_T2TOUCHID_TRANSPORT,
     0x6e0f1a7c, 0x6b7a, 0x4e7a, 0x9c, 0x6d, 0x2c, 0x6b, 0x1e, 0x7f, 0x3a, 0x10);
