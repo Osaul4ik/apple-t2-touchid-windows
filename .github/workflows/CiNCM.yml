@@ -1,19 +1,6 @@
 name: CI NCM (CodeQL + PREfast + INF checks + Build + Package)
 
 # ===========================================================================
-# Білд T2NCM з перевірками. Об'єднує:
-#   BuildNCM_Inf.yml  - збірка T2Ncm.sys + T2NcmCtrl.sys, StampInf, InfVerif,
-#                       Inf2Cat, необов'язковий підпис, пакет
-#   Cit2touchid.yml   - CodeQL (windows-drivers) + PREfast, mustrun/mustfix,
-#                       звіти всередині пакета (checks/)
-#
-# Один job, один раннер. CodeQL трасує ОДИН виклик скрипта, який будує обидва
-# драйвери (T2Ncm.vcxproj + T2NcmCtrl.vcxproj) з прапорами PREfast. Якщо
-# mustfix чистий - той самий бінарник (без другого білда) штампується,
-# перевіряється InfVerif, каталогізується Inf2Cat, підписується і пакується
-# разом зі звітами. Без vcpkg/libplist і без T2TouchId.sln - це білд
-# T2NCM.
-# ===========================================================================
 on:
   push:
     branches: [ main, Dev_lifecycle, Hello_Prepare ]
@@ -66,8 +53,6 @@ jobs:
       uses: microsoft/setup-msbuild@v2
 
     # =====================================================================
-    # Офіційний WDK-інсталятор (той самий fwlink, що і в інших workflow).
-    # =====================================================================
     - name: Install WDK
       run: |
         $ErrorActionPreference = "Stop"
@@ -83,8 +68,7 @@ jobs:
         Write-Host "OK: WDK installer exited with code $exitCode"
       shell: pwsh
 
-    # Один прохід шукає всі WDK-інструменти (замість окремих Locate-кроків).
-    # SignTool потрібен лише якщо задані секрети підпису.
+    # =====================================================================
     - name: Locate WDK tools (StampInf, InfVerif, Inf2Cat, SignTool)
       run: |
         $ErrorActionPreference = "Stop"
@@ -122,6 +106,7 @@ jobs:
         }
       shell: pwsh
 
+    # =====================================================================
     - name: Download CodeQL CLI
       run: |
         $ErrorActionPreference = "Stop"
@@ -167,18 +152,7 @@ jobs:
         Add-Content -Path $env:GITHUB_OUTPUT -Value "version=$driverVersion"
       shell: pwsh
 
-    # =====================================================================
-    # ПЕРЕВІРКА 1 (швидка, до білда): узгодженість джерел.
-    # Ловить помилки, які інакше вилізли б лише при інсталяції на залізі:
-    #   - усі ClCompile з обох .vcxproj існують на диску;
-    #   - TargetName у .vcxproj == ім'я .sys у ServiceBinary відповідного INF;
-    #   - .sys перелічений у [SourceDisksFiles] свого INF;
-    #   - KmdfLibraryVersion в INF == KMDF_VERSION_MAJOR.MINOR у .vcxproj
-    #     (для KMDF >= 1.13 немає co-installer fallback - розбіжність =
-    #     драйвер не завантажиться);
-    #   - CatalogFile кожного INF має очікуване ім'я;
-    #   - HWID NCM-INF (&MI_01) і CtrlStub-INF (&MI_00) не перетинаються.
-    # =====================================================================
+
     - name: Check INF <-> project consistency
       run: |
         $ErrorActionPreference = "Stop"
@@ -266,13 +240,6 @@ jobs:
         Write-Host "OK: INF <-> project consistency checks passed."
       shell: pwsh
 
-    # =====================================================================
-    # ПЕРЕВІРКА 2: CodeQL трасує один скрипт, що будує ОБИДВА драйвери з
-    # PREfast (/analyze) всередині. Обидва бінарники потрапляють в одну
-    # CodeQL-базу, тож mustrun/mustfix покривають T2Ncm.sys і T2NcmCtrl.sys.
-    # Скрипт будує ОБИДВА проєкти навіть після першої помилки і падає в кінці -
-    # так усі PREfast-знахідки видно за один прогін.
-    # WindowsTargetPlatformVersion прив'язаний до того, що поставив WDK.
     # =====================================================================
     - name: Write traced build script
       run: |
@@ -381,9 +348,6 @@ jobs:
         path: codeql-results/
 
     # =====================================================================
-    # Усе нижче виконується лише якщо mustfix чистий (без if: always()).
-    # Той самий бінарник, що вже лежить на диску після CodeQL-проходу.
-    # =====================================================================
     - name: Prepare NCM package folder
       run: |
         $ErrorActionPreference = "Stop"
@@ -437,8 +401,7 @@ jobs:
         Write-Host "OK: all INFs stamped."
       shell: pwsh
 
-    # ПЕРЕВІРКА 3: InfVerif для всіх трьох INF (не зупиняється на першій
-    # помилці - збирає всі, лог кожного йде в checks/).
+    # =====================================================================
     - name: Validate INFs (InfVerif)
       run: |
         $ErrorActionPreference = "Stop"
@@ -459,8 +422,7 @@ jobs:
         if ($failed.Count -gt 0) { Write-Error "InfVerif failed for: $($failed -join ', ')"; exit 1 }
       shell: pwsh
 
-    # Усі INF в одній теці, кожен має свій CatalogFile - один прохід Inf2Cat
-    # видає три .cat.
+    # =====================================================================
     - name: Generate CATs (Inf2Cat)
       run: |
         $ErrorActionPreference = "Stop"
@@ -478,16 +440,26 @@ jobs:
         }
       shell: pwsh
 
-    # Підпис необов'язковий (PoC-драйвер, не WHQL): без CERT/CERT_PWD вихід
-    # unsigned/test-signable.
+    # =====================================================================
     - name: Sign .sys and .cat files with SignTool
       if: ${{ env.SIGN_CERT_PFX != '' && env.SIGN_CERT_PASSWORD != '' }}
       run: |
         $ErrorActionPreference = "Stop"
         $pfxPath = Join-Path $env:TEMP "ncm-signcert.pfx"
-        $cerPath = Join-Path $env:NCM_PACKAGE_DIR "$env:DRIVER_NAME.cer"
         try {
           [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:SIGN_CERT_PFX))
+
+          # Real certificate name from its own params (Subject CN via
+          # GetNameInfo), NOT the driver name - this is what the .cer ships as.
+          $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(
+            $pfxPath, $env:SIGN_CERT_PASSWORD,
+            [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable
+          )
+          $certName = $cert.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+          if ([string]::IsNullOrWhiteSpace($certName)) { $certName = "Certificate" }
+          $certFileName = (($certName -replace '[\\/:*?"<>|]', '_')).Trim()
+          $cerPath = Join-Path $env:NCM_PACKAGE_DIR "$certFileName.cer"
+          Add-Content -Path $env:GITHUB_ENV -Value "NCM_CERT_NAME=$certFileName"
 
           $toSign = @(
             "$env:DRIVER_NAME.sys", "$env:CTRL_NAME.sys",
@@ -501,21 +473,15 @@ jobs:
             Write-Host "OK: $file signed."
           }
 
-          $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(
-            $pfxPath, $env:SIGN_CERT_PASSWORD,
-            [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable
-          )
           Export-Certificate -Cert $cert -FilePath $cerPath | Out-Null
-          Write-Host "OK: all files signed; .cer exported."
+          Write-Host "OK: all files signed; .cer exported as $certFileName.cer."
         }
         finally {
           if (Test-Path $pfxPath) { Remove-Item -Path $pfxPath -Force }
         }
       shell: pwsh
 
-    # ПЕРЕВІРКА 4: після підпису кожен файл справді має підпис. Статус
-    # довіри не перевіряємо (самопідписаний cert = NotTrusted), лише що
-    # підписувач присутній.
+    # =====================================================================
     - name: Verify signatures are present
       if: ${{ env.SIGN_CERT_PFX != '' && env.SIGN_CERT_PASSWORD != '' }}
       run: |
@@ -534,9 +500,7 @@ jobs:
       run: Write-Host "::warning::CERT/CERT_PWD secrets not set - T2Ncm.sys + T2NcmCtrl.sys + all CATs are UNSIGNED. Target machine needs test-signing mode."
       shell: pwsh
 
-    # Дані перевірок їдуть ВСЕРЕДИНІ пакета (checks/): SARIF, PREfast-логи,
-    # InfVerif/Inf2Cat-виводи і SUMMARY.txt - хто завантажить драйвер, отримає
-    # і докази перевірки саме цього білда.
+    # =====================================================================
     - name: Bundle checks with the package
       run: |
         $ErrorActionPreference = "Stop"

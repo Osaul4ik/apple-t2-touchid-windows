@@ -21,26 +21,12 @@ env:
   PLATFORM: x64
   SIGN_CERT_PFX: ${{ secrets.CERT }}
   SIGN_CERT_PASSWORD: ${{ secrets.CERT_PWD }}
-  # T2SepBootstrap (Win32 service) and T2SepCoInstaller (its PnP co-installer
-  # DLL, see [T2TouchIdTransport_Device.NT.CoInstallers] in the INF) are both
-  # v143 projects already in T2TouchId.sln, so "Build full solution" below
-  # produces them for free - only SepVaultGui (a standalone .NET/WPF project,
-  # not in the .sln) needs its own dotnet steps.
   BOOTSTRAP_PROJECT: T2SepBootstrap
   COINSTALLER_NAME: T2SepCoInstaller
   GUI_PROJECT: driver/T2TouchIdBio/Sepvaultgui.csproj
   GUI_ASSEMBLY_NAME: SepVaultGui
   DOTNET_VERSION: '8.0.x'
 
-# ===========================================================================
-# Той самий принцип, що й у CI (CodeQL + StaticAnalysis + Build) для
-# AmtPtpDeviceUsbKm: один job, один раннер. CodeQL трасує саме той msbuild-
-# виклик, що будує T2TouchIdTransport.vcxproj (PREfast-прапори всередині
-# цього виклику), потім mustrun/mustfix аналіз бази - і лише якщо mustfix
-# чистий, job іде далі: білдиться решта солюшна (protocol/tools/tests,
-# яким потрібен vcpkg/libplist), ганяються тести, і той самий .sys що вже
-# лежить на диску - стемпається/підписується й пакується разом із SARIF-
-# звітами. Ніякого окремого білда "на підпис" - той самий бінарник.
 # ===========================================================================
 jobs:
   ci:
@@ -62,11 +48,6 @@ jobs:
     - name: Add MSBuild to PATH
       uses: microsoft/setup-msbuild@v2
 
-    # =====================================================================
-    # Official WDK installer - same fwlink/flow as the reference driver's
-    # CI. Avoids the choco windowsdriverkit11 package's missing x86
-    # InfVerif.dll gap that MSBuild's automatic INF-verification step
-    # needs.
     # =====================================================================
     - name: Install WDK
       run: |
@@ -102,15 +83,6 @@ jobs:
         Write-Host "OK: found WDK build tooling, e.g. $($stampinf[0].FullName)"
       shell: pwsh
 
-    # =====================================================================
-    # protocol/tools/tests are user-mode and need libplist
-    # (protocol/BridgeXpc/PlistPayload.cpp). Only classic-mode consumers
-    # (this repo builds via plain MSBuild, not CMake) need the actual .lib
-    # filename vcpkg produced, so it's discovered rather than guessed -
-    # same "locate, don't assume" pattern used for StampInf/Inf2Cat/
-    # signtool below. This step is only needed for the full-solution build
-    # after the driver-only CodeQL/PREfast pass; the driver project itself
-    # does not depend on vcpkg.
     # =====================================================================
     - name: Bootstrap vcpkg
       run: |
@@ -175,10 +147,6 @@ jobs:
       shell: pwsh
 
     # =====================================================================
-    # Same version/date scheme as the reference project, computed once so
-    # it stays identical between the INF stamp later and any artifact
-    # naming.
-    # =====================================================================
     - name: Compute driver version and date
       id: setver
       run: |
@@ -196,17 +164,6 @@ jobs:
         Add-Content -Path $env:GITHUB_OUTPUT -Value "version=$driverVersion"
       shell: pwsh
 
-    # =====================================================================
-    # Single compile that CodeQL traces: only T2TouchIdTransport.vcxproj
-    # (the actual PCI\VEN_106B&DEV_1802 KMDF driver), same as the
-    # reference project's driver-only CodeQL pass. mustrun/mustfix.qls
-    # (windows-driver-suites) are driver-specific query suites, so scoping
-    # the traced build to the driver project - not the whole solution -
-    # keeps the WHCP-relevant signal from being diluted by unrelated
-    # user-mode protocol/tool/test code. KMDF_VERSION_MAJOR/MINOR (1.15)
-    # are already pinned inside the vcxproj; only the WDK target platform
-    # version needs to be pinned here, to whatever this runner's WDK
-    # installer actually shipped.
     # =====================================================================
     - name: Build CodeQL database (with PREfast /analyze baked in)
       run: |
@@ -288,27 +245,7 @@ jobs:
           ${{ env.SARIF_MUSTRUN }}
           ${{ env.SARIF_MUSTFIX }}
 
-    # GitHub Code Scanning (upload-sarif) is unavailable on this repository:
-    # "Advanced Security is only available for Organizations".
-    # SARIF results are already retained as workflow artifacts (codeql-results)
-    # and bundled into the driver package under checks/.
-
-    # =====================================================================
-    # Everything below only runs if mustfix.qls above passed clean (exit
-    # 0) - none of these steps use if: always(), so a Must-Fix defect
-    # stops the job right above and none of this - full-solution build,
-    # tests, signing, final artifact - ever runs.
-    # =====================================================================
-
-    # =====================================================================
-    # Full solution build: the driver project is already up to date from
-    # the CodeQL pass above (same OutDir/IntDir), so MSBuild's incremental
-    # check just confirms it and moves on to protocol/tools/tests, which
-    # need the vcpkg plist include/lib dirs discovered earlier. No PREfast
-    # flags here - static analysis already ran on the driver above, and
-    # PREfast is not meaningful for the plain user-mode protocol/tool/test
-    # projects.
-    # =====================================================================
+# ===========================================================================
     - name: Build full solution (protocol + tool + tests)
       run: |
         msbuild $env:SOLUTION `
@@ -320,9 +257,6 @@ jobs:
           /nologo /verbosity:minimal /clp:Summary
       shell: pwsh
 
-    # =====================================================================
-    # Milestone 2A's own rule ("don't write PASS unless verified") applies
-    # here too - a red test run fails the job, it doesn't just get logged.
     # =====================================================================
     - name: Run T2TouchIdTests.exe
       run: |
@@ -348,23 +282,6 @@ jobs:
         Write-Host "OK: all tests passed."
       shell: pwsh
 
-    # =====================================================================
-    # SepVaultGui (Sepvaultgui.csproj): a .NET 8 WPF project, standalone -
-    # not part of T2TouchId.sln, built with the .NET SDK directly. It is a
-    # plain user-run desktop app (one-time setup tool that writes
-    # sep-vault.bin) and does NOT get copied into %SystemRoot%\System32 or
-    # bundled inside the driver package/INF - the driver install and the
-    # GUI are two independent things a user installs separately. This job
-    # instead packages it into its own two standalone archives (see
-    # "Package standalone SepVaultGui archives" below), uploaded next to
-    # the driver package rather than inside it.
-    #
-    # Two publish flavors, each becoming its own archive:
-    #   - Full (self-contained, single-file): one .exe, no .NET runtime
-    #     needed on the target machine.
-    #   - Min (framework-dependent): needs its companion files
-    #     (.dll/.deps.json/.runtimeconfig.json) alongside the .exe, and
-    #     requires the .NET 8 Desktop Runtime on the target machine.
     # =====================================================================
     - name: Setup .NET
       uses: actions/setup-dotnet@v4
@@ -402,13 +319,6 @@ jobs:
       shell: pwsh
 
     # =====================================================================
-    # Min build - framework-dependent, NOT self-contained. Requires the
-    # target machine to already have the .NET 8 Desktop Runtime installed
-    # (https://dotnet.microsoft.com/download/dotnet/8.0 -> ".NET Desktop
-    # Runtime"); otherwise it refuses to launch with a "you must install
-    # .NET" prompt. Its files get bundled into its own standalone archive
-    # by the "Package standalone SepVaultGui archives" step below.
-    # =====================================================================
     - name: Publish SepVaultGui (framework-dependent win-x64) - Min
       run: |
         $ErrorActionPreference = "Stop"
@@ -427,13 +337,6 @@ jobs:
         Write-Host "OK: published $exePath ($sizeMb MB, framework-dependent - needs .NET 8 Desktop Runtime on target)"
       shell: pwsh
 
-    # =====================================================================
-    # SepVaultGui ships as its own two archives, completely separate from
-    # the driver package below - nothing here touches System32 or the INF.
-    # Each archive gets a named root folder inside the zip (same pattern
-    # used for the driver package's own staging step further down), so
-    # extracting either one drops a "SepVaultGui" folder rather than
-    # scattering loose files.
     # =====================================================================
     - name: Package standalone SepVaultGui archives (Full + Min)
       run: |
@@ -469,14 +372,6 @@ jobs:
         path: ${{ env.GUI_STAGING_DIR_MIN }}
         if-no-files-found: error
 
-    # =====================================================================
-    # Driver packaging: ONE package now - artifacts\driver ->
-    # T2TouchId-Signed-<version>. Previously this was split into "full"/
-    # "min" variants that differed only by which SepVaultGui build they
-    # carried; now that SepVaultGui isn't bundled into the driver package
-    # at all (it ships as its own standalone archives above), there is
-    # nothing left that would make two driver packages differ, so the
-    # split - and the INF-patching step it required - is gone.
     # =====================================================================
     - name: Prepare driver package files
       run: |
@@ -587,12 +482,6 @@ jobs:
       shell: pwsh
 
     # =====================================================================
-    # Signing stays OPTIONAL, matching what T2TouchIdTransport.inf itself
-    # says: "PoC-only, not WHQL signed - test-signing / Secure Boot test
-    # mode required" (docs/milestone-2-hardware-results.md). A missing
-    # CERT/CERT_PWD secret pair means unsigned/test-signable output for
-    # BOTH variants, not a broken build.
-    # =====================================================================
     - name: Locate signtool.exe
       if: ${{ env.SIGN_CERT_PFX != '' && env.SIGN_CERT_PASSWORD != '' }}
       run: |
@@ -629,7 +518,17 @@ jobs:
           $packageDir = "artifacts\driver"
           $sysPath = "$packageDir\$env:DRIVER_NAME.sys"
           $catPath = "$packageDir\$env:DRIVER_NAME.cat"
-          $cerPath = "$packageDir\$env:DRIVER_NAME.cer"
+
+          # Real certificate name from its own params (Subject CN via
+          # GetNameInfo), NOT the driver name - this is what the .cer ships as.
+          $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(
+            $pfxPath, $env:SIGN_CERT_PASSWORD,
+            [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable
+          )
+          $certName = $cert.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+          if ([string]::IsNullOrWhiteSpace($certName)) { $certName = "Certificate" }
+          $certFileName = (($certName -replace '[\\/:*?"<>|]', '_')).Trim()
+          $cerPath = "$packageDir\$certFileName.cer"
 
           & "$env:SIGNTOOL_PATH" sign /v /fd SHA256 /f "$pfxPath" /p "$env:SIGN_CERT_PASSWORD" `
             /tr http://timestamp.digicert.com /td SHA256 "$sysPath"
@@ -639,12 +538,8 @@ jobs:
             /tr http://timestamp.digicert.com /td SHA256 "$catPath"
           if ($LASTEXITCODE -ne 0) { Write-Error "Signing .cat failed (exit $LASTEXITCODE)."; exit 1 }
 
-          $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(
-            $pfxPath, $env:SIGN_CERT_PASSWORD,
-            [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable
-          )
           Export-Certificate -Cert $cert -FilePath $cerPath | Out-Null
-          Write-Host "OK: .sys and .cat signed; .cer exported."
+          Write-Host "OK: .sys and .cat signed; .cer exported as $certFileName.cer."
         }
         finally {
           if (Test-Path $pfxPath) { Remove-Item -Path $pfxPath -Force }
@@ -670,11 +565,6 @@ jobs:
         Write-Host "OK: staged t2touchid.exe and its runtime DLLs into $packageDir"
       shell: pwsh
 
-    # =====================================================================
-    # "Дані перевірок" go INTO the shipped driver package, not just into a
-    # separate workflow-artifact upload: mustrun/mustfix SARIF, the PREfast
-    # build log, and a short plain-text summary sit in a checks/ subfolder
-    # next to the driver.
     # =====================================================================
     - name: Bundle static-analysis results with the package
       run: |
@@ -730,9 +620,6 @@ jobs:
         Write-Host "OK: bundled checks/ into $packageDir"
       shell: pwsh
 
-    # =====================================================================
-    # Same "staging folder with a named root inside the zip" pattern used
-    # for the SepVaultGui archives above.
     # =====================================================================
     - name: Prepare final driver package folder
       run: |

@@ -1,17 +1,5 @@
 name: CI T2TouchIdBio (UMDF/PREfast)
 
-# T2TouchIdBio (driver/T2TouchIdBio) used to also build+package SepVaultGui
-# (Sepvaultgui.csproj) and T2SepBootstrap (T2SepBootstrap.vcxproj, in
-# T2TouchId.sln) in a `ci` job here. That job has moved into Cit2touchid.yml,
-# so those two ship staged in the same artifacts\driver folder as
-# T2TouchIdTransport.sys (and T2SepCoInstaller.dll, its PnP co-installer),
-# instead of as separate SepVaultGui-*/T2SepBootstrap artifacts nobody wires
-# together. This workflow now only builds driver/T2TouchIdBio/Umdf (the WBDI
-# UMDF 2 skeleton) with PREfast and packages it (StampInf/Inf2Cat/optional
-# signing) - unrelated to the SEP transport driver, still WIP, and kept on
-# its own WDK-installing runner so a red PREfast result here can't block the
-# T2TouchIdTransport package.
-
 on:
   push:
     branches: [ main ]
@@ -46,15 +34,6 @@ env:
 
 jobs:
   # ===========================================================================
-  # T2TouchIdBio UMDF 2 skeleton (WBDI) built with PREfast (/analyze via
-  # RunCodeAnalysis + EnableCppCoreCheck), same flags as the KMDF driver's
-  # build in Cit2touchid.yml. The only job left in this workflow now that
-  # SepVaultGui/T2SepBootstrap build+package in Cit2touchid.yml instead.
-  #
-  # Standalone .vcxproj (not in T2TouchId.sln). It now compiles protocol/
-  # (VerificationEngine -> BridgeXpc -> PlistPayload.cpp), so this job still
-  # needs its own vcpkg/libplist bootstrap below.
-  # ===========================================================================
   umdf:
     name: Build T2TouchIdBio UMDF (PREfast) + Package
     runs-on: windows-2022
@@ -64,15 +43,10 @@ jobs:
       UMDF_DIR: driver/T2TouchIdBio/Umdf
       UMDF_PROJECT: driver/T2TouchIdBio/Umdf/T2TouchIdBio.vcxproj
       UMDF_NAME: T2TouchIdBio
-      # WBF Engine Adapter (plain user-mode DLL) shipped in the same package;
-      # the INF copies it to System32\WinBioPlugIns.
       ENGINE_DIR: driver/T2TouchIdBio/EngineAdapter
       ENGINE_PROJECT: driver/T2TouchIdBio/EngineAdapter/T2TouchIdEngineAdapter.vcxproj
       ENGINE_NAME: T2TouchIdEngineAdapter
-      # Must match UMDF_VERSION_MAJOR/MINOR in T2TouchIdBio.vcxproj (2.15).
       UMDF_STAMP_VERSION: 2.15.0
-      # One-line switch: set to false to see PREfast findings without failing
-      # the job (useful while the skeleton is still being brought up).
       CA_TREAT_WARNINGS_AS_ERRORS: true
       SIGN_CERT_PFX: ${{ secrets.CERT }}
       SIGN_CERT_PASSWORD: ${{ secrets.CERT_PWD }}
@@ -83,7 +57,7 @@ jobs:
     - name: Add MSBuild to PATH
       uses: microsoft/setup-msbuild@v2
 
-    # Same official WDK installer flow as Cit2touchid.yml / BuildT2TouchId.yml.
+    # =====================================================================
     - name: Install WDK
       run: |
         $ErrorActionPreference = "Stop"
@@ -99,7 +73,7 @@ jobs:
         Write-Host "OK: WDK installer exited with code $exitCode"
       shell: pwsh
 
-    # Locate (don't assume) every WDK tool this job needs, once.
+    # =====================================================================
     - name: Locate WDK tools (StampInf, Inf2Cat, signtool)
       run: |
         $ErrorActionPreference = "Stop"
@@ -138,8 +112,7 @@ jobs:
         Add-Content -Path $env:GITHUB_ENV -Value "DRIVER_VERSION=$driverVersion"
       shell: pwsh
 
-    # protocol/BridgeXpc/PlistPayload.cpp needs <plist/plist.h>; the UMDF
-    # vcxproj takes the location from VcpkgInstalledDir / PlistLibName.
+    # =====================================================================
     - name: Bootstrap vcpkg
       run: |
         $ErrorActionPreference = "Stop"
@@ -170,10 +143,7 @@ jobs:
         Add-Content -Path $env:GITHUB_ENV -Value "VCPKG_INSTALLED_DIR=$PWD\vcpkg\installed\x64-windows"
       shell: pwsh
 
-    # Diagnostic: the first real compile showed the WBDI type names in
-    # Queue.cpp were guessed from memory. Put the runner's own WinBio headers
-    # into the log (collapsed group) and into the umdf-static-analysis-logs
-    # artifact, so names/layouts are read from the source of truth.
+    # =====================================================================
     - name: Dump WinBio WBDI headers (diagnostic)
       run: |
         $ErrorActionPreference = "Stop"
@@ -202,13 +172,6 @@ jobs:
         }
       shell: pwsh
 
-    # =====================================================================
-    # PREfast is baked into this msbuild invocation exactly like the KMDF
-    # build (RunCodeAnalysis + EnableCppCoreCheck). WindowsTargetPlatformVersion
-    # is pinned to whatever this runner's WDK installer shipped; UMDF_VERSION_*
-    # (2.15) are already pinned inside the vcxproj. The UMDF project writes to
-    # <project dir>\build\..., not the repo-root build\ that the user-mode
-    # projects in the .sln use.
     # =====================================================================
     - name: Build UMDF driver (with PREfast /analyze)
       run: |
@@ -241,8 +204,7 @@ jobs:
         Add-Content -Path $env:GITHUB_ENV -Value "UMDF_LOG_DIR=$logDir"
       shell: pwsh
 
-    # Engine adapter: no PREfast yet (bring-up; first compile against the real
-    # winbio_adapter.h happens here). Warnings land in engine-build.log.
+    # =====================================================================
     - name: Build WBF engine adapter
       run: |
         $ErrorActionPreference = "Stop"
@@ -286,10 +248,6 @@ jobs:
           driver/T2TouchIdBio/Umdf/build/**/obj/*.nativecodeanalysis.xml
 
     # =====================================================================
-    # Packaging: same StampInf / Inf2Cat / signtool sequence as the KMDF
-    # driver, adapted for a UMDF service DLL (-u instead of -k). Only reached
-    # when the build + PREfast above passed.
-    # =====================================================================
     - name: Prepare UMDF package folder
       run: |
         $ErrorActionPreference = "Stop"
@@ -325,12 +283,7 @@ jobs:
         Add-Content -Path $env:GITHUB_ENV -Value "CAT_PATH=$packageDir\$env:UMDF_NAME.cat"
       shell: pwsh
 
-    # T2TouchIdBio.dll imports plist-2.0.dll (+ libxml2/zlib/iconv/... from
-    # vcpkg). Without them in the driver package WUDFHost cannot load the
-    # driver and the node ends up in Code 31 / C0000001. Copy every vcpkg
-    # runtime DLL next to the driver and list them in the INF (SourceDisksFiles
-    # + UMDriverCopy) so they land in the driver store beside T2TouchIdBio.dll
-    # and are covered by the catalog. Must run BEFORE StampInf/Inf2Cat.
+    # =====================================================================
     - name: Bundle libplist runtime DLLs into the package + INF
       run: |
         $ErrorActionPreference = "Stop"
@@ -393,18 +346,27 @@ jobs:
         Write-Host "OK: .cat generated -> $env:CAT_PATH"
       shell: pwsh
 
-    # Signing stays OPTIONAL, same policy as the KMDF driver: a missing
-    # CERT/CERT_PWD secret pair means unsigned (test-signable) output.
+    # =====================================================================
     - name: Sign .dll and .cat with SignTool
       if: ${{ env.SIGN_CERT_PFX != '' && env.SIGN_CERT_PASSWORD != '' }}
       run: |
         $ErrorActionPreference = "Stop"
         $pfxPath = Join-Path $env:TEMP "signcert.pfx"
-        $cerPath = Join-Path $env:PACKAGE_DIR "$env:UMDF_NAME.cer"
 
         try {
           $bytes = [Convert]::FromBase64String($env:SIGN_CERT_PFX)
           [IO.File]::WriteAllBytes($pfxPath, $bytes)
+
+          # Real certificate name from its own params (Subject CN via
+          # GetNameInfo), NOT the UMDF driver name - this is what the .cer ships as.
+          $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(
+            $pfxPath, $env:SIGN_CERT_PASSWORD,
+            [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable
+          )
+          $certName = $cert.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+          if ([string]::IsNullOrWhiteSpace($certName)) { $certName = "Certificate" }
+          $certFileName = (($certName -replace '[\\/:*?"<>|]', '_')).Trim()
+          $cerPath = Join-Path $env:PACKAGE_DIR "$certFileName.cer"
 
           # Every DLL in the package (driver, engine adapter, bundled libplist
           # runtime) + the catalog.
@@ -415,12 +377,8 @@ jobs:
             if ($LASTEXITCODE -ne 0) { Write-Error "Signing $target failed (exit code $LASTEXITCODE)."; exit 1 }
           }
 
-          $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(
-            $pfxPath, $env:SIGN_CERT_PASSWORD,
-            [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable
-          )
           Export-Certificate -Cert $cert -FilePath $cerPath | Out-Null
-          Write-Host "OK: .dll and .cat signed; .cer exported."
+          Write-Host "OK: .dll and .cat signed; .cer exported as $certFileName.cer."
         }
         finally {
           if (Test-Path $pfxPath) { Remove-Item -Path $pfxPath -Force }
@@ -432,7 +390,7 @@ jobs:
       run: Write-Host "::warning::CERT/CERT_PWD secrets not set - packaging an UNSIGNED .dll/.cat. Target machine needs test-signing enabled."
       shell: pwsh
 
-    # PREfast evidence travels inside the package, like checks/ in the KMDF one.
+    # =====================================================================
     - name: Bundle PREfast results with the package
       run: |
         $ErrorActionPreference = "Stop"
