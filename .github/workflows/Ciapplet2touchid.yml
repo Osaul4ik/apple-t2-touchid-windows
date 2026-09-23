@@ -1,7 +1,13 @@
 name: CI Apple T2 TouchId (CodeQL + PREfast + Build + Package)
 
 # ===========================================================================
-#apple-t2-touchid.zip:
+# Артефакт apple-t2-touchid-<версія> (GitHub сам пакує його в zip; ВКЛАДЕНОГО
+# архіву немає) містить одну папку верхнього рівня:
+#
+# apple-t2-touchid/
+#   InstallDriver.bat  (з tools/; ставить сертифікат, SEP, NCM, Bio по порядку)
+#   Inst/           InstallCert.bat, Install-T2TouchIdBio.ps1 (з tools/) і
+#                   <CertCN>.cer
 #   SEP/            T2TouchIdTransport.sys, .inf, .cat, T2SepBootstrap.exe,
 #                   T2SepCoInstaller.dll, t2touchid.exe + vcpkg runtime dll,
 #                   checks/
@@ -13,9 +19,9 @@ name: CI Apple T2 TouchId (CodeQL + PREfast + Build + Package)
 #                   framework-dependent "Min" публікується ОКРЕМИМ
 #                   workflow-артефактом SepVaultGui-Min, у фінальний zip не
 #                   входить - у SEP/NCM/Bio/SepVaultGui нема сертифіката)
-#   <CertCN>.cer    ОДИН сертифікат на весь пакет (реальне ім'я з нього
+#   Inst/<CertCN>.cer  ОДИН сертифікат на весь пакет (реальне ім'я з нього
 #                   самого - Subject CN через GetNameInfo, не назва драйвера)
-#   InstallCert.bat (з tools/, файл-агностичний - шукає будь-який .cer поруч)
+#   InstallCert.bat файл-агностичний - шукає будь-який .cer у своїй папці (Inst/)
 #
 # ===========================================================================
 
@@ -826,7 +832,10 @@ jobs:
           $certName = $cert.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
           if ([string]::IsNullOrWhiteSpace($certName)) { $certName = "Certificate" }
           $certFileName = (($certName -replace '[\\/:*?"<>|]', '_')).Trim()
-          $cerPath = "final\$certFileName.cer"
+          # Certificate lives in Inst\ next to InstallCert.bat, which looks
+          # for any .cer in its own folder.
+          New-Item -ItemType Directory -Path "final\Inst" -Force | Out-Null
+          $cerPath = "final\Inst\$certFileName.cer"
           Add-Content -Path $env:GITHUB_ENV -Value "APPLE_T2_CERT_NAME=$certFileName"
 
           $toSign = @(
@@ -860,8 +869,17 @@ jobs:
       run: Write-Host "::warning::CERT/CERT_PWD secrets not set - SEP/NCM/Bio/SepVaultGui binaries are UNSIGNED. Target machine needs test-signing mode."
       shell: pwsh
 
-    - name: Copy InstallCert.bat into the final package root
-      run: Copy-Item -Path "tools\InstallCert.bat" -Destination "final\InstallCert.bat" -Force
+    - name: Copy installer scripts into the final package
+      run: |
+        $ErrorActionPreference = "Stop"
+        # InstallDriver.bat sits in the package root; everything it calls for
+        # the certificate / Bio node goes to Inst\ (the .cer is already there).
+        $inst = "final\Inst"
+        New-Item -ItemType Directory -Path $inst -Force | Out-Null
+        Copy-Item -Path "tools\InstallDriver.bat" -Destination "final\InstallDriver.bat" -Force
+        Copy-Item -Path "tools\InstallCert.bat" -Destination "$inst\InstallCert.bat" -Force
+        Copy-Item -Path "tools\Install-T2TouchIdBio.ps1" -Destination "$inst\Install-T2TouchIdBio.ps1" -Force
+        Write-Host "OK: InstallDriver.bat in package root; InstallCert.bat + Install-T2TouchIdBio.ps1 in Inst\."
       shell: pwsh
 
     # =====================================================================
@@ -923,17 +941,43 @@ jobs:
       shell: pwsh
 
     # =====================================================================
-    - name: Create apple-t2-touchid.zip
+    - name: Assemble apple-t2-touchid folder
       run: |
         $ErrorActionPreference = "Stop"
-        Get-ChildItem "final" | ForEach-Object { Write-Host "==> final\$($_.Name)" }
-        Compress-Archive -Path "final\*" -DestinationPath "apple-t2-touchid.zip" -Force
-        Write-Host "OK: apple-t2-touchid.zip created ($([Math]::Round((Get-Item 'apple-t2-touchid.zip').Length / 1MB, 1)) MB)"
+
+        # upload-artifact zips its path relative to that path, so the folder
+        # has to be a CHILD of the uploaded directory to survive as the
+        # archive's top-level entry: dist\apple-t2-touchid -> upload "dist".
+        if (Test-Path "dist") { Remove-Item -Path "dist" -Recurse -Force }
+        New-Item -ItemType Directory -Path "dist" -Force | Out-Null
+        Move-Item -Path "final" -Destination "dist\apple-t2-touchid"
+        $pkg = "dist\apple-t2-touchid"
+
+        # Layout check: fail the build instead of shipping a package whose
+        # installer cannot find its own files.
+        $required = @(
+          "InstallDriver.bat",
+          "Inst\InstallCert.bat",
+          "Inst\Install-T2TouchIdBio.ps1",
+          "SEP\$env:SEP_DRIVER_NAME.inf",
+          "NCM\apple-t2-ncm.inf", "NCM\apple-t2-ncm-ctrl-stub.inf", "NCM\apple-t2-composite.inf",
+          "Bio\$env:BIO_UMDF_NAME.inf"
+        )
+        foreach ($rel in $required) {
+          if (-not (Test-Path (Join-Path $pkg $rel))) { Write-Error "Package layout: missing $rel"; exit 1 }
+        }
+        if ($env:SIGN_CERT_PFX -and $env:SIGN_CERT_PASSWORD) {
+          if (-not (Test-Path (Join-Path $pkg "Inst\$env:APPLE_T2_CERT_NAME.cer"))) {
+            Write-Error "Package layout: Inst\$env:APPLE_T2_CERT_NAME.cer is missing"; exit 1
+          }
+        }
+        Get-ChildItem -Path $pkg | ForEach-Object { Write-Host "==> apple-t2-touchid\$($_.Name)" }
+        Get-ChildItem -Path "$pkg\Inst" | ForEach-Object { Write-Host "==> apple-t2-touchid\Inst\$($_.Name)" }
       shell: pwsh
 
-    - name: Upload apple-t2-touchid.zip
+    - name: Upload apple-t2-touchid
       uses: actions/upload-artifact@v4
       with:
         name: apple-t2-touchid-${{ env.DRIVER_VERSION }}
-        path: apple-t2-touchid.zip
+        path: dist
         if-no-files-found: error

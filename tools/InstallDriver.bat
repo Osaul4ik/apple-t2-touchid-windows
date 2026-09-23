@@ -12,7 +12,7 @@ if errorlevel 1 (
     echo.
     echo [ERROR] This installer must be run as Administrator.
     echo.
-    echo Right-click Install.bat and select "Run as administrator".
+    echo Right-click InstallDriver.bat and select "Run as administrator".
     echo.
     pause
     exit /b 1
@@ -191,9 +191,9 @@ rem ============================================================
 echo [5/5] Installing T2 Touch ID biometric driver...
 echo.
 
-if not exist "%ROOT%Install-T2TouchIdBio.ps1" (
+if not exist "%ROOT%Inst\Install-T2TouchIdBio.ps1" (
     echo [ERROR] PowerShell installer not found:
-    echo %ROOT%Install-T2TouchIdBio.ps1
+    echo %ROOT%Inst\Install-T2TouchIdBio.ps1
     echo.
     pause
     exit /b 1

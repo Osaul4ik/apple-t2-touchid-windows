@@ -380,6 +380,10 @@ T2NcmRxReadNdp(
 {
     ULONG ndpLength;
 
+    // Defined on EVERY path, including the FALSE returns: the caller only
+    // reads them after a TRUE return, but an _Out_ parameter that some
+    // path leaves unwritten is exactly what PREfast (C6101) rejects.
+    RtlZeroMemory(Ndp, sizeof(*Ndp));
     *EntryCount = 0;
 
     if (NdpOffset < sizeof(T2NCM_WIRE_NTH16) ||

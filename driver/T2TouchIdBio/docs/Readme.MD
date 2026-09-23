@@ -40,10 +40,12 @@ devcon install T2TouchIdBio.inf root\T2TouchIdBio
 створити явно. Без devcon/WDK на цільовій машині:
 
 ```
-powershell -ExecutionPolicy Bypass -File Install-T2TouchIdBio.ps1
+powershell -ExecutionPolicy Bypass -File Inst\Install-T2TouchIdBio.ps1
 ```
 
-(адмін-консоль, з папки зі штампованим пакетом `.inf`+`.dll`+`.cat`).
+(адмін-консоль, з кореня пакета `apple-t2-touchid`: скрипт лежить в `Inst\`,
+а `Bio\T2TouchIdBio.inf` (штампований `.inf`+`.dll`+`.cat`) шукає на рівень
+вище. Усі драйвери разом ставить `InstallDriver.bat` з кореня пакета).
 
 1. Device Manager → клас **Biometric devices** → пристрій без Code 31/39/43.
 2. DebugView (Capture Global Win32): рядки `T2TouchIdBio: IOCTL 0x...`.

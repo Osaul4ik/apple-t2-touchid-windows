@@ -19,6 +19,10 @@ if (-not $InfPath) {
         $root = (Get-Location).Path
     }
 
+    # This script lives in <package>\Inst; the driver folders (Bio\, SEP\,
+    # NCM\) are siblings of Inst, i.e. one level up.
+    $root = Split-Path -Parent $root
+
     $InfPath = Join-Path $root 'Bio\T2TouchIdBio.inf'
 }
 
