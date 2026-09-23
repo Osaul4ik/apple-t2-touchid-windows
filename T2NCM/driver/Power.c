@@ -197,6 +197,7 @@ T2NcmPowerArmHardware(
     DeviceContext->NtbOutMaxDatagrams     = 0;
     DeviceContext->BulkInPipe             = NULL;
     DeviceContext->BulkOutPipe            = NULL;
+    DeviceContext->BulkOutMaxPacketSize   = 0;
     DeviceContext->RxReaderConfigured     = FALSE;
 
     // The MAC address is deliberately NOT reset here. It is read once at

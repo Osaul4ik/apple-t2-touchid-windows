@@ -210,6 +210,12 @@ typedef struct _T2NCM_DEVICE_CONTEXT
     WDFUSBPIPE          BulkInPipe;         // 0x82 (alt 1)
     WDFUSBPIPE          BulkOutPipe;        // 0x01 (alt 1)
 
+    // wMaxPacketSize of BulkOutPipe, captured when alt 1 is activated and
+    // zeroed whenever the pipes are dropped. The TX builder needs it to
+    // keep an NTB from ending exactly on a packet boundary (see
+    // T2NcmTxComputeLayout). 0 = unknown, padding disabled.
+    ULONG               BulkOutMaxPacketSize;
+
     T2NCM_LIFECYCLE_STATE State;
     WDFSPINLOCK          StateLock;
 
@@ -248,6 +254,13 @@ typedef struct _T2NCM_DEVICE_CONTEXT
     // PASSIVE_LEVEL (control transfers are PASSIVE-only).
     WDFWORKITEM          PacketFilterWorkItem;
     ULONG                CurrentLookahead;
+
+    // MulticastList/MulticastAddressCount are rewritten by
+    // OID_802_3_MULTICAST_LIST (<= DISPATCH_LEVEL) while the RX path reads
+    // them at DISPATCH_LEVEL on other CPUs. Every access goes through this
+    // lock; without it a receive could see the list half zeroed and drop
+    // multicast frames (IPv6 neighbour discovery) for no visible reason.
+    KSPIN_LOCK           MulticastLock;
     ULONG                MulticastAddressCount;
     UCHAR                MulticastList[T2NCM_MAX_MULTICAST_LIST][T2NCM_MAC_LENGTH];
 
@@ -373,5 +386,14 @@ extern NDIS_HANDLE g_T2NcmMiniportDriverHandle;
 // Never used by the data path — see NdisMiniport.c for why that
 // restriction matters.
 extern PT2NCM_DEVICE_CONTEXT volatile g_T2NcmDiagnosticAdapter;
+
+// Guards g_T2NcmDiagnosticAdapter and the lifetime of what it points at.
+// The diagnostic IOCTLs hold it shared for their whole duration; publishing
+// or clearing the pointer (MiniportInitializeEx / MiniportHaltEx) takes it
+// exclusive, so MiniportHaltEx cannot free the device context underneath
+// an IOCTL that is still using it. ERESOURCE rather than a fast mutex:
+// the IOCTL path does a PASSIVE_LEVEL-only synchronous USB write while
+// holding it, and a fast mutex would raise IRQL to APC_LEVEL.
+extern ERESOURCE g_T2NcmDiagnosticLock;
 
 DRIVER_INITIALIZE DriverEntry;

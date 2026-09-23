@@ -172,11 +172,18 @@ T2NcmDispatchDeviceControl(
     )
 {
     PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(Irp);
-    PT2NCM_DEVICE_CONTEXT context = g_T2NcmDiagnosticAdapter;
+    PT2NCM_DEVICE_CONTEXT context;
     NTSTATUS status = STATUS_INVALID_DEVICE_REQUEST;
     ULONG_PTR information = 0;
 
     UNREFERENCED_PARAMETER(DeviceObject);
+
+    // Held shared until Complete: MiniportHaltEx clears the published
+    // adapter under the exclusive lock, so the context read here cannot
+    // be freed while this request is still using it.
+    KeEnterCriticalRegion();
+    ExAcquireResourceSharedLite(&g_T2NcmDiagnosticLock, TRUE);
+    context = g_T2NcmDiagnosticAdapter;
 
     if (context == NULL)
     {
@@ -251,11 +258,31 @@ T2NcmDispatchDeviceControl(
     }
 
 Complete:
+    ExReleaseResourceLite(&g_T2NcmDiagnosticLock);
+    KeLeaveCriticalRegion();
+
     Irp->IoStatus.Status = status;
     Irp->IoStatus.Information = information;
     IoCompleteRequest(Irp, IO_NO_INCREMENT);
 
     return status;
+}
+
+// Publishes (or, with NULL, withdraws) the adapter the diagnostic IOCTLs
+// operate on. Withdrawing waits for every IOCTL that already picked the
+// old pointer up, so the caller may free the context as soon as this
+// returns. PASSIVE_LEVEL only.
+static
+VOID
+T2NcmSetDiagnosticAdapter(
+    _In_opt_ PT2NCM_DEVICE_CONTEXT DeviceContext
+    )
+{
+    KeEnterCriticalRegion();
+    ExAcquireResourceExclusiveLite(&g_T2NcmDiagnosticLock, TRUE);
+    g_T2NcmDiagnosticAdapter = DeviceContext;
+    ExReleaseResourceLite(&g_T2NcmDiagnosticLock);
+    KeLeaveCriticalRegion();
 }
 
 static
@@ -595,7 +622,7 @@ T2NcmMiniportInitializeEx(
 
     // Publish for the diagnostic device before registering it, so the
     // first IRP through the door cannot find a NULL adapter.
-    g_T2NcmDiagnosticAdapter = context;
+    T2NcmSetDiagnosticAdapter(context);
     (VOID)T2NcmRegisterDiagnosticDevice(context);
 
     // Report the link explicitly as well as in the attributes: NDIS uses
@@ -686,8 +713,10 @@ T2NcmMiniportHaltEx(
     T2NcmRxStop(context);
     T2NcmWaitForDrain(context);
 
+    // Deregister first so no new IRPs arrive, then withdraw the pointer:
+    // that step blocks until any IOCTL already in flight has finished.
     T2NcmDeregisterDiagnosticDevice(context);
-    g_T2NcmDiagnosticAdapter = NULL;
+    T2NcmSetDiagnosticAdapter(NULL);
 
     T2NcmUsbDeactivateDataInterface(context);
     T2NcmRxFreeResources(context);
@@ -1124,8 +1153,17 @@ T2NcmOidQuery(
         return T2NcmOidQueryCopy(Request, &genericUlong, sizeof(genericUlong));
 
     case OID_802_3_MULTICAST_LIST:
-        return T2NcmOidQueryCopy(Request, DeviceContext->MulticastList,
+    {
+        NDIS_STATUS listStatus;
+        KIRQL oldIrql;
+
+        KeAcquireSpinLock(&DeviceContext->MulticastLock, &oldIrql);
+        listStatus = T2NcmOidQueryCopy(Request, DeviceContext->MulticastList,
             DeviceContext->MulticastAddressCount * T2NCM_MAC_LENGTH);
+        KeReleaseSpinLock(&DeviceContext->MulticastLock, oldIrql);
+
+        return listStatus;
+    }
 
     case OID_802_3_RCV_ERROR_ALIGNMENT:
     case OID_802_3_XMIT_ONE_COLLISION:
@@ -1209,6 +1247,7 @@ T2NcmOidSet(
     case OID_802_3_MULTICAST_LIST:
     {
         ULONG count;
+        KIRQL oldIrql;
 
         if ((length % T2NCM_MAC_LENGTH) != 0)
         {
@@ -1226,12 +1265,14 @@ T2NcmOidSet(
         // Software filtering only — the T2's NCM function has no
         // multicast filter to program, so the list is kept here and
         // applied in T2NcmRxAcceptsFrame.
+        KeAcquireSpinLock(&DeviceContext->MulticastLock, &oldIrql);
         RtlZeroMemory(DeviceContext->MulticastList, sizeof(DeviceContext->MulticastList));
         if (count != 0)
         {
             RtlCopyMemory(DeviceContext->MulticastList, buffer, length);
         }
         DeviceContext->MulticastAddressCount = count;
+        KeReleaseSpinLock(&DeviceContext->MulticastLock, oldIrql);
 
         Request->DATA.SET_INFORMATION.BytesRead = length;
 
@@ -1448,6 +1489,11 @@ T2NcmMiniportDriverUnload(
         NdisMDeregisterMiniportDriver(g_T2NcmMiniportDriverHandle);
         g_T2NcmMiniportDriverHandle = NULL;
     }
+
+    // Created in DriverEntry. No adapter is left to publish itself and
+    // the diagnostic device is gone with the last adapter, so nothing can
+    // still be holding it.
+    ExDeleteResourceLite(&g_T2NcmDiagnosticLock);
 
     // Undo the WdfDriverCreate from DriverEntry. Required for a driver
     // created with WdfDriverInitNoDispatchOverride — WDF has no unload

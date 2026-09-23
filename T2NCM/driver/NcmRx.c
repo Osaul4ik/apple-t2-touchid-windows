@@ -73,6 +73,9 @@ typedef struct _T2NCM_WIRE_NDP16
 // get delivered.
 #define T2NCM_RX_MAX_BATCH          64u
 
+// Upper bound on NDP16s followed in one NTB (wNextNdpIndex chain).
+#define T2NCM_RX_MAX_NDPS           8u
+
 // Per-NBL bookkeeping. NBLs come from a pool created with a context
 // area of this size, so the frame buffer and its MDL can be found again
 // in MiniportReturnNetBufferLists without a side table.
@@ -173,15 +176,26 @@ T2NcmRxAcceptsFrame(
         {
             return FALSE;
         }
-        for (ULONG i = 0; i < DeviceContext->MulticastAddressCount; i++)
         {
-            if (RtlCompareMemory(DeviceContext->MulticastList[i], Destination,
-                    T2NCM_MAC_LENGTH) == T2NCM_MAC_LENGTH)
+            BOOLEAN found = FALSE;
+            KIRQL oldIrql;
+
+            // The list is rewritten by OID_802_3_MULTICAST_LIST on another
+            // CPU; see MulticastLock in driver.h.
+            KeAcquireSpinLock(&DeviceContext->MulticastLock, &oldIrql);
+            for (ULONG i = 0; i < DeviceContext->MulticastAddressCount; i++)
             {
-                return TRUE;
+                if (RtlCompareMemory(DeviceContext->MulticastList[i], Destination,
+                        T2NCM_MAC_LENGTH) == T2NCM_MAC_LENGTH)
+                {
+                    found = TRUE;
+                    break;
+                }
             }
+            KeReleaseSpinLock(&DeviceContext->MulticastLock, oldIrql);
+
+            return found;
         }
-        return FALSE;
     }
 
     // Unicast.
@@ -348,6 +362,68 @@ T2NcmRxIndicateBatch(
         indicateFlags);
 }
 
+// Validates one NDP16 against what USB actually delivered and reports how
+// many datagram entries it holds. Returns FALSE (after logging and
+// counting the rejection) if the NDP16 cannot be trusted, in which case
+// the caller stops walking the chain but still delivers whatever earlier
+// NDP16s already produced.
+static
+BOOLEAN
+T2NcmRxReadNdp(
+    _In_  PT2NCM_DEVICE_CONTEXT DeviceContext,
+    _In_reads_bytes_(BlockLength) const UCHAR* Buffer,
+    _In_  ULONG BlockLength,
+    _In_  ULONG NdpOffset,
+    _Out_ T2NCM_WIRE_NDP16* Ndp,
+    _Out_ PULONG EntryCount
+    )
+{
+    ULONG ndpLength;
+
+    *EntryCount = 0;
+
+    if (NdpOffset < sizeof(T2NCM_WIRE_NTH16) ||
+        NdpOffset + T2NCM_NDP16_HEADER_LENGTH > BlockLength)
+    {
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+            "T2Ncm: RX NDP16 offset %u out of bounds (block=%u) - dropping NDP\n",
+            NdpOffset, BlockLength));
+        InterlockedIncrement64(&DeviceContext->RxFramesRejected);
+        return FALSE;
+    }
+
+    RtlCopyMemory(Ndp, Buffer + NdpOffset, sizeof(*Ndp));
+
+    if (Ndp->dwSignature != T2NCM_NDP16_SIGNATURE_NOCRC)
+    {
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
+            "T2Ncm: RX NDP16 signature 0x%08X not the handled NCM0 variant - "
+            "dropping NDP\n", Ndp->dwSignature));
+        InterlockedIncrement64(&DeviceContext->RxFramesRejected);
+        return FALSE;
+    }
+
+    ndpLength = Ndp->wLength;
+    if (ndpLength < T2NCM_NDP16_HEADER_LENGTH ||
+        NdpOffset + ndpLength > BlockLength ||
+        ((ndpLength - T2NCM_NDP16_HEADER_LENGTH) % sizeof(T2NCM_WIRE_NDP16_ENTRY)) != 0)
+    {
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+            "T2Ncm: RX NDP16 wLength=%u invalid/out of bounds (block=%u) - "
+            "dropping NDP\n", ndpLength, BlockLength));
+        InterlockedIncrement64(&DeviceContext->RxFramesRejected);
+        return FALSE;
+    }
+
+    // Explicit cast: (ULONG - unsigned literal) / sizeof(...) promotes to
+    // size_t before the divide, and the count is intentionally ULONG
+    // (bounded by ndpLength, a USHORT-derived value) - /W4 flags the
+    // implicit narrowing on assignment even though nothing can be lost.
+    *EntryCount = (ULONG)((ndpLength - T2NCM_NDP16_HEADER_LENGTH) / sizeof(T2NCM_WIRE_NDP16_ENTRY));
+
+    return TRUE;
+}
+
 static
 VOID
 T2NcmRxParseNtb(
@@ -361,7 +437,6 @@ T2NcmRxParseNtb(
     T2NCM_WIRE_NDP16 ndp;
     ULONG blockLength;
     ULONG ndpOffset;
-    ULONG ndpLength;
     ULONG entryCount;
     ULONG framesThisNtb = 0;
     PNET_BUFFER_LIST nblHead = NULL;
@@ -422,158 +497,150 @@ T2NcmRxParseNtb(
     }
 
     ndpOffset = nth.wNdpIndex;
-    if (ndpOffset < sizeof(T2NCM_WIRE_NTH16) ||
-        ndpOffset + T2NCM_NDP16_HEADER_LENGTH > blockLength)
+
+    // An NTB may carry a chain of NDP16s (wNextNdpIndex != 0). Walk all of
+    // them - stopping after the first would silently drop every datagram
+    // described by the later ones. The chain is bounded, and each link has
+    // to move strictly forward, so a malformed device cannot loop it.
+    for (ULONG ndpCount = 0; ndpCount < T2NCM_RX_MAX_NDPS; ndpCount++)
     {
-        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2Ncm: RX NDP16 offset %u out of bounds (block=%u) - dropping NTB\n",
-            ndpOffset, blockLength));
-        InterlockedIncrement64(&DeviceContext->RxFramesRejected);
-        return;
-    }
-
-    RtlCopyMemory(&ndp, Buffer + ndpOffset, sizeof(ndp));
-
-    if (ndp.dwSignature != T2NCM_NDP16_SIGNATURE_NOCRC)
-    {
-        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
-            "T2Ncm: RX NDP16 signature 0x%08X not the handled NCM0 variant - "
-            "dropping NTB\n", ndp.dwSignature));
-        InterlockedIncrement64(&DeviceContext->RxFramesRejected);
-        return;
-    }
-
-    ndpLength = ndp.wLength;
-    if (ndpLength < T2NCM_NDP16_HEADER_LENGTH ||
-        ndpOffset + ndpLength > blockLength ||
-        ((ndpLength - T2NCM_NDP16_HEADER_LENGTH) % sizeof(T2NCM_WIRE_NDP16_ENTRY)) != 0)
-    {
-        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2Ncm: RX NDP16 wLength=%u invalid/out of bounds (block=%u) - "
-            "dropping NTB\n", ndpLength, blockLength));
-        InterlockedIncrement64(&DeviceContext->RxFramesRejected);
-        return;
-    }
-
-    // Explicit cast: (ULONG - unsigned literal) / sizeof(...) promotes to
-    // size_t before the divide, and entryCount is intentionally ULONG
-    // (bounded by ndpLength, which is a USHORT-derived value that can
-    // never need more than 32 bits) — /W4 flags the implicit narrowing
-    // on assignment even though it can't actually lose data here.
-    entryCount = (ULONG)((ndpLength - T2NCM_NDP16_HEADER_LENGTH) / sizeof(T2NCM_WIRE_NDP16_ENTRY));
-
-    for (ULONG i = 0; i < entryCount; i++)
-    {
-        T2NCM_WIRE_NDP16_ENTRY entry;
-        // Same explicit-narrowing note as entryCount above.
-        ULONG entryOffset = (ULONG)(ndpOffset + T2NCM_NDP16_HEADER_LENGTH +
-                             (i * sizeof(T2NCM_WIRE_NDP16_ENTRY)));
-
-        RtlCopyMemory(&entry, Buffer + entryOffset, sizeof(entry));
-
-        if (entry.wDatagramIndex == 0 && entry.wDatagramLength == 0)
+        if (!T2NcmRxReadNdp(DeviceContext, Buffer, blockLength, ndpOffset,
+                &ndp, &entryCount))
         {
-            break; // required terminator — not an error, just the end
+            break; // logged and counted inside; keep what was parsed so far
         }
 
-        if (entry.wDatagramIndex < sizeof(T2NCM_WIRE_NTH16) ||
-            (ULONG)entry.wDatagramIndex + entry.wDatagramLength > blockLength)
+        for (ULONG i = 0; i < entryCount; i++)
         {
-            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
-                "T2Ncm: RX datagram entry %u out of bounds (index=%u len=%u "
-                "block=%u) - skipping this datagram only\n",
-                i, entry.wDatagramIndex, entry.wDatagramLength, blockLength));
-            InterlockedIncrement64(&DeviceContext->RxFramesRejected);
-            InterlockedIncrement64(&DeviceContext->InErrors);
-            continue;
-        }
+            T2NCM_WIRE_NDP16_ENTRY entry;
+            // Explicit narrowing, same reasoning as the entry count in
+            // T2NcmRxReadNdp.
+            ULONG entryOffset = (ULONG)(ndpOffset + T2NCM_NDP16_HEADER_LENGTH +
+                                 (i * sizeof(T2NCM_WIRE_NDP16_ENTRY)));
 
-        if (entry.wDatagramLength < T2NCM_ETHERNET_HEADER_LEN ||
-            entry.wDatagramLength > T2NCM_MAX_FRAME_SIZE)
-        {
-            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
-                "T2Ncm: RX datagram entry %u length %u outside [%u,%u] - "
-                "skipping this datagram only\n",
-                i, entry.wDatagramLength, T2NCM_ETHERNET_HEADER_LEN,
-                T2NCM_MAX_FRAME_SIZE));
-            InterlockedIncrement64(&DeviceContext->RxFramesRejected);
-            InterlockedIncrement64(&DeviceContext->InErrors);
-            continue;
-        }
+            RtlCopyMemory(&entry, Buffer + entryOffset, sizeof(entry));
 
-        {
-            const UCHAR* frame = Buffer + entry.wDatagramIndex;
-            PNET_BUFFER_LIST nbl;
-
-            // Diagnostic snapshot, kept from the pre-NDIS milestone: it
-            // is still the quickest way to tell "the parser is fine and
-            // NDIS is dropping them" apart from "nothing is arriving".
-            RtlCopyMemory(DeviceContext->RxLastFrameDest, frame, 6);
-            RtlCopyMemory(DeviceContext->RxLastFrameSrc, frame + 6, 6);
-            DeviceContext->RxLastFrameEtherType =
-                (USHORT)((frame[12] << 8) | frame[13]); // network byte order
-            DeviceContext->RxLastFrameLength = entry.wDatagramLength;
-
-            InterlockedIncrement64(&DeviceContext->RxFramesParsed);
-
-            if (!T2NcmRxAcceptsFrame(DeviceContext, frame))
+            if (entry.wDatagramIndex == 0 && entry.wDatagramLength == 0)
             {
-                InterlockedIncrement64(&DeviceContext->RxFramesFiltered);
-                // Filtered out by OID_GEN_CURRENT_PACKET_FILTER. Not an
-                // error and not a discard in the NDIS statistics sense —
-                // the frame was never ours to deliver.
+                break; // required terminator — not an error, just the end
+            }
+
+            if (entry.wDatagramIndex < sizeof(T2NCM_WIRE_NTH16) ||
+                (ULONG)entry.wDatagramIndex + entry.wDatagramLength > blockLength)
+            {
+                T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
+                    "T2Ncm: RX datagram entry %u out of bounds (index=%u len=%u "
+                    "block=%u) - skipping this datagram only\n",
+                    i, entry.wDatagramIndex, entry.wDatagramLength, blockLength));
+                InterlockedIncrement64(&DeviceContext->RxFramesRejected);
+                InterlockedIncrement64(&DeviceContext->InErrors);
                 continue;
             }
 
-            nbl = T2NcmRxBuildNbl(DeviceContext, frame, entry.wDatagramLength);
-            if (nbl == NULL)
+            if (entry.wDatagramLength < T2NCM_ETHERNET_HEADER_LEN ||
+                entry.wDatagramLength > T2NCM_MAX_FRAME_SIZE)
             {
-                InterlockedIncrement64(&DeviceContext->InDiscards);
+                T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
+                    "T2Ncm: RX datagram entry %u length %u outside [%u,%u] - "
+                    "skipping this datagram only\n",
+                    i, entry.wDatagramLength, T2NCM_ETHERNET_HEADER_LEN,
+                    T2NCM_MAX_FRAME_SIZE));
+                InterlockedIncrement64(&DeviceContext->RxFramesRejected);
+                InterlockedIncrement64(&DeviceContext->InErrors);
                 continue;
             }
 
-            if (nblHead == NULL)
             {
-                nblHead = nbl;
-            }
-            else
-            {
-                NET_BUFFER_LIST_NEXT_NBL(nblTail) = nbl;
-            }
-            nblTail = nbl;
-            NET_BUFFER_LIST_NEXT_NBL(nbl) = NULL;
+                const UCHAR* frame = Buffer + entry.wDatagramIndex;
+                PNET_BUFFER_LIST nbl;
 
-            InterlockedAdd64(&DeviceContext->InOctets, (LONG64)entry.wDatagramLength);
-            if (frame[0] & 0x01)
-            {
-                if (frame[0] == 0xFF && frame[1] == 0xFF && frame[2] == 0xFF &&
-                    frame[3] == 0xFF && frame[4] == 0xFF && frame[5] == 0xFF)
+                // Diagnostic snapshot, kept from the pre-NDIS milestone: it
+                // is still the quickest way to tell "the parser is fine and
+                // NDIS is dropping them" apart from "nothing is arriving".
+                RtlCopyMemory(DeviceContext->RxLastFrameDest, frame, 6);
+                RtlCopyMemory(DeviceContext->RxLastFrameSrc, frame + 6, 6);
+                DeviceContext->RxLastFrameEtherType =
+                    (USHORT)((frame[12] << 8) | frame[13]); // network byte order
+                DeviceContext->RxLastFrameLength = entry.wDatagramLength;
+
+                InterlockedIncrement64(&DeviceContext->RxFramesParsed);
+
+                if (!T2NcmRxAcceptsFrame(DeviceContext, frame))
                 {
-                    InterlockedIncrement64(&DeviceContext->InBroadcastPkts);
+                    InterlockedIncrement64(&DeviceContext->RxFramesFiltered);
+                    // Filtered out by OID_GEN_CURRENT_PACKET_FILTER. Not an
+                    // error and not a discard in the NDIS statistics sense —
+                    // the frame was never ours to deliver.
+                    continue;
+                }
+
+                nbl = T2NcmRxBuildNbl(DeviceContext, frame, entry.wDatagramLength);
+                if (nbl == NULL)
+                {
+                    InterlockedIncrement64(&DeviceContext->InDiscards);
+                    continue;
+                }
+
+                if (nblHead == NULL)
+                {
+                    nblHead = nbl;
                 }
                 else
                 {
-                    InterlockedIncrement64(&DeviceContext->InMulticastPkts);
+                    NET_BUFFER_LIST_NEXT_NBL(nblTail) = nbl;
+                }
+                nblTail = nbl;
+                NET_BUFFER_LIST_NEXT_NBL(nbl) = NULL;
+
+                InterlockedAdd64(&DeviceContext->InOctets, (LONG64)entry.wDatagramLength);
+                if (frame[0] & 0x01)
+                {
+                    if (frame[0] == 0xFF && frame[1] == 0xFF && frame[2] == 0xFF &&
+                        frame[3] == 0xFF && frame[4] == 0xFF && frame[5] == 0xFF)
+                    {
+                        InterlockedIncrement64(&DeviceContext->InBroadcastPkts);
+                    }
+                    else
+                    {
+                        InterlockedIncrement64(&DeviceContext->InMulticastPkts);
+                    }
+                }
+                else
+                {
+                    InterlockedIncrement64(&DeviceContext->InUcastPkts);
+                }
+
+                framesThisNtb++;
+
+                if (framesThisNtb == T2NCM_RX_MAX_BATCH)
+                {
+                    // Full batch: indicate it and start a new chain instead
+                    // of abandoning the rest of the NTB's datagrams.
+                    T2NcmRxIndicateBatch(DeviceContext, nblHead, framesThisNtb,
+                        AtDispatchLevel);
+                    nblHead = NULL;
+                    nblTail = NULL;
+                    framesThisNtb = 0;
                 }
             }
-            else
-            {
-                InterlockedIncrement64(&DeviceContext->InUcastPkts);
-            }
-
-            framesThisNtb++;
-
-            if (framesThisNtb == T2NCM_RX_MAX_BATCH)
-            {
-                // Full batch: indicate it and start a new chain instead
-                // of abandoning the rest of the NTB's datagrams.
-                T2NcmRxIndicateBatch(DeviceContext, nblHead, framesThisNtb,
-                    AtDispatchLevel);
-                nblHead = NULL;
-                nblTail = NULL;
-                framesThisNtb = 0;
-            }
         }
+
+        if (ndp.wNextNdpIndex == 0)
+        {
+            break; // last NDP16 in this NTB
+        }
+
+        if (ndp.wNextNdpIndex <= ndpOffset)
+        {
+            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
+                "T2Ncm: RX NDP16 wNextNdpIndex=%u does not advance past %u - "
+                "ignoring the rest of the chain\n",
+                ndp.wNextNdpIndex, ndpOffset));
+            InterlockedIncrement64(&DeviceContext->RxFramesRejected);
+            break;
+        }
+
+        ndpOffset = ndp.wNextNdpIndex;
     }
 
     if (nblHead != NULL)

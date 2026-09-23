@@ -190,6 +190,7 @@ T2NcmDeviceCreate(
     context->PacketFilter = 0;
 
     KeInitializeEvent(&context->QuiesceEvent, NotificationEvent, FALSE);
+    KeInitializeSpinLock(&context->MulticastLock);
 
     // BUGFIX (memory leak): WDF_NO_OBJECT_ATTRIBUTES here means "no
     // explicit parent", and per KMDF's documented default, an object

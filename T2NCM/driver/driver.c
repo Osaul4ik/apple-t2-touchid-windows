@@ -25,6 +25,7 @@
 
 NDIS_HANDLE g_T2NcmMiniportDriverHandle = NULL;
 PT2NCM_DEVICE_CONTEXT volatile g_T2NcmDiagnosticAdapter = NULL;
+ERESOURCE g_T2NcmDiagnosticLock;
 
 NTSTATUS
 DriverEntry(
@@ -39,6 +40,12 @@ DriverEntry(
 
     T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_TRACE_LEVEL,
         "T2Ncm: DriverEntry entered (NDIS miniport, NDIS-owned power)\n"));
+
+    // Must exist before NdisMRegisterMiniportDriver: the first adapter
+    // can initialize (and publish itself for the diagnostic device) as
+    // soon as registration succeeds. Deleted in MiniportDriverUnload, or
+    // on the failure paths below.
+    (VOID)ExInitializeResourceLite(&g_T2NcmDiagnosticLock);
 
     // WDF_NO_EVENT_CALLBACK for EvtDriverDeviceAdd: with
     // WdfDriverInitNoDispatchOverride the framework would reject a
@@ -62,6 +69,7 @@ DriverEntry(
     {
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
             "T2Ncm: WdfDriverCreate (miniport mode) failed 0x%08X\n", status));
+        ExDeleteResourceLite(&g_T2NcmDiagnosticLock);
         return status;
     }
 
@@ -75,6 +83,7 @@ DriverEntry(
         // for a driver created with WdfDriverInitNoDispatchOverride — a
         // plain WdfObjectDelete is not correct here.
         WdfDriverMiniportUnload(wdfDriver);
+        ExDeleteResourceLite(&g_T2NcmDiagnosticLock);
         return (NTSTATUS)ndisStatus;
     }
 

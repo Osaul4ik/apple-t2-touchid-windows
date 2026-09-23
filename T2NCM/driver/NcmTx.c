@@ -66,6 +66,7 @@ typedef struct _T2NCM_TX_REQUEST_CONTEXT
     PNET_BUFFER_LIST      NetBufferList;
     PUCHAR                Buffer;
     ULONG                 BlockLength;
+    ULONG                 DatagramOffset;   // where the frame sits in Buffer
     ULONG                 FrameLength;
 } T2NCM_TX_REQUEST_CONTEXT, *PT2NCM_TX_REQUEST_CONTEXT;
 
@@ -171,6 +172,24 @@ T2NcmTxComputeLayout(
     if (blockLength > DeviceContext->NtbOutMaxSize)
     {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    // Keep the NTB from ending exactly on a bulk-OUT packet boundary. A
+    // bulk transfer whose length is a multiple of wMaxPacketSize is not
+    // terminated by a short packet, so the device keeps waiting for more
+    // of that NTB and glues the next one onto it (CDC-NCM 1.0 3.2.1
+    // requires a ZLP in that case unless the NTB is already
+    // dwNtbOutMaxSize long). One trailing zero byte, counted in
+    // wBlockLength, makes the last packet short. This is what Linux's
+    // cdc_ncm does for the same reason, and the reference T2 setup runs on
+    // that driver. The padding lives after the datagram, so the datagram
+    // offset and the statistics that read it back are unaffected.
+    if (DeviceContext->BulkOutMaxPacketSize != 0 &&
+        (blockLength % DeviceContext->BulkOutMaxPacketSize) == 0 &&
+        blockLength < DeviceContext->NtbOutMaxSize &&
+        blockLength < T2NCM_TX_MAX_WIRE_OFFSET)
+    {
+        blockLength += 1;
     }
 
     *NdpOffset = ndpOffset;
@@ -337,7 +356,7 @@ T2NcmEvtTxWriteComplete(
         InterlockedIncrement64(&deviceContext->TxNtbsSent);
         InterlockedIncrement64(&deviceContext->TxFramesSent);
         T2NcmTxCountFrame(deviceContext, requestContext->Buffer +
-            (requestContext->BlockLength - requestContext->FrameLength),
+            requestContext->DatagramOffset,
             requestContext->FrameLength);
         ndisStatus = NDIS_STATUS_SUCCESS;
     }
@@ -439,6 +458,7 @@ T2NcmTxSubmitNetBuffer(
     requestContext->NetBufferList = Nbl;
     requestContext->Buffer        = buffer;
     requestContext->BlockLength   = blockLength;
+    requestContext->DatagramOffset = datagramOffset;
     requestContext->FrameLength   = frameLength;
 
     WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
@@ -578,6 +598,7 @@ T2NcmTxSendFrame(
     ULONG ndpOffset, ndpLength, datagramOffset, blockLength;
     PUCHAR buffer;
     WDF_MEMORY_DESCRIPTOR memDesc;
+    WDF_REQUEST_SEND_OPTIONS sendOptions;
     ULONG bytesWritten = 0;
     USHORT sequence;
     NTSTATUS status;
@@ -623,8 +644,15 @@ T2NcmTxSendFrame(
     // diagnostic IOCTL dispatch, at PASSIVE_LEVEL, with no NDIS send
     // path involved. Passing Request=NULL lets WDF allocate and manage a
     // one-shot internal request for this single call.
+    //
+    // Bounded: MiniportHaltEx waits for this IOCTL (see
+    // g_T2NcmDiagnosticLock), so a write the device never completes must
+    // not be able to hold the halt - and with it PnP - forever.
+    WDF_REQUEST_SEND_OPTIONS_INIT(&sendOptions, WDF_REQUEST_SEND_OPTION_TIMEOUT);
+    WDF_REQUEST_SEND_OPTIONS_SET_TIMEOUT(&sendOptions, WDF_REL_TIMEOUT_IN_SEC(2));
+
     status = WdfUsbTargetPipeWriteSynchronously(
-        DeviceContext->BulkOutPipe, NULL, NULL, &memDesc, &bytesWritten);
+        DeviceContext->BulkOutPipe, NULL, &sendOptions, &memDesc, &bytesWritten);
 
     ExFreePoolWithTag(buffer, T2NCM_TX_POOL_TAG);
 

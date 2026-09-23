@@ -137,6 +137,7 @@ T2NcmUsbReleaseHardware(
     // (Task 22). Harmless no-op for fields the stub role never set.
     DeviceContext->BulkInPipe = NULL;
     DeviceContext->BulkOutPipe = NULL;
+    DeviceContext->BulkOutMaxPacketSize = 0;
     DeviceContext->DataInterface = NULL;
     DeviceContext->UsbDevice = NULL;
     DeviceContext->RxReaderConfigured = FALSE;
@@ -165,6 +166,7 @@ T2NcmUsbActivateDataInterface(
     NTSTATUS status;
     WDFUSBPIPE bulkIn = NULL;
     WDFUSBPIPE bulkOut = NULL;
+    ULONG bulkOutMaxPacketSize = 0;
 
     // Task 12: only reachable once NCM control-plane negotiation (Tasks
     // 7-11) has already succeeded — callers (Device.c) are responsible
@@ -220,6 +222,7 @@ T2NcmUsbActivateDataInterface(
 
         WDF_USB_PIPE_INFORMATION_INIT(&info);
         WdfUsbTargetPipeGetInformation(bulkOut, &info);
+        bulkOutMaxPacketSize = info.MaximumPacketSize;
         if (info.EndpointAddress != T2NCM_EXPECTED_BULK_OUT_EP)
         {
             T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
@@ -231,6 +234,7 @@ T2NcmUsbActivateDataInterface(
 
     DeviceContext->BulkInPipe = bulkIn;
     DeviceContext->BulkOutPipe = bulkOut;
+    DeviceContext->BulkOutMaxPacketSize = bulkOutMaxPacketSize;
 
     // WdfUsbInterfaceSelectSetting above just handed back a brand-new
     // WDFUSBPIPE for BulkInPipe (a fresh alt-1 selection always does,
@@ -266,6 +270,7 @@ Unwind:
 
     DeviceContext->BulkInPipe = NULL;
     DeviceContext->BulkOutPipe = NULL;
+    DeviceContext->BulkOutMaxPacketSize = 0;
     DeviceContext->RxReaderConfigured = FALSE;
 
     return status;
@@ -284,6 +289,7 @@ T2NcmUsbDeactivateDataInterface(
     // the interface underneath it has already been torn down.
     DeviceContext->BulkInPipe = NULL;
     DeviceContext->BulkOutPipe = NULL;
+    DeviceContext->BulkOutMaxPacketSize = 0;
     DeviceContext->RxReaderConfigured = FALSE;
 
     // The device clears its Ethernet packet filter on SET_INTERFACE, so
