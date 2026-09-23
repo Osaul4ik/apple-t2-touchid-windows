@@ -619,8 +619,8 @@ static int CmdNetwork(int argc, wchar_t* argv[]) {
     opt.concurrency = 64;
     opt.connectTimeoutMs = 25;  // 10ms was flaky under concurrent scan load
     opt.includeTcpOnly = true;
-    opt.scanFromEnd = true;  // see ScanOptions::scanFromEnd - real BiometricKit
-                              // candidate sits in the upper part of the range
+    // Ascending (ScanOptions::scanFromEnd default) — the real BiometricKit
+    // candidate has been observed near portBegin (~49000), not the high end.
     opt.onProgress = [](unsigned tried, unsigned total, unsigned tcp, unsigned http2) {
         std::wcout << L"  scanned " << tried << L"/" << total
                    << L"  tcp=" << tcp << L"  http2=" << http2 << L"\r" << std::flush;
@@ -648,10 +648,10 @@ static int CmdNetwork(int argc, wchar_t* argv[]) {
         return 2;
     }
 
-    // With scanFromEnd, hits arrive in roughly descending-port order (and
-    // onHit/cancel can leave that order uneven besides) — sort ascending
-    // purely for a readable diagnostic table; this has no effect on scan
-    // or verification order above.
+    // Sort ascending purely for a readable diagnostic table — with
+    // scanFromEnd left at its default (ascending), hits already mostly
+    // arrive in this order, but onHit/cancel can still leave it uneven;
+    // this has no effect on scan or verification order above.
     std::sort(hits.begin(), hits.end(),
               [](const PortCandidate& a, const PortCandidate& b) { return a.port < b.port; });
 
@@ -814,9 +814,8 @@ static bool DiscoverBiometricKitBridge(int argc, wchar_t* argv[], int firstArgIn
         opt.concurrency = 256;
         opt.includeTcpOnly = true;
         opt.connectTimeoutMs = timeoutsMs[attempt];
-        opt.scanFromEnd = true;  // see ScanOptions::scanFromEnd - real
-                                  // BiometricKit candidate sits in the
-                                  // upper part of the range
+        // Ascending (ScanOptions::scanFromEnd default) — the real
+        // candidate sits near portBegin (~49000), not the high end.
 
         ScanProbeResult scan = ScanAndProbe(ep, opt);
         if (scan.servicePort != 0) {

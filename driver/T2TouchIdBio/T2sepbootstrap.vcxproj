@@ -67,6 +67,16 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="T2SepBootstrapService.cpp" />
+    <!-- protocol/Discovery/BridgeDiscovery.cpp is deliberately NOT part of
+         T2TouchIdProtocol.vcxproj (see its own header comment: it's a
+         driver-shaped, argv-free duplicate of main.cpp's discovery flow,
+         not shared CLI code) — driver/T2TouchIdBio/umdf/T2TouchIdBio.vcxproj
+         already compiles it directly for the same reason ConnectForCapture
+         needs it. This service now needs the identical function for its
+         own post-unlock warm-up step (see WarmUpBiometricKitBridge in
+         T2SepBootstrapService.cpp), so it gets the same direct ClCompile
+         rather than a second copy of the discovery logic. -->
+    <ClCompile Include="..\..\protocol\Discovery\BridgeDiscovery.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="SepVaultFormat.h" />

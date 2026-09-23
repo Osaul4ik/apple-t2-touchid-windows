@@ -53,19 +53,13 @@ struct ScanOptions {
     // from starting.
     std::atomic<bool>* cancel = nullptr;
 
-    // Real-hardware finding (2026-09-19, t2touchid `network`/`verify` on
-    // real T2 hardware): the RemoteXPC control-channel candidate that
-    // actually advertises com.apple.eos.BiometricKit is consistently found
-    // well into the upper part of the 49152-65535 range (observed e.g. at
-    // 59602), while the low end of the range is a dense cluster of decoy
-    // RemoteXPC services that complete the handshake but never advertise
-    // BiometricKit. Scanning ascending (the default, and what the Linux
-    // reference does) means the real candidate is discovered last, right
-    // when the USB NCM link is busiest with decoy checker threads already
-    // in flight from the low-end cluster — which is when RemoteXPC
-    // handshakes are most likely to time out. Scanning from the end
-    // instead surfaces the real candidate's onHit almost immediately, so
-    // its checker thread starts before link contention builds up.
+    // In practice the BiometricKit BridgeXPC/RemoteXPC candidate has been
+    // observed sitting near the low end of the ephemeral range (~49000,
+    // i.e. right at portBegin), not the high end — so the default is
+    // ascending (scanFromEnd=false), same direction as the Linux
+    // reference. A caller that has independently confirmed the opposite
+    // on its own hardware can still set this to true per call; nothing
+    // here assumes one direction is universally correct.
     bool scanFromEnd = false;
 };
 

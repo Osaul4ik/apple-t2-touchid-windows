@@ -1,4 +1,3 @@
-```bat
 @echo off
 setlocal
 
@@ -86,4 +85,3 @@ echo.
 
 pause
 exit /b 0
-```

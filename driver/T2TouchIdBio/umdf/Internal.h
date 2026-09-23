@@ -39,6 +39,15 @@
 #include "../../../protocol/BiometricKit/VerificationEngine.h"
 #include "../../../protocol/BiometricKit/VendorBir.h"
 
+// SEP readiness gate (see CheckSepReady in Queue.cpp): reads the same
+// in-memory bootstrap status T2SepBootstrapService reports via
+// IOCTL_T2_SET_BOOTSTRAP_STATUS, so this driver never starts a capture (or
+// claims WINBIO_SENSOR_READY) before the SEP has actually finished
+// unlocking on this boot. Client.h/public.h only need <windows.h> and
+// <setupapi.h> - no WDK-only types - so, like the protocol libraries
+// above, safe to pull into this UMDF host process directly.
+#include "../../../protocol/AppleKeyStore/Client.h"
+
 EXTERN_C_START
 DRIVER_INITIALIZE                  DriverEntry;
 EVT_WDF_DRIVER_DEVICE_ADD          T2BioEvtDeviceAdd;

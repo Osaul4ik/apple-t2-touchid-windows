@@ -1,23 +1,5 @@
 #requires -RunAsAdministrator
-<#
-.SYNOPSIS
-  Creates the root-enumerated T2TouchIdBio device node and installs the driver
-  on it - what "devcon install T2TouchIdBio.inf root\T2TouchIdBio" does, without
-  needing devcon.exe / the WDK on the target machine.
 
-.DESCRIPTION
-  Why this exists: T2TouchIdBio.inf matches the hardware ID root\T2TouchIdBio.
-  There is no bus behind it, so nothing in Windows ever creates that device
-  node by itself. "pnputil /add-driver" only stages the package in the driver
-  store (setupapi.dev.log then says "Unable to find any matching devices"), and
-  the Add Legacy Hardware wizard is unreliable for root devices. The node has to
-  be created explicitly: SetupDiCreateDeviceInfo + DIF_REGISTERDEVICE, then
-  UpdateDriverForPlugAndPlayDevices to bind the staged package to it.
-
-  Run from the folder that holds T2TouchIdBio.inf, .dll and .cat (the stamped,
-  signed CI package). Safe to run again: if the node already exists it only
-  re-applies the driver.
-#>
 [CmdletBinding()]
 param(
     [string]$InfPath
@@ -30,9 +12,14 @@ $HardwareId = 'root\T2TouchIdBio'
 # resolve the default here: script folder, else the current directory.
 if (-not $InfPath) {
     $root = $PSScriptRoot
-    if (-not $root -and $MyInvocation.MyCommand.Path) { $root = Split-Path -Parent $MyInvocation.MyCommand.Path }
-    if (-not $root) { $root = (Get-Location).Path }
-    $InfPath = Join-Path $root 'T2TouchIdBio.inf'
+    if (-not $root -and $MyInvocation.MyCommand.Path) {
+        $root = Split-Path -Parent $MyInvocation.MyCommand.Path
+    }
+    if (-not $root) {
+        $root = (Get-Location).Path
+    }
+
+    $InfPath = Join-Path $root 'Bio\T2TouchIdBio.inf'
 }
 
 $inf = (Resolve-Path -LiteralPath $InfPath).Path

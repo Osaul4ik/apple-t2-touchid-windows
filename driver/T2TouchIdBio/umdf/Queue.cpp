@@ -95,6 +95,72 @@ Payload* RetrieveProbedPayload(_In_ WDFREQUEST Request, _Out_ bool* fitsFully)
     return out;
 }
 
+// Real readiness logic (formerly a TODO comment in HandleGetSensorStatus):
+// reads the driver-held bootstrap status T2SepBootstrapService reports via
+// IOCTL_T2_SET_BOOTSTRAP_STATUS (public.h T2_BOOTSTRAP_STATUS) instead of
+// the two separate checks ("open GUID_DEVINTERFACE_T2TOUCHID_TRANSPORT,
+// IOCTL_T2_GET_STATUS, and Global\T2SepReady") originally sketched there -
+// one IOCTL already tells us both "is the transport up" and "did the SEP
+// actually unlock", with a specific reason attached when it didn't.
+//
+// Returns true (leaves outSensorStatus/outHresult untouched) only when the
+// SEP has fully unlocked this boot (T2SepReasonOk). Every other case - not
+// reported yet, or reported an actual failure - returns false with a
+// WBDI-meaningful status filled in, so callers can complete the IOCTL
+// without a hardcoded WINBIO_SENSOR_READY that got ahead of reality.
+bool CheckSepReady(_Out_ WINBIO_SENSOR_STATUS* outSensorStatus, _Out_ HRESULT* outHresult)
+{
+    using t2::applekeystore::AksResult;
+    using t2::applekeystore::Client;
+
+    Client client;
+    if (client.Open() != AksResult::Ok) {
+        // Driver not loaded / device not present at all - nothing to poll,
+        // nothing to capture from.
+        T2BioLog("  SEP readiness: T2TouchIdTransport device not found -> FAILURE");
+        *outSensorStatus = WINBIO_SENSOR_FAILURE;
+        *outHresult = WINBIO_E_DEVICE_FAILURE;
+        return false;
+    }
+
+    T2_BOOTSTRAP_STATUS status{};
+    if (client.GetBootstrapStatus(&status) != AksResult::Ok) {
+        T2BioLog("  SEP readiness: GetBootstrapStatus IOCTL failed -> FAILURE");
+        *outSensorStatus = WINBIO_SENSOR_FAILURE;
+        *outHresult = WINBIO_E_DEVICE_FAILURE;
+        return false;
+    }
+
+    switch (status.Reason) {
+    case T2SepReasonOk:
+        return true;
+
+    case T2SepReasonUnknown:
+        // T2SepBootstrap hasn't reported anything yet this boot - either
+        // it's still running, or (much less likely) it hasn't started yet.
+        // Not a failure - just not there yet. WINBIO_SENSOR_BUSY matches
+        // WBDI's own documented meaning for this status value: "the device
+        // could still be initializing after it has been turned on."
+        T2BioLog("  SEP readiness: bootstrap status Unknown (still booting?) -> BUSY");
+        *outSensorStatus = WINBIO_SENSOR_BUSY;
+        *outHresult = WINBIO_E_DEVICE_BUSY;
+        return false;
+
+    case T2SepReasonVaultMissing:
+    case T2SepReasonDpapi:
+    case T2SepReasonRegisterOolFailed:
+    case T2SepReasonSepHang:
+    case T2SepReasonSepRejected:
+    default:
+        T2BioLog("  SEP readiness: bootstrap reason=%d step=%d sep_status=%d -> FAILURE",
+                 static_cast<int>(status.Reason), static_cast<int>(status.Step),
+                 static_cast<int>(status.SepStatus));
+        *outSensorStatus = WINBIO_SENSOR_FAILURE;
+        *outHresult = WINBIO_E_DEVICE_FAILURE;
+        return false;
+    }
+}
+
 void HandleGetAttributes(_In_ WDFREQUEST Request)
 {
     bool fits = false;
@@ -116,16 +182,30 @@ void HandleGetSensorStatus(_In_ WDFREQUEST Request)
     }
     RtlZeroMemory(out, sizeof(*out));
     out->PayloadSize   = sizeof(*out);
+
+    // Real readiness logic (see CheckSepReady below): reports BUSY while
+    // T2SepBootstrap is still running/hasn't reported yet this boot, or
+    // FAILURE if it reported an actual problem — never a hardcoded READY
+    // before the SEP has genuinely finished unlocking.
+    WINBIO_SENSOR_STATUS sensorStatus = WINBIO_SENSOR_READY;
+    HRESULT hr = S_OK;
+    if (!CheckSepReady(&sensorStatus, &hr)) {
+        out->WinBioHresult = hr;
+        out->SensorStatus = sensorStatus;
+        out->VendorDiagnostics.Size = 0;
+        T2BioLog("  GET_SENSOR_STATUS: SEP not ready -> sensorStatus=%d hr=0x%08x",
+                 static_cast<int>(out->SensorStatus), static_cast<unsigned>(hr));
+        WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, out->PayloadSize);
+        return;
+    }
+
     out->WinBioHresult = S_OK;
-    // Always READY. Do NOT report ACCEPT here: a one-shot ACCEPT armed by a
-    // delivered sample was tried (2026-09-20) and leaked into the poll WBF
-    // makes before the NEXT capture (enrollment), which then never sent it.
+    // Do NOT report ACCEPT here: a one-shot ACCEPT armed by a delivered
+    // sample was tried (2026-09-20) and leaked into the poll WBF makes
+    // before the NEXT capture (enrollment), which then never sent it.
     // The trace showed AcceptSampleData firing straight after the capture
     // completed, with no status poll in between - the sample's own
     // SensorStatus=ACCEPT in the CAPTURE_DATA payload is what counts.
-    // Real readiness logic (design doc 3) later:
-    // open GUID_DEVINTERFACE_T2TOUCHID_TRANSPORT, IOCTL_T2_GET_STATUS, and
-    // Global\T2SepReady from T2SepBootstrap.
     out->SensorStatus  = WINBIO_SENSOR_READY;
     out->VendorDiagnostics.Size = 0;
     T2BioLog("  GET_SENSOR_STATUS ok sensorStatus=%d (READY)", static_cast<int>(out->SensorStatus));
@@ -763,6 +843,23 @@ void HandleCaptureData(_In_ WDFREQUEST Request)
                      static_cast<unsigned long long>(probeLen), static_cast<unsigned long long>(maxReply));
             probeOut->PayloadSize = static_cast<DWORD>(maxReply);
             WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, sizeof(DWORD));
+            return;
+        }
+    }
+
+    // Gate: never touch the SEP - no ConnectForCapture, no busy-slot, no
+    // actual fingerprint read - until T2SepBootstrap has reported the SEP
+    // fully unlocked this boot. Checked after the size-probe reply above
+    // (that one never touches the SEP either, so it's fine before this
+    // gate) and before CaptureBusyGuard, so a not-ready request doesn't
+    // consume the single in-flight capture slot or race a real one.
+    {
+        WINBIO_SENSOR_STATUS sensorStatus = WINBIO_SENSOR_READY;
+        HRESULT hr = S_OK;
+        if (!CheckSepReady(&sensorStatus, &hr)) {
+            T2BioLog("CAPTURE_DATA: SEP not ready yet -> sensorStatus=%d hr=0x%08x, refusing capture",
+                     static_cast<int>(sensorStatus), static_cast<unsigned>(hr));
+            CompleteCaptureData(Request, hr, sensorStatus, 0, {});
             return;
         }
     }

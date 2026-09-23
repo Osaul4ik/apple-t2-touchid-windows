@@ -127,6 +127,10 @@
     <ClCompile Include="..\..\..\protocol\Discovery\PortCache.cpp" />
     <ClCompile Include="..\..\..\protocol\Discovery\PortScan.cpp" />
     <ClCompile Include="..\..\..\protocol\Discovery\RemoteXpc.cpp" />
+    <!-- Client.cpp: SEP readiness gate (Internal.h / Queue.cpp CheckSepReady),
+         same "compile the protocol .cpp directly, no ProjectReference" shape
+         as everything else in this list — see the block comment above them. -->
+    <ClCompile Include="..\..\..\protocol\AppleKeyStore\Client.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Internal.h" />
