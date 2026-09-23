@@ -94,3 +94,64 @@ typedef struct _T2_TRANSPORT_STATUS
 
 #define IOCTL_T2_AKS_EXCHANGE \
     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x902, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
+
+// Bootstrap status: NOT part of the AppleKeyStore protocol. This is a
+// small in-memory mailbox the driver holds purely so T2SepBootstrapService
+// (which runs the actual load-keybag/unlock sequence in user mode, see
+// T2SepBootstrapService.cpp) can record the outcome once per boot, and
+// SepVaultGui can ask "what happened" without parsing C:\LogSEP.txt or
+// racing a separate status file on disk. The driver does not interpret
+// these values at all - it just stores whatever the service last wrote
+// and hands it back, guarded by its own lock (BootstrapStatusLock) so a
+// GUI query never blocks on an in-flight AKS exchange.
+typedef enum _T2_SEP_BOOTSTRAP_REASON
+{
+    T2SepReasonUnknown          = 0, // service hasn't reported anything yet this boot
+    T2SepReasonOk                = 1,
+    T2SepReasonVaultMissing      = 2, // sep-vault.bin absent/malformed - run SepVaultGui
+    T2SepReasonDpapi             = 3, // CryptUnprotectData failed
+    T2SepReasonRegisterOolFailed = 4, // driver/transport-level failure, no SEP exchange attempted
+    T2SepReasonSepHang           = 5, // AKS exchange never got a reply - SEP wedged, needs
+                                       // a macOS boot to hardware-reset it, then reboot to Windows
+    T2SepReasonSepRejected       = 6, // SEP replied and explicitly rejected (wrong password/keybag)
+} T2_SEP_BOOTSTRAP_REASON;
+
+typedef enum _T2_SEP_BOOTSTRAP_STEP
+{
+    T2SepStepNone              = 0,
+    T2SepStepReadVault         = 1,
+    T2SepStepUnprotectKeybag   = 2,
+    T2SepStepUnprotectPassword = 3,
+    T2SepStepRegisterOol       = 4,
+    T2SepStepLoadKeybag        = 5,
+    T2SepStepSetSystemKeybag   = 6,
+    T2SepStepUnlockHandle      = 7,
+    T2SepStepUnlockSpecialBag  = 8,
+    T2SepStepReady             = 9,
+} T2_SEP_BOOTSTRAP_STEP;
+
+typedef struct _T2_BOOTSTRAP_STATUS
+{
+    T2_SEP_BOOTSTRAP_REASON Reason;
+    T2_SEP_BOOTSTRAP_STEP   Step;
+    INT8                    SepStatus;
+    // Explicit padding to TimestampUtc's 8-byte natural alignment (x64):
+    // 4 (Reason) + 4 (Step) + 1 (SepStatus) = 9, next 8-aligned offset is
+    // 16, so 7 bytes here, not the 3 an offset-to-12 assumption would give
+    // - written out so the layout is exact and self-documenting instead of
+    // relying on the compiler's implicit tail padding, which SepStatusClient.cs
+    // on the GUI side has to reproduce byte-for-byte via StructLayout.
+    UINT8                   Reserved[7];
+    LARGE_INTEGER           TimestampUtc; // KeQuerySystemTimePrecise, 0 if never set
+} T2_BOOTSTRAP_STATUS, *PT2_BOOTSTRAP_STATUS;
+
+// Written once by T2SepBootstrapService right after each step of the
+// sequence (design doc §9.2); SYSTEM/Administrators-only, same as every
+// other IOCTL on this device (device interface SDDL).
+#define IOCTL_T2_SET_BOOTSTRAP_STATUS \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x903, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+
+// Read by SepVaultGui (or any other diagnostic caller) to show the current
+// SEP state without touching the SEP itself.
+#define IOCTL_T2_GET_BOOTSTRAP_STATUS \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x904, METHOD_BUFFERED, FILE_READ_ACCESS)

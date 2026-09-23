@@ -1,47 +1,139 @@
 <Window x:Class="T2TouchId.SepVaultGui.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="SEP Vault — one-time setup" Height="300" Width="460"
-        ResizeMode="NoResize" WindowStartupLocation="CenterScreen">
-    <Grid Margin="16">
-        <Grid.RowDefinitions>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="*"/>
-            <RowDefinition Height="Auto"/>
-        </Grid.RowDefinitions>
+        Title="T2 SEP — стан і налаштування"
+        Height="560" Width="480"
+        MinHeight="560" MinWidth="480"
+        ResizeMode="CanResize"
+        WindowStartupLocation="CenterScreen"
+        FontFamily="Segoe UI"
+        Background="#F3F3F3">
 
-        <TextBlock Grid.Row="0" TextWrapping="Wrap" Margin="0,0,0,12"
-                   Text="Разовий імпорт: user.kb шифрується DPAPI (machine scope) і зберігається в %ProgramData%\T2TouchId\sep-vault.bin. T2SepBootstrap читає цей файл при кожному холодному старті." />
+    <Window.Resources>
+        <!-- Shared look for the two "cards" on this page, so status and
+             vault-import read as clearly separate sections instead of one
+             long undifferentiated stack of controls. -->
+        <Style x:Key="Card" TargetType="Border">
+            <Setter Property="Background" Value="White"/>
+            <Setter Property="BorderBrush" Value="#E0E0E0"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="CornerRadius" Value="6"/>
+            <Setter Property="Padding" Value="16"/>
+            <Setter Property="Margin" Value="0,0,0,16"/>
+        </Style>
+        <Style x:Key="SectionHeader" TargetType="TextBlock">
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+            <Setter Property="Margin" Value="0,0,0,10"/>
+        </Style>
+        <Style x:Key="FieldLabel" TargetType="TextBlock">
+            <Setter Property="VerticalAlignment" Value="Center"/>
+            <Setter Property="Width" Value="120"/>
+            <Setter Property="Foreground" Value="#333333"/>
+        </Style>
+        <Style TargetType="Button">
+            <Setter Property="Padding" Value="12,6"/>
+            <Setter Property="Cursor" Value="Hand"/>
+        </Style>
+    </Window.Resources>
 
-        <Grid Grid.Row="1" Margin="0,0,0,8">
-            <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="*"/>
-                <ColumnDefinition Width="Auto"/>
-            </Grid.ColumnDefinitions>
-            <TextBox x:Name="KeybagPathBox" IsReadOnly="True" VerticalContentAlignment="Center" Margin="0,0,8,0"/>
-            <Button Grid.Column="1" Content="Обрати user.kb…" Click="OnBrowseKeybag" Padding="10,4"/>
-        </Grid>
+    <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="20">
+        <StackPanel>
 
-        <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,0,0,8">
-            <TextBlock Text="Special bag id:" VerticalAlignment="Center" Width="120"/>
-            <TextBox x:Name="SpecialBagBox" Width="100" Text="-501"/>
+            <TextBlock Text="T2 Touch ID для Windows" FontSize="18" FontWeight="Bold" Margin="0,0,0,2"/>
+            <TextBlock Text="Стан Secure Enclave (SEP) та імпорт keybag" Foreground="#666666" Margin="0,0,0,16"/>
+
+            <!-- ===================== SEP status card ===================== -->
+            <Border Style="{StaticResource Card}">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+
+                    <Grid Grid.Row="0">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+
+                        <Border x:Name="SepStatusDot" Grid.Column="0" Width="12" Height="12"
+                                CornerRadius="6" Background="#9E9E9E"
+                                VerticalAlignment="Center" Margin="0,0,10,0"/>
+
+                        <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                            <TextBlock x:Name="SepStatusTitle" FontWeight="SemiBold" FontSize="14"
+                                       Text="Стан SEP невідомий"/>
+                            <TextBlock x:Name="SepStatusSubtitle" Foreground="#666666" FontSize="12"
+                                       TextWrapping="Wrap"
+                                       Text="Ще не було жодної спроби завантаження цього сеансу."/>
+                        </StackPanel>
+
+                        <Button Grid.Column="2" x:Name="RefreshButton" Content="Оновити"
+                                VerticalAlignment="Center" Click="OnRefreshStatus"/>
+                    </Grid>
+
+                    <!-- Only shown when the diagnosed reason is "SEP wedged" -
+                         the exact fix the user needs, spelled out as steps,
+                         not buried in C:\LogSEP.txt. -->
+                    <Border Grid.Row="1" x:Name="SepHangPanel" Visibility="Collapsed"
+                            Background="#FDECEA" CornerRadius="4" Padding="12" Margin="0,12,0,0">
+                        <StackPanel>
+                            <TextBlock FontWeight="SemiBold" Foreground="#B3261E"
+                                       Text="SEP не відповідає (апаратне зависання)" Margin="0,0,0,6"/>
+                            <TextBlock TextWrapping="Wrap" Foreground="#5A1611" Margin="0,0,0,4"
+                                       Text="1. Перезавантажте комп'ютер і завантажтесь у macOS."/>
+                            <TextBlock TextWrapping="Wrap" Foreground="#5A1611" Margin="0,0,0,4"
+                                       Text="2. На початку завантаження macOS може з'явитись помилка — це очікувано, вона й скидає SEP."/>
+                            <TextBlock TextWrapping="Wrap" Foreground="#5A1611" Margin="0,0,0,4"
+                                       Text="3. Перезавантажте комп'ютер знову і завантажтесь у Windows — Touch ID має запрацювати."/>
+                            <TextBlock TextWrapping="Wrap" Foreground="#8A3B36" FontStyle="Italic" FontSize="11"
+                                       Text="Повторні спроби з боку Windows тут не допоможуть — це не програмна помилка сервісу."/>
+                        </StackPanel>
+                    </Border>
+                </Grid>
+            </Border>
+
+            <!-- ===================== Vault import card ===================== -->
+            <Border Style="{StaticResource Card}">
+                <StackPanel>
+                    <TextBlock Style="{StaticResource SectionHeader}" Text="Разовий імпорт keybag"/>
+                    <TextBlock TextWrapping="Wrap" Foreground="#666666" FontSize="12" Margin="0,0,0,14"
+                               Text="user.kb шифрується DPAPI (machine scope) і зберігається в %ProgramData%\T2TouchId\sep-vault.bin. T2SepBootstrap читає цей файл при кожному холодному старті."/>
+
+                    <Grid Margin="0,0,0,10">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBox x:Name="KeybagPathBox" Grid.Column="0" IsReadOnly="True"
+                                 VerticalContentAlignment="Center" Padding="6,4" Margin="0,0,8,0"/>
+                        <Button Grid.Column="1" Content="Обрати user.kb…" Click="OnBrowseKeybag"/>
+                    </Grid>
+
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
+                        <TextBlock Style="{StaticResource FieldLabel}" Text="Special bag id:"/>
+                        <TextBox x:Name="SpecialBagBox" Width="100" Padding="6,4" Text="-501"/>
+                    </StackPanel>
+
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
+                        <TextBlock Style="{StaticResource FieldLabel}" Text="Пароль:"/>
+                        <PasswordBox x:Name="PasswordBox" Width="220" Padding="6,4"/>
+                    </StackPanel>
+
+                    <TextBlock Text="Той самий пароль піде і для unlock(handle), і для unlock(special bag)."
+                               FontStyle="Italic" Foreground="Gray" FontSize="11" Margin="0,0,0,12"/>
+
+                    <TextBlock x:Name="VaultStatusText" TextWrapping="Wrap" Foreground="DarkRed" Margin="0,0,0,10"/>
+
+                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                        <Button Content="Зберегти" Padding="18,7" Click="OnSave"
+                                Background="#2F6FED" Foreground="White" BorderThickness="0"/>
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+
         </StackPanel>
-
-        <StackPanel Grid.Row="3" Orientation="Horizontal" Margin="0,0,0,8">
-            <TextBlock Text="Пароль:" VerticalAlignment="Center" Width="120"/>
-            <PasswordBox x:Name="PasswordBox" Width="220"/>
-        </StackPanel>
-
-        <TextBlock Grid.Row="4" Text="Той самий пароль піде і для unlock(handle), і для unlock(special bag)." FontStyle="Italic" Foreground="Gray" Margin="0,0,0,8"/>
-
-        <TextBlock Grid.Row="5" x:Name="StatusText" TextWrapping="Wrap" Foreground="DarkRed" VerticalAlignment="Top"/>
-
-        <StackPanel Grid.Row="6" Orientation="Horizontal" HorizontalAlignment="Right">
-            <Button Content="Зберегти" Padding="16,6" Click="OnSave"/>
-        </StackPanel>
-    </Grid>
+    </ScrollViewer>
 </Window>

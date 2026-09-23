@@ -250,6 +250,17 @@ T2EvtDeviceAdd(
     }
     ctx->NextTransaction = 0;
 
+    // Independent lock (see driver.h field comment) - created the same way,
+    // right next to ExchangeLock, so a status query never contends with an
+    // in-flight (possibly 5s-timing-out) AKS exchange.
+    WDF_OBJECT_ATTRIBUTES_INIT(&lockAttributes);
+    lockAttributes.ParentObject = device;
+    status = WdfSpinLockCreate(&lockAttributes, &ctx->BootstrapStatusLock);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+    RtlZeroMemory(&ctx->BootstrapStatus, sizeof(ctx->BootstrapStatus)); // Reason/Step both 0 = Unknown/None
+
     status = WdfDeviceCreateDeviceInterface(
         device, &GUID_DEVINTERFACE_T2TOUCHID_TRANSPORT, NULL);
     if (!NT_SUCCESS(status)) {
@@ -764,6 +775,64 @@ T2EvtIoDeviceControlRegisterOol(_In_ WDFREQUEST Request, _In_ PT2_DEVICE_CONTEXT
     WdfRequestComplete(Request, status);
 }
 
+// T2SepBootstrapService calls this once after each step of the sequence
+// (success or failure) - see T2SepBootstrapService.cpp. Plain overwrite,
+// no history kept: only "what's true right now, this boot" matters to a
+// GUI asking "does SEP work". Input-only IOCTL, nothing returned.
+static VOID
+T2EvtIoDeviceControlSetBootstrapStatus(_In_ WDFREQUEST Request, _In_ PT2_DEVICE_CONTEXT Ctx)
+{
+    NTSTATUS status;
+    PT2_BOOTSTRAP_STATUS in;
+    size_t inLen;
+
+    status = WdfRequestRetrieveInputBuffer(Request, sizeof(*in), (PVOID*)&in, &inLen);
+    if (!NT_SUCCESS(status)) {
+        WdfRequestComplete(Request, status);
+        return;
+    }
+
+    // Same rationale as T2EvtIoDeviceControlGetStatus's _Analysis_assume_
+    // above: WdfRequestRetrieveInputBuffer's success guarantees inLen >=
+    // the MinimumRequiredSize we passed in, just not in a form /analyze
+    // can see on its own.
+    _Analysis_assume_(inLen >= sizeof(*in));
+    WdfSpinLockAcquire(Ctx->BootstrapStatusLock);
+    Ctx->BootstrapStatus.Reason = in->Reason;
+    Ctx->BootstrapStatus.Step = in->Step;
+    Ctx->BootstrapStatus.SepStatus = in->SepStatus;
+    KeQuerySystemTimePrecise(&Ctx->BootstrapStatus.TimestampUtc);
+    WdfSpinLockRelease(Ctx->BootstrapStatusLock);
+
+    WdfRequestComplete(Request, STATUS_SUCCESS);
+}
+
+// Read-only counterpart for SepVaultGui. Deliberately independent of
+// ExchangeLock/State (see driver.h field comment) - answering "what
+// happened last" must keep working even while an AKS exchange is stuck
+// waiting out its 5s timeout against a wedged SEP, which is exactly the
+// situation a GUI status check is most likely to run into.
+static VOID
+T2EvtIoDeviceControlGetBootstrapStatus(_In_ WDFREQUEST Request, _In_ PT2_DEVICE_CONTEXT Ctx)
+{
+    NTSTATUS status;
+    PT2_BOOTSTRAP_STATUS out;
+    size_t outLen;
+
+    status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*out), (PVOID*)&out, &outLen);
+    if (!NT_SUCCESS(status)) {
+        WdfRequestComplete(Request, status);
+        return;
+    }
+
+    _Analysis_assume_(outLen >= sizeof(*out));
+    WdfSpinLockAcquire(Ctx->BootstrapStatusLock);
+    *out = Ctx->BootstrapStatus;
+    WdfSpinLockRelease(Ctx->BootstrapStatusLock);
+
+    WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, sizeof(*out));
+}
+
 VOID
 T2EvtIoDeviceControl(
     _In_ WDFQUEUE Queue,
@@ -787,6 +856,12 @@ T2EvtIoDeviceControl(
         break;
     case IOCTL_T2_AKS_EXCHANGE:
         T2EvtIoDeviceControlAksExchange(Request, ctx);
+        break;
+    case IOCTL_T2_SET_BOOTSTRAP_STATUS:
+        T2EvtIoDeviceControlSetBootstrapStatus(Request, ctx);
+        break;
+    case IOCTL_T2_GET_BOOTSTRAP_STATUS:
+        T2EvtIoDeviceControlGetBootstrapStatus(Request, ctx);
         break;
     default:
         WdfRequestComplete(Request, STATUS_INVALID_DEVICE_REQUEST);

@@ -276,6 +276,14 @@ typedef struct _T2_DEVICE_CONTEXT
     WDFWAITLOCK          ExchangeLock;
     UINT8                NextTransaction;
     T2_TRANSPORT_STATE   State;   // guarded by ExchangeLock
+
+    // Bootstrap status mailbox (see public.h T2_BOOTSTRAP_STATUS). Separate
+    // from ExchangeLock deliberately: a GUI issuing IOCTL_T2_GET_BOOTSTRAP_STATUS
+    // must never block behind an in-flight AKS exchange, which can legitimately
+    // hold ExchangeLock for up to T2_SEP_TIMEOUT_US (5s) while waiting on a
+    // wedged SEP - the exact moment a status query is most useful.
+    WDFSPINLOCK          BootstrapStatusLock;
+    T2_BOOTSTRAP_STATUS  BootstrapStatus;  // guarded by BootstrapStatusLock
 } T2_DEVICE_CONTEXT, *PT2_DEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(T2_DEVICE_CONTEXT, GetDeviceContext);

@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <vector>
 #include <optional>
+#include "../../driver/T2TouchIdTransport/public.h" // T2_BOOTSTRAP_STATUS, T2_SEP_BOOTSTRAP_REASON/STEP
 
 namespace t2::applekeystore {
 
@@ -66,6 +67,15 @@ public:
 
     AksResult GetStatus(bool* pciPresent, bool* bar4Mapped, bool* oolRegistered, bool* mailboxAccessible);
     AksResult RegisterOol();
+
+    // Bootstrap status mailbox the driver holds in memory (public.h
+    // T2_BOOTSTRAP_STATUS) — independent of the AppleKeyStore/SEP protocol
+    // below. T2SepBootstrapService calls SetBootstrapStatus once after
+    // each step of its sequence; SepVaultGui calls GetBootstrapStatus to
+    // show the current state. Neither call touches the SEP.
+    AksResult SetBootstrapStatus(T2_SEP_BOOTSTRAP_REASON reason, T2_SEP_BOOTSTRAP_STEP step,
+                                int8_t sepStatus);
+    AksResult GetBootstrapStatus(T2_BOOTSTRAP_STATUS* outStatus);
 
     // secretUtf8 is zeroed by this call before returning, regardless of
     // outcome — caller must not reuse the buffer contents afterward.

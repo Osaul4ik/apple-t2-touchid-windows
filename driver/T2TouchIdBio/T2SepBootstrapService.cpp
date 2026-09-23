@@ -71,6 +71,46 @@ void Log(const wchar_t* msg) {
     f << L"[" << buf << L"] " << msg << L"\n";
 }
 
+// Reports the current step's outcome to the driver's in-memory bootstrap
+// status (public.h T2_BOOTSTRAP_STATUS, IOCTL_T2_SET_BOOTSTRAP_STATUS) so
+// SepVaultGui can ask the driver "what happened" instead of parsing a
+// status file this service used to maintain on disk. client must already
+// be Open(); if the IOCTL itself fails, that's logged and otherwise
+// swallowed — a failure to *report* status must never turn into a reason
+// to fail the bootstrap sequence itself.
+//
+// reason is one of a small fixed set the GUI understands (see public.h):
+//   ok                   - SEP fully unlocked, event signaled
+//   vault-missing        - sep-vault.bin absent/corrupt, run SepVaultGui
+//   dpapi                - CryptUnprotectData failed (vault copied from
+//                          another machine, or ProgramData ACL tampered)
+//   register-ool-failed  - transport/driver-level failure before any SEP
+//                          exchange was attempted
+//   sep-hang             - an AKS exchange (load-keybag / set-system-keybag /
+//                          unlock) never got a reply from the SEP at all
+//                          (AksResult != Ok). This is the "boot macOS, let
+//                          it fault, reboot into Windows" case — the SEP
+//                          coprocessor itself is wedged, not the driver or
+//                          this service.
+//   sep-rejected         - the SEP replied and explicitly rejected the
+//                          request (sep_status != 0) - wrong password,
+//                          wrong keybag, or a stale handle. Re-running
+//                          SepVaultGui with the correct user.kb/password is
+//                          the fix, not a macOS reboot.
+//
+// "driver not loaded" is deliberately NOT a reason value here: if the
+// device interface can't even be opened, there is no driver instance to
+// hold this status in memory in the first place - SepVaultGui detects
+// that case itself the same way (its own Open() attempt), rather than the
+// service somehow reporting it through the channel that doesn't exist yet.
+void ReportStatus(t2::applekeystore::Client& client, T2_SEP_BOOTSTRAP_REASON reason,
+                   T2_SEP_BOOTSTRAP_STEP step, int8_t sepStatus) {
+    using t2::applekeystore::AksResult;
+    if (client.SetBootstrapStatus(reason, step, sepStatus) != AksResult::Ok) {
+        Log(L"bootstrap: SetBootstrapStatus IOCTL failed (status not reported to driver)");
+    }
+}
+
 // RAII zeroing wrapper. Every buffer that ever holds decrypted keybag bytes
 // or the plaintext password goes through this — mirrors the guarantee
 // Client::Unlock() already gives its own argument (Client.h: "zeroed by
@@ -125,9 +165,23 @@ bool RunBootstrapSequence(HANDLE readyEvent) {
 
     Log(L"bootstrap: sequence starting");
 
+    // Opened first, before anything else: every later failure branch needs
+    // an open client to call ReportStatus() through IOCTL_T2_SET_BOOTSTRAP_STATUS.
+    // If this itself fails, there is no device to report through in the
+    // first place - see ReportStatus's header comment - so that one case
+    // stays log-only, same as before.
+    Client client;
+    if (client.Open() != AksResult::Ok) {
+        Log(L"bootstrap: could not open T2TouchIdTransport device interface "
+            L"— driver not loaded yet? (PnP race — see design doc §10)");
+        return false;
+    }
+    Log(L"bootstrap: T2TouchIdTransport device interface opened OK");
+
     auto vault = t2::sepvault::ReadVaultFile(kVaultPath);
     if (!vault.ok) {
         Log(L"bootstrap: sep-vault.bin missing or malformed — run SepVaultGui first");
+        ReportStatus(client, T2SepReasonVaultMissing, T2SepStepReadVault, 0);
         return false;
     }
     Log(L"bootstrap: sep-vault.bin read OK");
@@ -137,24 +191,19 @@ bool RunBootstrapSequence(HANDLE readyEvent) {
     if (!Unprotect(vault.protectedKeybag, &keybag.data)) {
         Log(L"bootstrap: CryptUnprotectData failed for keybag blob "
             L"(wrong machine? vault copied from another install?)");
+        ReportStatus(client, T2SepReasonDpapi, T2SepStepUnprotectKeybag, 0);
         return false;
     }
     if (!Unprotect(vault.protectedPassword, &password.data)) {
         Log(L"bootstrap: CryptUnprotectData failed for password blob");
+        ReportStatus(client, T2SepReasonDpapi, T2SepStepUnprotectPassword, 0);
         return false;
     }
     Log(L"bootstrap: keybag and password unprotected OK");
 
-    Client client;
-    if (client.Open() != AksResult::Ok) {
-        Log(L"bootstrap: could not open T2TouchIdTransport device interface "
-            L"— driver not loaded yet? (PnP race — see design doc §10)");
-        return false;
-    }
-    Log(L"bootstrap: T2TouchIdTransport device interface opened OK");
-
     if (client.RegisterOol() != AksResult::Ok) {
         Log(L"bootstrap: register-ool failed");
+        ReportStatus(client, T2SepReasonRegisterOolFailed, T2SepStepRegisterOol, 0);
         return false;
     }
     Log(L"bootstrap: register-ool OK");
@@ -162,9 +211,30 @@ bool RunBootstrapSequence(HANDLE readyEvent) {
     int32_t handle = 0;
     int8_t sepStatus = 0;
     if (client.LoadKeybag(keybag.data, &handle, /*session=*/1, &sepStatus) != AksResult::Ok) {
+        // Exchange() itself never completed - the mailbox never posted a
+        // reply (see mailbox.c T2_SEP_TIMEOUT_US). sepStatus is whatever
+        // Exchange() left it at (its own default 0), NOT a real SEP
+        // response, so do not present it as one - this is a wedged SEP,
+        // the same family as the "SEP failed to power-gate" panic macOS
+        // itself hits, and it needs the same hardware-level reset that a
+        // macOS boot forces. Retrying from this service will not help;
+        // see the file header comment on why this is one-shot-per-boot.
         wchar_t buf[128];
-        swprintf_s(buf, L"bootstrap: load-keybag failed, sep_status=%d", sepStatus);
+        swprintf_s(buf, L"bootstrap: load-keybag failed, sep_status=%d (SEP unresponsive)", sepStatus);
         Log(buf);
+        ReportStatus(client, T2SepReasonSepHang, T2SepStepLoadKeybag, sepStatus);
+        return false;
+    }
+    if (sepStatus != 0) {
+        // Exchange completed - the SEP is alive and answered, and
+        // explicitly rejected this load-keybag. Previously this fell
+        // through as an implicit success (only AksResult was checked),
+        // logging "OK" with a meaningless handle and letting the next
+        // steps fail confusingly instead of here, with the actual reason.
+        wchar_t buf[128];
+        swprintf_s(buf, L"bootstrap: load-keybag rejected by SEP, sep_status=%d (bad keybag/session?)", sepStatus);
+        Log(buf);
+        ReportStatus(client, T2SepReasonSepRejected, T2SepStepLoadKeybag, sepStatus);
         return false;
     }
     {
@@ -176,8 +246,16 @@ bool RunBootstrapSequence(HANDLE readyEvent) {
     if (client.MakeSystemKeybag(handle, vault.specialUserBag, /*session=*/1, &sepStatus)
             != AksResult::Ok) {
         wchar_t buf[160];
-        swprintf_s(buf, L"bootstrap: set-system-keybag failed, sep_status=%d", sepStatus);
+        swprintf_s(buf, L"bootstrap: set-system-keybag failed, sep_status=%d (SEP unresponsive)", sepStatus);
         Log(buf);
+        ReportStatus(client, T2SepReasonSepHang, T2SepStepSetSystemKeybag, sepStatus);
+        return false;
+    }
+    if (sepStatus != 0) {
+        wchar_t buf[160];
+        swprintf_s(buf, L"bootstrap: set-system-keybag rejected by SEP, sep_status=%d", sepStatus);
+        Log(buf);
+        ReportStatus(client, T2SepReasonSepRejected, T2SepStepSetSystemKeybag, sepStatus);
         return false;
     }
     Log(L"bootstrap: set-system-keybag OK");
@@ -191,8 +269,16 @@ bool RunBootstrapSequence(HANDLE readyEvent) {
     std::vector<uint8_t> passwordForHandle = password.data;
     if (client.Unlock(handle, passwordForHandle, /*session=*/1, &sepStatus) != AksResult::Ok) {
         wchar_t buf[128];
-        swprintf_s(buf, L"bootstrap: unlock(handle) failed, sep_status=%d", sepStatus);
+        swprintf_s(buf, L"bootstrap: unlock(handle) failed, sep_status=%d (SEP unresponsive)", sepStatus);
         Log(buf);
+        ReportStatus(client, T2SepReasonSepHang, T2SepStepUnlockHandle, sepStatus);
+        return false;
+    }
+    if (sepStatus != 0) {
+        wchar_t buf[128];
+        swprintf_s(buf, L"bootstrap: unlock(handle) rejected by SEP, sep_status=%d (wrong password?)", sepStatus);
+        Log(buf);
+        ReportStatus(client, T2SepReasonSepRejected, T2SepStepUnlockHandle, sepStatus);
         return false;
     }
     Log(L"bootstrap: unlock(handle) OK");
@@ -201,13 +287,22 @@ bool RunBootstrapSequence(HANDLE readyEvent) {
     if (client.Unlock(vault.specialUserBag, passwordForSpecialBag, /*session=*/1, &sepStatus)
             != AksResult::Ok) {
         wchar_t buf[160];
-        swprintf_s(buf, L"bootstrap: unlock(special bag) failed, sep_status=%d", sepStatus);
+        swprintf_s(buf, L"bootstrap: unlock(special bag) failed, sep_status=%d (SEP unresponsive)", sepStatus);
         Log(buf);
+        ReportStatus(client, T2SepReasonSepHang, T2SepStepUnlockSpecialBag, sepStatus);
+        return false;
+    }
+    if (sepStatus != 0) {
+        wchar_t buf[160];
+        swprintf_s(buf, L"bootstrap: unlock(special bag) rejected by SEP, sep_status=%d (wrong password?)", sepStatus);
+        Log(buf);
+        ReportStatus(client, T2SepReasonSepRejected, T2SepStepUnlockSpecialBag, sepStatus);
         return false;
     }
     Log(L"bootstrap: unlock(special bag) OK");
 
     Log(L"bootstrap: SEP ready");
+    ReportStatus(client, T2SepReasonOk, T2SepStepReady, 0);
     SetEvent(readyEvent);
     return true;
 }
@@ -256,6 +351,12 @@ VOID WINAPI ServiceMain(DWORD, LPWSTR*) {
                    kReadyEventName, GetLastError());
         Log(buf);
     } else if (AlreadyPrepared(readyEvent)) {
+        // Nothing to report here: the driver's in-memory BootstrapStatus
+        // already holds "ok" from whichever earlier run in this same boot
+        // signaled the event in the first place (see driver.h field
+        // comment - it lives in the device context, not this process, so
+        // it survives this service restarting). Re-sending the same value
+        // would only cost an IOCTL round-trip for no new information.
         Log(L"bootstrap: Global\\T2SepReady already signaled this session — skipping (SEP already unlocked)");
     } else {
         RunBootstrapSequence(readyEvent);

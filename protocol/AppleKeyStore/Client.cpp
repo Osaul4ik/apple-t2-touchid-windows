@@ -78,6 +78,37 @@ AksResult Client::RegisterOol() {
     return AksResult::Ok;
 }
 
+AksResult Client::SetBootstrapStatus(T2_SEP_BOOTSTRAP_REASON reason, T2_SEP_BOOTSTRAP_STEP step,
+                                    int8_t sepStatus) {
+    T2_BOOTSTRAP_STATUS in{};
+    in.Reason = reason;
+    in.Step = step;
+    in.SepStatus = sepStatus;
+    // TimestampUtc is set by the driver itself (KeQuerySystemTimePrecise)
+    // on the way in - the caller's clock/value here is ignored.
+    DWORD returned = 0;
+    if (!DeviceIoControl(handle_, IOCTL_T2_SET_BOOTSTRAP_STATUS,
+            &in, sizeof(in), nullptr, 0, &returned, nullptr)) {
+        DWORD err = GetLastError();
+        if (err == ERROR_NOT_READY) return AksResult::NotReady;
+        return AksResult::IoError;
+    }
+    return AksResult::Ok;
+}
+
+AksResult Client::GetBootstrapStatus(T2_BOOTSTRAP_STATUS* outStatus) {
+    if (!outStatus) return AksResult::IoError;
+    DWORD returned = 0;
+    if (!DeviceIoControl(handle_, IOCTL_T2_GET_BOOTSTRAP_STATUS,
+            nullptr, 0, outStatus, sizeof(*outStatus), &returned, nullptr)) {
+        DWORD err = GetLastError();
+        if (err == ERROR_NOT_READY) return AksResult::NotReady;
+        return AksResult::IoError;
+    }
+    if (returned < sizeof(*outStatus)) return AksResult::IoError;
+    return AksResult::Ok;
+}
+
 AksResult Client::Exchange(uint8_t operation, const std::vector<uint8_t>& request,
                             std::vector<uint8_t>* response, int8_t* outSepStatus) {
     if (outSepStatus) {
