@@ -28,7 +28,21 @@
 #include <strsafe.h>
 #include <winbio_types.h>
 #include <winbio_err.h>   // WINBIO_E_* HRESULTs (not pulled in by winbio_types.h)
+
+// INITGUID must be scoped tightly around winbio_ioctl.h ONLY (it is what
+// DEFINE_GUIDs GUID_DEVINTERFACE_BIOMETRIC_READER; without INITGUID that
+// header only *declares* it and the link fails with LNK2001). It must NOT
+// stay defined across <windows.h>/<wdf.h> above: those pull in winioctl.h
+// (directly and, separately, via WDF's own storage-GUID headers), and with
+// INITGUID left on globally each DEFINE_GUID in winioctl.h gets fully
+// instantiated on both paths, i.e. twice in this one TU -> C2374
+// "redefinition; multiple initialization" on GUID_DEVINTERFACE_DISK and
+// friends. Defining INITGUID only for this one header, then undefining it
+// immediately, keeps windows.h/wdf.h on the normal extern-declaration path
+// no matter how many times/routes they end up pulling winioctl.h in.
+#include <initguid.h>
 #include <winbio_ioctl.h>
+#undef INITGUID
 
 // Protocol libraries (protocol/T2TouchIdProtocol.vcxproj). Plain C++, no
 // WDK-only headers - see BridgeDiscovery.h / VendorBir.h for why these are
