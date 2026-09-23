@@ -213,8 +213,10 @@ typedef struct _T2NCM_DEVICE_CONTEXT
     T2NCM_LIFECYCLE_STATE State;
     WDFSPINLOCK          StateLock;
 
+    // The single station address. The adapter has no user-settable
+    // address (no NetworkAddress override), so the "current" and
+    // "permanent" addresses NDIS asks for are always this same value.
     UCHAR                PermanentMacAddress[6];
-    UCHAR                CurrentMacAddress[6];
     BOOLEAN              MacAddressValid;
 
     // TRUE only when PermanentMacAddress came from a real device string

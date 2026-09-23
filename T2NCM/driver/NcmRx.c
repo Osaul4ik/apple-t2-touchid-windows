@@ -66,11 +66,11 @@ typedef struct _T2NCM_WIRE_NDP16
 // large amount of pinned pool.
 #define T2NCM_RX_PENDING_READS      4u
 
-// Upper bound on frames indicated in a single NdisMIndicateReceive-
-// NetBufferLists call. An NTB can in principle carry hundreds of
-// datagrams; batching them all into one indication is fine, but the
-// chain is built on the stack-walked list below and this keeps the
-// per-NTB work bounded if a device ever reports an absurd entry count.
+// Upper bound on frames handed to NDIS in a single NdisMIndicateReceive-
+// NetBufferLists call. An NTB can carry hundreds of datagrams, so the
+// parser flushes a full batch and keeps going - the cap bounds the size
+// of one indication, it must never bound how many datagrams of an NTB
+// get delivered.
 #define T2NCM_RX_MAX_BATCH          64u
 
 // Per-NBL bookkeeping. NBLs come from a pool created with a context
@@ -194,7 +194,7 @@ T2NcmRxAcceptsFrame(
         return FALSE;
     }
 
-    if (RtlCompareMemory(DeviceContext->CurrentMacAddress, Destination,
+    if (RtlCompareMemory(DeviceContext->PermanentMacAddress, Destination,
             T2NCM_MAC_LENGTH) == T2NCM_MAC_LENGTH)
     {
         return TRUE;
@@ -316,6 +316,38 @@ T2NcmRxReturnNetBufferLists(
     }
 }
 
+// Hands one chain of already-built NBLs to NDIS. Takes the outstanding-
+// indication references BEFORE indicating: NDIS is entitled to call
+// MiniportReturnNetBufferLists from inside this call on the same thread,
+// so a reference taken afterwards could be taken against a count that
+// has already gone negative.
+static
+VOID
+T2NcmRxIndicateBatch(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext,
+    _In_ PNET_BUFFER_LIST      NblHead,
+    _In_ ULONG                 NblCount,
+    _In_ BOOLEAN               AtDispatchLevel
+    )
+{
+    ULONG indicateFlags = 0;
+
+    if (AtDispatchLevel)
+    {
+        NDIS_SET_RECEIVE_FLAG(indicateFlags, NDIS_RECEIVE_FLAGS_DISPATCH_LEVEL);
+    }
+
+    InterlockedAdd(&DeviceContext->OutstandingRxNbls, (LONG)NblCount);
+    InterlockedAdd64(&DeviceContext->RxFramesIndicated, (LONG64)NblCount);
+
+    NdisMIndicateReceiveNetBufferLists(
+        DeviceContext->MiniportAdapterHandle,
+        NblHead,
+        NDIS_DEFAULT_PORT_NUMBER,
+        NblCount,
+        indicateFlags);
+}
+
 static
 VOID
 T2NcmRxParseNtb(
@@ -430,7 +462,7 @@ T2NcmRxParseNtb(
     // on assignment even though it can't actually lose data here.
     entryCount = (ULONG)((ndpLength - T2NCM_NDP16_HEADER_LENGTH) / sizeof(T2NCM_WIRE_NDP16_ENTRY));
 
-    for (ULONG i = 0; i < entryCount && framesThisNtb < T2NCM_RX_MAX_BATCH; i++)
+    for (ULONG i = 0; i < entryCount; i++)
     {
         T2NCM_WIRE_NDP16_ENTRY entry;
         // Same explicit-narrowing note as entryCount above.
@@ -530,32 +562,24 @@ T2NcmRxParseNtb(
             }
 
             framesThisNtb++;
+
+            if (framesThisNtb == T2NCM_RX_MAX_BATCH)
+            {
+                // Full batch: indicate it and start a new chain instead
+                // of abandoning the rest of the NTB's datagrams.
+                T2NcmRxIndicateBatch(DeviceContext, nblHead, framesThisNtb,
+                    AtDispatchLevel);
+                nblHead = NULL;
+                nblTail = NULL;
+                framesThisNtb = 0;
+            }
         }
     }
 
     if (nblHead != NULL)
     {
-        ULONG indicateFlags = 0;
-
-        if (AtDispatchLevel)
-        {
-            NDIS_SET_RECEIVE_FLAG(indicateFlags, NDIS_RECEIVE_FLAGS_DISPATCH_LEVEL);
-        }
-
-        // Take the outstanding-indication references BEFORE indicating.
-        // NDIS is entitled to call MiniportReturnNetBufferLists from
-        // inside this call on the same thread, so a reference taken
-        // afterwards could be taken against a count that has already
-        // gone negative.
-        InterlockedAdd(&DeviceContext->OutstandingRxNbls, (LONG)framesThisNtb);
-        InterlockedAdd64(&DeviceContext->RxFramesIndicated, (LONG64)framesThisNtb);
-
-        NdisMIndicateReceiveNetBufferLists(
-            DeviceContext->MiniportAdapterHandle,
-            nblHead,
-            NDIS_DEFAULT_PORT_NUMBER,
-            framesThisNtb,
-            indicateFlags);
+        T2NcmRxIndicateBatch(DeviceContext, nblHead, framesThisNtb,
+            AtDispatchLevel);
     }
 
     // Per-NTB success trace deliberately removed (16.09.2026) - this ran on

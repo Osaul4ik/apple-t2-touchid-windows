@@ -440,9 +440,6 @@ T2NcmMiniportInitializeEx(
         goto Fail;
     }
 
-    RtlCopyMemory(context->CurrentMacAddress, context->PermanentMacAddress,
-        T2NCM_MAC_LENGTH);
-
     status = T2NcmPowerArmHardware(context);
     if (!NT_SUCCESS(status))
     {
@@ -549,7 +546,7 @@ T2NcmMiniportInitializeEx(
     RtlCopyMemory(generalAttributes.PermanentMacAddress,
         context->PermanentMacAddress, T2NCM_MAC_LENGTH);
     RtlCopyMemory(generalAttributes.CurrentMacAddress,
-        context->CurrentMacAddress, T2NCM_MAC_LENGTH);
+        context->PermanentMacAddress, T2NCM_MAC_LENGTH);
     generalAttributes.RecvScaleCapabilities   = NULL;
     generalAttributes.AccessType              = NET_IF_ACCESS_BROADCAST;
     generalAttributes.DirectionType           = NET_IF_DIRECTION_SENDRECEIVE;
@@ -628,9 +625,9 @@ T2NcmMiniportInitializeEx(
     T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
         "T2Ncm: adapter registered and PAUSED - waiting for MiniportRestart "
         "(mac=%02X:%02X:%02X:%02X:%02X:%02X permanent=%u)\n",
-        context->CurrentMacAddress[0], context->CurrentMacAddress[1],
-        context->CurrentMacAddress[2], context->CurrentMacAddress[3],
-        context->CurrentMacAddress[4], context->CurrentMacAddress[5],
+        context->PermanentMacAddress[0], context->PermanentMacAddress[1],
+        context->PermanentMacAddress[2], context->PermanentMacAddress[3],
+        context->PermanentMacAddress[4], context->PermanentMacAddress[5],
         context->MacAddressIsPermanent));
 
     return NDIS_STATUS_SUCCESS;
@@ -1118,7 +1115,8 @@ T2NcmOidQuery(
             T2NCM_MAC_LENGTH);
 
     case OID_802_3_CURRENT_ADDRESS:
-        return T2NcmOidQueryCopy(Request, DeviceContext->CurrentMacAddress,
+        // No override exists, so the current address is the station address.
+        return T2NcmOidQueryCopy(Request, DeviceContext->PermanentMacAddress,
             T2NCM_MAC_LENGTH);
 
     case OID_802_3_MAXIMUM_LIST_SIZE:

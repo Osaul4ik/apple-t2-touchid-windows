@@ -227,16 +227,29 @@ T2NcmCtrlEvtDevicePrepareHardware(
     UNREFERENCED_PARAMETER(ResourcesRaw);
     UNREFERENCED_PARAMETER(ResourcesTranslated);
 
-    WDF_USB_DEVICE_CREATE_CONFIG_INIT(&createConfig, USBD_CLIENT_CONTRACT_VERSION_602);
+    // EvtDevicePrepareHardware runs again if PnP stops and restarts this
+    // device (resource rebalance, driver update). The WDFUSBDEVICE is a
+    // child of the WDFDEVICE and survives that, so it is created only the
+    // first time - a second create would leak/duplicate the USB target.
+    // SelectConfig below IS repeated on every start: the USB stack may
+    // reconfigure the device, which hands back new interface/pipe objects,
+    // so the pipe cached from the previous start is dropped here.
+    context->NotificationPipe = NULL;
+    context->ControlInterface = NULL;
 
-    status = WdfUsbTargetDeviceCreateWithParameters(
-        Device, &createConfig, WDF_NO_OBJECT_ATTRIBUTES, &context->UsbDevice);
-    if (!NT_SUCCESS(status))
+    if (context->UsbDevice == NULL)
     {
-        T2NCMCTRL_LOG((T2NCMCTRL_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2NcmCtrl: WdfUsbTargetDeviceCreateWithParameters failed 0x%08X\n",
-            status));
-        return status;
+        WDF_USB_DEVICE_CREATE_CONFIG_INIT(&createConfig, USBD_CLIENT_CONTRACT_VERSION_602);
+
+        status = WdfUsbTargetDeviceCreateWithParameters(
+            Device, &createConfig, WDF_NO_OBJECT_ATTRIBUTES, &context->UsbDevice);
+        if (!NT_SUCCESS(status))
+        {
+            T2NCMCTRL_LOG((T2NCMCTRL_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+                "T2NcmCtrl: WdfUsbTargetDeviceCreateWithParameters failed 0x%08X\n",
+                status));
+            return status;
+        }
     }
 
     // MI_00 has exactly one interface with one alt setting.
