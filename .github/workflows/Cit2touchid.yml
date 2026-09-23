@@ -733,24 +733,32 @@ jobs:
 
           $guiDesc = if ($variant -eq "full") { "SepVaultGui.exe - self-contained, single-file (no .NET runtime needed on target)" } else { "SepVaultGui.exe + companions - framework-dependent (.NET 8 Desktop Runtime required on target)" }
 
-          @"
-          T2TouchIdTransport static-analysis summary ($variant package)
-          ===========================================
-          Driver:          $env:DRIVER_NAME.sys
-          Driver version:  $env:DRIVER_VERSION
-          Built:           $env:DRIVER_DATE (UTC build date; local runner clock)
-          Target:          PCI\VEN_106B&DEV_1802, KMDF 1.15
-          SepVaultGui:     $guiDesc
-
-          CodeQL query pack:  microsoft/windows-drivers@$env:CODEQL_DRIVERS_PACK_VERSION
-          PREfast:            enabled (RunCodeAnalysis + EnableCppCoreCheck, warnings-as-errors)
-
-          mustrun.qls (informational): $mustrunCount finding(s) - see codeql-mustrun.sarif
-          mustfix.qls (WHCP-blocking): $mustfixCount finding(s) - see codeql-mustfix.sarif
-
-          Tests:  T2TouchIdTests.exe passed (see workflow log for details)
-          Signed: $signed
-          "@ | Set-Content -Path (Join-Path $checksDir "SUMMARY.txt") -Encoding utf8
+          # String array (one element per line) instead of an @"..."@
+          # here-string: the closing "@ is only valid with ZERO leading
+          # whitespace, which an indented YAML "run: |" block can't give
+          # it - that mismatch is exactly what produced the earlier
+          # "White space is not allowed before the string terminator"
+          # ParserError. Piping the array to Set-Content writes one line
+          # per element (same pattern already used in CiNCM.yml).
+          $summary = @(
+            "T2TouchIdTransport static-analysis summary ($variant package)",
+            "===========================================",
+            "Driver:          $env:DRIVER_NAME.sys",
+            "Driver version:  $env:DRIVER_VERSION",
+            "Built:           $env:DRIVER_DATE (UTC build date; local runner clock)",
+            "Target:          PCI\VEN_106B&DEV_1802, KMDF 1.15",
+            "SepVaultGui:     $guiDesc",
+            "",
+            "CodeQL query pack:  microsoft/windows-drivers@$env:CODEQL_DRIVERS_PACK_VERSION",
+            "PREfast:            enabled (RunCodeAnalysis + EnableCppCoreCheck, warnings-as-errors)",
+            "",
+            "mustrun.qls (informational): $mustrunCount finding(s) - see codeql-mustrun.sarif",
+            "mustfix.qls (WHCP-blocking): $mustfixCount finding(s) - see codeql-mustfix.sarif",
+            "",
+            "Tests:  T2TouchIdTests.exe passed (see workflow log for details)",
+            "Signed: $signed"
+          )
+          $summary | Set-Content -Path (Join-Path $checksDir "SUMMARY.txt") -Encoding utf8
         }
 
         Write-Host "OK: bundled checks/ into both artifacts\driver-full and artifacts\driver-min"

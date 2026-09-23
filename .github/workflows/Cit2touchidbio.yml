@@ -447,18 +447,28 @@ jobs:
           ForEach-Object { Copy-Item -Path $_.FullName -Destination $checksDir -Force }
 
         $signed = if ($env:SIGN_CERT_PFX -and $env:SIGN_CERT_PASSWORD) { "yes" } else { "no - test-signing required on target machine" }
-        @"
-        T2TouchIdBio (UMDF 2 / WBDI skeleton) build summary
-        ====================================================
-        Driver:          $env:UMDF_NAME.dll
-        Driver version:  $env:DRIVER_VERSION
-        Built:           $env:DRIVER_DATE (UTC build date; local runner clock)
-        Target:          root\T2TouchIdBio, UMDF $env:UMDF_STAMP_VERSION, class Biometric
 
-        PREfast:         enabled (RunCodeAnalysis + EnableCppCoreCheck, warnings-as-errors: $env:CA_TREAT_WARNINGS_AS_ERRORS)
-        PREfast warnings in build log: $env:PREFAST_WARNING_COUNT
-        Signed:          $signed
-        "@ | Set-Content -Path (Join-Path $checksDir "SUMMARY.txt") -Encoding utf8
+        # Built as a string array (one element per line) instead of an
+        # @"..."@ here-string: a here-string's closing "@ is only valid
+        # with ZERO leading whitespace, which is incompatible with this
+        # step living inside an indented YAML "run: |" block - the exact
+        # cause of the earlier "White space is not allowed before the
+        # string terminator" ParserError. Piping an array to Set-Content
+        # writes one line per element and sidesteps the conflict entirely
+        # (same pattern already used in CiNCM.yml's summary step).
+        $summary = @(
+          "T2TouchIdBio (UMDF 2 / WBDI skeleton) build summary",
+          "====================================================",
+          "Driver:          $env:UMDF_NAME.dll",
+          "Driver version:  $env:DRIVER_VERSION",
+          "Built:           $env:DRIVER_DATE (UTC build date; local runner clock)",
+          "Target:          root\T2TouchIdBio, UMDF $env:UMDF_STAMP_VERSION, class Biometric",
+          "",
+          "PREfast:         enabled (RunCodeAnalysis + EnableCppCoreCheck, warnings-as-errors: $env:CA_TREAT_WARNINGS_AS_ERRORS)",
+          "PREfast warnings in build log: $env:PREFAST_WARNING_COUNT",
+          "Signed:          $signed"
+        )
+        $summary | Set-Content -Path (Join-Path $checksDir "SUMMARY.txt") -Encoding utf8
 
         Write-Host "OK: bundled checks/ into $env:PACKAGE_DIR :"
         Get-ChildItem -Recurse $checksDir | ForEach-Object { Write-Host "  - $($_.FullName)" }
