@@ -9,7 +9,11 @@ name: CI Apple T2 TouchId (CodeQL + PREfast + Build + Package)
 #   Inst/           InstallCert.bat, Install-T2TouchIdBio.ps1 (з tools/) і
 #                   <CertCN>.cer
 #   SEP/            T2TouchIdTransport.sys, .inf, .cat, T2SepBootstrap.exe,
-#                   T2SepCoInstaller.dll, t2touchid.exe + vcpkg runtime dll,
+#                   T2SepCoInstaller.dll, t2touchid.exe + vcpkg runtime dll(s)
+#                   (plist-2.0.dll etc. - also listed in the .inf's
+#                   [T2SepBootstrap_CopyFiles]/[SourceDisksFiles] so PnP
+#                   installs them alongside T2SepBootstrap.exe into
+#                   %SystemRoot%\System32\T2SepBootstrap\, not just the .exe),
 #                   checks/
 #   NCM/            T2Ncm.sys, T2NcmCtrl.sys, 3x .inf, 3x .cat, checks/
 #   Bio/            T2TouchIdBio.dll, .inf, .cat, T2TouchIdEngineAdapter.dll
@@ -712,6 +716,44 @@ jobs:
         New-Item -ItemType Directory -Path (Join-Path $pkg "checks") -Force | Out-Null
         Write-Host "OK: staged SEP package:"
         Get-ChildItem $pkg | ForEach-Object { Write-Host "  - $($_.Name)" }
+      shell: pwsh
+
+    - name: "SEP: bundle libplist runtime DLLs into package + INF"
+      run: |
+        $ErrorActionPreference = "Stop"
+        $binDir = Join-Path $env:VCPKG_INSTALLED_DIR "bin"
+        $dlls = @(Get-ChildItem -Path $binDir -Filter "*.dll" -ErrorAction SilentlyContinue)
+        if ($dlls.Count -eq 0) { Write-Error "No runtime DLLs under $binDir"; exit 1 }
+        if (-not ($dlls | Where-Object { $_.Name -match 'plist' })) { Write-Error "plist DLL not found under $binDir"; exit 1 }
+
+        # T2SepBootstrap.exe links plist-2.0.lib dynamically (vcpkg
+        # x64-windows triplet -> plist-2.0.dll at runtime), but
+        # [T2SepBootstrap_CopyFiles] below only ever listed the .exe itself.
+        # PnP's CopyFiles only stages what a section lists into
+        # %SystemRoot%\System32\T2SepBootstrap\, so the service binary landed
+        # there with no plist-2.0.dll next to it and could not initialize -
+        # SCM: "service did not respond to the start or control request in a
+        # timely fashion" (error 1053 / Event 7000). The DLLs were already
+        # being copied into final\SEP\ for t2touchid.exe's own use (see the
+        # staging step above) but the INF never knew about them. Same fix as
+        # "Bio: bundle libplist runtime DLLs into package + INF": list every
+        # vcpkg runtime DLL in the SAME CopyFiles section as the .exe so they
+        # land in the same System32\T2SepBootstrap\ subfolder as it.
+        $infFull = "final\SEP\$env:SEP_DRIVER_NAME.inf"
+        if (-not (Test-Path $infFull)) { Write-Error "SEP INF not found: $infFull"; exit 1 }
+        $infFull = (Resolve-Path $infFull).Path
+
+        $srcLines  = ($dlls | ForEach-Object { "$($_.Name) = 1,," }) -join "`r`n"
+        $copyLines = ($dlls | ForEach-Object { $_.Name }) -join "`r`n"
+
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        $inf  = [System.IO.File]::ReadAllText($infFull)
+        $inf2 = [regex]::Replace($inf, '(?m)^\[SourceDisksFiles\]\r?$', "[SourceDisksFiles]`r`n$srcLines")
+        $inf2 = [regex]::Replace($inf2, '(?m)^\[T2SepBootstrap_CopyFiles\]\r?$', "[T2SepBootstrap_CopyFiles]`r`n$copyLines")
+        if ($inf2 -eq $inf -or $inf2 -notmatch [regex]::Escape($dlls[0].Name)) { Write-Error "SEP INF was not patched with the runtime DLLs."; exit 1 }
+        [System.IO.File]::WriteAllText($infFull, $inf2, $utf8)
+        Write-Host "OK: patched SEP INF so T2SepBootstrap's runtime DLLs install alongside it:"
+        $dlls | ForEach-Object { Write-Host "  - $($_.Name)" }
       shell: pwsh
 
     - name: "SEP: stamp INF (KMDF 1.15)"
