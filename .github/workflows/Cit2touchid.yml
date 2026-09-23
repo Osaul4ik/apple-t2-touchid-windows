@@ -350,22 +350,21 @@ jobs:
 
     # =====================================================================
     # SepVaultGui (Sepvaultgui.csproj): a .NET 8 WPF project, standalone -
-    # not part of T2TouchId.sln, built with the .NET SDK directly. Moved
-    # here (was Cit2touchidbio.yml's `ci` job) so the one file the INF's
-    # [T2SepBootstrap_CopyFiles] actually expects - SepVaultGui.exe - is
-    # produced by the same job that packages the driver, instead of a
-    # separate path-filtered workflow whose artifact nobody wires in.
+    # not part of T2TouchId.sln, built with the .NET SDK directly. It is a
+    # plain user-run desktop app (one-time setup tool that writes
+    # sep-vault.bin) and does NOT get copied into %SystemRoot%\System32 or
+    # bundled inside the driver package/INF - the driver install and the
+    # GUI are two independent things a user installs separately. This job
+    # instead packages it into its own two standalone archives (see
+    # "Package standalone SepVaultGui archives" below), uploaded next to
+    # the driver package rather than inside it.
     #
-    # Two publish flavors, BOTH end up inside a full driver package
-    # (driver + coinstaller + T2SepBootstrap + SepVaultGui) later in this
-    # job - see "Prepare common driver files (both variants)" below:
-    #   - Full (self-contained, single-file): satisfies the INF's
-    #     [T2SepBootstrap_CopyFiles] / [SourceDisksFiles] as-is (single exe,
-    #     no companion DLLs).
+    # Two publish flavors, each becoming its own archive:
+    #   - Full (self-contained, single-file): one .exe, no .NET runtime
+    #     needed on the target machine.
     #   - Min (framework-dependent): needs its companion files
-    #     (.dll/.deps.json/.runtimeconfig.json) staged and added to that
-    #     copy's INF - handled later by the "Patch Min package INF" step.
-    #     Requires the .NET 8 Desktop Runtime on the target machine.
+    #     (.dll/.deps.json/.runtimeconfig.json) alongside the .exe, and
+    #     requires the .NET 8 Desktop Runtime on the target machine.
     # =====================================================================
     - name: Setup .NET
       uses: actions/setup-dotnet@v4
@@ -407,9 +406,8 @@ jobs:
     # target machine to already have the .NET 8 Desktop Runtime installed
     # (https://dotnet.microsoft.com/download/dotnet/8.0 -> ".NET Desktop
     # Runtime"); otherwise it refuses to launch with a "you must install
-    # .NET" prompt. Its files get bundled into the Min driver package by
-    # the "Prepare common driver files" / "Patch Min package INF" steps
-    # below - no standalone GUI-only artifact anymore.
+    # .NET" prompt. Its files get bundled into its own standalone archive
+    # by the "Package standalone SepVaultGui archives" step below.
     # =====================================================================
     - name: Publish SepVaultGui (framework-dependent win-x64) - Min
       run: |
@@ -430,18 +428,57 @@ jobs:
       shell: pwsh
 
     # =====================================================================
-    # Driver packaging: TWO full packages instead of one, differing only
-    # by which SepVaultGui build they carry:
-    #   - artifacts\driver-full -> T2TouchId-Signed-Full-<version>
-    #   - artifacts\driver-min  -> T2TouchId-Signed-Min-<version>
-    # Both get the .sys, the coinstaller, T2SepBootstrap.exe, t2touchid.exe
-    # and checks/ - identical in both. The Min package additionally needs
-    # SepVaultGui's companion files (.dll/.deps.json/.runtimeconfig.json,
-    # framework-dependent build has no single-file merge) staged and added
-    # to that copy's INF, which the Full package doesn't need (single-file
-    # exe, nothing to add).
+    # SepVaultGui ships as its own two archives, completely separate from
+    # the driver package below - nothing here touches System32 or the INF.
+    # Each archive gets a named root folder inside the zip (same pattern
+    # used for the driver package's own staging step further down), so
+    # extracting either one drops a "SepVaultGui" folder rather than
+    # scattering loose files.
     # =====================================================================
-    - name: Prepare common driver files (both variants)
+    - name: Package standalone SepVaultGui archives (Full + Min)
+      run: |
+        $ErrorActionPreference = "Stop"
+
+        $fullStagingDir = "temp-upload-gui-full\SepVaultGui"
+        New-Item -ItemType Directory -Path $fullStagingDir -Force | Out-Null
+        Copy-Item -Path "artifacts\SepVaultGui-full\*" -Destination $fullStagingDir -Recurse -Force
+
+        $minStagingDir = "temp-upload-gui-min\SepVaultGui"
+        New-Item -ItemType Directory -Path $minStagingDir -Force | Out-Null
+        Copy-Item -Path "artifacts\SepVaultGui-min\*" -Destination $minStagingDir -Recurse -Force
+
+        Add-Content -Path $env:GITHUB_ENV -Value "GUI_STAGING_DIR_FULL=temp-upload-gui-full"
+        Add-Content -Path $env:GITHUB_ENV -Value "GUI_STAGING_DIR_MIN=temp-upload-gui-min"
+
+        Write-Host "OK: staged standalone SepVaultGui archives:"
+        Write-Host "  - $fullStagingDir (self-contained, single-file)"
+        Write-Host "  - $minStagingDir (framework-dependent, needs .NET 8 Desktop Runtime)"
+      shell: pwsh
+
+    - name: Upload SepVaultGui Full (standalone, self-contained)
+      uses: actions/upload-artifact@v4
+      with:
+        name: SepVaultGui-Full-${{ env.DRIVER_VERSION }}
+        path: ${{ env.GUI_STAGING_DIR_FULL }}
+        if-no-files-found: error
+
+    - name: Upload SepVaultGui Min (standalone, framework-dependent)
+      uses: actions/upload-artifact@v4
+      with:
+        name: SepVaultGui-Min-${{ env.DRIVER_VERSION }}
+        path: ${{ env.GUI_STAGING_DIR_MIN }}
+        if-no-files-found: error
+
+    # =====================================================================
+    # Driver packaging: ONE package now - artifacts\driver ->
+    # T2TouchId-Signed-<version>. Previously this was split into "full"/
+    # "min" variants that differed only by which SepVaultGui build they
+    # carried; now that SepVaultGui isn't bundled into the driver package
+    # at all (it ships as its own standalone archives above), there is
+    # nothing left that would make two driver packages differ, so the
+    # split - and the INF-patching step it required - is gone.
+    # =====================================================================
+    - name: Prepare driver package files
       run: |
         $ErrorActionPreference = "Stop"
 
@@ -458,81 +495,22 @@ jobs:
         $bootstrapPath = "build\$env:BOOTSTRAP_PROJECT\$env:PLATFORM\$env:CONFIGURATION\$env:BOOTSTRAP_PROJECT.exe"
         if (-not (Test-Path $bootstrapPath)) { Write-Error "Built bootstrap exe not found: $bootstrapPath"; exit 1 }
 
-        $fullGuiExe = "artifacts\SepVaultGui-full\$env:GUI_ASSEMBLY_NAME.exe"
-        if (-not (Test-Path $fullGuiExe)) { Write-Error "Published Full SepVaultGui not found: $fullGuiExe"; exit 1 }
+        $packageDir = "artifacts\driver"
+        New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
 
-        $minGuiDir = "artifacts\SepVaultGui-min"
-        if (-not (Test-Path "$minGuiDir\$env:GUI_ASSEMBLY_NAME.exe")) { Write-Error "Published Min SepVaultGui not found under $minGuiDir"; exit 1 }
+        Copy-Item -Path $sysPath    -Destination $packageDir -Force
+        Copy-Item -Path $infSrcPath -Destination $packageDir -Force
 
-        foreach ($variant in @("full", "min")) {
-          $packageDir = "artifacts\driver-$variant"
-          New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
+        $pdbPath = "$buildOutDir\$env:DRIVER_NAME.pdb"
+        if (Test-Path $pdbPath) { Copy-Item -Path $pdbPath -Destination $packageDir -Force }
 
-          Copy-Item -Path $sysPath    -Destination $packageDir -Force
-          Copy-Item -Path $infSrcPath -Destination $packageDir -Force
+        Copy-Item -Path $coinstallerPath -Destination $packageDir -Force
 
-          $pdbPath = "$buildOutDir\$env:DRIVER_NAME.pdb"
-          if (Test-Path $pdbPath) { Copy-Item -Path $pdbPath -Destination $packageDir -Force }
+        Copy-Item -Path $bootstrapPath -Destination $packageDir -Force
+        $bootstrapPdb = "build\$env:BOOTSTRAP_PROJECT\$env:PLATFORM\$env:CONFIGURATION\$env:BOOTSTRAP_PROJECT.pdb"
+        if (Test-Path $bootstrapPdb) { Copy-Item -Path $bootstrapPdb -Destination $packageDir -Force }
 
-          Copy-Item -Path $coinstallerPath -Destination $packageDir -Force
-
-          Copy-Item -Path $bootstrapPath -Destination $packageDir -Force
-          $bootstrapPdb = "build\$env:BOOTSTRAP_PROJECT\$env:PLATFORM\$env:CONFIGURATION\$env:BOOTSTRAP_PROJECT.pdb"
-          if (Test-Path $bootstrapPdb) { Copy-Item -Path $bootstrapPdb -Destination $packageDir -Force }
-
-          Write-Host "OK: staged common files into $packageDir"
-        }
-
-        # Full variant: single self-contained exe, nothing else to add.
-        Copy-Item -Path $fullGuiExe -Destination "artifacts\driver-full" -Force
-
-        # Min variant: exe + every companion file dotnet publish produced
-        # next to it (.dll, .deps.json, .runtimeconfig.json, optional .pdb) -
-        # a framework-dependent build does not run from the .exe alone.
-        $minFiles = Get-ChildItem -Path $minGuiDir -File
-        if ($minFiles.Count -eq 0) { Write-Error "No published files found under $minGuiDir"; exit 1 }
-        foreach ($f in $minFiles) { Copy-Item -Path $f.FullName -Destination "artifacts\driver-min" -Force }
-        Write-Host "OK: staged Min SepVaultGui files into artifacts\driver-min:"
-        $minFiles | ForEach-Object { Write-Host "  - $($_.Name)" }
-
-        Add-Content -Path $env:GITHUB_ENV -Value "MIN_GUI_FILE_NAMES=$(($minFiles.Name) -join ',')"
-      shell: pwsh
-
-    # =====================================================================
-    # The Min package's INF needs its SepVaultGui companion files added to
-    # [SourceDisksFiles] and [T2SepBootstrap_CopyFiles] - same regex-patch
-    # pattern already used in Cit2touchidbio.yml for bundling libplist's
-    # runtime DLLs into that driver's INF. The Full package's INF is left
-    # untouched (still lists only SepVaultGui.exe, which is all it needs).
-    # =====================================================================
-    - name: Patch Min package INF with SepVaultGui companion files
-      run: |
-        $ErrorActionPreference = "Stop"
-        $infPath = (Resolve-Path "artifacts\driver-min\$env:DRIVER_NAME.inf").Path
-
-        # Companion files only (SepVaultGui.exe itself is already listed by
-        # the INF as shipped) - $env:GUI_ASSEMBLY_NAME.exe stays out of this
-        # list so it isn't duplicated.
-        $companions = $env:MIN_GUI_FILE_NAMES -split ',' | Where-Object { $_ -ne "$env:GUI_ASSEMBLY_NAME.exe" -and $_ -notmatch '\.pdb$' }
-        if ($companions.Count -eq 0) { Write-Error "No SepVaultGui companion files to add to the Min INF."; exit 1 }
-
-        $srcLines  = ($companions | ForEach-Object { "$_ = 1,," }) -join "`r`n"
-        $copyLines = ($companions) -join "`r`n"
-
-        $utf8 = New-Object System.Text.UTF8Encoding($false)
-        $inf  = [System.IO.File]::ReadAllText($infPath)
-
-        $inf2 = [regex]::Replace($inf, '(?m)^\[SourceDisksFiles\][ \t]*(?=\r?$)', "[SourceDisksFiles]`r`n$srcLines")
-        $inf2 = [regex]::Replace($inf2, '(?m)^\[T2SepBootstrap_CopyFiles\][ \t]*(?=\r?$)', "[T2SepBootstrap_CopyFiles]`r`n$copyLines")
-
-        if ($inf2 -eq $inf -or $inf2 -notmatch [regex]::Escape($companions[0])) {
-          Write-Error "Min INF was not patched with SepVaultGui companion files."
-          exit 1
-        }
-        [System.IO.File]::WriteAllText($infPath, $inf2, $utf8)
-
-        Write-Host "OK: patched Min INF with companion files:"
-        $companions | ForEach-Object { Write-Host "  - $_" }
+        Write-Host "OK: staged driver package files into $packageDir"
       shell: pwsh
 
     - name: Locate StampInf.exe
@@ -557,24 +535,22 @@ jobs:
         Add-Content -Path $env:GITHUB_ENV -Value "STAMPINF_PATH=$($tool.FullName)"
       shell: pwsh
 
-    - name: Stamp both INFs (architecture / date / version / KMDF)
+    - name: Stamp INF (architecture / date / version / KMDF)
       run: |
         $ErrorActionPreference = "Stop"
-        foreach ($variant in @("full", "min")) {
-          $infPath = (Resolve-Path "artifacts\driver-$variant\$env:DRIVER_NAME.inf").Path
+        $infPath = (Resolve-Path "artifacts\driver\$env:DRIVER_NAME.inf").Path
 
-          # -k 1.15 must match KMDF_VERSION_MAJOR/MINOR in
-          # T2TouchIdTransport.vcxproj - same reasoning as the original
-          # single-package step (KMDF >= 1.13 has no co-installer fallback).
-          & "$env:STAMPINF_PATH" -f "$infPath" -a amd64 -d "$env:DRIVER_DATE" -v "$env:DRIVER_VERSION" -k 1.15
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "StampInf failed for $variant (exit $LASTEXITCODE)."
-            exit 1
-          }
-          Write-Host "==> Stamped INF ($variant):"
-          Get-Content -Path $infPath | Select-String -Pattern 'DriverVer|PCI\\VEN|KmdfLibraryVersion'
+        # -k 1.15 must match KMDF_VERSION_MAJOR/MINOR in
+        # T2TouchIdTransport.vcxproj - same reasoning as the original
+        # single-package step (KMDF >= 1.13 has no co-installer fallback).
+        & "$env:STAMPINF_PATH" -f "$infPath" -a amd64 -d "$env:DRIVER_DATE" -v "$env:DRIVER_VERSION" -k 1.15
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "StampInf failed (exit $LASTEXITCODE)."
+          exit 1
         }
-        Write-Host "OK: both INFs stamped."
+        Write-Host "==> Stamped INF:"
+        Get-Content -Path $infPath | Select-String -Pattern 'DriverVer|PCI\\VEN|KmdfLibraryVersion'
+        Write-Host "OK: INF stamped."
       shell: pwsh
 
     - name: Locate Inf2Cat.exe
@@ -599,17 +575,15 @@ jobs:
         Add-Content -Path $env:GITHUB_ENV -Value "INF2CAT_PATH=$($tool.FullName)"
       shell: pwsh
 
-    - name: Generate CAT files (Inf2Cat, both variants)
+    - name: Generate CAT file (Inf2Cat)
       run: |
         $ErrorActionPreference = "Stop"
-        foreach ($variant in @("full", "min")) {
-          $packageDir = (Resolve-Path "artifacts\driver-$variant").Path
-          & "$env:INF2CAT_PATH" /driver:"$packageDir" /os:10_X64 /verbose
-          if ($LASTEXITCODE -ne 0) { Write-Error "Inf2Cat failed for $variant (exit $LASTEXITCODE)."; exit 1 }
-          $catPath = "$packageDir\$env:DRIVER_NAME.cat"
-          if (-not (Test-Path $catPath)) { Write-Error "Inf2Cat did not produce $catPath"; exit 1 }
-          Write-Host "OK: .cat generated -> $catPath"
-        }
+        $packageDir = (Resolve-Path "artifacts\driver").Path
+        & "$env:INF2CAT_PATH" /driver:"$packageDir" /os:10_X64 /verbose
+        if ($LASTEXITCODE -ne 0) { Write-Error "Inf2Cat failed (exit $LASTEXITCODE)."; exit 1 }
+        $catPath = "$packageDir\$env:DRIVER_NAME.cat"
+        if (-not (Test-Path $catPath)) { Write-Error "Inf2Cat did not produce $catPath"; exit 1 }
+        Write-Host "OK: .cat generated -> $catPath"
       shell: pwsh
 
     # =====================================================================
@@ -642,7 +616,7 @@ jobs:
         Add-Content -Path $env:GITHUB_ENV -Value "SIGNTOOL_PATH=$($tool.FullName)"
       shell: pwsh
 
-    - name: Sign .sys and .cat with SignTool (both variants)
+    - name: Sign .sys and .cat with SignTool
       if: ${{ env.SIGN_CERT_PFX != '' && env.SIGN_CERT_PASSWORD != '' }}
       run: |
         $ErrorActionPreference = "Stop"
@@ -652,27 +626,25 @@ jobs:
           $bytes = [Convert]::FromBase64String($env:SIGN_CERT_PFX)
           [IO.File]::WriteAllBytes($pfxPath, $bytes)
 
-          foreach ($variant in @("full", "min")) {
-            $packageDir = "artifacts\driver-$variant"
-            $sysPath = "$packageDir\$env:DRIVER_NAME.sys"
-            $catPath = "$packageDir\$env:DRIVER_NAME.cat"
-            $cerPath = "$packageDir\$env:DRIVER_NAME.cer"
+          $packageDir = "artifacts\driver"
+          $sysPath = "$packageDir\$env:DRIVER_NAME.sys"
+          $catPath = "$packageDir\$env:DRIVER_NAME.cat"
+          $cerPath = "$packageDir\$env:DRIVER_NAME.cer"
 
-            & "$env:SIGNTOOL_PATH" sign /v /fd SHA256 /f "$pfxPath" /p "$env:SIGN_CERT_PASSWORD" `
-              /tr http://timestamp.digicert.com /td SHA256 "$sysPath"
-            if ($LASTEXITCODE -ne 0) { Write-Error "Signing .sys failed for $variant (exit $LASTEXITCODE)."; exit 1 }
+          & "$env:SIGNTOOL_PATH" sign /v /fd SHA256 /f "$pfxPath" /p "$env:SIGN_CERT_PASSWORD" `
+            /tr http://timestamp.digicert.com /td SHA256 "$sysPath"
+          if ($LASTEXITCODE -ne 0) { Write-Error "Signing .sys failed (exit $LASTEXITCODE)."; exit 1 }
 
-            & "$env:SIGNTOOL_PATH" sign /v /fd SHA256 /f "$pfxPath" /p "$env:SIGN_CERT_PASSWORD" `
-              /tr http://timestamp.digicert.com /td SHA256 "$catPath"
-            if ($LASTEXITCODE -ne 0) { Write-Error "Signing .cat failed for $variant (exit $LASTEXITCODE)."; exit 1 }
+          & "$env:SIGNTOOL_PATH" sign /v /fd SHA256 /f "$pfxPath" /p "$env:SIGN_CERT_PASSWORD" `
+            /tr http://timestamp.digicert.com /td SHA256 "$catPath"
+          if ($LASTEXITCODE -ne 0) { Write-Error "Signing .cat failed (exit $LASTEXITCODE)."; exit 1 }
 
-            $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(
-              $pfxPath, $env:SIGN_CERT_PASSWORD,
-              [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable
-            )
-            Export-Certificate -Cert $cert -FilePath $cerPath | Out-Null
-            Write-Host "OK: $variant .sys and .cat signed; .cer exported."
-          }
+          $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(
+            $pfxPath, $env:SIGN_CERT_PASSWORD,
+            [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable
+          )
+          Export-Certificate -Cert $cert -FilePath $cerPath | Out-Null
+          Write-Host "OK: .sys and .cat signed; .cer exported."
         }
         finally {
           if (Test-Path $pfxPath) { Remove-Item -Path $pfxPath -Force }
@@ -681,10 +653,10 @@ jobs:
 
     - name: Warn if packaging unsigned
       if: ${{ env.SIGN_CERT_PFX == '' || env.SIGN_CERT_PASSWORD == '' }}
-      run: Write-Host "::warning::CERT/CERT_PWD secrets not set - packaging UNSIGNED .sys/.cat in both variants. Target machine needs test-signing enabled or Secure Boot test mode (see docs/milestone-2-hardware-results.md)."
+      run: Write-Host "::warning::CERT/CERT_PWD secrets not set - packaging UNSIGNED .sys/.cat. Target machine needs test-signing enabled or Secure Boot test mode (see docs/milestone-2-hardware-results.md)."
       shell: pwsh
 
-    - name: Stage t2touchid.exe alongside both driver variants
+    - name: Stage t2touchid.exe alongside the driver
       run: |
         $ErrorActionPreference = "Stop"
         $vcpkgBinDir = Join-Path $env:VCPKG_INSTALLED_DIR "bin"
@@ -692,21 +664,19 @@ jobs:
           Write-Error "vcpkg bin dir not found: $vcpkgBinDir"
           exit 1
         }
-        foreach ($variant in @("full", "min")) {
-          $packageDir = "artifacts\driver-$variant"
-          Copy-Item -Path "build\t2touchid\$env:PLATFORM\$env:CONFIGURATION\t2touchid.exe" -Destination $packageDir -Force
-          Copy-Item -Path (Join-Path $vcpkgBinDir "*.dll") -Destination $packageDir -Force
-        }
-        Write-Host "OK: staged t2touchid.exe and its runtime DLLs into both variants"
+        $packageDir = "artifacts\driver"
+        Copy-Item -Path "build\t2touchid\$env:PLATFORM\$env:CONFIGURATION\t2touchid.exe" -Destination $packageDir -Force
+        Copy-Item -Path (Join-Path $vcpkgBinDir "*.dll") -Destination $packageDir -Force
+        Write-Host "OK: staged t2touchid.exe and its runtime DLLs into $packageDir"
       shell: pwsh
 
     # =====================================================================
-    # "Дані перевірок" go INTO both shipped packages, not just into
-    # separate workflow-artifact uploads: mustrun/mustfix SARIF, the
-    # PREfast build log, and a short plain-text summary sit in a checks/
-    # subfolder next to the driver in each variant.
+    # "Дані перевірок" go INTO the shipped driver package, not just into a
+    # separate workflow-artifact upload: mustrun/mustfix SARIF, the PREfast
+    # build log, and a short plain-text summary sit in a checks/ subfolder
+    # next to the driver.
     # =====================================================================
-    - name: Bundle static-analysis results with both packages
+    - name: Bundle static-analysis results with the package
       run: |
         $ErrorActionPreference = "Stop"
 
@@ -720,79 +690,65 @@ jobs:
         $mustfixCount = Get-SarifResultCount $env:SARIF_MUSTFIX
         $signed = if ($env:SIGN_CERT_PFX -and $env:SIGN_CERT_PASSWORD) { "yes" } else { "no - test-signing / Secure Boot test mode required on target machine" }
 
-        foreach ($variant in @("full", "min")) {
-          $packageDir = "artifacts\driver-$variant"
-          $checksDir  = Join-Path $packageDir "checks"
-          New-Item -ItemType Directory -Path $checksDir -Force | Out-Null
+        $packageDir = "artifacts\driver"
+        $checksDir  = Join-Path $packageDir "checks"
+        New-Item -ItemType Directory -Path $checksDir -Force | Out-Null
 
-          Copy-Item -Path $env:SARIF_MUSTRUN -Destination (Join-Path $checksDir "codeql-mustrun.sarif") -Force
-          Copy-Item -Path $env:SARIF_MUSTFIX -Destination (Join-Path $checksDir "codeql-mustfix.sarif") -Force
-          if (Test-Path (Join-Path $env:BUILD_LOG_DIR "build.log")) {
-            Copy-Item -Path (Join-Path $env:BUILD_LOG_DIR "build.log") -Destination (Join-Path $checksDir "prefast-build.log") -Force
-          }
-
-          $guiDesc = if ($variant -eq "full") { "SepVaultGui.exe - self-contained, single-file (no .NET runtime needed on target)" } else { "SepVaultGui.exe + companions - framework-dependent (.NET 8 Desktop Runtime required on target)" }
-
-          # String array (one element per line) instead of an @"..."@
-          # here-string: the closing "@ is only valid with ZERO leading
-          # whitespace, which an indented YAML "run: |" block can't give
-          # it - that mismatch is exactly what produced the earlier
-          # "White space is not allowed before the string terminator"
-          # ParserError. Piping the array to Set-Content writes one line
-          # per element (same pattern already used in CiNCM.yml).
-          $summary = @(
-            "T2TouchIdTransport static-analysis summary ($variant package)",
-            "===========================================",
-            "Driver:          $env:DRIVER_NAME.sys",
-            "Driver version:  $env:DRIVER_VERSION",
-            "Built:           $env:DRIVER_DATE (UTC build date; local runner clock)",
-            "Target:          PCI\VEN_106B&DEV_1802, KMDF 1.15",
-            "SepVaultGui:     $guiDesc",
-            "",
-            "CodeQL query pack:  microsoft/windows-drivers@$env:CODEQL_DRIVERS_PACK_VERSION",
-            "PREfast:            enabled (RunCodeAnalysis + EnableCppCoreCheck, warnings-as-errors)",
-            "",
-            "mustrun.qls (informational): $mustrunCount finding(s) - see codeql-mustrun.sarif",
-            "mustfix.qls (WHCP-blocking): $mustfixCount finding(s) - see codeql-mustfix.sarif",
-            "",
-            "Tests:  T2TouchIdTests.exe passed (see workflow log for details)",
-            "Signed: $signed"
-          )
-          $summary | Set-Content -Path (Join-Path $checksDir "SUMMARY.txt") -Encoding utf8
+        Copy-Item -Path $env:SARIF_MUSTRUN -Destination (Join-Path $checksDir "codeql-mustrun.sarif") -Force
+        Copy-Item -Path $env:SARIF_MUSTFIX -Destination (Join-Path $checksDir "codeql-mustfix.sarif") -Force
+        if (Test-Path (Join-Path $env:BUILD_LOG_DIR "build.log")) {
+          Copy-Item -Path (Join-Path $env:BUILD_LOG_DIR "build.log") -Destination (Join-Path $checksDir "prefast-build.log") -Force
         }
 
-        Write-Host "OK: bundled checks/ into both artifacts\driver-full and artifacts\driver-min"
+        # String array (one element per line) instead of an @"..."@
+        # here-string: the closing "@ is only valid with ZERO leading
+        # whitespace, which an indented YAML "run: |" block can't give
+        # it - that mismatch is exactly what produced the earlier
+        # "White space is not allowed before the string terminator"
+        # ParserError. Piping the array to Set-Content writes one line
+        # per element (same pattern already used in CiNCM.yml).
+        $summary = @(
+          "T2TouchIdTransport static-analysis summary",
+          "===========================================",
+          "Driver:          $env:DRIVER_NAME.sys",
+          "Driver version:  $env:DRIVER_VERSION",
+          "Built:           $env:DRIVER_DATE (UTC build date; local runner clock)",
+          "Target:          PCI\VEN_106B&DEV_1802, KMDF 1.15",
+          "SepVaultGui:     ships separately - see the SepVaultGui-Full/-Min archives, not bundled with the driver",
+          "",
+          "CodeQL query pack:  microsoft/windows-drivers@$env:CODEQL_DRIVERS_PACK_VERSION",
+          "PREfast:            enabled (RunCodeAnalysis + EnableCppCoreCheck, warnings-as-errors)",
+          "",
+          "mustrun.qls (informational): $mustrunCount finding(s) - see codeql-mustrun.sarif",
+          "mustfix.qls (WHCP-blocking): $mustfixCount finding(s) - see codeql-mustfix.sarif",
+          "",
+          "Tests:  T2TouchIdTests.exe passed (see workflow log for details)",
+          "Signed: $signed"
+        )
+        $summary | Set-Content -Path (Join-Path $checksDir "SUMMARY.txt") -Encoding utf8
+
+        Write-Host "OK: bundled checks/ into $packageDir"
       shell: pwsh
 
     # =====================================================================
-    # Same "staging folder with a named root inside the zip" pattern as
-    # before, done twice - one staging dir per variant.
+    # Same "staging folder with a named root inside the zip" pattern used
+    # for the SepVaultGui archives above.
     # =====================================================================
-    - name: Prepare final package folders (both variants)
+    - name: Prepare final driver package folder
       run: |
         $ErrorActionPreference = "Stop"
-        foreach ($variant in @("full", "min")) {
-          $tempRoot   = "temp-upload-$variant"
-          $stagingDir = Join-Path $tempRoot "T2TouchId"
-          New-Item -ItemType Directory -Path $stagingDir -Force | Out-Null
-          Copy-Item -Path (Join-Path "artifacts\driver-$variant" "*") -Destination $stagingDir -Recurse -Force
-          Write-Host "==> Staged $variant package into $stagingDir :"
-          Get-ChildItem -Recurse $stagingDir | ForEach-Object { Write-Host "  - $($_.FullName)" }
-        }
-        Add-Content -Path $env:GITHUB_ENV -Value "STAGING_DIR_FULL=temp-upload-full"
-        Add-Content -Path $env:GITHUB_ENV -Value "STAGING_DIR_MIN=temp-upload-min"
+        $tempRoot   = "temp-upload-driver"
+        $stagingDir = Join-Path $tempRoot "T2TouchId"
+        New-Item -ItemType Directory -Path $stagingDir -Force | Out-Null
+        Copy-Item -Path (Join-Path "artifacts\driver" "*") -Destination $stagingDir -Recurse -Force
+        Write-Host "==> Staged driver package into $stagingDir :"
+        Get-ChildItem -Recurse $stagingDir | ForEach-Object { Write-Host "  - $($_.FullName)" }
+        Add-Content -Path $env:GITHUB_ENV -Value "STAGING_DIR_DRIVER=temp-upload-driver"
       shell: pwsh
 
-    - name: Upload Full package (driver + bootstrap + coinstaller + Full GUI)
+    - name: Upload driver package (driver + bootstrap + coinstaller)
       uses: actions/upload-artifact@v4
       with:
-        name: T2TouchId-Signed-Full-${{ env.DRIVER_VERSION }}
-        path: ${{ env.STAGING_DIR_FULL }}
-        if-no-files-found: error
-
-    - name: Upload Min package (driver + bootstrap + coinstaller + Min GUI)
-      uses: actions/upload-artifact@v4
-      with:
-        name: T2TouchId-Signed-Min-${{ env.DRIVER_VERSION }}
-        path: ${{ env.STAGING_DIR_MIN }}
+        name: T2TouchId-Signed-${{ env.DRIVER_VERSION }}
+        path: ${{ env.STAGING_DIR_DRIVER }}
         if-no-files-found: error

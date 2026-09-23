@@ -30,9 +30,11 @@ CopyFiles = Drivers_Dir, T2SepBootstrap_CopyFiles
 ; installs/refreshes the T2SepBootstrap Win32 service that runs the
 ; register-ool -> load-keybag -> set-system-keybag -> unlock sequence from
 ; sep-vault.bin (see T2SepCoInstaller.cpp / T2SepBootstrapService.cpp).
-; SepVaultGui.exe (staged by T2SepBootstrap_CopyFiles below, alongside the
-; bootstrap exe) is NOT touched by the co-installer - it's a user-launched
-; tool to populate sep-vault.bin, not a service.
+; SepVaultGui.exe is NOT part of this driver package at all - it's a
+; standalone user app (one-time setup tool that writes sep-vault.bin) and
+; ships in its own separate archive from the build workflow instead of
+; being copied into %SystemRoot%\System32 by this INF. Install it
+; wherever the user wants, same as any other desktop app.
 [T2TouchIdTransport_Device.NT.CoInstallers]
 CopyFiles = T2SepCoInstaller_CopyFiles
 AddReg    = T2SepCoInstaller_AddReg
@@ -43,14 +45,13 @@ HKR,,CoInstallers32,0x00010000,"T2SepCoInstaller.dll,T2SepCoInstallerEntry"
 [T2SepCoInstaller_CopyFiles]
 T2SepCoInstaller.dll
 
-; T2SepBootstrap.exe / SepVaultGui.exe intentionally do NOT go through the
-; driver-store DIRID (13) that Drivers_Dir uses for the .sys - they are
-; plain user-mode binaries, not drivers, and T2SepCoInstaller.cpp's
+; T2SepBootstrap.exe (the service binary) intentionally does NOT go through
+; the driver-store DIRID (13) that Drivers_Dir uses for the .sys - it's a
+; plain user-mode binary, not a driver, and T2SepCoInstaller.cpp's
 ; GetBootstrapExePath() hardcodes %SystemRoot%\System32\T2SepBootstrap\ to
 ; match this exact destination rather than re-deriving a driver-store path.
 [T2SepBootstrap_CopyFiles]
 T2SepBootstrap.exe
-SepVaultGui.exe
 
 ; NOTE: no [T2TouchIdTransport_Device.NT.HW] / UpperFilters entry here.
 ; An earlier draft of this INF added
@@ -84,7 +85,6 @@ T2TouchIdTransport.sys
 T2TouchIdTransport.sys = 1,,
 T2SepCoInstaller.dll = 1,,
 T2SepBootstrap.exe = 1,,
-SepVaultGui.exe = 1,,
 
 [DestinationDirs]
 ; DIRID 13 = "run from Driver Store", not a UMDF-specific path - this is
@@ -111,8 +111,10 @@ Drivers_Dir = 13
 ; service didn't get installed, no T2 unlock at boot" symptom this fixes.
 T2SepCoInstaller_CopyFiles = 11
 ; DIRID 11 = %SystemRoot%\System32, subdirectory T2SepBootstrap - a plain
-; filesystem location for the two ordinary user-mode binaries, deliberately
-; NOT the driver store (see T2SepBootstrap_CopyFiles comment above).
+; filesystem location for the service's own binary, deliberately NOT the
+; driver store (see T2SepBootstrap_CopyFiles comment above). SepVaultGui.exe
+; is no longer listed in T2SepBootstrap_CopyFiles at all, so nothing here
+; routes it into System32 anymore - it ships as its own standalone archive.
 T2SepBootstrap_CopyFiles = 11,T2SepBootstrap
 
 [Strings]
