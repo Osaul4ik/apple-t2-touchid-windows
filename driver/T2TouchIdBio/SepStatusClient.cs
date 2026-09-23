@@ -145,7 +145,7 @@ namespace T2TouchId.SepVaultGui
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool CloseHandle(IntPtr hObject);
 
-        private static string FindDevicePath()
+        private static string? FindDevicePath()
         {
             Guid guid = DeviceInterfaceGuid;
             IntPtr devInfo = SetupDiGetClassDevsW(ref guid, IntPtr.Zero, IntPtr.Zero,
@@ -199,7 +199,7 @@ namespace T2TouchId.SepVaultGui
         // this is a plain in-memory read).
         public static SepBootstrapStatus GetStatus()
         {
-            string path = FindDevicePath();
+            string? path = FindDevicePath();
             if (path == null) throw new SepDeviceNotFoundException();
 
             IntPtr handle = CreateFileW(path, GENERIC_READ | GENERIC_WRITE,
