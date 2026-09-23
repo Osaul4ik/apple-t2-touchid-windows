@@ -21,7 +21,36 @@ PnpLockdown = 1
 %T2TouchIdTransport.DeviceDesc% = T2TouchIdTransport_Device, PCI\VEN_106B&DEV_1802
 
 [T2TouchIdTransport_Device.NT]
-CopyFiles = Drivers_Dir
+CopyFiles = Drivers_Dir, T2SepBootstrap_CopyFiles
+
+; Registers T2SepCoInstaller.dll as this device's co-installer. PnP calls
+; its T2SepCoInstallerEntry export around DIF_INSTALLDEVICE; on the
+; post-processing pass (after CopyFiles above and after
+; T2TouchIdTransport_Service_Inst has started the kernel service) it
+; installs/refreshes the T2SepBootstrap Win32 service that runs the
+; register-ool -> load-keybag -> set-system-keybag -> unlock sequence from
+; sep-vault.bin (see T2SepCoInstaller.cpp / T2SepBootstrapService.cpp).
+; SepVaultGui.exe (staged by T2SepBootstrap_CopyFiles below, alongside the
+; bootstrap exe) is NOT touched by the co-installer - it's a user-launched
+; tool to populate sep-vault.bin, not a service.
+[T2TouchIdTransport_Device.NT.CoInstallers]
+CopyFiles = T2SepCoInstaller_CopyFiles
+AddReg    = T2SepCoInstaller_AddReg
+
+[T2SepCoInstaller_AddReg]
+HKR,,CoInstallers32,0x00010000,"T2SepCoInstaller.dll,T2SepCoInstallerEntry"
+
+[T2SepCoInstaller_CopyFiles]
+T2SepCoInstaller.dll
+
+; T2SepBootstrap.exe / SepVaultGui.exe intentionally do NOT go through the
+; driver-store DIRID (13) that Drivers_Dir uses for the .sys - they are
+; plain user-mode binaries, not drivers, and T2SepCoInstaller.cpp's
+; GetBootstrapExePath() hardcodes %SystemRoot%\System32\T2SepBootstrap\ to
+; match this exact destination rather than re-deriving a driver-store path.
+[T2SepBootstrap_CopyFiles]
+T2SepBootstrap.exe
+SepVaultGui.exe
 
 ; NOTE: no [T2TouchIdTransport_Device.NT.HW] / UpperFilters entry here.
 ; An earlier draft of this INF added
@@ -53,6 +82,9 @@ T2TouchIdTransport.sys
 
 [SourceDisksFiles]
 T2TouchIdTransport.sys = 1,,
+T2SepCoInstaller.dll = 1,,
+T2SepBootstrap.exe = 1,,
+SepVaultGui.exe = 1,,
 
 [DestinationDirs]
 ; DIRID 13 = "run from Driver Store", not a UMDF-specific path - this is
@@ -63,6 +95,16 @@ T2TouchIdTransport.sys = 1,,
 ; would only revert to the older, non-driver-store install style, not
 ; fix anything.
 Drivers_Dir = 13
+; Co-installer DLL also goes in the driver-store folder (DIRID 13), same as
+; the .sys - PnP resolves an unqualified "file,entrypoint" CoInstallers32
+; value (no path) by looking in the driver package's own store folder
+; first, so this needs to be right next to T2TouchIdTransport.sys, not in
+; System32.
+T2SepCoInstaller_CopyFiles = 13
+; DIRID 11 = %SystemRoot%\System32, subdirectory T2SepBootstrap - a plain
+; filesystem location for the two ordinary user-mode binaries, deliberately
+; NOT the driver store (see T2SepBootstrap_CopyFiles comment above).
+T2SepBootstrap_CopyFiles = 11,T2SepBootstrap
 
 [Strings]
 ManufacturerName = "Osaul4ik"

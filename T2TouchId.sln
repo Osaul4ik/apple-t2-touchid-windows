@@ -12,6 +12,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "T2TouchIdTests", "tests\T2T
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "T2SepBootstrap", "driver\T2TouchIdBio\T2SepBootstrap.vcxproj", "{5D4C0C5A-0EC6-4238-A1A1-7A19AF5D2782}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "T2SepCoInstaller", "driver\T2TouchIdTransport\CoInstaller\T2SepCoInstaller.vcxproj", "{9B6E9B0B-6D3E-4B1A-9E2E-2B7B7F4B9A11}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -38,6 +40,10 @@ Global
 		{5D4C0C5A-0EC6-4238-A1A1-7A19AF5D2782}.Debug|x64.Build.0 = Debug|x64
 		{5D4C0C5A-0EC6-4238-A1A1-7A19AF5D2782}.Release|x64.ActiveCfg = Release|x64
 		{5D4C0C5A-0EC6-4238-A1A1-7A19AF5D2782}.Release|x64.Build.0 = Release|x64
+		{9B6E9B0B-6D3E-4B1A-9E2E-2B7B7F4B9A11}.Debug|x64.ActiveCfg = Debug|x64
+		{9B6E9B0B-6D3E-4B1A-9E2E-2B7B7F4B9A11}.Debug|x64.Build.0 = Debug|x64
+		{9B6E9B0B-6D3E-4B1A-9E2E-2B7B7F4B9A11}.Release|x64.ActiveCfg = Release|x64
+		{9B6E9B0B-6D3E-4B1A-9E2E-2B7B7F4B9A11}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
