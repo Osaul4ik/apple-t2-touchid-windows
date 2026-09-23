@@ -4,7 +4,7 @@
 // Deliberately does NOT talk to protocol/AppleKeyStore or the SEP at all —
 // this tool only ever produces sep-vault.bin. Verifying the password/keybag
 // actually unlock the SEP happens the first time T2SepBootstrap runs on the
-// next boot, and its failures land in bootstrap.log (see the service's
+// next boot, and its failures land in C:\LogSEP.txt (see the service's
 // Log() calls) rather than here, since this process never has device access
 // or SEP context to validate against.
 

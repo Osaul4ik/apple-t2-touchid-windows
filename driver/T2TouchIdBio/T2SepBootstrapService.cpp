@@ -36,7 +36,12 @@ namespace {
 
 constexpr wchar_t kServiceName[] = L"T2SepBootstrap";
 constexpr wchar_t kVaultPath[] = L"C:\\ProgramData\\T2TouchId\\sep-vault.bin";
-constexpr wchar_t kLogPath[] = L"C:\\ProgramData\\T2TouchId\\bootstrap.log";
+// Plain root-of-C: path instead of the previous C:\ProgramData\T2TouchId\
+// location: ProgramData is hidden by default and needs an elevated/explicit
+// path to browse to, which made "service installed but SEP still not
+// unlocked" hard to diagnose - nothing to look at without already knowing
+// where to look. C:\LogSEP.txt is trivially findable after a reboot.
+constexpr wchar_t kLogPath[] = L"C:\\LogSEP.txt";
 
 // Named event the WBDI driver's IOCTL_BIOMETRIC_GET_SENSOR_STATUS handler
 // waits/polls on (design doc §9.2 step 8). "Global\" so it is visible
@@ -56,7 +61,6 @@ SERVICE_STATUS_HANDLE gStatusHandle = nullptr;
 // unconditionally records the failure reason beats a nicer mechanism that
 // isn't wired up yet.
 void Log(const wchar_t* msg) {
-    CreateDirectoryW(L"C:\\ProgramData\\T2TouchId", nullptr); // ignore ERROR_ALREADY_EXISTS
     std::wofstream f(kLogPath, std::ios::app);
     if (!f) return;
     time_t t = time(nullptr);
@@ -119,11 +123,14 @@ bool RunBootstrapSequence(HANDLE readyEvent) {
     using t2::applekeystore::AksResult;
     using t2::applekeystore::Client;
 
+    Log(L"bootstrap: sequence starting");
+
     auto vault = t2::sepvault::ReadVaultFile(kVaultPath);
     if (!vault.ok) {
         Log(L"bootstrap: sep-vault.bin missing or malformed — run SepVaultGui first");
         return false;
     }
+    Log(L"bootstrap: sep-vault.bin read OK");
 
     ZeroingBuffer keybag;
     ZeroingBuffer password;
@@ -136,6 +143,7 @@ bool RunBootstrapSequence(HANDLE readyEvent) {
         Log(L"bootstrap: CryptUnprotectData failed for password blob");
         return false;
     }
+    Log(L"bootstrap: keybag and password unprotected OK");
 
     Client client;
     if (client.Open() != AksResult::Ok) {
@@ -143,11 +151,13 @@ bool RunBootstrapSequence(HANDLE readyEvent) {
             L"— driver not loaded yet? (PnP race — see design doc §10)");
         return false;
     }
+    Log(L"bootstrap: T2TouchIdTransport device interface opened OK");
 
     if (client.RegisterOol() != AksResult::Ok) {
         Log(L"bootstrap: register-ool failed");
         return false;
     }
+    Log(L"bootstrap: register-ool OK");
 
     int32_t handle = 0;
     int8_t sepStatus = 0;
@@ -157,6 +167,11 @@ bool RunBootstrapSequence(HANDLE readyEvent) {
         Log(buf);
         return false;
     }
+    {
+        wchar_t buf[96];
+        swprintf_s(buf, L"bootstrap: load-keybag OK, handle=%d, sep_status=%d", handle, sepStatus);
+        Log(buf);
+    }
 
     if (client.MakeSystemKeybag(handle, vault.specialUserBag, /*session=*/1, &sepStatus)
             != AksResult::Ok) {
@@ -165,6 +180,7 @@ bool RunBootstrapSequence(HANDLE readyEvent) {
         Log(buf);
         return false;
     }
+    Log(L"bootstrap: set-system-keybag OK");
 
     // Same password unlocks both bags (confirmed against this project's own
     // hardware trace — see design doc §9.1). Client::Unlock() zeroes
@@ -179,6 +195,7 @@ bool RunBootstrapSequence(HANDLE readyEvent) {
         Log(buf);
         return false;
     }
+    Log(L"bootstrap: unlock(handle) OK");
 
     std::vector<uint8_t> passwordForSpecialBag = password.data; // password.data not yet zeroed — see above
     if (client.Unlock(vault.specialUserBag, passwordForSpecialBag, /*session=*/1, &sepStatus)
@@ -188,6 +205,7 @@ bool RunBootstrapSequence(HANDLE readyEvent) {
         Log(buf);
         return false;
     }
+    Log(L"bootstrap: unlock(special bag) OK");
 
     Log(L"bootstrap: SEP ready");
     SetEvent(readyEvent);
@@ -218,6 +236,8 @@ VOID WINAPI ServiceMain(DWORD, LPWSTR*) {
     gStatus.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN;
     SetServiceStatus(gStatusHandle, &gStatus);
 
+    Log(L"bootstrap: T2SepBootstrap service starting");
+
     // bInheritHandle=FALSE, DACL null (default) is fine: this event only
     // needs to be readable by other privileged components on the same
     // machine (the WBDI driver host, itself running as SYSTEM/LocalService
@@ -226,7 +246,18 @@ VOID WINAPI ServiceMain(DWORD, LPWSTR*) {
     // scope for a status-only event.
     HANDLE readyEvent = CreateEventW(nullptr, /*manualReset=*/TRUE,
                                       /*initialState=*/FALSE, kReadyEventName);
-    if (readyEvent && !AlreadyPrepared(readyEvent)) {
+    if (!readyEvent) {
+        // Previously silent: the service would just sit idle with zero
+        // clue in the log about why the SEP was never unlocked. Log the
+        // actual CreateEventW error so this doesn't look identical to
+        // "sequence ran and failed silently".
+        wchar_t buf[96];
+        swprintf_s(buf, L"bootstrap: CreateEventW(%ls) failed, error=%lu",
+                   kReadyEventName, GetLastError());
+        Log(buf);
+    } else if (AlreadyPrepared(readyEvent)) {
+        Log(L"bootstrap: Global\\T2SepReady already signaled this session — skipping (SEP already unlocked)");
+    } else {
         RunBootstrapSequence(readyEvent);
         // Deliberately does not retry or loop on failure here (file header
         // comment) — a failed bootstrap leaves the event unsignaled, WinBio
