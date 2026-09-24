@@ -34,6 +34,42 @@ echo %ROOT%
 echo.
 
 rem ============================================================
+rem Check SEP vault
+rem ============================================================
+
+echo Checking SEP vault...
+echo.
+
+if exist "%ProgramData%\t2touchid\sep-vault.bin" (
+    echo [OK] SEP vault found:
+    echo %ProgramData%\t2touchid\sep-vault.bin
+    echo.
+) else (
+    echo [WARNING] SEP vault not found:
+    echo %ProgramData%\t2touchid\sep-vault.bin
+    echo.
+    echo Opening SepVaultGui...
+    echo.
+
+    if not exist "%ROOT%SepVaultGui\SepVaultGui.exe" (
+        echo [ERROR] SepVaultGui.exe not found:
+        echo %ROOT%SepVaultGui\SepVaultGui.exe
+        echo.
+        pause
+        exit /b 1
+    )
+
+    start "" "%ROOT%SepVaultGui\SepVaultGui.exe"
+
+    echo [OK] SepVaultGui started.
+    echo.
+    echo Please create the SEP vault and run the installer again.
+    echo.
+    pause
+    exit /b 0
+)
+
+rem ============================================================
 rem 1. Install certificate
 rem ============================================================
 
@@ -210,29 +246,47 @@ if errorlevel 1 (
     exit /b 1
 )
 
-
 rem ============================================================
 rem Refresh devices
 rem ============================================================
 
+echo.
 echo Refreshing device list...
 pnputil /scan-devices
-echo [OK] 
 
+if errorlevel 1 (
+    echo [WARNING] Device rescan returned an error.
+) else (
+    echo [OK] Device list refreshed.
+)
+
+echo.
 
 rem ============================================================
 rem Restart WbioSrvc
 rem ============================================================
 
-net stop WbioSrvc
-net start WbioSrvc
-echo [OK] 
+echo Restarting Windows Biometric Service...
 
+net stop WbioSrvc
+
+if errorlevel 1 (
+    echo [WARNING] Failed to stop WbioSrvc.
+)
+
+net start WbioSrvc
+
+if errorlevel 1 (
+    echo [WARNING] Failed to start WbioSrvc.
+) else (
+    echo [OK] WbioSrvc restarted.
+)
 
 echo.
 echo ============================================================
 echo              INSTALLATION COMPLETE
 echo ============================================================
 echo.
-pause
+echo Restarting computer...
+shutdown /r /t 0
 exit /b 0
