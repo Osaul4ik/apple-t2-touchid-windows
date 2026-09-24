@@ -279,27 +279,32 @@ std::atomic<bool> g_captureBusy{false};
 // with a real SEP Match, arm a one-shot replay, answer #2 with the same
 // result (no connect / StartMatch / cancel-poll).
 //
-// 24.09.2026: a one-shot "suppressPostPairArm" used to live here. It answered
-// the *third* CAPTURE with an immediate NO_MATCH so Win+L would not wait on
-// it - but the fourth CAPTURE (same request, one step later) sat pending in
-// StartMatch anyway and Win+L still waited for the next touch. The problem
-// was not the pending request but where it waited: the whole verify wait ran
-// inside the WDF callback (EvtIoDeviceControl), and the hardware log is
-// consistent with Windows' CancelIoEx not being serviced until that callback
-// returned (see StartCaptureWorker). With the wait on its own thread a pending
-// CAPTURE_DATA is harmless and nothing needs to be answered without a sample.
+// TTL (kMatchReplayTtlMs): without a time bound a cancelled/stale arm could
+// satisfy an unrelated later CAPTURE (e.g. after Win+L or resume). Hardware
+// pair spacing is 15–30 ms; 500 ms is generous for the pair and tight enough
+// that a lock-screen re-arm cannot inherit a previous unlock's Match.
 struct RecentMatchCache {
     std::mutex mu;
     bool pendingReplay = false;
+    ULONGLONG armedAtMs = 0;
     std::optional<std::array<uint8_t, 16>> matchedUuid;
 };
 RecentMatchCache g_recentMatch;
+constexpr ULONGLONG kMatchReplayTtlMs = 500;
+
+// Consumed by the next real verify CAPTURE so ResetSensor+LoadCalibration
+// run once after process start and after every resume (skip flags are
+// otherwise true for steady-state latency — see VerificationEngine.h).
+// Starts true: WUDFHost may load long after bridgeOS is "warm", but the first
+// Hello capture of this host process still needs a known-good sensor arm.
+std::atomic<bool> g_needPostResumeWarmup{true};
 
 void ArmMatchReplay(const std::optional<std::array<uint8_t, 16>>& uuid)
 {
     std::lock_guard<std::mutex> lock(g_recentMatch.mu);
     g_recentMatch.matchedUuid = uuid;
     g_recentMatch.pendingReplay = true;
+    g_recentMatch.armedAtMs = GetTickCount64();
 }
 
 // Returns true and fills *outUuid for the 2nd CAPTURE of the pair.
@@ -307,6 +312,12 @@ bool ConsumeMatchReplay(std::optional<std::array<uint8_t, 16>>* outUuid)
 {
     std::lock_guard<std::mutex> lock(g_recentMatch.mu);
     if (!g_recentMatch.pendingReplay) return false;
+    const ULONGLONG age = GetTickCount64() - g_recentMatch.armedAtMs;
+    if (age > kMatchReplayTtlMs) {
+        g_recentMatch.pendingReplay = false;
+        g_recentMatch.matchedUuid.reset();
+        return false;
+    }
     *outUuid = g_recentMatch.matchedUuid;
     g_recentMatch.pendingReplay = false;
     return true;
@@ -316,7 +327,17 @@ void ClearMatchReplay()
 {
     std::lock_guard<std::mutex> lock(g_recentMatch.mu);
     g_recentMatch.pendingReplay = false;
+    g_recentMatch.matchedUuid.reset();
 }
+
+// Sticky NCM endpoint for this WUDFHost process (see ConnectForCapture).
+// Declared here so OnSuspendResume can invalidate it across Sx.
+struct StickyNcmEndpoint {
+    std::mutex mu;
+    bool valid = false;
+    t2::discovery::NcmEndpoint ep{};
+};
+StickyNcmEndpoint g_stickyNcm;
 
 struct CaptureBusyGuard {
     bool acquired = false;
@@ -398,16 +419,28 @@ ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_
     if (Type == PBT_APMSUSPEND) {
         T2BioLog("OnSuspendResume: PBT_APMSUSPEND - waking any pending CAPTURE_DATA "
                  "before the process is frozen for sleep");
+        ClearMatchReplay(); // never replay a pre-sleep Match after resume
+        {
+            // NCM/ifIndex may change across Sx; force rediscovery on resume.
+            std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
+            g_stickyNcm.valid = false;
+        }
         HANDLE cancelEvent = GetCaptureCancelEvent();
         if (cancelEvent) {
             SetEvent(cancelEvent); // same wakeup EvtCaptureCancel/T2BioEvtIoStop
                                     // use - see header comment above
         }
+    } else if (Type == PBT_APMRESUMESUSPEND || Type == PBT_APMRESUMEAUTOMATIC) {
+        // First verify after resume should re-arm sensor/calibration once;
+        // steady-state path keeps skipResetSensor/skipLoadCalibration.
+        g_needPostResumeWarmup.store(true, std::memory_order_relaxed);
+        ClearMatchReplay();
+        {
+            std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
+            g_stickyNcm.valid = false;
+        }
+        T2BioLog("OnSuspendResume: resume notify - next CAPTURE_DATA will run full WarmUp once");
     }
-    // PBT_APMRESUMESUSPEND / PBT_APMRESUMEAUTOMATIC: nothing to do here - a
-    // fresh CAPTURE_DATA from WBF after resume goes through the normal
-    // ResetEvent-before-StartMatch path (HandleCaptureVerify above) on its
-    // own, exactly like any other new capture.
     return 0; // return value is unused for suspend/resume notifications
 }
 
@@ -698,12 +731,32 @@ void CompleteCaptureData(_In_ WDFREQUEST Request, HRESULT winBioHresult,
 // already logged why) if the SEP/T2 side cannot be reached at all - the
 // caller maps that to WINBIO_E_DEVICE_FAILURE, never to a Match/NoMatch
 // verdict, because "couldn't ask the SEP" is not an answer from the SEP.
+// Sticky adapter selection: g_stickyNcm (declared near RecentMatchCache).
 bool ConnectForCapture(t2::bridgexpc::Connection* outConn)
 {
-    // Timings: on the 20.09.2026 hardware log this step alone was a constant
-    // ~3.8s per CAPTURE_DATA (full port scan, cache never hit), during which
-    // the sensor is not armed and a touch is silently lost.
     const ULONGLONG t0 = GetTickCount64();
+
+    t2::discovery::NcmEndpoint stickyEp{};
+    bool haveSticky = false;
+    {
+        std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
+        if (g_stickyNcm.valid) {
+            stickyEp = g_stickyNcm.ep;
+            haveSticky = true;
+        }
+    }
+    if (haveSticky) {
+        if (t2::discovery::ConnectToBiometricKitBridge(stickyEp, outConn)) {
+            T2BioLog("CAPTURE_DATA: connected via sticky NCM endpoint "
+                     "(discovery+connect %llu ms)",
+                     static_cast<unsigned long long>(GetTickCount64() - t0));
+            return true;
+        }
+        T2BioLog("CAPTURE_DATA: sticky NCM endpoint failed - rediscovering");
+        std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
+        g_stickyNcm.valid = false;
+    }
+
     t2::discovery::NcmEndpoint ep;
     if (!t2::discovery::PickDefaultT2Endpoint(&ep)) {
         T2BioLog("CAPTURE_DATA: no T2 NCM adapter found");
@@ -716,6 +769,11 @@ bool ConnectForCapture(t2::bridgexpc::Connection* outConn)
                  static_cast<unsigned long long>(t1 - t0),
                  static_cast<unsigned long long>(GetTickCount64() - t1));
         return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
+        g_stickyNcm.ep = ep;
+        g_stickyNcm.valid = true;
     }
     T2BioLog("CAPTURE_DATA: connected to BiometricKit BridgeXPC "
              "(endpoint lookup %llu ms, discovery+connect %llu ms)",
@@ -808,10 +866,30 @@ t2::wbdi::BirOptions LoadBirOptions()
 void HandleCaptureEnroll(_In_ WDFREQUEST Request, const CaptureKey& key)
 {
     T2BioLog("CAPTURE_DATA(enroll): begin, macosUserId=%u", static_cast<unsigned>(kDefaultMacosUserId));
+    // Same cancel-aware connect retry as verify: cold-boot NCM lag must not
+    // turn enroll into an immediate DEVICE_FAILURE (Settings → Fingerprint).
+    HANDLE cancelEvent = GetCaptureCancelEvent();
+    if (cancelEvent) {
+        ResetEvent(cancelEvent);
+    }
+    CancelableScope cancelScope(Request);
+    cancelScope.Arm();
     t2::bridgexpc::Connection conn;
-    if (!ConnectForCapture(&conn)) {
-        CompleteCaptureData(Request, WINBIO_E_DEVICE_FAILURE, WINBIO_SENSOR_FAILURE, 0, {});
+    const ConnectWait cw = ConnectForCaptureWithRetry(cancelEvent, &conn);
+    if (cw == ConnectWait::Cancelled) {
+        if (cancelScope.Release()) {
+            WdfRequestComplete(Request, STATUS_CANCELLED);
+        }
         return;
+    }
+    if (cw != ConnectWait::Connected) {
+        if (cancelScope.Release()) {
+            CompleteCaptureData(Request, WINBIO_E_DEVICE_FAILURE, WINBIO_SENSOR_FAILURE, 0, {});
+        }
+        return;
+    }
+    if (!cancelScope.Release()) {
+        return; // already completed by cancel routine
     }
 
     VerifyConfig cfg;
@@ -898,6 +976,15 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
     VerifyConfig cfg;
     cfg.macosUserId = kDefaultMacosUserId;
     cfg.matchWindow = kCaptureMatchWindow;
+    // Post-resume (and only then): force ResetSensor + LoadCalibration once.
+    // Steady-state keeps the verified skip=true defaults for ~200ms less
+    // per-touch latency (VerificationEngine.h). Atomic exchange so concurrent
+    // CAPTURE workers do not both pay the full warmup.
+    if (g_needPostResumeWarmup.exchange(false, std::memory_order_relaxed)) {
+        cfg.skipResetSensor = false;
+        cfg.skipLoadCalibration = false;
+        T2BioLog("CAPTURE_DATA(verify): post-resume WarmUp armed (reset+calibration once)");
+    }
     std::optional<std::array<uint8_t, 16>> matchedUuid;
     VerifyOutcome outcome = VerifyOutcome::TransportError;   // also what a failed connect completes as
 

@@ -651,7 +651,7 @@ T2NcmApplyPacketFilter(
     )
 {
     USHORT desired = T2NcmNdisFilterToCdcFilter(
-        (ULONG)InterlockedCompareExchange(&DeviceContext->PacketFilter, 0, 0),
+        T2NcmReadPacketFilter(DeviceContext),
         DeviceContext->MacAddressIsPermanent);
 
     return T2NcmSetEthernetPacketFilter(DeviceContext, desired);

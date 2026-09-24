@@ -55,23 +55,29 @@ constexpr wchar_t kReadyEventName[] = L"Global\\T2SepReady";
 SERVICE_STATUS gStatus = {};
 SERVICE_STATUS_HANDLE gStatusHandle = nullptr;
 
-// Plain timestamped file log, not the Windows Event Log. A proper event
-// source needs a registered message-table DLL to avoid "description not
-// found" noise in Event Viewer — that registration is follow-up work, not
-// a blocker for this service actually functioning. This is the same
-// pragmatic call the driver side already made with DbgPrintEx over a
-// filtered ETW provider (see driver.h's T2_LOG comment): something that
-// unconditionally records the failure reason beats a nicer mechanism that
-// isn't wired up yet.
+// File log + Application Event Log. Without a registered message-table DLL
+// Event Viewer may wrap the text in a generic "description not found"
+// notice; the insertion string still carries the full message.
 void Log(const wchar_t* msg) {
     std::wofstream f(kLogPath, std::ios::app);
-    if (!f) return;
-    time_t t = time(nullptr);
-    wchar_t buf[32] = {};
-    tm tmBuf{};
-    localtime_s(&tmBuf, &t);
-    wcsftime(buf, 32, L"%Y-%m-%d %H:%M:%S", &tmBuf);
-    f << L"[" << buf << L"] " << msg << L"\n";
+    if (f) {
+        time_t t = time(nullptr);
+        wchar_t buf[32] = {};
+        tm tmBuf{};
+        localtime_s(&tmBuf, &t);
+        wcsftime(buf, 32, L"%Y-%m-%d %H:%M:%S", &tmBuf);
+        f << L"[" << buf << L"] " << msg << L"\n";
+    }
+}
+
+void LogEvent(WORD type, const wchar_t* msg) {
+    Log(msg);
+    HANDLE h = RegisterEventSourceW(nullptr, kServiceName);
+    if (!h) return;
+    const wchar_t* strings[1] = { msg };
+    const DWORD eventId = (type == EVENTLOG_ERROR_TYPE) ? 2u : 1u;
+    ReportEventW(h, type, 0, eventId, nullptr, 1, 0, strings, nullptr);
+    DeregisterEventSource(h);
 }
 
 // Reports the current step's outcome to the driver's in-memory bootstrap
@@ -111,6 +117,18 @@ void ReportStatus(t2::applekeystore::Client& client, T2_SEP_BOOTSTRAP_REASON rea
     using t2::applekeystore::AksResult;
     if (client.SetBootstrapStatus(reason, step, sepStatus) != AksResult::Ok) {
         Log(L"bootstrap: SetBootstrapStatus IOCTL failed (status not reported to driver)");
+    }
+    // Surface failures in Event Viewer so "fingerprint missing after boot"
+    // is diagnosable without opening C:\LogSEP.txt (Session 0 service has
+    // no UI). Success is also logged once so boot scripts can wait on it.
+    wchar_t detail[192];
+    swprintf_s(detail,
+        L"bootstrap status: reason=%d step=%d sepStatus=%d",
+        static_cast<int>(reason), static_cast<int>(step), static_cast<int>(sepStatus));
+    if (reason == T2SepReasonOk) {
+        LogEvent(EVENTLOG_INFORMATION_TYPE, detail);
+    } else {
+        LogEvent(EVENTLOG_ERROR_TYPE, detail);
     }
 }
 
@@ -158,6 +176,51 @@ bool AlreadyPrepared(HANDLE readyEvent) {
     return WaitForSingleObject(readyEvent, 0) == WAIT_OBJECT_0;
 }
 
+// Wait for T2TouchIdTransport's device interface (design doc §10 PnP race).
+// SERVICE_AUTO_START often races AddDevice; a single Open() failure used to
+// abort the whole boot sequence and leave the sensor dead until the next
+// reboot. Bounded poll with exponential backoff — not a permanent daemon
+// retry loop (still one-shot per boot once Open succeeds).
+bool WaitForTransportOpen(t2::applekeystore::Client& client, DWORD timeoutMs) {
+    using t2::applekeystore::AksResult;
+    const DWORD start = GetTickCount();
+    DWORD backoffMs = 200;
+    unsigned attempt = 0;
+    while (true) {
+        ++attempt;
+        if (client.Open() == AksResult::Ok) {
+            if (attempt > 1) {
+                wchar_t buf[128];
+                swprintf_s(buf,
+                    L"bootstrap: T2TouchIdTransport opened after %u attempts (%lu ms)",
+                    attempt, GetTickCount() - start);
+                Log(buf);
+            }
+            return true;
+        }
+        const DWORD waited = GetTickCount() - start;
+        if (waited >= timeoutMs) {
+            wchar_t buf[160];
+            swprintf_s(buf,
+                L"bootstrap: T2TouchIdTransport still missing after %lu ms (%u attempts) — giving up",
+                waited, attempt);
+            Log(buf);
+            return false;
+        }
+        if ((attempt % 5) == 1) {
+            wchar_t buf[128];
+            swprintf_s(buf,
+                L"bootstrap: waiting for T2TouchIdTransport (attempt %u, %lu ms elapsed)",
+                attempt, waited);
+            Log(buf);
+        }
+        Sleep(backoffMs);
+        if (backoffMs < 2000) {
+            backoffMs *= 2;
+        }
+    }
+}
+
 // Runs the full sequence once. Returns true only on a clean, fully-unlocked
 // SEP — every intermediate failure is fail-closed (mirrors
 // VerificationEngine's own stated philosophy: never convert a transport or
@@ -170,13 +233,15 @@ bool RunBootstrapSequence(HANDLE readyEvent) {
 
     // Opened first, before anything else: every later failure branch needs
     // an open client to call ReportStatus() through IOCTL_T2_SET_BOOTSTRAP_STATUS.
-    // If this itself fails, there is no device to report through in the
-    // first place - see ReportStatus's header comment - so that one case
-    // stays log-only, same as before.
+    // If this itself fails after the wait window, there is no device to report
+    // through - see ReportStatus's header comment - so that one case stays log-only.
     Client client;
-    if (client.Open() != AksResult::Ok) {
-        Log(L"bootstrap: could not open T2TouchIdTransport device interface "
-            L"— driver not loaded yet? (PnP race — see design doc §10)");
+    // 120s matches CAPTURE_DATA's BridgeXPC connect retry window in Queue.cpp:
+    // long enough for late PCI/PnP bring-up, short enough not to look hung.
+    if (!WaitForTransportOpen(client, 120000)) {
+        LogEvent(EVENTLOG_ERROR_TYPE,
+            L"bootstrap: could not open T2TouchIdTransport device interface "
+            L"— driver never appeared this boot (PnP / test-sign / install?)");
         return false;
     }
     Log(L"bootstrap: T2TouchIdTransport device interface opened OK");

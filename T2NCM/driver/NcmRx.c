@@ -134,7 +134,7 @@ T2NcmRxFreeResources(
         // crash — the pool leaks until unload, which is recoverable,
         // unlike a bugcheck on Halt during surprise-remove.
         LONG outstanding = InterlockedCompareExchange(
-            &DeviceContext->OutstandingRxNbls, 0, 0);
+            (LONG volatile *)&DeviceContext->OutstandingRxNbls, 0, 0);
         if (outstanding != 0)
         {
             T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
@@ -161,8 +161,7 @@ T2NcmRxAcceptsFrame(
     _In_reads_bytes_(T2NCM_MAC_LENGTH) const UCHAR* Destination
     )
 {
-    ULONG filter = (ULONG)InterlockedCompareExchange(
-        &DeviceContext->PacketFilter, 0, 0);
+    ULONG filter = T2NcmReadPacketFilter(DeviceContext);
 
     if (filter & NDIS_PACKET_TYPE_PROMISCUOUS)
     {

@@ -177,7 +177,14 @@
 // honest answer available.
 #define T2NCM_LINK_SPEED_BPS        480000000ULL
 
-// ---- Lifecycle states ----
+// ---- Lifecycle states / device context ----
+// Guard against accidental double inclusion of this block (e.g. a stale
+// fat Device.h that still embeds the same typedefs while also #include'ing
+// Driver.h — on Windows that yields C2011/C2374 because #pragma once is
+// per-path and Device.h vs Driver.h are distinct files).
+#ifndef T2NCM_DEVICE_CONTEXT_TYPES_DEFINED
+#define T2NCM_DEVICE_CONTEXT_TYPES_DEFINED
+
 // Unchanged names, but the owners have moved with the inversion:
 //   Created        WDFDEVICE made (MiniportInitializeEx)
 //   Prepared       USB target created + configuration selected
@@ -239,7 +246,11 @@ typedef struct _T2NCM_DEVICE_CONTEXT
     NDIS_HANDLE          NdisDeviceHandle;        // NdisMRegisterDeviceEx (diagnostics)
     PDEVICE_OBJECT       ControlDeviceObject;
 
-    ULONG                PacketFilter;
+    // Written by OID_GEN_CURRENT_PACKET_FILTER on one CPU; read by the RX
+    // indication path at DISPATCH_LEVEL on others. Access only via the
+    // T2NcmRead/WritePacketFilter helpers below (Interlocked, LONG-typed
+    // so /WX does not trip C4057 on ULONG* vs LONG*).
+    volatile LONG        PacketFilter;
 
     // The CDC-side filter last successfully pushed to the device with
     // SET_ETHERNET_PACKET_FILTER, and whether that has ever succeeded
@@ -374,6 +385,32 @@ typedef struct _T2NCM_DEVICE_CONTEXT
 } T2NCM_DEVICE_CONTEXT, *PT2NCM_DEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(T2NCM_DEVICE_CONTEXT, T2NcmGetDeviceContext)
+
+// Atomic accessors for PacketFilter (volatile LONG). Keep all call sites
+// on these helpers so Interlocked always sees LONG volatile * — matching
+// the WDK intrinsic prototypes and avoiding C4057 under /WX.
+FORCEINLINE
+ULONG
+T2NcmReadPacketFilter(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
+    )
+{
+    return (ULONG)InterlockedOr(
+        (LONG volatile *)&DeviceContext->PacketFilter, 0);
+}
+
+FORCEINLINE
+VOID
+T2NcmWritePacketFilter(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext,
+    _In_ ULONG Filter
+    )
+{
+    (VOID)InterlockedExchange(
+        (LONG volatile *)&DeviceContext->PacketFilter, (LONG)Filter);
+}
+
+#endif // T2NCM_DEVICE_CONTEXT_TYPES_DEFINED
 
 // Set once in DriverEntry. Needed by MiniportDriverUnload
 // (NdisMDeregisterMiniportDriver) and nothing else.
