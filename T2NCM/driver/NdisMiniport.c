@@ -1065,7 +1065,8 @@ T2NcmOidQuery(
         return T2NcmOidQueryCopy(Request, &genericUlong, sizeof(genericUlong));
 
     case OID_GEN_CURRENT_PACKET_FILTER:
-        genericUlong = DeviceContext->PacketFilter;
+        genericUlong = (ULONG)InterlockedCompareExchange(
+            &DeviceContext->PacketFilter, 0, 0);
         return T2NcmOidQueryCopy(Request, &genericUlong, sizeof(genericUlong));
 
     case OID_GEN_MAXIMUM_SEND_PACKETS:
@@ -1211,7 +1212,7 @@ T2NcmOidSet(
             return NDIS_STATUS_NOT_SUPPORTED;
         }
 
-        DeviceContext->PacketFilter = filter;
+        (VOID)InterlockedExchange(&DeviceContext->PacketFilter, (LONG)filter);
         Request->DATA.SET_INFORMATION.BytesRead = sizeof(ULONG);
 
         // Push it to the device as well. The NDIS-level filter only

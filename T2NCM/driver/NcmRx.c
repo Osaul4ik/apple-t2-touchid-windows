@@ -128,11 +128,21 @@ T2NcmRxFreeResources(
 {
     if (DeviceContext->RxNblPool != NULL)
     {
-        // Caller contract (NcmRx.h): every indicated NBL has already
-        // been returned. Freeing a pool with outstanding allocations is
-        // a bugcheck, so this is not defensive-coded around — it would
-        // only hide a real drain failure that MiniportPause/HaltEx
-        // should have caught first.
+        // Freeing a pool with outstanding allocations is a bugcheck.
+        // MiniportPause/HaltEx must drain first; if a drain timed out
+        // and left OutstandingRxNbls > 0, refuse the free rather than
+        // crash — the pool leaks until unload, which is recoverable,
+        // unlike a bugcheck on Halt during surprise-remove.
+        LONG outstanding = InterlockedCompareExchange(
+            &DeviceContext->OutstandingRxNbls, 0, 0);
+        if (outstanding != 0)
+        {
+            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+                "T2Ncm: T2NcmRxFreeResources skipped - %ld NBLs still outstanding "
+                "(drain timed out?); leaving pool alive to avoid bugcheck\n",
+                outstanding));
+            return;
+        }
         NdisFreeNetBufferListPool(DeviceContext->RxNblPool);
         DeviceContext->RxNblPool = NULL;
     }
@@ -151,7 +161,8 @@ T2NcmRxAcceptsFrame(
     _In_reads_bytes_(T2NCM_MAC_LENGTH) const UCHAR* Destination
     )
 {
-    ULONG filter = DeviceContext->PacketFilter;
+    ULONG filter = (ULONG)InterlockedCompareExchange(
+        &DeviceContext->PacketFilter, 0, 0);
 
     if (filter & NDIS_PACKET_TYPE_PROMISCUOUS)
     {

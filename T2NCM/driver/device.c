@@ -187,7 +187,7 @@ T2NcmDeviceCreate(
     // before any traffic is expected; starting at zero (accept nothing)
     // rather than at "accept everything" means a frame indicated before
     // that OID arrives is dropped rather than leaked upward.
-    context->PacketFilter = 0;
+    (VOID)InterlockedExchange(&context->PacketFilter, 0);
 
     KeInitializeEvent(&context->QuiesceEvent, NotificationEvent, FALSE);
     KeInitializeSpinLock(&context->MulticastLock);

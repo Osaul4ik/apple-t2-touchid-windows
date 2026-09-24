@@ -697,15 +697,21 @@ T2EvtIoDeviceControlGetStatus(_In_ WDFREQUEST Request, _In_ PT2_DEVICE_CONTEXT C
     out->PciPresent = TRUE;
     out->VendorId = T2_SEP_VENDOR_ID;
     out->DeviceId = T2_SEP_DEVICE_ID;
+
+    // Snapshot under ExchangeLock so OolRegistered / Bar4Mapped cannot
+    // race a concurrent D0Exit, RegisterOol, or ReleaseHardware transition
+    // (previously read lock-free and could report "OOL registered" while
+    // State was already demoted out of Ready).
+    WdfWaitLockAcquire(Ctx->ExchangeLock, NULL);
     out->Bar4Mapped = Ctx->Bar4Mapped;
     out->Bar4Size = Ctx->Bar4Length;
     out->OolRegistered = Ctx->OolInRegistered && Ctx->OolOutRegistered;
-
     if (Ctx->Bar4Mapped) {
         ULONG inbox = READ_REGISTER_ULONG((PULONG)(Ctx->Bar4VirtualAddress + T2_SEP_INBOX_STATUS));
         UNREFERENCED_PARAMETER(inbox);
         out->MailboxAccessible = TRUE; // a successful MMIO read is our liveness signal
     }
+    WdfWaitLockRelease(Ctx->ExchangeLock);
 
     WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, sizeof(*out));
 }

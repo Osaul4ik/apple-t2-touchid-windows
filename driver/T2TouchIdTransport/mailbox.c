@@ -17,14 +17,17 @@ static ULONGLONG T2NowUs(VOID)
 
 static VOID T2StallMicroseconds(_In_ ULONG MinUs, _In_ ULONG MaxUs)
 {
-    // KeStallExecutionProcessor busy-waits; acceptable here because the
-    // Linux reference also busy-polls (usleep_range 100-200us) and this
-    // path runs at PASSIVE_LEVEL under a WDFWAITLOCK, never in a DPC.
-    // A real implementation should prefer a short KeDelayExecutionThread
-    // sleep once actual hardware timing is measured (VERIFIED ON WINDOWS
-    // pending) - flagged for the milestone-2-hardware-results.md follow-up.
-    ULONG mid = (MinUs + MaxUs) / 2;
-    KeStallExecutionProcessor(mid);
+    // PASSIVE_LEVEL under ExchangeLock (WDFWAITLOCK) — never in a DPC.
+    // Prefer a real sleep over KeStallExecutionProcessor busy-wait so a
+    // multi-second SEP timeout does not pin a CPU core for the full
+    // T2_SEP_TIMEOUT_US / T2_SEP_TRANSACTION_DEADLINE_US window (which also
+    // delays D0Exit/ReleaseHardware that serialize on the same lock).
+    // Interval is relative (negative) in 100 ns units.
+    UNREFERENCED_PARAMETER(MaxUs);
+    LARGE_INTEGER interval;
+    ULONG us = (MinUs > 0) ? MinUs : 1;
+    interval.QuadPart = -((LONGLONG)us * 10);
+    (VOID)KeDelayExecutionThread(KernelMode, FALSE, &interval);
 }
 
 NTSTATUS
