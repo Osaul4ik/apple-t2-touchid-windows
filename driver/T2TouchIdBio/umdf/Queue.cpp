@@ -1105,13 +1105,18 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
         return;
     }
 
-    // Sx boundary: Match that crossed suspend must not unlock on resume.
-    // Generation was snapped at session start; OnSuspendResume bumps it on
-    // every PBT_APMSUSPEND. Fail-closed: treat as Cancelled, no BIR, no replay.
+    // Sx boundary: never deliver Match once suspend has started.
+    // - gen changed: CAPTURE began before PBT_APMSUSPEND
+    // - g_suspended: cancel/Match raced with the suspend broadcast
+    // Fail-closed: no BIR, no replay (touch during sleep transition must not
+    // unlock on wake).
+    const bool suspendedNow = g_suspended.load(std::memory_order_acquire);
     if (outcome == VerifyOutcome::Match &&
-        g_sxGeneration.load(std::memory_order_acquire) != sxGenAtStart) {
-        T2BioLog("CAPTURE_DATA(verify): *** MATCH discarded - Sx boundary crossed "
-                 "(gen_start=%llu gen_now=%llu; no unlock from pre-sleep touch) ***",
+        (suspendedNow ||
+         g_sxGeneration.load(std::memory_order_acquire) != sxGenAtStart)) {
+        T2BioLog("CAPTURE_DATA(verify): *** MATCH discarded - Sx boundary "
+                 "(suspended=%d gen_start=%llu gen_now=%llu) ***",
+                 suspendedNow ? 1 : 0,
                  static_cast<unsigned long long>(sxGenAtStart),
                  static_cast<unsigned long long>(
                      g_sxGeneration.load(std::memory_order_relaxed)));
@@ -1129,20 +1134,21 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
         T2BioLog("CAPTURE_DATA(verify): post-resume WarmUp retained after cancel/transport");
     }
 
-    // Post-resume CAPTURE is frequently CancelIoEx'd by WBF while WarmUp
-    // (ResetSensor + LoadCalibration) is still running — engine Deactivate /
-    // credential-UI lag after resume. Completing that as WINBIO_E_CANCELED
-    // paints the lock-screen error flash even though a later CAPTURE unlocks
-    // fine. Soft-map to BAD_CAPTURE + READY so the framework treats it as a
-    // non-fatal bad sample, not a hard cancel/error. Normal cancels
-    // (password fallback, Win+L) keep WINBIO_E_CANCELED.
+    // Silent complete for power-path cancels (not user PIN/password cancel):
+    // - suspended: pre-sleep CAPTURE cancelled by OnSuspendResume (log showed
+    //   0x80098004 → lock-screen error flash)
+    // - postResumeWarmup: cold-boot / post-resume CAPTURE cancelled during
+    //   WarmUp or UI lag (BAD_CAPTURE still flashed; S_OK+READY does not)
+    // Normal Cancelled (Win+L, password fallback) keeps WINBIO_E_CANCELED.
     HRESULT hr;
     WINBIO_SENSOR_STATUS sensorStatus;
-    if (outcome == VerifyOutcome::Cancelled && postResumeWarmup) {
-        hr = WINBIO_E_BAD_CAPTURE;
+    if (outcome == VerifyOutcome::Cancelled &&
+        (suspendedNow || postResumeWarmup)) {
+        hr = S_OK;
         sensorStatus = WINBIO_SENSOR_READY;
-        T2BioLog("CAPTURE_DATA(verify): post-resume cancel -> soft BAD_CAPTURE "
-                 "(no lock-screen error flash)");
+        T2BioLog("CAPTURE_DATA(verify): power-path cancel -> silent READY "
+                 "(suspended=%d postResumeWarmup=%d)",
+                 suspendedNow ? 1 : 0, postResumeWarmup ? 1 : 0);
     } else {
         hr = MapVerifyOutcomeToHresult(outcome);
         sensorStatus =
