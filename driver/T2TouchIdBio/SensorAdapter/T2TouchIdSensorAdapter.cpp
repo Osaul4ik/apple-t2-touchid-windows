@@ -3,14 +3,10 @@
 //
 // Replaces in-box WinBioSensorAdapter.dll so we own StartCapture / Cancel /
 // NotifyPowerChange. After Sx, WBF re-issues StartCapture through this
-// adapter (SuspendAndWaitForPlatformResume path) instead of depending on a
-// CAPTURE that straddled sleep (security hole) or a dead LogonUI session.
+// adapter instead of depending on a CAPTURE that straddled sleep.
 //
-// Talks WBDI to T2TouchIdBio UMDF via Pipeline->SensorHandle:
-//   IOCTL_BIOMETRIC_CAPTURE_DATA (overlapped)
-//   IOCTL_BIOMETRIC_GET_SENSOR_STATUS
-//   IOCTL_BIOMETRIC_RESET
-//   CancelIoEx on cancel / suspend
+// Threading: all mutable context fields are guarded by ctx->Lock. Cancel /
+// power paths cancel outstanding I/O and wait before freeing buffers.
 
 #include <windows.h>
 #include <stddef.h>
@@ -31,9 +27,11 @@
 namespace {
 
 constexpr ULONG kSensorCtxSig = 'T2SC';
-// GUID for this adapter (unique; not the sample GUID).
 const GUID kAdapterId = {
     0xb039a556, 0x3eec, 0x475a, {0xab, 0xbd, 0x3a, 0xa5, 0xc5, 0xf5, 0x50, 0xdb}};
+
+constexpr SIZE_T kInitialCaptureCap = 4096;
+constexpr SIZE_T kMaxCaptureCap = 256 * 1024;
 
 void SensLog(const char* fmt, ...)
 {
@@ -49,6 +47,7 @@ void SensLog(const char* fmt, ...)
 
 struct _WINIBIO_SENSOR_CONTEXT {
     ULONG Signature;
+    CRITICAL_SECTION Lock;
     OVERLAPPED Overlapped;
     HANDLE OverlappedEvent;
     PUCHAR CaptureBuffer;
@@ -72,7 +71,7 @@ SensorCtx* GetContext(PWINBIO_PIPELINE Pipeline)
     return ctx;
 }
 
-void FreeCaptureBuffer(SensorCtx* ctx)
+void FreeCaptureBuffer_Locked(SensorCtx* ctx)
 {
     if (ctx->CaptureBuffer) {
         HeapFree(GetProcessHeap(), 0, ctx->CaptureBuffer);
@@ -80,6 +79,84 @@ void FreeCaptureBuffer(SensorCtx* ctx)
         ctx->CaptureBufferSize = 0;
     }
     ctx->BytesTransferred = 0;
+}
+
+// Cancel outstanding CAPTURE and wait for I/O completion before freeing.
+void CancelAndWaitCapture(PWINBIO_PIPELINE Pipeline, SensorCtx* ctx)
+{
+    EnterCriticalSection(&ctx->Lock);
+    const BOOL inProgress = ctx->CaptureInProgress;
+    HANDLE sensor = (Pipeline && Pipeline->SensorHandle &&
+                     Pipeline->SensorHandle != INVALID_HANDLE_VALUE)
+                        ? Pipeline->SensorHandle
+                        : nullptr;
+    OVERLAPPED ovCopy = ctx->Overlapped;
+    LeaveCriticalSection(&ctx->Lock);
+
+    if (!inProgress || !sensor) {
+        EnterCriticalSection(&ctx->Lock);
+        ctx->CaptureInProgress = FALSE;
+        FreeCaptureBuffer_Locked(ctx);
+        LeaveCriticalSection(&ctx->Lock);
+        return;
+    }
+
+    CancelIoEx(sensor, &ovCopy);
+    DWORD ignored = 0;
+    GetOverlappedResult(sensor, &ovCopy, &ignored, TRUE);
+
+    EnterCriticalSection(&ctx->Lock);
+    ctx->CaptureInProgress = FALSE;
+    FreeCaptureBuffer_Locked(ctx);
+    LeaveCriticalSection(&ctx->Lock);
+}
+
+bool CapturePayloadValid(const PUCHAR buffer, DWORD bytesTransferred)
+{
+    if (!buffer || bytesTransferred < sizeof(WINBIO_CAPTURE_DATA)) {
+        return false;
+    }
+    auto* capture = reinterpret_cast<const WINBIO_CAPTURE_DATA*>(buffer);
+    if (capture->PayloadSize != 0 &&
+        capture->PayloadSize > bytesTransferred) {
+        return false;
+    }
+    const SIZE_T dataOffset =
+        offsetof(WINBIO_CAPTURE_DATA, CaptureData) + offsetof(WINBIO_DATA, Data);
+    if (capture->CaptureData.Size != 0) {
+        if (dataOffset + capture->CaptureData.Size > bytesTransferred) {
+            return false;
+        }
+    }
+    return true;
+}
+
+HRESULT IssueCaptureIoctl(PWINBIO_PIPELINE Pipeline, SensorCtx* ctx,
+                          WINBIO_BIR_PURPOSE purpose)
+{
+    WINBIO_CAPTURE_PARAMETERS params = {};
+    params.PayloadSize = sizeof(params);
+    params.Purpose = purpose;
+    params.Format.Owner = 0x001b;
+    params.Format.Type = 0x0401;
+    params.Flags = WINBIO_DATA_FLAG_RAW;
+
+    ZeroMemory(&ctx->Overlapped, sizeof(ctx->Overlapped));
+    ResetEvent(ctx->OverlappedEvent);
+    ctx->Overlapped.hEvent = ctx->OverlappedEvent;
+    ctx->LastPurpose = purpose;
+    ctx->BytesTransferred = 0;
+
+    const BOOL ok = DeviceIoControl(
+        Pipeline->SensorHandle, IOCTL_BIOMETRIC_CAPTURE_DATA, &params,
+        sizeof(params), ctx->CaptureBuffer,
+        static_cast<DWORD>(ctx->CaptureBufferSize), nullptr, &ctx->Overlapped);
+    const DWORD err = GetLastError();
+    if (!ok && err != ERROR_IO_PENDING) {
+        return HRESULT_FROM_WIN32(err);
+    }
+    ctx->CaptureInProgress = TRUE;
+    return S_OK;
 }
 
 HRESULT WINAPI SensorAttach(_Inout_ PWINBIO_PIPELINE Pipeline)
@@ -97,8 +174,10 @@ HRESULT WINAPI SensorAttach(_Inout_ PWINBIO_PIPELINE Pipeline)
         return E_OUTOFMEMORY;
     }
     ctx->Signature = kSensorCtxSig;
+    InitializeCriticalSection(&ctx->Lock);
     ctx->OverlappedEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!ctx->OverlappedEvent) {
+        DeleteCriticalSection(&ctx->Lock);
         HeapFree(GetProcessHeap(), 0, ctx);
         return E_OUTOFMEMORY;
     }
@@ -114,18 +193,13 @@ HRESULT WINAPI SensorDetach(_Inout_ PWINBIO_PIPELINE Pipeline)
     if (!ctx) {
         return E_POINTER;
     }
-    if (ctx->CaptureInProgress && ARGUMENT_PRESENT(Pipeline) &&
-        Pipeline->SensorHandle != INVALID_HANDLE_VALUE &&
-        Pipeline->SensorHandle != nullptr) {
-        CancelIoEx(Pipeline->SensorHandle, &ctx->Overlapped);
-        DWORD ignored = 0;
-        GetOverlappedResult(Pipeline->SensorHandle, &ctx->Overlapped, &ignored, TRUE);
-        ctx->CaptureInProgress = FALSE;
-    }
-    FreeCaptureBuffer(ctx);
+    CancelAndWaitCapture(Pipeline, ctx);
     if (ctx->OverlappedEvent) {
         CloseHandle(ctx->OverlappedEvent);
+        ctx->OverlappedEvent = nullptr;
     }
+    DeleteCriticalSection(&ctx->Lock);
+    ctx->Signature = 0;
     HeapFree(GetProcessHeap(), 0, ctx);
     Pipeline->SensorContext = nullptr;
     return S_OK;
@@ -137,7 +211,7 @@ HRESULT WINAPI SensorClearContext(_Inout_ PWINBIO_PIPELINE Pipeline)
     if (!ctx) {
         return E_POINTER;
     }
-    FreeCaptureBuffer(ctx);
+    CancelAndWaitCapture(Pipeline, ctx);
     return S_OK;
 }
 
@@ -148,19 +222,27 @@ HRESULT WINAPI SensorQueryStatus(
     if (!ARGUMENT_PRESENT(Pipeline) || !ARGUMENT_PRESENT(Status)) {
         return E_POINTER;
     }
-    *Status = WINBIO_SENSOR_READY;
-    if (Pipeline->SensorHandle == nullptr ||
+    *Status = WINBIO_SENSOR_FAILURE;
+    if (!Pipeline->SensorHandle ||
         Pipeline->SensorHandle == INVALID_HANDLE_VALUE) {
-        return S_OK;
+        return WINBIO_E_INVALID_DEVICE_STATE;
     }
     WINBIO_DIAGNOSTICS diag = {};
     DWORD bytes = 0;
-    if (DeviceIoControl(Pipeline->SensorHandle, IOCTL_BIOMETRIC_GET_SENSOR_STATUS,
-                        nullptr, 0, &diag, sizeof(diag), &bytes, nullptr)) {
-        if (bytes >= sizeof(diag)) {
-            *Status = diag.SensorStatus;
-        }
+    if (!DeviceIoControl(Pipeline->SensorHandle, IOCTL_BIOMETRIC_GET_SENSOR_STATUS,
+                         nullptr, 0, &diag, sizeof(diag), &bytes, nullptr)) {
+        const DWORD err = GetLastError();
+        SensLog("QueryStatus IOCTL failed err=%lu", static_cast<unsigned long>(err));
+        return HRESULT_FROM_WIN32(err);
     }
+    if (bytes < sizeof(diag)) {
+        return WINBIO_E_INVALID_DEVICE_STATE;
+    }
+    if (FAILED(diag.WinBioHresult)) {
+        *Status = WINBIO_SENSOR_FAILURE;
+        return diag.WinBioHresult;
+    }
+    *Status = diag.SensorStatus;
     return S_OK;
 }
 
@@ -171,13 +253,7 @@ HRESULT WINAPI SensorReset(_Inout_ PWINBIO_PIPELINE Pipeline)
     if (!ctx) {
         return E_POINTER;
     }
-    if (ctx->CaptureInProgress && Pipeline->SensorHandle) {
-        CancelIoEx(Pipeline->SensorHandle, &ctx->Overlapped);
-        DWORD ignored = 0;
-        GetOverlappedResult(Pipeline->SensorHandle, &ctx->Overlapped, &ignored, TRUE);
-        ctx->CaptureInProgress = FALSE;
-    }
-    FreeCaptureBuffer(ctx);
+    CancelAndWaitCapture(Pipeline, ctx);
     if (Pipeline->SensorHandle &&
         Pipeline->SensorHandle != INVALID_HANDLE_VALUE) {
         WINBIO_BLANK_PAYLOAD blank = {};
@@ -230,50 +306,54 @@ HRESULT WINAPI SensorStartCapture(
     if (!ctx) {
         return WINBIO_E_INVALID_DEVICE_STATE;
     }
-    if (ctx->CaptureInProgress) {
-        return WINBIO_E_DATA_COLLECTION_IN_PROGRESS;
-    }
     if (!Pipeline->SensorHandle ||
         Pipeline->SensorHandle == INVALID_HANDLE_VALUE) {
         return WINBIO_E_INVALID_DEVICE_STATE;
     }
 
-    FreeCaptureBuffer(ctx);
-    // Typical BIR payload from our UMDF is ~444 bytes; allocate headroom.
-    constexpr SIZE_T kCaptureCap = 4096;
-    ctx->CaptureBuffer = static_cast<PUCHAR>(
-        HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, kCaptureCap));
-    if (!ctx->CaptureBuffer) {
-        return E_OUTOFMEMORY;
+    EnterCriticalSection(&ctx->Lock);
+    if (ctx->CaptureInProgress) {
+        LeaveCriticalSection(&ctx->Lock);
+        return WINBIO_E_DATA_COLLECTION_IN_PROGRESS;
     }
-    ctx->CaptureBufferSize = kCaptureCap;
-    ctx->LastPurpose = Purpose;
+    FreeCaptureBuffer_Locked(ctx);
 
-    WINBIO_CAPTURE_PARAMETERS params = {};
-    params.PayloadSize = sizeof(params);
-    params.Purpose = Purpose;
-    // Match UMDF CAPTURE_DATA path (Queue.cpp / hardware logs).
-    params.Format.Owner = 0x001b;
-    params.Format.Type = 0x0401;
-    params.Flags = WINBIO_DATA_FLAG_RAW;
+    SIZE_T cap = kInitialCaptureCap;
+    HRESULT hr = E_FAIL;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        ctx->CaptureBuffer = static_cast<PUCHAR>(
+            HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, cap));
+        if (!ctx->CaptureBuffer) {
+            LeaveCriticalSection(&ctx->Lock);
+            return E_OUTOFMEMORY;
+        }
+        ctx->CaptureBufferSize = cap;
 
-    ZeroMemory(&ctx->Overlapped, sizeof(ctx->Overlapped));
-    ResetEvent(ctx->OverlappedEvent);
-    ctx->Overlapped.hEvent = ctx->OverlappedEvent;
-
-    const BOOL ok = DeviceIoControl(
-        Pipeline->SensorHandle, IOCTL_BIOMETRIC_CAPTURE_DATA, &params,
-        sizeof(params), ctx->CaptureBuffer, static_cast<DWORD>(ctx->CaptureBufferSize),
-        nullptr, &ctx->Overlapped);
-    const DWORD err = GetLastError();
-    if (!ok && err != ERROR_IO_PENDING) {
-        SensLog("StartCapture DeviceIoControl failed err=%lu",
-                static_cast<unsigned long>(err));
-        FreeCaptureBuffer(ctx);
-        return HRESULT_FROM_WIN32(err);
+        hr = IssueCaptureIoctl(Pipeline, ctx, Purpose);
+        if (FAILED(hr)) {
+            if (hr == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) ||
+                hr == HRESULT_FROM_WIN32(ERROR_MORE_DATA)) {
+                DWORD needed = 0;
+                if (ctx->CaptureBufferSize >= sizeof(DWORD)) {
+                    needed = *reinterpret_cast<DWORD*>(ctx->CaptureBuffer);
+                }
+                FreeCaptureBuffer_Locked(ctx);
+                if (needed > kInitialCaptureCap && needed <= kMaxCaptureCap) {
+                    cap = needed;
+                    continue;
+                }
+            }
+            FreeCaptureBuffer_Locked(ctx);
+            LeaveCriticalSection(&ctx->Lock);
+            SensLog("StartCapture failed hr=0x%08lx",
+                    static_cast<unsigned long>(hr));
+            return hr;
+        }
+        break;
     }
-    ctx->CaptureInProgress = TRUE;
+
     *Overlapped = &ctx->Overlapped;
+    LeaveCriticalSection(&ctx->Lock);
     return S_OK;
 }
 
@@ -290,43 +370,64 @@ HRESULT WINAPI SensorFinishCapture(
     if (!ctx) {
         return WINBIO_E_INVALID_DEVICE_STATE;
     }
+
+    EnterCriticalSection(&ctx->Lock);
     if (!ctx->CaptureInProgress) {
+        LeaveCriticalSection(&ctx->Lock);
         return WINBIO_E_INVALID_DEVICE_STATE;
     }
+    HANDLE sensor = Pipeline->SensorHandle;
+    OVERLAPPED ov = ctx->Overlapped;
+    LeaveCriticalSection(&ctx->Lock);
 
     DWORD transferred = 0;
-    const BOOL ok = GetOverlappedResult(Pipeline->SensorHandle, &ctx->Overlapped,
-                                        &transferred, TRUE);
+    const BOOL ok = GetOverlappedResult(sensor, &ov, &transferred, TRUE);
+    const DWORD err = ok ? 0 : GetLastError();
+
+    EnterCriticalSection(&ctx->Lock);
     ctx->CaptureInProgress = FALSE;
     if (!ok) {
-        const DWORD err = GetLastError();
+        FreeCaptureBuffer_Locked(ctx);
+        LeaveCriticalSection(&ctx->Lock);
         SensLog("FinishCapture GetOverlappedResult err=%lu",
                 static_cast<unsigned long>(err));
-        FreeCaptureBuffer(ctx);
         if (err == ERROR_OPERATION_ABORTED || err == ERROR_CANCELLED) {
             return WINBIO_E_CANCELED;
         }
         return HRESULT_FROM_WIN32(err);
     }
-    ctx->BytesTransferred = transferred;
-    if (transferred < sizeof(WINBIO_CAPTURE_DATA)) {
-        FreeCaptureBuffer(ctx);
+
+    if (transferred == sizeof(DWORD) && ctx->CaptureBuffer) {
+        const DWORD needed = *reinterpret_cast<DWORD*>(ctx->CaptureBuffer);
+        FreeCaptureBuffer_Locked(ctx);
+        LeaveCriticalSection(&ctx->Lock);
+        if (needed > sizeof(DWORD) && needed <= kMaxCaptureCap) {
+            SensLog("FinishCapture need larger buffer %lu",
+                    static_cast<unsigned long>(needed));
+            return WINBIO_E_MORE_DATA;
+        }
         return WINBIO_E_NO_CAPTURE_DATA;
     }
+
+    if (!CapturePayloadValid(ctx->CaptureBuffer, transferred)) {
+        FreeCaptureBuffer_Locked(ctx);
+        LeaveCriticalSection(&ctx->Lock);
+        return WINBIO_E_NO_CAPTURE_DATA;
+    }
+
+    ctx->BytesTransferred = transferred;
     auto* capture = reinterpret_cast<PWINBIO_CAPTURE_DATA>(ctx->CaptureBuffer);
     if (FAILED(capture->WinBioHresult)) {
         const HRESULT hr = capture->WinBioHresult;
         *RejectDetail = capture->RejectDetail;
+        FreeCaptureBuffer_Locked(ctx);
+        LeaveCriticalSection(&ctx->Lock);
         SensLog("FinishCapture WinBioHresult=0x%08lx",
                 static_cast<unsigned long>(hr));
-        // Keep buffer only for S_OK Export path.
-        if (hr != WINBIO_E_CANCELED) {
-            // non-success: drop
-        }
-        FreeCaptureBuffer(ctx);
         return hr;
     }
     *RejectDetail = capture->RejectDetail;
+    LeaveCriticalSection(&ctx->Lock);
     return S_OK;
 }
 
@@ -342,24 +443,42 @@ HRESULT WINAPI SensorExportSensorData(
     *SampleBuffer = nullptr;
     *SampleSize = 0;
     SensorCtx* ctx = GetContext(Pipeline);
-    if (!ctx || !ctx->CaptureBuffer || ctx->BytesTransferred < sizeof(WINBIO_CAPTURE_DATA)) {
+    if (!ctx) {
+        return WINBIO_E_INVALID_DEVICE_STATE;
+    }
+
+    EnterCriticalSection(&ctx->Lock);
+    if (ctx->CaptureInProgress) {
+        LeaveCriticalSection(&ctx->Lock);
+        return WINBIO_E_INVALID_DEVICE_STATE;
+    }
+    if (!CapturePayloadValid(ctx->CaptureBuffer, ctx->BytesTransferred)) {
+        LeaveCriticalSection(&ctx->Lock);
         return WINBIO_E_NO_CAPTURE_DATA;
     }
     auto* capture = reinterpret_cast<PWINBIO_CAPTURE_DATA>(ctx->CaptureBuffer);
-    if (capture->CaptureData.Size == 0 ||
-        capture->CaptureData.Size > ctx->BytesTransferred) {
+    if (capture->CaptureData.Size == 0) {
+        LeaveCriticalSection(&ctx->Lock);
         return WINBIO_E_NO_CAPTURE_DATA;
     }
-    // CaptureData.Data is the BIR; hand ownership to WBF via process heap.
+    const SIZE_T dataOffset =
+        offsetof(WINBIO_CAPTURE_DATA, CaptureData) + offsetof(WINBIO_DATA, Data);
+    if (dataOffset + capture->CaptureData.Size > ctx->BytesTransferred) {
+        LeaveCriticalSection(&ctx->Lock);
+        return WINBIO_E_NO_CAPTURE_DATA;
+    }
     const SIZE_T birSize = capture->CaptureData.Size;
     void* copy = HeapAlloc(GetProcessHeap(), 0, birSize);
     if (!copy) {
+        LeaveCriticalSection(&ctx->Lock);
         return E_OUTOFMEMORY;
     }
     memcpy(copy, capture->CaptureData.Data, birSize);
+    FreeCaptureBuffer_Locked(ctx);
+    LeaveCriticalSection(&ctx->Lock);
+
     *SampleBuffer = static_cast<PWINBIO_BIR>(copy);
     *SampleSize = birSize;
-    FreeCaptureBuffer(ctx);
     return S_OK;
 }
 
@@ -370,9 +489,11 @@ HRESULT WINAPI SensorCancel(_Inout_ PWINBIO_PIPELINE Pipeline)
     if (!ctx) {
         return E_POINTER;
     }
+    EnterCriticalSection(&ctx->Lock);
     if (ctx->CaptureInProgress && Pipeline->SensorHandle) {
         CancelIoEx(Pipeline->SensorHandle, &ctx->Overlapped);
     }
+    LeaveCriticalSection(&ctx->Lock);
     return S_OK;
 }
 
@@ -387,21 +508,22 @@ HRESULT WINAPI SensorPushDataToEngine(
         return E_POINTER;
     }
     *RejectDetail = 0;
-    // Standard path: ExportSensorData then Engine AcceptSampleData is done by
-    // framework when we return S_OK after placing BIR - for push, call engine.
-    if (!Pipeline->EngineInterface || !Pipeline->EngineInterface->AcceptSampleData) {
-        return E_NOTIMPL;
-    }
     PWINBIO_BIR bir = nullptr;
     SIZE_T birSize = 0;
     HRESULT hr = SensorExportSensorData(Pipeline, &bir, &birSize);
     if (FAILED(hr)) {
         return hr;
     }
+#if defined(WbioEngineAcceptSampleData)
+    hr = WbioEngineAcceptSampleData(Pipeline, bir, birSize, Purpose, RejectDetail);
+#else
+    if (!Pipeline->EngineInterface || !Pipeline->EngineInterface->AcceptSampleData) {
+        HeapFree(GetProcessHeap(), 0, bir);
+        return E_NOTIMPL;
+    }
     hr = Pipeline->EngineInterface->AcceptSampleData(Pipeline, bir, birSize, Purpose,
                                                      RejectDetail);
-    // AcceptSampleData takes ownership semantics per engine - engine adapter
-    // copies what it needs; free our heap BIR.
+#endif
     HeapFree(GetProcessHeap(), 0, bir);
     return hr;
 }
@@ -446,8 +568,6 @@ HRESULT WINAPI SensorControlUnitPrivileged(
                              OperationStatus);
 }
 
-// Critical for post-Sx re-arm: cancel in-flight capture on suspend; clear
-// state on resume so WBF's next StartCapture is a clean arm.
 HRESULT WINAPI SensorNotifyPowerChange(
     _Inout_ PWINBIO_PIPELINE Pipeline,
     _In_ ULONG PowerEventType)
@@ -458,18 +578,15 @@ HRESULT WINAPI SensorNotifyPowerChange(
     if (!ctx) {
         return E_POINTER;
     }
-    if (PowerEventType == PBT_APMSUSPEND) {
-        if (ctx->CaptureInProgress && Pipeline->SensorHandle) {
-            CancelIoEx(Pipeline->SensorHandle, &ctx->Overlapped);
-            // Do not wait here - FinishCapture/Cancel path will complete.
-        }
-        FreeCaptureBuffer(ctx);
-    } else if (PowerEventType == PBT_APMRESUMEAUTOMATIC ||
-               PowerEventType == PBT_APMRESUMESUSPEND ||
-               PowerEventType == PBT_APMRESUMECRITICAL) {
-        FreeCaptureBuffer(ctx);
-        ctx->CaptureInProgress = FALSE;
-        if (Pipeline->SensorHandle &&
+    if (PowerEventType == PBT_APMSUSPEND ||
+        PowerEventType == PBT_APMRESUMEAUTOMATIC ||
+        PowerEventType == PBT_APMRESUMESUSPEND ||
+        PowerEventType == PBT_APMRESUMECRITICAL) {
+        CancelAndWaitCapture(Pipeline, ctx);
+        if ((PowerEventType == PBT_APMRESUMEAUTOMATIC ||
+             PowerEventType == PBT_APMRESUMESUSPEND ||
+             PowerEventType == PBT_APMRESUMECRITICAL) &&
+            Pipeline->SensorHandle &&
             Pipeline->SensorHandle != INVALID_HANDLE_VALUE) {
             WINBIO_BLANK_PAYLOAD blank = {};
             DWORD bytes = 0;
@@ -500,8 +617,8 @@ HRESULT WINAPI SensorDeactivate(_Inout_ PWINBIO_PIPELINE Pipeline)
 {
     SensLog("Deactivate pipeline=%p", Pipeline);
     SensorCtx* ctx = GetContext(Pipeline);
-    if (ctx && ctx->CaptureInProgress && Pipeline->SensorHandle) {
-        CancelIoEx(Pipeline->SensorHandle, &ctx->Overlapped);
+    if (ctx) {
+        CancelAndWaitCapture(Pipeline, ctx);
     }
     return ARGUMENT_PRESENT(Pipeline) ? S_OK : E_POINTER;
 }
@@ -523,7 +640,6 @@ HRESULT WINAPI SensorQueryExtendedInfo(
     return S_OK;
 }
 
-// Remaining V3 slots used by some units - safe stubs.
 HRESULT WINAPI SensorQueryCalibrationFormats(
     _Inout_ PWINBIO_PIPELINE Pipeline,
     _Outptr_result_bytebuffer_(*FormatArraySize) PWINBIO_UUID* FormatArray,

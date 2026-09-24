@@ -46,6 +46,9 @@ jobs:
       ENGINE_DIR: driver/T2TouchIdBio/EngineAdapter
       ENGINE_PROJECT: driver/T2TouchIdBio/EngineAdapter/T2TouchIdEngineAdapter.vcxproj
       ENGINE_NAME: T2TouchIdEngineAdapter
+      SENSOR_DIR: driver/T2TouchIdBio/SensorAdapter
+      SENSOR_PROJECT: driver/T2TouchIdBio/SensorAdapter/T2TouchIdSensorAdapter.vcxproj
+      SENSOR_NAME: T2TouchIdSensorAdapter
       UMDF_STAMP_VERSION: 2.15.0
       CA_TREAT_WARNINGS_AS_ERRORS: true
       SIGN_CERT_PFX: ${{ secrets.CERT }}
@@ -236,6 +239,23 @@ jobs:
         Write-Host "OK: engine adapter built, WbioQueryEngineInterface exported."
       shell: pwsh
 
+    - name: Build WBF sensor adapter
+      shell: pwsh
+      run: |
+        msbuild $env:SENSOR_PROJECT `
+          /p:Configuration=$env:CONFIGURATION `
+          /p:Platform=$env:PLATFORM `
+          /p:SignMode=Off `
+          /m /v:minimal
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "msbuild (sensor adapter) failed with exit code $LASTEXITCODE"
+        }
+        $dll = "$env:SENSOR_DIR\build\$env:SENSOR_NAME\$env:PLATFORM\$env:CONFIGURATION\$env:SENSOR_NAME.dll"
+        if (-not (Test-Path $dll)) {
+          Write-Error "Sensor adapter DLL not found at $dll"
+        }
+        Write-Host "OK: sensor adapter built: $dll"
+
     - name: Upload UMDF build / PREfast logs
       if: always()
       uses: actions/upload-artifact@v4
@@ -273,6 +293,13 @@ jobs:
         Copy-Item -Path $engineDll -Destination $packageDir -Force
         $enginePdb = "$engineOut\$env:ENGINE_NAME.pdb"
         if (Test-Path $enginePdb) { Copy-Item -Path $enginePdb -Destination $packageDir -Force }
+
+        $sensorOut = "$env:SENSOR_DIR\build\$env:SENSOR_NAME\$env:PLATFORM\$env:CONFIGURATION"
+        $sensorDll = "$sensorOut\$env:SENSOR_NAME.dll"
+        if (-not (Test-Path $sensorDll)) { Write-Error "Sensor adapter DLL missing at $sensorDll" }
+        Copy-Item -Path $sensorDll -Destination $packageDir -Force
+        $sensorPdb = "$sensorOut\$env:SENSOR_NAME.pdb"
+        if (Test-Path $sensorPdb) { Copy-Item -Path $sensorPdb -Destination $packageDir -Force }
 
         Write-Host "OK: staged UMDF files:"
         Get-ChildItem $packageDir | ForEach-Object { Write-Host "  - $($_.Name)" }

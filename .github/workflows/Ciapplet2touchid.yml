@@ -16,7 +16,7 @@ name: CI Apple T2 TouchId (CodeQL + PREfast + Build + Package)
 #                   %SystemRoot%\System32\T2SepBootstrap\, not just the .exe),
 #                   checks/
 #   NCM/            T2Ncm.sys, T2NcmCtrl.sys, 3x .inf, 3x .cat, checks/
-#   Bio/            T2TouchIdBio.dll, .inf, .cat, T2TouchIdEngineAdapter.dll
+#   Bio/            T2TouchIdBio.dll, .inf, .cat, T2TouchIdEngineAdapter.dll, T2TouchIdSensorAdapter.dll
 #                   + libplist runtime dll, checks/
 #   SepVaultGui/    SepVaultGui.exe (framework-dependent "Min" publish -
 #                   потребує встановленого .NET 8 runtime на цільовій машині,
@@ -87,6 +87,9 @@ env:
   BIO_ENGINE_DIR: driver/T2TouchIdBio/EngineAdapter
   BIO_ENGINE_PROJECT: driver/T2TouchIdBio/EngineAdapter/T2TouchIdEngineAdapter.vcxproj
   BIO_ENGINE_NAME: T2TouchIdEngineAdapter
+  BIO_SENSOR_DIR: driver/T2TouchIdBio/SensorAdapter
+  BIO_SENSOR_PROJECT: driver/T2TouchIdBio/SensorAdapter/T2TouchIdSensorAdapter.vcxproj
+  BIO_SENSOR_NAME: T2TouchIdSensorAdapter
   BIO_UMDF_STAMP_VERSION: 2.15.0
 
   # --- SepVaultGui ---
@@ -536,6 +539,23 @@ jobs:
         Write-Host "OK: Bio engine adapter built, WbioQueryEngineInterface exported."
       shell: pwsh
 
+    - name: "Bio: build WBF sensor adapter"
+      shell: pwsh
+      run: |
+        msbuild $env:BIO_SENSOR_PROJECT `
+          /p:Configuration=$env:CONFIGURATION `
+          /p:Platform=$env:PLATFORM `
+          /p:SignMode=Off `
+          /m /v:minimal
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "msbuild (sensor adapter) failed with exit code $LASTEXITCODE"
+        }
+        $dll = "$env:BIO_SENSOR_DIR\build\$env:BIO_SENSOR_NAME\$env:PLATFORM\$env:CONFIGURATION\$env:BIO_SENSOR_NAME.dll"
+        if (-not (Test-Path $dll)) {
+          Write-Error "Sensor adapter DLL not found at $dll"
+        }
+        Write-Host "OK: sensor adapter built: $dll"
+
     - name: Upload Bio build/PREfast logs
       if: always()
       uses: actions/upload-artifact@v4
@@ -798,6 +818,15 @@ jobs:
         Copy-Item -Path $engineDll -Destination $pkg -Force
         $enginePdb = "$engineOut\$env:BIO_ENGINE_NAME.pdb"
         if (Test-Path $enginePdb) { Copy-Item -Path $enginePdb -Destination $pkg -Force }
+
+        $sensorOut = "$env:BIO_SENSOR_DIR\build\$env:BIO_SENSOR_NAME\$env:PLATFORM\$env:CONFIGURATION"
+        $sensorDll = "$sensorOut\$env:BIO_SENSOR_NAME.dll"
+        if (-not (Test-Path $sensorDll)) {
+          Write-Error "Sensor adapter DLL missing at $sensorDll"
+        }
+        Copy-Item -Path $sensorDll -Destination $pkg -Force
+        $sensorPdb = "$sensorOut\$env:BIO_SENSOR_NAME.pdb"
+        if (Test-Path $sensorPdb) { Copy-Item -Path $sensorPdb -Destination $pkg -Force }
 
         New-Item -ItemType Directory -Path (Join-Path $pkg "checks") -Force | Out-Null
         Add-Content -Path $env:GITHUB_ENV -Value "BIO_PACKAGE_DIR=$pkg"
