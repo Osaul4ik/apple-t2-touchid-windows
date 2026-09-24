@@ -66,6 +66,13 @@ EXTERN_C_START
 DRIVER_INITIALIZE                  DriverEntry;
 EVT_WDF_DRIVER_DEVICE_ADD          T2BioEvtDeviceAdd;
 EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL T2BioEvtIoDeviceControl;
+// Power-managed queue stop notification (device leaving D0, or queue/device
+// removal). See the definition in Queue.cpp for why this driver needs one:
+// without it, WDF's documented default is to block D0Exit until every
+// outstanding request completes on its own, and CAPTURE_DATA(verify) is
+// deliberately left pending with no deadline (design doc §9.4) until a
+// touch or Windows' own CancelIoEx - neither of which a system sleep causes.
+EVT_WDF_IO_QUEUE_IO_STOP           T2BioEvtIoStop;
 EXTERN_C_END
 
 // Debug-only trace; visible in DebugView (Capture Global Win32) because

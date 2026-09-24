@@ -73,12 +73,18 @@ extern "C" NTSTATUS T2BioEvtDeviceAdd(_In_ WDFDRIVER Driver,
     WDF_IO_QUEUE_CONFIG queueConfig;
     WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&queueConfig, WdfIoQueueDispatchParallel);
     queueConfig.EvtIoDeviceControl = T2BioEvtIoDeviceControl;
+    // Required precisely because CAPTURE_DATA can be the long-pending
+    // request above: this power-managed queue's default (no EvtIoStop) is
+    // to block device D0Exit until that request completes on its own, which
+    // for CAPTURE_DATA(verify) means "until a touch or CancelIoEx" - a
+    // system sleep triggers neither. See T2BioEvtIoStop in Queue.cpp.
+    queueConfig.EvtIoStop = T2BioEvtIoStop;
 
     status = WdfIoQueueCreate(device, &queueConfig, WDF_NO_OBJECT_ATTRIBUTES, WDF_NO_HANDLE);
     if (!NT_SUCCESS(status)) {
         T2BioLog("WdfIoQueueCreate failed 0x%08x", status);
     } else {
-        T2BioLog("EvtDeviceAdd ok: biometric interface + parallel IOCTL queue created");
+        T2BioLog("EvtDeviceAdd ok: biometric interface + parallel IOCTL queue created, EvtIoStop wired");
     }
     return status;
 }

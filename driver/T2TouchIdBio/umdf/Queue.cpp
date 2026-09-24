@@ -967,3 +967,68 @@ extern "C" VOID T2BioEvtIoDeviceControl(_In_ WDFQUEUE Queue,
         return;
     }
 }
+
+// EVT_WDF_IO_QUEUE_IO_STOP. The framework calls this for every request the
+// driver has not yet completed when the device is about to leave D0 (system
+// sleep, selective suspend, connected-standby) or the queue is being purged
+// (device removal). Until this callback existed, this driver had none at
+// all, so WDF fell back to its documented default for a power-managed
+// queue: wait for every outstanding request to complete, be acknowledged,
+// or be requeued before letting the device leave D0.
+//
+// The one request ever left outstanding here is CAPTURE_DATA(verify)
+// (HandleCaptureVerify above): by design (§9.4) it blocks with NO deadline
+// until a touch or Windows' own CancelIoEx. A system sleep triggers
+// neither, so with no EvtIoStop, sleep entry wound up waiting on a
+// fingerprint touch that was never coming (hardware log: last CAPTURE_DATA
+// sits in StartMatch, then two "IPC detected that the message to host timed
+// out"). UMDF eventually kills the stalled WUDFHost.exe host process
+// (Event 10110, Problem=3, ExitCode=259); enough of those and Device
+// Manager gives up on the device for the rest of the boot (Event 10111,
+// RestartCount=5) -> Code 43, fingerprint unlock dead until reboot.
+//
+// The fix does not invent a new cancellation path: it reuses the one
+// Windows' own CancelIoEx already drives correctly and that is proven on
+// hardware (EvtCaptureCancel / GetCaptureCancelEvent() above) - just
+// triggered from a different origin (device leaving D0) instead of only
+// from WinBio cancelling the IOCTL. Setting the same manual-reset event
+// wakes the blocked VerificationEngine::Verify() wait (Connection.cpp,
+// bounded by kCancelPollSlice) almost immediately, exactly as it does for a
+// real CancelIoEx. This routine does NOT mark/unmark the request's
+// cancelable state or call WdfRequestComplete itself - HandleCaptureVerify's
+// own WdfRequestUnmarkCancelable / CompleteCaptureData path (above) still
+// owns and completes the request once its worker thread unwinds; there is
+// no lower I/O target to forward/cancel down to (the T2's SEP is reached
+// over a user-mode BridgeXPC/TCP session, not a WDM device stack), so
+// WdfRequestCancelSentRequest does not apply here.
+// WdfRequestStopAcknowledge(Request, FALSE) tells the framework "the driver
+// acknowledges the stop and will finish this request on its own" - that is
+// what unblocks D0Exit/removal immediately, without waiting for the
+// request's actual completion.
+extern "C" VOID T2BioEvtIoStop(_In_ WDFQUEUE Queue,
+                               _In_ WDFREQUEST Request,
+                               _In_ ULONG ActionFlags)
+{
+    UNREFERENCED_PARAMETER(Queue);
+
+    T2BioLog("EvtIoStop: ActionFlags=0x%08x cancelable=%d",
+             static_cast<unsigned>(ActionFlags),
+             (ActionFlags & WdfRequestStopRequestCancelable) ? 1 : 0);
+
+    if (ActionFlags & WdfRequestStopRequestCancelable) {
+        HANDLE cancelEvent = GetCaptureCancelEvent();
+        if (cancelEvent) {
+            SetEvent(cancelEvent); // same wakeup EvtCaptureCancel uses for a
+                                    // real CancelIoEx - see header comment
+        }
+    }
+    // If ActionFlags does NOT have WdfRequestStopRequestCancelable set, the
+    // request is between WdfRequestCreate/dispatch and HandleCaptureVerify's
+    // own WdfRequestMarkCancelable call (a narrow window) - nothing to wake
+    // yet, but the driver still owns and will complete it shortly on its
+    // own, so acknowledging now is still correct.
+
+    WdfRequestStopAcknowledge(Request, FALSE); // FALSE: do not requeue, the
+                                                // driver retains and
+                                                // completes this itself
+}
