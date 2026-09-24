@@ -299,6 +299,13 @@ constexpr ULONGLONG kMatchReplayTtlMs = 500;
 // Hello capture of this host process still needs a known-good sensor arm.
 std::atomic<bool> g_needPostResumeWarmup{true};
 
+// Sx boundary token. Bumped on every PBT_APMSUSPEND. A CAPTURE that began
+// before the bump and later returns Match is treated as Cancelled: the
+// match belonged to a pre-sleep session and must not unlock after resume
+// (hardware: touch before sleep → auto-unlock on wake). Checked under the
+// same release-path that would otherwise ArmMatchReplay / build a BIR.
+std::atomic<uint64_t> g_sxGeneration{0};
+
 void ArmMatchReplay(const std::optional<std::array<uint8_t, 16>>& uuid)
 {
     std::lock_guard<std::mutex> lock(g_recentMatch.mu);
@@ -406,6 +413,11 @@ ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_
     UNREFERENCED_PARAMETER(Context);
     UNREFERENCED_PARAMETER(Setting);
     if (Type == PBT_APMSUSPEND) {
+        // Bump first so any Match that is still in-flight (or finishes after
+        // this broadcast) sees a changed generation and is discarded before
+        // BIR / ArmMatchReplay. Cancel event + replay clear are the rest of
+        // the Sx boundary.
+        g_sxGeneration.fetch_add(1, std::memory_order_acq_rel);
         ClearMatchReplay();
         {
             std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
@@ -416,7 +428,8 @@ ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_
         if (cancelEvent) {
             SetEvent(cancelEvent);
         }
-        T2BioLog("OnSuspendResume: PBT_APMSUSPEND - CAPTURE cancel (no match across Sx)");
+        T2BioLog("OnSuspendResume: PBT_APMSUSPEND - CAPTURE cancel (no match across Sx, gen=%llu)",
+                 static_cast<unsigned long long>(g_sxGeneration.load(std::memory_order_relaxed)));
     } else if (Type == PBT_APMRESUMESUSPEND || Type == PBT_APMRESUMEAUTOMATIC) {
         g_needPostResumeWarmup.store(true, std::memory_order_relaxed);
         ClearMatchReplay();
@@ -985,6 +998,10 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
         T2BioLog("CAPTURE_DATA(verify): post-resume WarmUp armed (reset+calibration; "
                  "flag kept until non-cancel outcome)");
     }
+    // Snapshot Sx generation for this session. If suspend bumps it while we
+    // are still in Verify (or between Verify return and CompleteCaptureData),
+    // a Match is discarded — never delivered as a post-resume unlock.
+    const uint64_t sxGenAtStart = g_sxGeneration.load(std::memory_order_acquire);
     std::optional<std::array<uint8_t, 16>> matchedUuid;
     VerifyOutcome outcome = VerifyOutcome::TransportError;   // also what a failed connect completes as
 
@@ -1069,6 +1086,20 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
         return;
     }
 
+    // Sx boundary: Match that crossed suspend must not unlock on resume.
+    // Generation was snapped at session start; OnSuspendResume bumps it on
+    // every PBT_APMSUSPEND. Fail-closed: treat as Cancelled, no BIR, no replay.
+    if (outcome == VerifyOutcome::Match &&
+        g_sxGeneration.load(std::memory_order_acquire) != sxGenAtStart) {
+        T2BioLog("CAPTURE_DATA(verify): *** MATCH discarded - Sx boundary crossed "
+                 "(gen_start=%llu gen_now=%llu; no unlock from pre-sleep touch) ***",
+                 static_cast<unsigned long long>(sxGenAtStart),
+                 static_cast<unsigned long long>(
+                     g_sxGeneration.load(std::memory_order_relaxed)));
+        outcome = VerifyOutcome::Cancelled;
+        matchedUuid.reset();
+    }
+
     // Real terminal outcome (Match, NoMatch, bad capture, etc.): SEP path
     // was exercised; drop the forced WarmUp for steady-state latency.
     if (outcome != VerifyOutcome::Cancelled &&
@@ -1079,16 +1110,30 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
         T2BioLog("CAPTURE_DATA(verify): post-resume WarmUp retained after cancel/transport");
     }
 
-    const HRESULT hr = MapVerifyOutcomeToHresult(outcome);
+    // Post-resume CAPTURE is frequently CancelIoEx'd by WBF while WarmUp
+    // (ResetSensor + LoadCalibration) is still running — engine Deactivate /
+    // credential-UI lag after resume. Completing that as WINBIO_E_CANCELED
+    // paints the lock-screen error flash even though a later CAPTURE unlocks
+    // fine. Soft-map to BAD_CAPTURE + READY so the framework treats it as a
+    // non-fatal bad sample, not a hard cancel/error. Normal cancels
+    // (password fallback, Win+L) keep WINBIO_E_CANCELED.
+    HRESULT hr;
+    WINBIO_SENSOR_STATUS sensorStatus;
+    if (outcome == VerifyOutcome::Cancelled && postResumeWarmup) {
+        hr = WINBIO_E_BAD_CAPTURE;
+        sensorStatus = WINBIO_SENSOR_READY;
+        T2BioLog("CAPTURE_DATA(verify): post-resume cancel -> soft BAD_CAPTURE "
+                 "(no lock-screen error flash)");
+    } else {
+        hr = MapVerifyOutcomeToHresult(outcome);
+        sensorStatus =
+            (outcome == VerifyOutcome::TransportError || outcome == VerifyOutcome::RejectedByDevice ||
+             outcome == VerifyOutcome::UnstableIdentityInventory)
+                ? WINBIO_SENSOR_FAILURE
+                : (outcome == VerifyOutcome::Match ? WINBIO_SENSOR_ACCEPT : WINBIO_SENSOR_READY);
+    }
     T2BioLog("CAPTURE_DATA(verify): outcome=%d -> hresult=0x%08x", static_cast<int>(outcome),
              static_cast<unsigned>(hr));
-    // ACCEPT only for a delivered sample (a real Match); see the note in
-    // HandleCaptureEnroll. Failures stay FAILURE, everything else READY.
-    const WINBIO_SENSOR_STATUS sensorStatus =
-        (outcome == VerifyOutcome::TransportError || outcome == VerifyOutcome::RejectedByDevice ||
-         outcome == VerifyOutcome::UnstableIdentityInventory)
-            ? WINBIO_SENSOR_FAILURE
-            : (outcome == VerifyOutcome::Match ? WINBIO_SENSOR_ACCEPT : WINBIO_SENSOR_READY);
     // A sample goes to WBF only for a real Match; every other outcome completes
     // with its error HRESULT and no data (fail-closed: no BIR to misread).
     std::vector<uint8_t> bir;
