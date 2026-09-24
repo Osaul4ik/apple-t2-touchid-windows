@@ -112,12 +112,16 @@ T2NcmWaitForDrain(
 
         if (waitedMs >= maxWaitMs)
         {
+            const LONG timeouts =
+                InterlockedIncrement(&DeviceContext->DrainTimeoutCount);
             T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-                "T2Ncm: drain timed out after %lums (rxNbls=%ld txReqs=%ld) - "
-                "proceeding anyway; this is a reference leak, not a slow "
-                "device\n", maxWaitMs,
+                "T2Ncm: drain timed out after %lums (rxNbls=%ld txReqs=%ld, "
+                "lifetimeTimeouts=%ld) - proceeding anyway; this is a "
+                "reference leak, not a slow device\n",
+                maxWaitMs,
                 DeviceContext->OutstandingRxNbls,
-                DeviceContext->OutstandingTxRequests));
+                DeviceContext->OutstandingTxRequests,
+                timeouts));
             break;
         }
 

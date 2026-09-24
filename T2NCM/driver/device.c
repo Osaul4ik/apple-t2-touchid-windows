@@ -325,6 +325,7 @@ T2NcmDeviceFillStatus(
     Status->NdisAdapterReady = (DeviceContext->MiniportAdapterHandle != NULL);
     Status->OutstandingRxNbls     = (UINT32)DeviceContext->OutstandingRxNbls;
     Status->OutstandingTxRequests = (UINT32)DeviceContext->OutstandingTxRequests;
+    Status->DrainTimeoutCount    = (UINT32)DeviceContext->DrainTimeoutCount;
 
     // LONG64 counters read without a lock: RX/TX completions can only
     // ever increase them, so a torn/interleaved read is at worst a

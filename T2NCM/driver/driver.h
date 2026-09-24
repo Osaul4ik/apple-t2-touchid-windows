@@ -291,6 +291,9 @@ typedef struct _T2NCM_DEVICE_CONTEXT
     volatile LONG        OutstandingRxNbls;
     volatile LONG        OutstandingTxRequests;
     volatile LONG        PauseInProgress;
+    // Times T2NcmWaitForDrain hit the 5s bound with refs still outstanding.
+    // Diagnostic for sleep/resume ref leaks (pool free is skipped then).
+    volatile LONG        DrainTimeoutCount;
     KEVENT               QuiesceEvent;
 
     // Current D-state as told to us by OID_PNP_SET_POWER. NDIS owns

@@ -160,6 +160,12 @@ typedef struct _T2NCM_STATUS
     // us (Parsed high, Filtered high), or arriving and delivered
     // (Indicated high).
     UINT64  RxFramesFiltered;
+
+    // Times MiniportPause/Halt drain waited 5s and still had outstanding
+    // RX NBLs or TX requests. Non-zero after sleep/resume cycles points
+    // at a reference leak (pool free is then skipped to avoid bugcheck).
+    UINT32  DrainTimeoutCount;
+    UINT8   Reserved6[4];
 } T2NCM_STATUS, *PT2NCM_STATUS;
 #pragma pack(pop)
 
