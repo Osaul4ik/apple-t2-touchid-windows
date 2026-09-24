@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <vector>
 #include <cstddef>
+#include <thread>
 
 // ---------------------------------------------------------------------------
 // Type names below were checked against winbio_ioctl.h / winbio_types.h of
@@ -278,17 +279,18 @@ std::atomic<bool> g_captureBusy{false};
 // with a real SEP Match, arm a one-shot replay, answer #2 with the same
 // result (no connect / StartMatch / cancel-poll).
 //
-// After the pair, WBF often issues a *third* CAPTURE that would StartMatch
-// and sit in WaitForEvent (log: replay complete → CAPTURE begin → connect →
-// StartMatch). That held g_captureBusy so Win+L waited on CancelIoEx unwind
-// (~seconds), and a finger touch during that window matched while lock was
-// in progress (lock+unlock). suppressPostPairArm answers that third CAPTURE
-// immediately with READY / no sample so the sensor is not armed until the
-// next real need (lock screen, later unlock).
+// 24.09.2026: a one-shot "suppressPostPairArm" used to live here. It answered
+// the *third* CAPTURE with an immediate NO_MATCH so Win+L would not wait on
+// it - but the fourth CAPTURE (same request, one step later) sat pending in
+// StartMatch anyway and Win+L still waited for the next touch. The problem
+// was not the pending request but where it waited: the whole verify wait ran
+// inside the WDF callback (EvtIoDeviceControl), and the hardware log is
+// consistent with Windows' CancelIoEx not being serviced until that callback
+// returned (see StartCaptureWorker). With the wait on its own thread a pending
+// CAPTURE_DATA is harmless and nothing needs to be answered without a sample.
 struct RecentMatchCache {
     std::mutex mu;
     bool pendingReplay = false;
-    bool suppressPostPairArm = false; // one-shot: skip sensor after pair done
     std::optional<std::array<uint8_t, 16>> matchedUuid;
 };
 RecentMatchCache g_recentMatch;
@@ -298,27 +300,15 @@ void ArmMatchReplay(const std::optional<std::array<uint8_t, 16>>& uuid)
     std::lock_guard<std::mutex> lock(g_recentMatch.mu);
     g_recentMatch.matchedUuid = uuid;
     g_recentMatch.pendingReplay = true;
-    g_recentMatch.suppressPostPairArm = false;
 }
 
-// Returns true and fills *outUuid for the 2nd CAPTURE of the pair. Also arms
-// suppressPostPairArm so the following CAPTURE does not StartMatch.
+// Returns true and fills *outUuid for the 2nd CAPTURE of the pair.
 bool ConsumeMatchReplay(std::optional<std::array<uint8_t, 16>>* outUuid)
 {
     std::lock_guard<std::mutex> lock(g_recentMatch.mu);
     if (!g_recentMatch.pendingReplay) return false;
     *outUuid = g_recentMatch.matchedUuid;
     g_recentMatch.pendingReplay = false;
-    g_recentMatch.suppressPostPairArm = true;
-    return true;
-}
-
-// True once after a completed pair: caller should complete READY without SEP.
-bool ConsumePostPairArmSuppress()
-{
-    std::lock_guard<std::mutex> lock(g_recentMatch.mu);
-    if (!g_recentMatch.suppressPostPairArm) return false;
-    g_recentMatch.suppressPostPairArm = false;
     return true;
 }
 
@@ -326,7 +316,6 @@ void ClearMatchReplay()
 {
     std::lock_guard<std::mutex> lock(g_recentMatch.mu);
     g_recentMatch.pendingReplay = false;
-    g_recentMatch.suppressPostPairArm = false;
 }
 
 struct CaptureBusyGuard {
@@ -633,6 +622,60 @@ bool ConnectForCapture(t2::bridgexpc::Connection* outConn)
     return true;
 }
 
+// 24.09.2026: "the T2 is not reachable yet" is not an answer from the SEP and
+// not a sensor fault. After a cold boot the SEP is unlocked (CheckSepReady
+// passes) several seconds before the NCM link + BiometricKit BridgeXPC on the
+// T2 side answer (cold-boot hardware log: SEP ready, then BridgeXPC
+// discovery/connect failed after 6.9 s).
+// The lock-screen CAPTURE_DATA used to end right there with DEVICE_FAILURE /
+// SENSOR_FAILURE, WBF did not re-arm it, and the fingerprint stayed dead on
+// the lock screen until the next session (i.e. after a PIN unlock).
+//
+// A verify CAPTURE_DATA is supposed to stay pending until a touch or Windows'
+// own CancelIoEx (design doc 9.4), so an unreachable T2 is waited out the same
+// way: retry with backoff, cancel-aware, and only give up (-> the old
+// DEVICE_FAILURE) after kConnectRetryWindowMs so a T2 that is genuinely gone
+// (NCM driver failed, no adapter) does not scan forever.
+constexpr ULONGLONG kConnectRetryWindowMs = 120000;
+constexpr DWORD kConnectRetryFirstMs = 500;
+constexpr DWORD kConnectRetryMaxMs = 5000;
+
+enum class ConnectWait { Connected, Cancelled, GaveUp };
+
+ConnectWait ConnectForCaptureWithRetry(HANDLE cancelEvent, t2::bridgexpc::Connection* outConn)
+{
+    const ULONGLONG start = GetTickCount64();
+    DWORD backoffMs = kConnectRetryFirstMs;
+    for (unsigned attempt = 1;; ++attempt) {
+        if (ConnectForCapture(outConn)) {
+            if (attempt > 1) {
+                T2BioLog("CAPTURE_DATA: BridgeXPC reachable after %u attempts (%llu ms)",
+                         attempt, static_cast<unsigned long long>(GetTickCount64() - start));
+            }
+            return ConnectWait::Connected;
+        }
+        if (t2::bridgexpc::Connection::IsEventSignaled(cancelEvent)) {
+            return ConnectWait::Cancelled;
+        }
+        const ULONGLONG waited = GetTickCount64() - start;
+        if (waited >= kConnectRetryWindowMs) {
+            T2BioLog("CAPTURE_DATA: BridgeXPC still unreachable after %llu ms - giving up",
+                     static_cast<unsigned long long>(waited));
+            return ConnectWait::GaveUp;
+        }
+        T2BioLog("CAPTURE_DATA: BridgeXPC not reachable yet (attempt %u, %llu ms) - retrying in %lu ms",
+                 attempt, static_cast<unsigned long long>(waited), static_cast<unsigned long>(backoffMs));
+        if (cancelEvent) {
+            if (WaitForSingleObject(cancelEvent, backoffMs) == WAIT_OBJECT_0) {
+                return ConnectWait::Cancelled;
+            }
+        } else {
+            Sleep(backoffMs);
+        }
+        backoffMs = (backoffMs * 2 > kConnectRetryMaxMs) ? kConnectRetryMaxMs : backoffMs * 2;
+    }
+}
+
 // A/B switch for the BIR layout (see WbdiBir.h BirOptions). Read on every capture so a
 // registry edit takes effect without a rebuild. Missing value = shipped default (3).
 //   HKLM\SOFTWARE\T2TouchIdBio\BirVariant  (REG_DWORD)
@@ -734,15 +777,6 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
         }
     }
 
-    // Fast path: third CAPTURE right after the unlock pair. Do not StartMatch —
-    // that was holding the sensor and blocking Win+L (see struct comment).
-    if (ConsumePostPairArmSuppress()) {
-        T2BioLog("CAPTURE_DATA(verify): post-pair arm suppressed - READY, no sensor session "
-                 "(avoids holding capture across Win+L)");
-        CompleteCaptureData(Request, WINBIO_E_NO_MATCH, WINBIO_SENSOR_READY, 0, {});
-        return;
-    }
-
     // design doc §9.4: register this specific request as cancelable BEFORE
     // doing anything that can block (Connect included — a cancel arriving
     // during discovery/connect should still complete the IOCTL promptly,
@@ -774,8 +808,14 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
     constexpr int kMaxSessionAttempts = 3;
     for (int attempt = 1; attempt <= kMaxSessionAttempts; ++attempt) {
         t2::bridgexpc::Connection conn;
-        if (!ConnectForCapture(&conn)) {
-            outcome = VerifyOutcome::TransportError;   // completed as DEVICE_FAILURE below (or dropped if cancelled)
+        const ConnectWait cw = ConnectForCaptureWithRetry(cancelEvent, &conn);
+        if (cw == ConnectWait::Cancelled) {
+            T2BioLog("CAPTURE_DATA(verify): cancelled while waiting for BridgeXPC - not starting a session");
+            outcome = VerifyOutcome::Cancelled;
+            break;
+        }
+        if (cw == ConnectWait::GaveUp) {
+            outcome = VerifyOutcome::TransportError;   // completed as DEVICE_FAILURE below
             break;
         }
         if (t2::bridgexpc::Connection::IsEventSignaled(cancelEvent)) {
@@ -858,6 +898,93 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
     CompleteCaptureData(Request, hr, sensorStatus, 0, bir);
 }
 
+// Everything CAPTURE_DATA does once the size probe and the SEP-ready gate have
+// passed: claim the single capture slot, then verify / enroll. Runs on a
+// worker thread (StartCaptureWorker), never inside the WDF callback.
+void ProcessCapture(_In_ WDFREQUEST Request, const CaptureKey& key)
+{
+    CaptureBusyGuard guard;
+    if (!guard.acquired) {
+        switch (WaitForCancelledPredecessor(Request, guard)) {
+        case SlotWait::Acquired:
+            break;                     // predecessor finished unwinding: carry on normally
+        case SlotWait::RequestCancelled:
+            return;                    // Request was already completed by EvtCaptureCancel
+        case SlotWait::StillBusy:
+            break;                     // fall through to the BUSY answer below
+        }
+    }
+    if (!guard.acquired) {
+        T2BioLog("CAPTURE_DATA: another capture is already in flight -> DATA_COLLECTION_IN_PROGRESS");
+        // Mirrors VerificationEngine::IsBusy()'s existing rule, at the WBDI
+        // layer this time (design doc 6): a second CAPTURE_DATA arriving
+        // while one is already in flight is a normal WBDI occurrence, not
+        // an error to log loudly about.
+        CompleteCaptureData(Request, WINBIO_E_DATA_COLLECTION_IN_PROGRESS, WINBIO_SENSOR_BUSY, 0, {});
+        return;
+    }
+
+    switch (key.Purpose) {
+    case WINBIO_PURPOSE_VERIFY:
+    case WINBIO_PURPOSE_IDENTIFY:
+        // WBF's own flows use IDENTIFY (Windows Hello sign-in, and the check
+        // Settings runs before an enrollment), not only VERIFY. For this
+        // sensor both are the same 1:1 SEP verification for macosUserId; the
+        // engine adapter turns the match into an identity from the enrolled
+        // records, so IDENTIFY does not mean the SEP searches other users.
+        HandleCaptureVerify(Request, key);
+        return;
+    case WINBIO_PURPOSE_ENROLL:
+    case WINBIO_PURPOSE_ENROLL_FOR_VERIFICATION:
+    case WINBIO_PURPOSE_ENROLL_FOR_IDENTIFICATION:
+        HandleCaptureEnroll(Request, key);
+        return;
+    default:
+        // AUDIT / NO_PURPOSE_AVAILABLE: a request for anything else is a
+        // WBF/engine config mismatch, not something to guess an answer for.
+        T2BioLog("CAPTURE_DATA: unsupported purpose 0x%02x -> E_NOTIMPL", static_cast<unsigned>(key.Purpose));
+        CompleteCaptureData(Request, E_NOTIMPL, WINBIO_SENSOR_FAILURE, 0, {});
+        return;
+    }
+}
+
+// 24.09.2026: CAPTURE_DATA(verify) must not wait inside EvtIoDeviceControl.
+// By design it stays pending with no deadline (design doc 9.4) - and while it
+// did so on the framework's callback thread, Windows' CancelIoEx (Win+L,
+// switching to the lock screen, password fallback) apparently could not be
+// serviced: hardware log, 24.09.2026 - the fourth CAPTURE sat in StartMatch,
+// Win+L did nothing, no EvtCaptureCancel was logged, and the cancel only
+// surfaced after the next touch had produced a Match ("genuine MATCH
+// discarded" then "EvtCaptureCancel fired" 9 ms apart). Most consistent
+// reading: Windows waited for the cancel to complete, the cancel waited for
+// the callback to return, and the callback waited for a finger. (Not proven
+// at the UMDF level - verify on hardware: EvtCaptureCancel should now be
+// logged at the moment of Win+L, not after the next touch.)
+//
+// The request is therefore handed to a worker thread and the callback returns
+// at once. Completion arbitration is unchanged (EvtCaptureCancel completes
+// with STATUS_CANCELLED, the worker's WdfRequestUnmarkCancelable finds out),
+// only the thread it happens on differs. The worker marks the request
+// cancelable itself, after ResetEvent(cancelEvent) - a cancel that arrived
+// before that makes WdfRequestMarkCancelable invoke EvtCaptureCancel
+// immediately, which sets the freshly reset event, so it is not lost.
+std::atomic<int> g_captureWorkers{0};
+
+void StartCaptureWorker(_In_ WDFREQUEST Request, const CaptureKey& key)
+{
+    g_captureWorkers.fetch_add(1);
+    try {
+        std::thread([Request, key]() {
+            ProcessCapture(Request, key);
+            g_captureWorkers.fetch_sub(1);
+        }).detach();
+    } catch (...) {
+        g_captureWorkers.fetch_sub(1);
+        T2BioLog("CAPTURE_DATA: could not start the capture worker -> DEVICE_FAILURE");
+        CompleteCaptureData(Request, WINBIO_E_DEVICE_FAILURE, WINBIO_SENSOR_FAILURE, 0, {});
+    }
+}
+
 void HandleCaptureData(_In_ WDFREQUEST Request)
 {
     PWINBIO_CAPTURE_PARAMETERS in = nullptr;
@@ -920,49 +1047,9 @@ void HandleCaptureData(_In_ WDFREQUEST Request)
         }
     }
 
-    CaptureBusyGuard guard;
-    if (!guard.acquired) {
-        switch (WaitForCancelledPredecessor(Request, guard)) {
-        case SlotWait::Acquired:
-            break;                     // predecessor finished unwinding: carry on normally
-        case SlotWait::RequestCancelled:
-            return;                    // Request was already completed by EvtCaptureCancel
-        case SlotWait::StillBusy:
-            break;                     // fall through to the BUSY answer below
-        }
-    }
-    if (!guard.acquired) {
-        T2BioLog("CAPTURE_DATA: another capture is already in flight -> DATA_COLLECTION_IN_PROGRESS");
-        // Mirrors VerificationEngine::IsBusy()'s existing rule, at the WBDI
-        // layer this time (design doc 6): a second CAPTURE_DATA arriving
-        // while one is already in flight is a normal WBDI occurrence, not
-        // an error to log loudly about.
-        CompleteCaptureData(Request, WINBIO_E_DATA_COLLECTION_IN_PROGRESS, WINBIO_SENSOR_BUSY, 0, {});
-        return;
-    }
-
-    switch (in->Purpose) {
-    case WINBIO_PURPOSE_VERIFY:
-    case WINBIO_PURPOSE_IDENTIFY:
-        // WBF's own flows use IDENTIFY (Windows Hello sign-in, and the check
-        // Settings runs before an enrollment), not only VERIFY. For this
-        // sensor both are the same 1:1 SEP verification for macosUserId; the
-        // engine adapter turns the match into an identity from the enrolled
-        // records, so IDENTIFY does not mean the SEP searches other users.
-        HandleCaptureVerify(Request, key);
-        return;
-    case WINBIO_PURPOSE_ENROLL:
-    case WINBIO_PURPOSE_ENROLL_FOR_VERIFICATION:
-    case WINBIO_PURPOSE_ENROLL_FOR_IDENTIFICATION:
-        HandleCaptureEnroll(Request, key);
-        return;
-    default:
-        // AUDIT / NO_PURPOSE_AVAILABLE: a request for anything else is a
-        // WBF/engine config mismatch, not something to guess an answer for.
-        T2BioLog("CAPTURE_DATA: unsupported purpose 0x%02x -> E_NOTIMPL", static_cast<unsigned>(in->Purpose));
-        CompleteCaptureData(Request, E_NOTIMPL, WINBIO_SENSOR_FAILURE, 0, {});
-        return;
-    }
+    // Hand the request to a worker and return: the wait for a touch must not
+    // occupy the WDF callback thread (see StartCaptureWorker).
+    StartCaptureWorker(Request, key);
 }
 
 } // namespace
@@ -1106,6 +1193,26 @@ extern "C" VOID T2BioRegisterSuspendResumeNotification(VOID)
         g_suspendResumeNotify = nullptr;
     } else {
         T2BioLog("PowerRegisterSuspendResumeNotification ok");
+    }
+}
+
+// Called from EvtDriverUnload (Driver.cpp) before the suspend/resume hook is
+// dropped: capture workers are detached threads running code from this DLL, so
+// wake any that is still waiting for a touch (same wakeup as EvtCaptureCancel)
+// and give them a bounded moment to unwind before the host may unload us.
+extern "C" VOID T2BioDrainCaptureWorkers(VOID)
+{
+    if (g_captureWorkers.load() == 0) {
+        return;
+    }
+    T2BioLog("EvtDriverUnload: waiting for %d capture worker(s) to unwind", g_captureWorkers.load());
+    HANDLE cancelEvent = GetCaptureCancelEvent();
+    if (cancelEvent) {
+        SetEvent(cancelEvent);
+    }
+    const ULONGLONG start = GetTickCount64();
+    while (g_captureWorkers.load() != 0 && GetTickCount64() - start < 3000) {
+        Sleep(10);
     }
 }
 

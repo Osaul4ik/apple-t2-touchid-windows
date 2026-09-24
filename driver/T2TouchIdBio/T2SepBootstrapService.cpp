@@ -20,32 +20,18 @@
 // idempotency guard that makes a restart harmless rather than relying on
 // SCM configuration alone.
 
-// winsock2.h must be the very first Windows header this translation unit
-// pulls in, same reason as driver/T2TouchIdBio/umdf/Internal.h and
-// tools/t2touchid/main.cpp: protocol/Discovery and protocol/BridgeXpc
-// headers (pulled in below for the post-unlock warm-up step) include
-// winsock2.h/ws2tcpip.h themselves, and if <windows.h> is seen first,
-// winsock.h wins the header-guard race and the later winsock2.h include
-// becomes a redefinition-error mess. WIN32_LEAN_AND_MEAN keeps <windows.h>
-// from re-pulling winsock.h on its own.
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
-#include <winsock2.h>
-#include <ws2tcpip.h>
-
 #include <windows.h>
 #include <wincrypt.h>
 #include <string>
 #include <vector>
 #include <fstream>
 #include <ctime>
-#include <thread>
 
 #include "SepVaultFormat.h"
 #include "../../protocol/AppleKeyStore/Client.h"
-#include "../../protocol/Discovery/BridgeDiscovery.h"
-#include "../../protocol/BiometricKit/VerificationEngine.h"
 
 #pragma comment(lib, "crypt32.lib")
 
@@ -126,73 +112,6 @@ void ReportStatus(t2::applekeystore::Client& client, T2_SEP_BOOTSTRAP_REASON rea
     if (client.SetBootstrapStatus(reason, step, sepStatus) != AksResult::Ok) {
         Log(L"bootstrap: SetBootstrapStatus IOCTL failed (status not reported to driver)");
     }
-}
-
-// Runs the exact same discovery+connect+WarmUp() sequence as the CLI's
-// `warmup` command (main.cpp CmdWarmup/DiscoverBiometricKitBridge), minus
-// argv parsing, once right after the SEP unlocks. Purpose: prime
-// protocol/Discovery's port cache (SaveCachedPort, see PortCache.h) BEFORE
-// Windows' first real IOCTL_BIOMETRIC_CAPTURE_DATA arrives.
-//
-// Why this matters: ConnectForCapture()'s own comment in
-// driver/T2TouchIdBio/umdf/Queue.cpp records a real hardware trace where an
-// uncached first capture cost ~3.8s of full port-scan latency, during which
-// "the sensor is not armed and a touch is silently lost." A cache hit
-// (TryCachedBridgePort) skips that scan entirely. Warming the cache here
-// moves that cost from "in the middle of the user's first login attempt"
-// to "in the background, overlapped with the rest of Windows' own boot/
-// logon sequence" — by the time WinBio/Windows Hello gets around to asking
-// for a fingerprint, the port is (usually) already known.
-//
-// Runs on a detached background thread (see call site) so a slow or failed
-// discovery (T2 NCM adapter not enumerated yet, no neighbor entry yet -
-// see PickDefaultT2Endpoint -> FindNeighborPeer's own built-in ff02::1
-// retry) never delays ServiceMain reaching SERVICE_RUNNING. A failure here
-// is not fatal to anything: it just means the first real capture pays the
-// full discovery cost it always used to pay, same as before this existed.
-void WarmUpBiometricKitBridge() {
-    using namespace t2::discovery;
-    using namespace t2::bridgexpc;
-    using namespace t2::biometrickit;
-
-    const ULONGLONG t0 = GetTickCount64();
-
-    NcmEndpoint ep;
-    if (!PickDefaultT2Endpoint(&ep)) {
-        Log(L"warmup: no T2 NCM adapter found yet - skipping "
-            L"(first real capture will pay full discovery cost)");
-        return;
-    }
-
-    Connection bridge;
-    if (!ConnectToBiometricKitBridge(ep, &bridge)) {
-        wchar_t buf[96];
-        swprintf_s(buf, L"warmup: BiometricKit BridgeXPC discovery/connect failed (%llu ms)",
-                   static_cast<unsigned long long>(GetTickCount64() - t0));
-        Log(buf);
-        return;
-    }
-
-    // Same default as Queue.cpp's kDefaultMacosUserId (multi-account SEP is
-    // a known unhandled gap there too - see its own comment). Warm-up's
-    // only observable side effect on the SEP side is the identity-list
-    // read; it does not start a match and does not require this UID to
-    // already have an enrolled identity to be worth caching the port for.
-    VerifyConfig cfg;
-    VerificationEngine engine(cfg);
-    std::vector<IdentityRecordV1> identities;
-    if (!engine.WarmUp(&bridge, &identities)) {
-        wchar_t buf[96];
-        swprintf_s(buf, L"warmup: WarmUp() failed (%llu ms)",
-                   static_cast<unsigned long long>(GetTickCount64() - t0));
-        Log(buf);
-        return;
-    }
-
-    wchar_t buf[128];
-    swprintf_s(buf, L"warmup: OK in %llu ms, port cached, identities=%zu",
-               static_cast<unsigned long long>(GetTickCount64() - t0), identities.size());
-    Log(buf);
 }
 
 // RAII zeroing wrapper. Every buffer that ever holds decrypted keybag bytes
@@ -443,17 +362,7 @@ VOID WINAPI ServiceMain(DWORD, LPWSTR*) {
         // would only cost an IOCTL round-trip for no new information.
         Log(L"bootstrap: Global\\T2SepReady already signaled this session — skipping (SEP already unlocked)");
     } else {
-        bool ok = RunBootstrapSequence(readyEvent);
-        if (ok) {
-            // Fire-and-forget, detached: see WarmUpBiometricKitBridge's own
-            // header comment for why this must not block ServiceMain from
-            // reaching SERVICE_RUNNING below. Started the instant the SEP
-            // is unlocked - the earliest point warm-up can possibly begin -
-            // specifically so it has the most possible head start against
-            // Windows' own boot/logon sequence before a real capture
-            // request can arrive. "мінімум очікування."
-            std::thread(WarmUpBiometricKitBridge).detach();
-        }
+        RunBootstrapSequence(readyEvent);
         // Deliberately does not retry or loop on failure here (file header
         // comment) — a failed bootstrap leaves the event unsignaled, WinBio
         // sees the sensor as not ready, and the design doc's own fallback
