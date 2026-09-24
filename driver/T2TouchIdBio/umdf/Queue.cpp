@@ -297,7 +297,15 @@ constexpr ULONGLONG kMatchReplayTtlMs = 500;
 // otherwise true for steady-state latency — see VerificationEngine.h).
 // Starts true: WUDFHost may load long after bridgeOS is "warm", but the first
 // Hello capture of this host process still needs a known-good sensor arm.
+// Armed ONLY on PBT_APMRESUME* (and cold start) — never on suspend.
 std::atomic<bool> g_needPostResumeWarmup{true};
+
+// True from PBT_APMSUSPEND until PBT_APMRESUME*. While set, HandleCaptureVerify
+// must not touch the SEP (no Connect / WarmUp / StartMatch): WBF often
+// re-issues CAPTURE_DATA during the sleep transition after we cancel the
+// pre-sleep session; answering that IOCTL with a real verify session is what
+// looked like "sensor starts reading on suspend" after e01a27f/OnSuspendResume.
+std::atomic<bool> g_suspended{false};
 
 // Sx boundary token. Bumped on every PBT_APMSUSPEND. A CAPTURE that began
 // before the bump and later returns Match is treated as Cancelled: the
@@ -413,24 +421,25 @@ ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_
     UNREFERENCED_PARAMETER(Context);
     UNREFERENCED_PARAMETER(Setting);
     if (Type == PBT_APMSUSPEND) {
-        // Bump first so any Match that is still in-flight (or finishes after
-        // this broadcast) sees a changed generation and is discarded before
-        // BIR / ArmMatchReplay. Cancel event + replay clear are the rest of
-        // the Sx boundary.
+        // 1) Gate: no new SEP work until resume (WBF re-CAPTURE in transition).
+        // 2) gen++: in-flight Match completing after this is discarded.
+        // 3) cancel + clear replay: pre-sleep CAPTURE/pair cannot unlock.
+        // WarmUp is NOT armed here — only on resume.
+        g_suspended.store(true, std::memory_order_release);
         g_sxGeneration.fetch_add(1, std::memory_order_acq_rel);
         ClearMatchReplay();
         {
             std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
             g_stickyNcm.valid = false;
         }
-        g_needPostResumeWarmup.store(true, std::memory_order_relaxed);
         HANDLE cancelEvent = GetCaptureCancelEvent();
         if (cancelEvent) {
             SetEvent(cancelEvent);
         }
-        T2BioLog("OnSuspendResume: PBT_APMSUSPEND - CAPTURE cancel (no match across Sx, gen=%llu)",
+        T2BioLog("OnSuspendResume: PBT_APMSUSPEND - suspended=1, CAPTURE cancel (gen=%llu)",
                  static_cast<unsigned long long>(g_sxGeneration.load(std::memory_order_relaxed)));
     } else if (Type == PBT_APMRESUMESUSPEND || Type == PBT_APMRESUMEAUTOMATIC) {
+        g_suspended.store(false, std::memory_order_release);
         g_needPostResumeWarmup.store(true, std::memory_order_relaxed);
         ClearMatchReplay();
         {
@@ -442,7 +451,7 @@ ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_
             ResetEvent(cancelEvent);
         }
         g_captureBusy.store(false, std::memory_order_relaxed);
-        T2BioLog("OnSuspendResume: resume - WarmUp armed, cancel cleared, captureBusy released");
+        T2BioLog("OnSuspendResume: resume - suspended=0, WarmUp armed, cancel cleared, captureBusy released");
     }
     return 0;
 }
@@ -949,7 +958,8 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
 
     // Fast path: second CAPTURE of the WBF pair. Real Match already armed a
     // one-shot replay — return the same result, no sensor session.
-    {
+    // Skip while suspended (replay was cleared on Sx; refuse if a race left it).
+    if (!g_suspended.load(std::memory_order_acquire)) {
         std::optional<std::array<uint8_t, 16>> replayUuid;
         if (ConsumeMatchReplay(&replayUuid)) {
             T2BioLog("CAPTURE_DATA(verify): replaying Match (WBF 2nd CAPTURE of pair) - no sensor session");
@@ -961,6 +971,15 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
             CompleteCaptureData(Request, S_OK, WINBIO_SENSOR_ACCEPT, 0, bir);
             return;
         }
+    }
+
+    // Sleep transition / Sx: WBF re-issues CAPTURE after our suspend cancel.
+    // Answer without touching BridgeXPC/SEP — no WarmUp, no StartMatch, no
+    // error HRESULT (avoids lock-screen flash and "sensor reads on suspend").
+    if (g_suspended.load(std::memory_order_acquire)) {
+        T2BioLog("CAPTURE_DATA(verify): suspended - silent READY (no SEP session)");
+        CompleteCaptureData(Request, S_OK, WINBIO_SENSOR_READY, 0, {});
+        return;
     }
 
     // design doc §9.4: register this specific request as cancelable BEFORE
