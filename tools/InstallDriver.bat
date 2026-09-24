@@ -210,6 +210,25 @@ if errorlevel 1 (
     exit /b 1
 )
 
+
+rem ============================================================
+rem Refresh devices
+rem ============================================================
+
+echo Refreshing device list...
+pnputil /scan-devices
+echo [OK] 
+
+
+rem ============================================================
+rem Restart WbioSrvc
+rem ============================================================
+
+net stop WbioSrvc
+net start WbioSrvc
+echo [OK] 
+
+
 echo.
 echo ============================================================
 echo              INSTALLATION COMPLETE
