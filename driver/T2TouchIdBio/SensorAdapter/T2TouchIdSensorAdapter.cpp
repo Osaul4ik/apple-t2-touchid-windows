@@ -586,21 +586,22 @@ HRESULT WINAPI SensorNotifyPowerChange(
     if (!ctx) {
         return E_POINTER;
     }
-    if (PowerEventType == PBT_APMSUSPEND ||
-        PowerEventType == PBT_APMRESUMEAUTOMATIC ||
-        PowerEventType == PBT_APMRESUMESUSPEND ||
-        PowerEventType == PBT_APMRESUMECRITICAL) {
+    // Suspend: cancel any in-flight CAPTURE (security + clean Sx boundary).
+    // Resume: only drop local adapter state. Do NOT IOCTL_BIOMETRIC_RESET —
+    // WBF often StartCapture's before/during this callback; RESET aborts that
+    // new CAPTURE (WINBIO_E_CANCELED → lock-screen error flash) even though a
+    // later StartCapture then unlocks successfully (hardware log 25.09.2026).
+    // UMDF Queue already arms post-resume WarmUp on its own suspend notify.
+    if (PowerEventType == PBT_APMSUSPEND) {
         CancelAndWaitCapture(Pipeline, ctx);
-        if ((PowerEventType == PBT_APMRESUMEAUTOMATIC ||
-             PowerEventType == PBT_APMRESUMESUSPEND ||
-             PowerEventType == PBT_APMRESUMECRITICAL) &&
-            Pipeline->SensorHandle &&
-            Pipeline->SensorHandle != INVALID_HANDLE_VALUE) {
-            WINBIO_BLANK_PAYLOAD blank = {};
-            DWORD bytes = 0;
-            DeviceIoControl(Pipeline->SensorHandle, IOCTL_BIOMETRIC_RESET, nullptr, 0,
-                            &blank, sizeof(blank), &bytes, nullptr);
+    } else if (PowerEventType == PBT_APMRESUMEAUTOMATIC ||
+               PowerEventType == PBT_APMRESUMESUSPEND ||
+               PowerEventType == PBT_APMRESUMECRITICAL) {
+        EnterCriticalSection(&ctx->Lock);
+        if (!ctx->CaptureInProgress) {
+            FreeCaptureBuffer_Locked(ctx);
         }
+        LeaveCriticalSection(&ctx->Lock);
     }
     return S_OK;
 }
