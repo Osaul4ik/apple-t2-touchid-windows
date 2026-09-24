@@ -396,20 +396,20 @@ HANDLE GetCaptureCancelEvent()
 // (a touch/match belonging to the pre-sleep session gets treated as a valid
 // sign-in the instant the system resumes).
 //
-// Since this device's own D0 state is not a reliable signal, the fix hooks
-// the OS-level, per-process suspend notification instead of the per-device
-// one: PowerRegisterSuspendResumeNotification (Powrprof.dll) delivers
-// PBT_APMSUSPEND to every registered process shortly before the machine
-// actually suspends, regardless of any individual device's power state -
-// WUDFHost.exe hosting this driver is an ordinary Win32 service process, so
-// it qualifies. On PBT_APMSUSPEND this reuses the exact same wakeup
-// EvtCaptureCancel/T2BioEvtIoStop already use: set the shared cancelEvent so
-// the blocked VerificationEngine::Verify() wait notices within
-// kCancelPollSlice and unwinds through HandleCaptureVerify's own normal
-// completion path (Cancelled outcome) *before* the process is frozen for
-// the sleep - so no CAPTURE_DATA is ever left straddling a suspend/resume
-// boundary, and the next touch after resume starts a brand-new capture the
-// way WBF expects.
+// PowerRegisterSuspendResumeNotification is still registered so we can do
+// *hygiene* on Sx (sticky NCM, match-replay, post-resume WarmUp). We do NOT
+// complete pending CAPTURE_DATA here anymore (option 2, 24.09.2026):
+//
+// Early SetEvent(cancel) on PBT_APMSUSPEND forced WINBIO_E_CANCELED into
+// LogonUI's identify session. After resume WBF often left the unit without a
+// new CAPTURE until Deactivate/Activate (PIN path). Official WBDI power path
+// is CancelIoEx + IOCTL_BIOMETRIC_RESET from the in-box sensor adapter /
+// framework — not a process-wide preempt cancel from the UMDF host.
+//
+// Pending CAPTURE may straddle sleep (process frozen mid-waitForEvent). On
+// thaw the same request is still owned by LogonUI; a finger touch can finish
+// it. If WBF cancels around Sx, EvtCaptureCancel / RESET / EvtIoStop still
+// signal cancelEvent as before.
 HPOWERNOTIFY g_suspendResumeNotify = nullptr;
 
 ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_ PVOID Setting)
@@ -417,31 +417,22 @@ ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_
     UNREFERENCED_PARAMETER(Context);
     UNREFERENCED_PARAMETER(Setting);
     if (Type == PBT_APMSUSPEND) {
-        T2BioLog("OnSuspendResume: PBT_APMSUSPEND - waking any pending CAPTURE_DATA "
-                 "before the process is frozen for sleep");
+        // Hygiene only — do not cancel CAPTURE. WBF owns cancel via
+        // CancelIoEx / IOCTL_BIOMETRIC_RESET; EvtIoStop remains as WDF path.
         ClearMatchReplay(); // never replay a pre-sleep Match after resume
         {
             // NCM/ifIndex may change across Sx; force rediscovery on resume.
             std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
             g_stickyNcm.valid = false;
         }
-        HANDLE cancelEvent = GetCaptureCancelEvent();
-        if (cancelEvent) {
-            SetEvent(cancelEvent); // same wakeup EvtCaptureCancel/T2BioEvtIoStop
-                                    // use - see header comment above
-        }
+        g_needPostResumeWarmup.store(true, std::memory_order_relaxed);
+        T2BioLog("OnSuspendResume: PBT_APMSUSPEND - hygiene only (no CAPTURE cancel; "
+                 "WBF CancelIoEx/RESET owns power cancel)");
     } else if (Type == PBT_APMRESUMESUSPEND || Type == PBT_APMRESUMEAUTOMATIC) {
-        // Resume hygiene (no service restarts — WBF owns Activate/CAPTURE):
-        // 1) Force WarmUp on the next real verify (SEP cancel residue after Sx).
-        // 2) Drop sticky NCM / match-replay (adapter and session are new).
-        // 3) Reset the process-wide cancel event — leave it signaled and the
-        //    first post-resume CAPTURE can observe a stale cancel before its
-        //    own ResetEvent runs (worker scheduling).
-        // 4) Clear g_captureBusy — if the cancel worker was frozen mid-unwind
-        //    across Sx, busy stays true forever and WBF only sees
-        //    DATA_COLLECTION_IN_PROGRESS (or stops arming). Hardware log
-        //    24.09.2026: ~14s with zero CAPTURE after resume until a full
-        //    Deactivate/Activate cycle (PIN path).
+        // Resume hygiene: WarmUp for SEP residue if a *new* CAPTURE starts;
+        // clear sticky/replay; ensure cancel is not left signaled from a
+        // framework cancel that raced resume; release stuck captureBusy if
+        // a cancel worker was frozen mid-unwind (edge case).
         g_needPostResumeWarmup.store(true, std::memory_order_relaxed);
         ClearMatchReplay();
         {
@@ -1325,8 +1316,10 @@ extern "C" VOID T2BioEvtIoDeviceControl(_In_ WDFQUEUE Queue,
         return;
 
     case IOCTL_BIOMETRIC_RESET: {
-        // WBF may RESET after power transitions. Drop all session-local
-        // state so the next CAPTURE is a clean arm (same hygiene as resume).
+        // Official WBDI power / idle path (MSDN IOCTL_BIOMETRIC_RESET):
+        // cancel any pending CAPTURE_DATA, then return the sensor to a
+        // known idle state. In-box sensor adapter / WBF issue this around
+        // Sx; we must wake Verify() the same way EvtCaptureCancel does.
         ClearMatchReplay();
         {
             std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
@@ -1334,11 +1327,10 @@ extern "C" VOID T2BioEvtIoDeviceControl(_In_ WDFQUEUE Queue,
         }
         HANDLE cancelEvent = GetCaptureCancelEvent();
         if (cancelEvent) {
-            ResetEvent(cancelEvent);
+            SetEvent(cancelEvent); // wake pending CAPTURE; worker completes CANCELED
         }
-        g_captureBusy.store(false, std::memory_order_relaxed);
         g_needPostResumeWarmup.store(true, std::memory_order_relaxed);
-        T2BioLog("  RESET -> session cleared, WarmUp armed, STATUS_SUCCESS");
+        T2BioLog("  RESET -> cancel signaled, session cleared, WarmUp armed, STATUS_SUCCESS");
         WdfRequestComplete(Request, STATUS_SUCCESS);
         return;
     }
