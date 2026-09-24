@@ -4,6 +4,7 @@
 // (same select()-based non-blocking-connect pattern, same IPV6_UNICAST_IF
 // scoping) rather than inventing a second style for the same problem.
 #include "RemoteXpc.h"
+#include "../BridgeXpc/Winsock.h"
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <cstring>
@@ -521,6 +522,7 @@ bool RemoteXpcConnection::ReadDataFrame(uint32_t wantStreamId, std::vector<uint8
 
 RemoteXpcResult RemoteXpcConnection::Connect(const NcmEndpoint& endpoint, uint16_t port,
                                               std::chrono::milliseconds connectTimeout) {
+    if (!t2::EnsureWinsock()) return RemoteXpcResult::ConnectFailed;
     socket_ = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
     if (socket_ == INVALID_SOCKET) return RemoteXpcResult::ConnectFailed;
 

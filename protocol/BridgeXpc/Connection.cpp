@@ -2,6 +2,7 @@
 // Connection.cpp
 #include "Connection.h"
 #include "Log.h"
+#include "Winsock.h"
 #include <ws2tcpip.h>
 #include <rpc.h>
 #include <cctype>
@@ -113,6 +114,10 @@ static std::vector<uint8_t> BuildClientHeloBody(int64_t bridgeXpcVersion) {
 ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned long interfaceIndex,
                                    uint16_t port, std::chrono::milliseconds connectTimeout) {
     connectionLost_ = false;
+    if (!t2::EnsureWinsock()) {
+        T2_LOG("connect", L"WSAStartup failed");
+        return ConnectResult::ConnectFailed;
+    }
     socket_ = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
     if (socket_ == INVALID_SOCKET) {
         T2_LOG("connect", L"socket() failed, WSAGetLastError=%d", WSAGetLastError());

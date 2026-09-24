@@ -4,6 +4,7 @@
 //
 // Connect, then recv only (peer SETTINGS first). No client preface.
 #include "PortScan.h"
+#include "../BridgeXpc/Winsock.h"
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <vector>
@@ -17,16 +18,6 @@
 
 namespace t2::discovery {
 namespace {
-
-bool EnsureWinsock() {
-    static std::once_flag once;
-    static bool ok = false;
-    std::call_once(once, [] {
-        WSADATA wsa{};
-        ok = (WSAStartup(MAKEWORD(2, 2), &wsa) == 0);
-    });
-    return ok;
-}
 
 struct ProbeResult {
     bool connected = false;
