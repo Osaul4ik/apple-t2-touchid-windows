@@ -971,14 +971,22 @@ static int CmdVerify(int argc, wchar_t* argv[]) {
             // Linux: --match-processed-flags (default 0; "use 1 for an unlock match")
             cfg.matchFlags = static_cast<uint32_t>(_wtoi(argv[++i]));
         } else if (a == L"--no-reset-sensor") {
-            // macOS live unlock never issues cmd 2 on the match connection
+            // Redundant with the current default (VerifyConfig::
+            // skipResetSensor = true, 24.09.2026) — kept as an explicit,
+            // self-documenting no-op for scripts/muscle memory.
             cfg.skipResetSensor = true;
         } else if (a == L"--no-load-calibration") {
-            // macOS live unlock never issues cmd 0x20; bridgeOS calibrates at boot
+            // Same: redundant with the current default. bridgeOS
+            // calibrates at its own boot; cmd 0x20 is not required per
+            // verify attempt (real-hardware A/B, 24.09.2026).
             cfg.skipLoadCalibration = true;
         } else if (a == L"--reset-sensor") {
-            cfg.skipResetSensor = false; // explicit opt-in (default already does it)
+            // Explicit opt-OUT of the current default — forces ResetSensor
+            // back on, e.g. for an A/B against Linux's always-resend warm_up.
+            cfg.skipResetSensor = false;
         } else if (a == L"--load-calibration") {
+            // Explicit opt-OUT of the current default — forces LoadCalibration
+            // back on, same reason as --reset-sensor above.
             cfg.skipLoadCalibration = false;
         }
     }

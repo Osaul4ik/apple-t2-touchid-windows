@@ -318,10 +318,11 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     // (VERIFIED FROM SOURCE: biometric_command(sock, 4, data=match_data) is
     // the very next call after the identity/stability gate, no Cancel, no
     // wait, nothing else between). config_.skipResetSensor/
-    // skipLoadCalibration also now default to false for the same reason:
-    // Linux's warm_up always sends both; skipping them was a macOS-capture-
-    // only assumption with the same lack of confirmation as the sequence
-    // just removed.
+    // skipLoadCalibration briefly defaulted to false for the same reason
+    // (Linux's warm_up always sends both) — see VerificationEngine.h for
+    // the 24.09.2026 re-revert back to true/true, once real-hardware A/B
+    // (three back-to-back `verify --no-reset-sensor --no-load-calibration`
+    // runs, all verify-match) gave the confirmation that was missing here.
 
     // start match (cmd 4) — Linux counted default: II60x + count + records
     // (132 B for 3 identities). Override with --match-layout inline|padded.
