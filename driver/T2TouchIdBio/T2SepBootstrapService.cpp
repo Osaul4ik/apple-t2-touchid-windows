@@ -25,6 +25,7 @@
 #endif
 #include <windows.h>
 #include <wincrypt.h>
+#include <cfgmgr32.h>
 #include <string>
 #include <vector>
 #include <fstream>
@@ -33,7 +34,12 @@
 #include "SepVaultFormat.h"
 #include "../../protocol/AppleKeyStore/Client.h"
 
+// Same GUID as public.h / Client::Open — declare only (do not #include
+// public.h here: it DEFINE_GUIDs and Client.cpp already owns that symbol).
+EXTERN_C const GUID GUID_DEVINTERFACE_T2TOUCHID_TRANSPORT;
+
 #pragma comment(lib, "crypt32.lib")
+#pragma comment(lib, "cfgmgr32.lib")
 
 namespace {
 
@@ -176,47 +182,123 @@ bool AlreadyPrepared(HANDLE readyEvent) {
     return WaitForSingleObject(readyEvent, 0) == WAIT_OBJECT_0;
 }
 
+// PnP wait context for CM_Register_Notification (device-interface arrival).
+struct TransportArrivalWait {
+    HANDLE event = nullptr;
+};
+
+DWORD CALLBACK TransportInterfaceNotify(
+    _In_ HCMNOTIFICATION /*hNotify*/,
+    _In_ PVOID Context,
+    _In_ CM_NOTIFY_ACTION Action,
+    _In_reads_bytes_(EventDataSize) PCM_NOTIFY_EVENT_DATA /*EventData*/,
+    _In_ DWORD /*EventDataSize*/)
+{
+    if (Action == CM_NOTIFY_ACTION_DEVICEINTERFACEARRIVAL && Context) {
+        auto* wait = static_cast<TransportArrivalWait*>(Context);
+        if (wait->event) {
+            SetEvent(wait->event);
+        }
+    }
+    return ERROR_SUCCESS;
+}
+
 // Wait for T2TouchIdTransport's device interface (design doc §10 PnP race).
-// SERVICE_AUTO_START often races AddDevice; a single Open() failure used to
-// abort the whole boot sequence and leave the sensor dead until the next
-// reboot. Bounded poll with exponential backoff — not a permanent daemon
-// retry loop (still one-shot per boot once Open succeeds).
+// SERVICE_AUTO_START often races AddDevice. Prefer CM_Register_Notification
+// on GUID_DEVINTERFACE_T2TOUCHID_TRANSPORT (wakes on arrival) with a short
+// Open() poll as fallback for the case the interface was already present
+// before registration, or CM APIs are unavailable. Still one-shot per boot.
 bool WaitForTransportOpen(t2::applekeystore::Client& client, DWORD timeoutMs) {
     using t2::applekeystore::AksResult;
+
+    // Fast path: driver already up (common after a slow service start).
+    if (client.Open() == AksResult::Ok) {
+        Log(L"bootstrap: T2TouchIdTransport already present");
+        return true;
+    }
+
+    TransportArrivalWait wait{};
+    wait.event = CreateEventW(nullptr, /*manualReset=*/TRUE,
+                              /*initialState=*/FALSE, nullptr);
+    HCMNOTIFICATION notifyHandle = nullptr;
+    bool usingCm = false;
+
+    if (wait.event) {
+        CM_NOTIFY_FILTER filter{};
+        filter.cbSize = sizeof(filter);
+        filter.Flags = 0;
+        filter.FilterType = CM_NOTIFY_FILTER_TYPE_DEVICEINTERFACE;
+        filter.u.DeviceInterface.ClassGuid = GUID_DEVINTERFACE_T2TOUCHID_TRANSPORT;
+
+        const CONFIGRET cr = CM_Register_Notification(
+            &filter, &wait, TransportInterfaceNotify, &notifyHandle);
+        if (cr == CR_SUCCESS && notifyHandle) {
+            usingCm = true;
+            Log(L"bootstrap: CM_Register_Notification on T2TouchIdTransport interface OK");
+        } else {
+            wchar_t buf[128];
+            swprintf_s(buf,
+                L"bootstrap: CM_Register_Notification failed (cr=%lu) — falling back to poll",
+                static_cast<unsigned long>(cr));
+            Log(buf);
+        }
+    }
+
     const DWORD start = GetTickCount();
-    DWORD backoffMs = 200;
     unsigned attempt = 0;
+    // When CM is active, sleep on the arrival event (or 500 ms slice) so we
+    // wake promptly; when not, keep a light exponential poll.
+    DWORD pollSliceMs = usingCm ? 500u : 200u;
+
     while (true) {
         ++attempt;
         if (client.Open() == AksResult::Ok) {
-            if (attempt > 1) {
-                wchar_t buf[128];
-                swprintf_s(buf,
-                    L"bootstrap: T2TouchIdTransport opened after %u attempts (%lu ms)",
-                    attempt, GetTickCount() - start);
-                Log(buf);
+            wchar_t buf[160];
+            swprintf_s(buf,
+                L"bootstrap: T2TouchIdTransport opened after %u attempts (%lu ms, cm=%d)",
+                attempt, GetTickCount() - start, usingCm ? 1 : 0);
+            Log(buf);
+            if (notifyHandle) {
+                CM_Unregister_Notification(notifyHandle);
+            }
+            if (wait.event) {
+                CloseHandle(wait.event);
             }
             return true;
         }
+
         const DWORD waited = GetTickCount() - start;
         if (waited >= timeoutMs) {
             wchar_t buf[160];
             swprintf_s(buf,
-                L"bootstrap: T2TouchIdTransport still missing after %lu ms (%u attempts) — giving up",
-                waited, attempt);
+                L"bootstrap: T2TouchIdTransport still missing after %lu ms (%u attempts, cm=%d) — giving up",
+                waited, attempt, usingCm ? 1 : 0);
             Log(buf);
+            if (notifyHandle) {
+                CM_Unregister_Notification(notifyHandle);
+            }
+            if (wait.event) {
+                CloseHandle(wait.event);
+            }
             return false;
         }
-        if ((attempt % 5) == 1) {
+
+        if ((attempt % 10) == 1) {
             wchar_t buf[128];
             swprintf_s(buf,
-                L"bootstrap: waiting for T2TouchIdTransport (attempt %u, %lu ms elapsed)",
-                attempt, waited);
+                L"bootstrap: waiting for T2TouchIdTransport (attempt %u, %lu ms elapsed, cm=%d)",
+                attempt, waited, usingCm ? 1 : 0);
             Log(buf);
         }
-        Sleep(backoffMs);
-        if (backoffMs < 2000) {
-            backoffMs *= 2;
+
+        if (usingCm && wait.event) {
+            ResetEvent(wait.event);
+            WaitForSingleObject(wait.event, pollSliceMs);
+        } else {
+            Sleep(pollSliceMs);
+            if (pollSliceMs < 2000) {
+                pollSliceMs *= 2;
+            }
         }
     }
 }
@@ -236,9 +318,9 @@ bool RunBootstrapSequence(HANDLE readyEvent) {
     // If this itself fails after the wait window, there is no device to report
     // through - see ReportStatus's header comment - so that one case stays log-only.
     Client client;
-    // 120s matches CAPTURE_DATA's BridgeXPC connect retry window in Queue.cpp:
-    // long enough for late PCI/PnP bring-up, short enough not to look hung.
-    if (!WaitForTransportOpen(client, 120000)) {
+    // 60s: CM arrival wakes promptly; bound still covers late PCI/PnP.
+    // Aligns with the reduced BridgeXPC connect window in Queue.cpp (P3.12).
+    if (!WaitForTransportOpen(client, 60000)) {
         LogEvent(EVENTLOG_ERROR_TYPE,
             L"bootstrap: could not open T2TouchIdTransport device interface "
             L"— driver never appeared this boot (PnP / test-sign / install?)");
