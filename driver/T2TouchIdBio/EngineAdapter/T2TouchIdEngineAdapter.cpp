@@ -869,8 +869,10 @@ HRESULT WINAPI EngineControlUnitPrivileged(
 }
 
 // ---------------------------------------------------------------------------
-// V2.0 - power notification. Informational only; nothing here depends on
-// power state yet, so just observe and succeed.
+// V2.0 - power notification. Clear any in-flight sample/enrollment residue
+// so a post-resume Identify/Verify cannot consume a pre-sleep AcceptSample
+// payload. Does not touch storage or force WBF to Activate — that is the
+// framework's job after it finishes its own power path.
 // ---------------------------------------------------------------------------
 HRESULT WINAPI EngineNotifyPowerChange(
     _Inout_ PWINBIO_PIPELINE Pipeline,
@@ -878,8 +880,22 @@ HRESULT WINAPI EngineNotifyPowerChange(
 {
     Trace("NotifyPowerChange", Pipeline);
     EngLog("     powerEventType=%lu", static_cast<unsigned long>(PowerEventType));
-    UNREFERENCED_PARAMETER(PowerEventType);
-    return TraceRet("NotifyPowerChange", ARGUMENT_PRESENT(Pipeline) ? S_OK : E_POINTER);
+    PWINIBIO_ENGINE_CONTEXT ctx = GetContext(Pipeline);
+    if (ctx == nullptr) {
+        return TraceRet("NotifyPowerChange", E_POINTER);
+    }
+    // Any power broadcast: drop volatile pipeline state. Persistent templates
+    // live in the storage adapter and are intentionally left alone.
+    ClearSample(ctx);
+    if (PowerEventType == PBT_APMSUSPEND ||
+        PowerEventType == PBT_APMRESUMESUSPEND ||
+        PowerEventType == PBT_APMRESUMEAUTOMATIC ||
+        PowerEventType == PBT_APMRESUMECRITICAL) {
+        ResetEnrollment(ctx);
+        EngLog("     cleared sample/enrollment for power event %lu",
+               static_cast<unsigned long>(PowerEventType));
+    }
+    return TraceRet("NotifyPowerChange", S_OK);
 }
 
 // Reserved_1 is documented as "reserved, must be set to NULL" - it is not a

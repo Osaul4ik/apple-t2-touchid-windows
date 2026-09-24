@@ -431,15 +431,29 @@ ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_
                                     // use - see header comment above
         }
     } else if (Type == PBT_APMRESUMESUSPEND || Type == PBT_APMRESUMEAUTOMATIC) {
-        // First verify after resume should re-arm sensor/calibration once;
-        // steady-state path keeps skipResetSensor/skipLoadCalibration.
+        // Resume hygiene (no service restarts — WBF owns Activate/CAPTURE):
+        // 1) Force WarmUp on the next real verify (SEP cancel residue after Sx).
+        // 2) Drop sticky NCM / match-replay (adapter and session are new).
+        // 3) Reset the process-wide cancel event — leave it signaled and the
+        //    first post-resume CAPTURE can observe a stale cancel before its
+        //    own ResetEvent runs (worker scheduling).
+        // 4) Clear g_captureBusy — if the cancel worker was frozen mid-unwind
+        //    across Sx, busy stays true forever and WBF only sees
+        //    DATA_COLLECTION_IN_PROGRESS (or stops arming). Hardware log
+        //    24.09.2026: ~14s with zero CAPTURE after resume until a full
+        //    Deactivate/Activate cycle (PIN path).
         g_needPostResumeWarmup.store(true, std::memory_order_relaxed);
         ClearMatchReplay();
         {
             std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
             g_stickyNcm.valid = false;
         }
-        T2BioLog("OnSuspendResume: resume notify - next CAPTURE_DATA will run full WarmUp once");
+        HANDLE cancelEvent = GetCaptureCancelEvent();
+        if (cancelEvent) {
+            ResetEvent(cancelEvent);
+        }
+        g_captureBusy.store(false, std::memory_order_relaxed);
+        T2BioLog("OnSuspendResume: resume - WarmUp armed, cancel cleared, captureBusy released");
     }
     return 0; // return value is unused for suspend/resume notifications
 }
@@ -1310,11 +1324,24 @@ extern "C" VOID T2BioEvtIoDeviceControl(_In_ WDFQUEUE Queue,
         HandleGetSensorStatus(Request);
         return;
 
-    case IOCTL_BIOMETRIC_RESET:
-        // No sensor state to reset yet.
-        T2BioLog("  RESET -> STATUS_SUCCESS");
+    case IOCTL_BIOMETRIC_RESET: {
+        // WBF may RESET after power transitions. Drop all session-local
+        // state so the next CAPTURE is a clean arm (same hygiene as resume).
+        ClearMatchReplay();
+        {
+            std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
+            g_stickyNcm.valid = false;
+        }
+        HANDLE cancelEvent = GetCaptureCancelEvent();
+        if (cancelEvent) {
+            ResetEvent(cancelEvent);
+        }
+        g_captureBusy.store(false, std::memory_order_relaxed);
+        g_needPostResumeWarmup.store(true, std::memory_order_relaxed);
+        T2BioLog("  RESET -> session cleared, WarmUp armed, STATUS_SUCCESS");
         WdfRequestComplete(Request, STATUS_SUCCESS);
         return;
+    }
 
     case IOCTL_BIOMETRIC_CAPTURE_DATA:
         HandleCaptureData(Request);
