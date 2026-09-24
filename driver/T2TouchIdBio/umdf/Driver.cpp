@@ -35,16 +35,29 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject,
 
     WDF_DRIVER_CONFIG config;
     WDF_DRIVER_CONFIG_INIT(&config, T2BioEvtDeviceAdd);
+    config.EvtDriverUnload = T2BioEvtDriverUnload;
 
     const NTSTATUS status = WdfDriverCreate(DriverObject, RegistryPath,
                                             WDF_NO_OBJECT_ATTRIBUTES, &config,
                                             WDF_NO_HANDLE);
     if (!NT_SUCCESS(status)) {
         T2BioLog("WdfDriverCreate failed 0x%08x", status);
-    } else {
-        T2BioLog("DriverEntry ok");
+        return status;
     }
+    // Process-wide (not per-device) - see Queue.cpp's OnSuspendResume header
+    // comment for why EvtIoStop alone is not enough for this driver's
+    // root-enumerated device. Registered once here rather than in
+    // EvtDeviceAdd since it does not depend on the device at all.
+    T2BioRegisterSuspendResumeNotification();
+    T2BioLog("DriverEntry ok");
     return status;
+}
+
+extern "C" VOID T2BioEvtDriverUnload(_In_ WDFDRIVER Driver)
+{
+    UNREFERENCED_PARAMETER(Driver);
+    T2BioUnregisterSuspendResumeNotification();
+    T2BioLog("EvtDriverUnload ok");
 }
 
 extern "C" NTSTATUS T2BioEvtDeviceAdd(_In_ WDFDRIVER Driver,

@@ -366,6 +366,62 @@ HANDLE GetCaptureCancelEvent()
               // rather than crash, so this isn't checked here.
 }
 
+// 24.09.2026: EvtIoStop (below in this file / Driver.cpp) turned out to be
+// dead code for THIS device in practice. T2TouchIdBio.inf installs under
+// root\T2TouchIdBio - a root-enumerated *virtual* device with no bus behind
+// it and, per that INF's own comment, deliberately no SystemWakeEnabled /
+// DeviceIdle* keys (those are for real USB sensors). A root-enumerated
+// device with no wake/idle policy is never told by the framework to leave
+// D0 for an ordinary system sleep - the Root bus driver does not propagate
+// Sx transitions to it the way a real ACPI/PCI/USB bus does. Hardware log
+// (24.09.2026) confirms this directly: across a full sleep/resume cycle
+// (T2TouchIdTransport's D0Exit/D0Entry and T2Ncm's MiniportPause/Restart
+// both fire correctly - they sit on real buses), this driver never logs a
+// single EvtIoStop, and a CAPTURE_DATA(verify) that was already in
+// StartMatch before sleep simply keeps waiting THROUGH the entire sleep and
+// delivers a match afterward - WinBio's engine happily accepts it
+// (AcceptSampleData/IdentifyFeatureSet succeed) even though nothing
+// re-validated that the touch belongs to a session still meaningful after a
+// full suspend/resume. Observed effect: waking with no lock screen at all
+// (a touch/match belonging to the pre-sleep session gets treated as a valid
+// sign-in the instant the system resumes).
+//
+// Since this device's own D0 state is not a reliable signal, the fix hooks
+// the OS-level, per-process suspend notification instead of the per-device
+// one: PowerRegisterSuspendResumeNotification (Powrprof.dll) delivers
+// PBT_APMSUSPEND to every registered process shortly before the machine
+// actually suspends, regardless of any individual device's power state -
+// WUDFHost.exe hosting this driver is an ordinary Win32 service process, so
+// it qualifies. On PBT_APMSUSPEND this reuses the exact same wakeup
+// EvtCaptureCancel/T2BioEvtIoStop already use: set the shared cancelEvent so
+// the blocked VerificationEngine::Verify() wait notices within
+// kCancelPollSlice and unwinds through HandleCaptureVerify's own normal
+// completion path (Cancelled outcome) *before* the process is frozen for
+// the sleep - so no CAPTURE_DATA is ever left straddling a suspend/resume
+// boundary, and the next touch after resume starts a brand-new capture the
+// way WBF expects.
+HPOWERNOTIFY g_suspendResumeNotify = nullptr;
+
+ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_ PVOID Setting)
+{
+    UNREFERENCED_PARAMETER(Context);
+    UNREFERENCED_PARAMETER(Setting);
+    if (Type == PBT_APMSUSPEND) {
+        T2BioLog("OnSuspendResume: PBT_APMSUSPEND - waking any pending CAPTURE_DATA "
+                 "before the process is frozen for sleep");
+        HANDLE cancelEvent = GetCaptureCancelEvent();
+        if (cancelEvent) {
+            SetEvent(cancelEvent); // same wakeup EvtCaptureCancel/T2BioEvtIoStop
+                                    // use - see header comment above
+        }
+    }
+    // PBT_APMRESUMESUSPEND / PBT_APMRESUMEAUTOMATIC: nothing to do here - a
+    // fresh CAPTURE_DATA from WBF after resume goes through the normal
+    // ResetEvent-before-StartMatch path (HandleCaptureVerify above) on its
+    // own, exactly like any other new capture.
+    return 0; // return value is unused for suspend/resume notifications
+}
+
 // EVT_WDF_REQUEST_CANCEL for the in-flight CAPTURE_DATA request. WDF invokes
 // this when Windows calls CancelIoEx on the pending IOCTL — per design doc
 // §9.4, that is exactly what happens when a password-fallback login (or any
@@ -1031,4 +1087,33 @@ extern "C" VOID T2BioEvtIoStop(_In_ WDFQUEUE Queue,
     WdfRequestStopAcknowledge(Request, FALSE); // FALSE: do not requeue, the
                                                 // driver retains and
                                                 // completes this itself
+}
+
+// Called once from DriverEntry (Driver.cpp) - see OnSuspendResume's header
+// comment in this file for why this driver needs a process-wide suspend
+// notification in addition to EvtIoStop. Registration failure is logged and
+// otherwise ignored (not fatal to the driver's core WBDI function - it only
+// means a capture left pending across a sleep can again straddle it).
+extern "C" VOID T2BioRegisterSuspendResumeNotification(VOID)
+{
+    DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS params = {};
+    params.Callback = OnSuspendResume;
+    params.Context = nullptr;
+    const DWORD err = PowerRegisterSuspendResumeNotification(
+        DEVICE_NOTIFY_CALLBACK, reinterpret_cast<HANDLE>(&params), &g_suspendResumeNotify);
+    if (err != ERROR_SUCCESS) {
+        T2BioLog("PowerRegisterSuspendResumeNotification failed, error=%lu", static_cast<unsigned long>(err));
+        g_suspendResumeNotify = nullptr;
+    } else {
+        T2BioLog("PowerRegisterSuspendResumeNotification ok");
+    }
+}
+
+// Called once from EvtDriverUnload (Driver.cpp).
+extern "C" VOID T2BioUnregisterSuspendResumeNotification(VOID)
+{
+    if (g_suspendResumeNotify) {
+        PowerUnregisterSuspendResumeNotification(g_suspendResumeNotify);
+        g_suspendResumeNotify = nullptr;
+    }
 }

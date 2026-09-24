@@ -24,6 +24,11 @@
 #include <ws2tcpip.h>
 
 #include <windows.h>
+// PowerRegisterSuspendResumeNotification (Queue.cpp, OnSuspendResume): a
+// process-wide, OS-level suspend/resume notification - see that function's
+// header comment for why this driver needs one instead of relying on
+// EvtIoStop/EvtDeviceD0Exit alone. Link dependency: PowrProf.lib.
+#include <powrprof.h>
 #include <wdf.h>
 #include <strsafe.h>
 #include <winbio_types.h>
@@ -65,6 +70,7 @@
 EXTERN_C_START
 DRIVER_INITIALIZE                  DriverEntry;
 EVT_WDF_DRIVER_DEVICE_ADD          T2BioEvtDeviceAdd;
+EVT_WDF_DRIVER_UNLOAD               T2BioEvtDriverUnload;    // unregisters the suspend/resume hook below
 EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL T2BioEvtIoDeviceControl;
 // Power-managed queue stop notification (device leaving D0, or queue/device
 // removal). See the definition in Queue.cpp for why this driver needs one:
@@ -72,7 +78,20 @@ EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL T2BioEvtIoDeviceControl;
 // outstanding request completes on its own, and CAPTURE_DATA(verify) is
 // deliberately left pending with no deadline (design doc §9.4) until a
 // touch or Windows' own CancelIoEx - neither of which a system sleep causes.
+// 24.09.2026: proven on hardware to be dead code for THIS device (it is
+// root-enumerated with no wake/idle policy - see Queue.cpp's OnSuspendResume
+// comment) - kept anyway as the structurally-correct WDF-level handler for
+// the (currently theoretical, for this device) cases where the framework
+// does call it, e.g. a future non-root-enumerated build, or device removal.
 EVT_WDF_IO_QUEUE_IO_STOP           T2BioEvtIoStop;
+EXTERN_C_END
+
+// Process-wide suspend/resume hook (Queue.cpp) - the fix that actually
+// engages for this root-enumerated device, unlike EvtIoStop above. Called
+// from DriverEntry / T2BioEvtDriverUnload (Driver.cpp).
+EXTERN_C_START
+VOID T2BioRegisterSuspendResumeNotification(VOID);
+VOID T2BioUnregisterSuspendResumeNotification(VOID);
 EXTERN_C_END
 
 // Debug-only trace; visible in DebugView (Capture Global Win32) because

@@ -97,8 +97,12 @@
            <RuntimeLibrary> setting here and in
            protocol/T2TouchIdProtocol.vcxproj, not a change to the C++ code.
            ws2_32.lib is required directly (BridgeXpc/Discovery use raw
-           Winsock, not a wrapper this project already links). -->
-      <AdditionalDependencies>ws2_32.lib;$(VcpkgInstalledDir)\lib\$(PlistLibName);%(AdditionalDependencies)</AdditionalDependencies>
+           Winsock, not a wrapper this project already links). PowrProf.lib
+           is required for PowerRegisterSuspendResumeNotification (Queue.cpp,
+           OnSuspendResume) - see the comment there for why this driver needs
+           a process-wide suspend notification instead of relying on
+           EvtIoStop/EvtDeviceD0Exit. -->
+      <AdditionalDependencies>ws2_32.lib;PowrProf.lib;$(VcpkgInstalledDir)\lib\$(PlistLibName);%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalLibraryDirectories>$(VcpkgInstalledDir)\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
     <DriverSign>
