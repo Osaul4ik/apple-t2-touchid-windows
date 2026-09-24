@@ -974,11 +974,12 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
     }
 
     // Sleep transition / Sx: WBF re-issues CAPTURE after our suspend cancel.
-    // Answer without touching BridgeXPC/SEP — no WarmUp, no StartMatch, no
-    // error HRESULT (avoids lock-screen flash and "sensor reads on suspend").
+    // No SEP. Must NOT complete with S_OK+empty — that made WBF spin
+    // StartCapture hundreds of times (log: silent READY loop → SensorStopV2).
+    // CANCELED matches EvtCaptureCancel and stops the re-arm loop.
     if (g_suspended.load(std::memory_order_acquire)) {
-        T2BioLog("CAPTURE_DATA(verify): suspended - silent READY (no SEP session)");
-        CompleteCaptureData(Request, S_OK, WINBIO_SENSOR_READY, 0, {});
+        T2BioLog("CAPTURE_DATA(verify): suspended - CANCELED (no SEP, no S_OK spin)");
+        CompleteCaptureData(Request, WINBIO_E_CANCELED, WINBIO_SENSOR_READY, 0, {});
         return;
     }
 
@@ -1134,29 +1135,15 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
         T2BioLog("CAPTURE_DATA(verify): post-resume WarmUp retained after cancel/transport");
     }
 
-    // Silent complete for power-path cancels (not user PIN/password cancel):
-    // - suspended: pre-sleep CAPTURE cancelled by OnSuspendResume (log showed
-    //   0x80098004 → lock-screen error flash)
-    // - postResumeWarmup: cold-boot / post-resume CAPTURE cancelled during
-    //   WarmUp or UI lag (BAD_CAPTURE still flashed; S_OK+READY does not)
-    // Normal Cancelled (Win+L, password fallback) keeps WINBIO_E_CANCELED.
-    HRESULT hr;
-    WINBIO_SENSOR_STATUS sensorStatus;
-    if (outcome == VerifyOutcome::Cancelled &&
-        (suspendedNow || postResumeWarmup)) {
-        hr = S_OK;
-        sensorStatus = WINBIO_SENSOR_READY;
-        T2BioLog("CAPTURE_DATA(verify): power-path cancel -> silent READY "
-                 "(suspended=%d postResumeWarmup=%d)",
-                 suspendedNow ? 1 : 0, postResumeWarmup ? 1 : 0);
-    } else {
-        hr = MapVerifyOutcomeToHresult(outcome);
-        sensorStatus =
-            (outcome == VerifyOutcome::TransportError || outcome == VerifyOutcome::RejectedByDevice ||
-             outcome == VerifyOutcome::UnstableIdentityInventory)
-                ? WINBIO_SENSOR_FAILURE
-                : (outcome == VerifyOutcome::Match ? WINBIO_SENSOR_ACCEPT : WINBIO_SENSOR_READY);
-    }
+    // S_OK+empty for power-path cancel was tried to avoid lock-screen flash;
+    // log showed WBF then spinning StartCapture for the whole suspend window
+    // and SensorStopV2 on resume. Always map Cancelled → WINBIO_E_CANCELED.
+    const HRESULT hr = MapVerifyOutcomeToHresult(outcome);
+    const WINBIO_SENSOR_STATUS sensorStatus =
+        (outcome == VerifyOutcome::TransportError || outcome == VerifyOutcome::RejectedByDevice ||
+         outcome == VerifyOutcome::UnstableIdentityInventory)
+            ? WINBIO_SENSOR_FAILURE
+            : (outcome == VerifyOutcome::Match ? WINBIO_SENSOR_ACCEPT : WINBIO_SENSOR_READY);
     T2BioLog("CAPTURE_DATA(verify): outcome=%d -> hresult=0x%08x", static_cast<int>(outcome),
              static_cast<unsigned>(hr));
     // A sample goes to WBF only for a real Match; every other outcome completes
