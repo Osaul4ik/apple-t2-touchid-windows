@@ -298,6 +298,9 @@ constexpr ULONGLONG kMatchReplayTtlMs = 500;
 // Starts true: WUDFHost may load long after bridgeOS is "warm", but the first
 // Hello capture of this host process still needs a known-good sensor arm.
 std::atomic<bool> g_needPostResumeWarmup{true};
+// Bumped on every resume. VerificationEngine accepts Match only after FingerOn
+// under the current generation (blocks unlock from a pre-sleep finger on thaw).
+std::atomic<uint32_t> g_resumeGeneration{0};
 
 void ArmMatchReplay(const std::optional<std::array<uint8_t, 16>>& uuid)
 {
@@ -396,20 +399,8 @@ HANDLE GetCaptureCancelEvent()
 // (a touch/match belonging to the pre-sleep session gets treated as a valid
 // sign-in the instant the system resumes).
 //
-// PowerRegisterSuspendResumeNotification is still registered so we can do
-// *hygiene* on Sx (sticky NCM, match-replay, post-resume WarmUp). We do NOT
-// complete pending CAPTURE_DATA here anymore (option 2, 24.09.2026):
-//
-// Early SetEvent(cancel) on PBT_APMSUSPEND forced WINBIO_E_CANCELED into
-// LogonUI's identify session. After resume WBF often left the unit without a
-// new CAPTURE until Deactivate/Activate (PIN path). Official WBDI power path
-// is CancelIoEx + IOCTL_BIOMETRIC_RESET from the in-box sensor adapter /
-// framework — not a process-wide preempt cancel from the UMDF host.
-//
-// Pending CAPTURE may straddle sleep (process frozen mid-waitForEvent). On
-// thaw the same request is still owned by LogonUI; a finger touch can finish
-// it. If WBF cancels around Sx, EvtCaptureCancel / RESET / EvtIoStop still
-// signal cancelEvent as before.
+// CAPTURE retained across Sx (no cancel). Security: g_resumeGeneration +
+// FingerOn gate in VerificationEngine rejects Match until post-resume touch.
 HPOWERNOTIFY g_suspendResumeNotify = nullptr;
 
 ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_ PVOID Setting)
@@ -417,22 +408,16 @@ ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_
     UNREFERENCED_PARAMETER(Context);
     UNREFERENCED_PARAMETER(Setting);
     if (Type == PBT_APMSUSPEND) {
-        // Hygiene only — do not cancel CAPTURE. WBF owns cancel via
-        // CancelIoEx / IOCTL_BIOMETRIC_RESET; EvtIoStop remains as WDF path.
-        ClearMatchReplay(); // never replay a pre-sleep Match after resume
+        ClearMatchReplay();
         {
-            // NCM/ifIndex may change across Sx; force rediscovery on resume.
             std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
             g_stickyNcm.valid = false;
         }
         g_needPostResumeWarmup.store(true, std::memory_order_relaxed);
-        T2BioLog("OnSuspendResume: PBT_APMSUSPEND - hygiene only (no CAPTURE cancel; "
-                 "WBF CancelIoEx/RESET owns power cancel)");
+        T2BioLog("OnSuspendResume: PBT_APMSUSPEND - hygiene only (CAPTURE retained; Match gated by resume FingerOn)");
     } else if (Type == PBT_APMRESUMESUSPEND || Type == PBT_APMRESUMEAUTOMATIC) {
-        // Resume hygiene: WarmUp for SEP residue if a *new* CAPTURE starts;
-        // clear sticky/replay; ensure cancel is not left signaled from a
-        // framework cancel that raced resume; release stuck captureBusy if
-        // a cancel worker was frozen mid-unwind (edge case).
+        const uint32_t gen =
+            g_resumeGeneration.fetch_add(1, std::memory_order_relaxed) + 1;
         g_needPostResumeWarmup.store(true, std::memory_order_relaxed);
         ClearMatchReplay();
         {
@@ -444,9 +429,10 @@ ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_
             ResetEvent(cancelEvent);
         }
         g_captureBusy.store(false, std::memory_order_relaxed);
-        T2BioLog("OnSuspendResume: resume - WarmUp armed, cancel cleared, captureBusy released");
+        T2BioLog("OnSuspendResume: resume gen=%u - WarmUp armed, Match needs FingerOn under this gen",
+                 static_cast<unsigned>(gen));
     }
-    return 0; // return value is unused for suspend/resume notifications
+    return 0;
 }
 
 // 24.09.2026: who completes a cancelled CAPTURE_DATA.
@@ -984,6 +970,7 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
     VerifyConfig cfg;
     cfg.macosUserId = kDefaultMacosUserId;
     cfg.matchWindow = kCaptureMatchWindow;
+    cfg.resumeGeneration = &g_resumeGeneration;
     // Post-resume / post-boot: force ResetSensor + LoadCalibration until a
     // CAPTURE actually finishes with a user-visible outcome (Match/NoMatch/…).
     // Do NOT clear the flag on Cancelled/TransportError — after sleep WBF
@@ -1397,21 +1384,9 @@ extern "C" VOID T2BioEvtIoStop(_In_ WDFQUEUE Queue,
              (ActionFlags & WdfRequestStopActionSuspend) ? 1 : 0,
              (ActionFlags & WdfRequestStopActionPurge) ? 1 : 0);
 
-    // Option 2 (24.09.2026 hardware log): on system sleep WDF *does* call
-    // EvtIoStop with WdfRequestStopActionSuspend|Cancelable (0x10000001).
-    // Previously we SetEvent(cancel) here → same WINBIO_E_CANCELED into
-    // LogonUI as the old PowerRegister path, so fingerprint stayed dead
-    // until PIN/Activate.
-    //
-    // For suspend: acknowledge only. Keep CAPTURE pending across Sx; the
-    // worker stays in waitForEvent (process frozen), thaws on resume, and
-    // a touch can complete the same LogonUI session. Do not requeue
-    // (requeue fights the worker that still owns Request).
-    //
-    // For purge/removal: still cancel so the worker unwinds before unload.
+    // Suspend: retain CAPTURE (Match gated by resume FingerOn). Purge: cancel.
     const bool isSuspend = (ActionFlags & WdfRequestStopActionSuspend) != 0;
     const bool isPurge = (ActionFlags & WdfRequestStopActionPurge) != 0;
-
     if (!isSuspend && isPurge &&
         (ActionFlags & WdfRequestStopRequestCancelable)) {
         HANDLE cancelEvent = GetCaptureCancelEvent();
@@ -1420,10 +1395,10 @@ extern "C" VOID T2BioEvtIoStop(_In_ WDFQUEUE Queue,
             T2BioLog("EvtIoStop: purge - cancel signaled");
         }
     } else if (isSuspend) {
-        T2BioLog("EvtIoStop: suspend - retaining CAPTURE across Sx (no cancel)");
+        T2BioLog("EvtIoStop: suspend - retaining CAPTURE (Match gated post-resume)");
     }
 
-    WdfRequestStopAcknowledge(Request, FALSE); // driver retains Request
+    WdfRequestStopAcknowledge(Request, FALSE);
 }
 
 // Called once from DriverEntry (Driver.cpp) - see OnSuspendResume's header

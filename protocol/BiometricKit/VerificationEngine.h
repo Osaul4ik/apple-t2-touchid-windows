@@ -4,6 +4,7 @@
 #include "Commands.h"
 #include "MatchResult.h"
 #include "../BridgeXpc/Connection.h"
+#include <atomic>
 #include <chrono>
 #include <vector>
 
@@ -127,6 +128,14 @@ struct VerifyConfig {
     // explicit A/B against Linux's own always-resend behavior.
     bool skipResetSensor = true;
     bool skipLoadCalibration = true;
+
+    // Optional (T2TouchIdBio post-Sx): when non-null, its value is a generation
+    // bumped on every system resume. Match is accepted only if this Verify()
+    // has already seen status FingerOn (63) while the generation equalled the
+    // current value — so a finger that was on the sensor before/during sleep
+    // cannot complete Match on thaw without a new post-resume touch.
+    // Null / generation 0 = disabled (CLI, cold path).
+    std::atomic<uint32_t>* resumeGeneration = nullptr;
 };
 
 // One VerificationEngine instance == one in-flight session (Milestone 2

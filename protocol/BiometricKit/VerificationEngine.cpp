@@ -426,6 +426,10 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     size_t imagePipelineEvents = 0;
     size_t unnamedStatusEvents = 0;
     size_t fingerTouchCycles = 0;
+    // Generation observed at last FingerOn (63). Match allowed only when this
+    // equals config_.resumeGeneration (post-Sx barrier). 0 = no FingerOn yet
+    // under the current generation.
+    uint32_t fingerOnAtResumeGen = 0;
     size_t rejectedTouchAttempts = 0;
 
     while (steady_clock::now() < deadline) {
@@ -469,7 +473,13 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
                 StatusEventBody body = ParseStatusEventBody(eventData);
                 if (body.statusCode) {
                     const uint32_t code = *body.statusCode;
-                    if (code == 63) fingerTouchCycles++;
+                    if (code == 63) {
+                        fingerTouchCycles++;
+                        if (config_.resumeGeneration) {
+                            fingerOnAtResumeGen = config_.resumeGeneration->load(
+                                std::memory_order_relaxed);
+                        }
+                    }
                     if (StatusCodeIsImagePipeline(code)) imagePipelineEvents++;
                     if (!StatusCodeName(code)) unnamedStatusEvents++;
                 }
@@ -514,6 +524,30 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
 
         MatchResult mr = ParseMatchResult(embeddedType, eventData, identities);
         if (mr.outcome == MatchOutcome::Match) {
+            // Post-Sx barrier: require FingerOn observed under the current
+            // resume generation so a pre-sleep touch cannot unlock on thaw.
+            if (config_.resumeGeneration) {
+                const uint32_t needGen =
+                    config_.resumeGeneration->load(std::memory_order_relaxed);
+                if (needGen != 0 && fingerOnAtResumeGen != needGen) {
+                    T2_LOG("verify",
+                           L"match_result MATCH ignored (resumeGen=%u fingerOnGen=%u) - "
+                           L"need FingerOn after resume",
+                           needGen, fingerOnAtResumeGen);
+                    // Discard this match and re-arm StartMatch so a real
+                    // post-resume touch can still succeed in this CAPTURE.
+                    if (cancelEvent) {
+                        std::vector<uint8_t> discard;
+                        conn->SendBiometricCommand(cancelCmd, 0, &discard,
+                                                   kCancelBestEffortTimeout);
+                        if (!sendStartMatch()) {
+                            outcome = VerifyOutcome::TransportError;
+                            break;
+                        }
+                    }
+                    continue;
+                }
+            }
             T2_LOG("verify", L"match_result outcome=MATCH (identity matched, UUID not logged)");
             outcome = VerifyOutcome::Match;
             *outMatchedUuid = mr.matchedIdentityUuid;
