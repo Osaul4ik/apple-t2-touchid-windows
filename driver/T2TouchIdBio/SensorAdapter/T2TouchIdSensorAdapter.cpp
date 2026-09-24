@@ -9,6 +9,7 @@
 // power paths cancel outstanding I/O and wait before freeing buffers.
 
 #include <windows.h>
+#include <winioctl.h>
 #include <stddef.h>
 #include <stdarg.h>
 #include <strsafe.h>
@@ -22,7 +23,25 @@
 #include <winbio_ioctl.h>
 #include <winbio_types.h>
 
+#ifndef WINBIO_I_MORE_DATA
+#define WINBIO_I_MORE_DATA ((HRESULT)0x00090001L)
+#endif
+
 #include <cstring>
+
+// Must be at global scope: winbio_adapter.h forward-declares
+// struct _WINIBIO_SENSOR_CONTEXT; Pipeline->SensorContext is that type.
+struct _WINIBIO_SENSOR_CONTEXT {
+    ULONG Signature;
+    CRITICAL_SECTION Lock;
+    OVERLAPPED Overlapped;
+    HANDLE OverlappedEvent;
+    PUCHAR CaptureBuffer;
+    SIZE_T CaptureBufferSize;
+    DWORD BytesTransferred;
+    BOOL CaptureInProgress;
+    WINBIO_BIR_PURPOSE LastPurpose;
+};
 
 namespace {
 
@@ -45,19 +64,8 @@ void SensLog(const char* fmt, ...)
     OutputDebugStringA(line);
 }
 
-struct _WINIBIO_SENSOR_CONTEXT {
-    ULONG Signature;
-    CRITICAL_SECTION Lock;
-    OVERLAPPED Overlapped;
-    HANDLE OverlappedEvent;
-    PUCHAR CaptureBuffer;
-    SIZE_T CaptureBufferSize;
-    DWORD BytesTransferred;
-    BOOL CaptureInProgress;
-    WINBIO_BIR_PURPOSE LastPurpose;
-};
-
 using SensorCtx = _WINIBIO_SENSOR_CONTEXT;
+
 
 SensorCtx* GetContext(PWINBIO_PIPELINE Pipeline)
 {
@@ -404,7 +412,7 @@ HRESULT WINAPI SensorFinishCapture(
         if (needed > sizeof(DWORD) && needed <= kMaxCaptureCap) {
             SensLog("FinishCapture need larger buffer %lu",
                     static_cast<unsigned long>(needed));
-            return WINBIO_E_MORE_DATA;
+            return WINBIO_I_MORE_DATA;
         }
         return WINBIO_E_NO_CAPTURE_DATA;
     }
@@ -632,7 +640,7 @@ HRESULT WINAPI SensorQueryExtendedInfo(
         return E_POINTER;
     }
     if (SensorInfoSize < sizeof(WINBIO_EXTENDED_SENSOR_INFO)) {
-        return WINBIO_E_MORE_DATA;
+        return WINBIO_I_MORE_DATA;
     }
     ZeroMemory(SensorInfo, SensorInfoSize);
     SensorInfo->GenericSensorCapabilities = 0;
@@ -642,26 +650,22 @@ HRESULT WINAPI SensorQueryExtendedInfo(
 
 HRESULT WINAPI SensorQueryCalibrationFormats(
     _Inout_ PWINBIO_PIPELINE Pipeline,
-    _Outptr_result_bytebuffer_(*FormatArraySize) PWINBIO_UUID* FormatArray,
-    _Out_ PSIZE_T FormatArraySize,
-    _Out_ PSIZE_T PreferredCalibrationFormat)
+    _Out_writes_to_(FormatArraySize, *FormatCount) PWINBIO_UUID FormatArray,
+    _In_ SIZE_T FormatArraySize,
+    _Out_ PSIZE_T FormatCount)
 {
     UNREFERENCED_PARAMETER(Pipeline);
-    if (ARGUMENT_PRESENT(FormatArray)) {
-        *FormatArray = nullptr;
-    }
-    if (ARGUMENT_PRESENT(FormatArraySize)) {
-        *FormatArraySize = 0;
-    }
-    if (ARGUMENT_PRESENT(PreferredCalibrationFormat)) {
-        *PreferredCalibrationFormat = 0;
+    UNREFERENCED_PARAMETER(FormatArray);
+    UNREFERENCED_PARAMETER(FormatArraySize);
+    if (ARGUMENT_PRESENT(FormatCount)) {
+        *FormatCount = 0;
     }
     return E_NOTIMPL;
 }
 
 HRESULT WINAPI SensorSetCalibrationFormat(
     _Inout_ PWINBIO_PIPELINE Pipeline,
-    _In_ REFGUID Format)
+    _In_ PWINBIO_UUID Format)
 {
     UNREFERENCED_PARAMETER(Pipeline);
     UNREFERENCED_PARAMETER(Format);
@@ -670,10 +674,12 @@ HRESULT WINAPI SensorSetCalibrationFormat(
 
 HRESULT WINAPI SensorAcceptCalibrationData(
     _Inout_ PWINBIO_PIPELINE Pipeline,
-    _In_ PWINBIO_DATA CalibrationData)
+    _In_reads_bytes_(CalibrationBufferSize) PUCHAR CalibrationBuffer,
+    _In_ SIZE_T CalibrationBufferSize)
 {
     UNREFERENCED_PARAMETER(Pipeline);
-    UNREFERENCED_PARAMETER(CalibrationData);
+    UNREFERENCED_PARAMETER(CalibrationBuffer);
+    UNREFERENCED_PARAMETER(CalibrationBufferSize);
     return E_NOTIMPL;
 }
 
