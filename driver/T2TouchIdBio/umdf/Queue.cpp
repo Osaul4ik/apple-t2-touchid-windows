@@ -1391,26 +1391,39 @@ extern "C" VOID T2BioEvtIoStop(_In_ WDFQUEUE Queue,
 {
     UNREFERENCED_PARAMETER(Queue);
 
-    T2BioLog("EvtIoStop: ActionFlags=0x%08x cancelable=%d",
+    T2BioLog("EvtIoStop: ActionFlags=0x%08x cancelable=%d suspend=%d purge=%d",
              static_cast<unsigned>(ActionFlags),
-             (ActionFlags & WdfRequestStopRequestCancelable) ? 1 : 0);
+             (ActionFlags & WdfRequestStopRequestCancelable) ? 1 : 0,
+             (ActionFlags & WdfRequestStopActionSuspend) ? 1 : 0,
+             (ActionFlags & WdfRequestStopActionPurge) ? 1 : 0);
 
-    if (ActionFlags & WdfRequestStopRequestCancelable) {
+    // Option 2 (24.09.2026 hardware log): on system sleep WDF *does* call
+    // EvtIoStop with WdfRequestStopActionSuspend|Cancelable (0x10000001).
+    // Previously we SetEvent(cancel) here → same WINBIO_E_CANCELED into
+    // LogonUI as the old PowerRegister path, so fingerprint stayed dead
+    // until PIN/Activate.
+    //
+    // For suspend: acknowledge only. Keep CAPTURE pending across Sx; the
+    // worker stays in waitForEvent (process frozen), thaws on resume, and
+    // a touch can complete the same LogonUI session. Do not requeue
+    // (requeue fights the worker that still owns Request).
+    //
+    // For purge/removal: still cancel so the worker unwinds before unload.
+    const bool isSuspend = (ActionFlags & WdfRequestStopActionSuspend) != 0;
+    const bool isPurge = (ActionFlags & WdfRequestStopActionPurge) != 0;
+
+    if (!isSuspend && isPurge &&
+        (ActionFlags & WdfRequestStopRequestCancelable)) {
         HANDLE cancelEvent = GetCaptureCancelEvent();
         if (cancelEvent) {
-            SetEvent(cancelEvent); // same wakeup EvtCaptureCancel uses for a
-                                    // real CancelIoEx - see header comment
+            SetEvent(cancelEvent);
+            T2BioLog("EvtIoStop: purge - cancel signaled");
         }
+    } else if (isSuspend) {
+        T2BioLog("EvtIoStop: suspend - retaining CAPTURE across Sx (no cancel)");
     }
-    // If ActionFlags does NOT have WdfRequestStopRequestCancelable set, the
-    // request is between WdfRequestCreate/dispatch and HandleCaptureVerify's
-    // own WdfRequestMarkCancelable call (a narrow window) - nothing to wake
-    // yet, but the driver still owns and will complete it shortly on its
-    // own, so acknowledging now is still correct.
 
-    WdfRequestStopAcknowledge(Request, FALSE); // FALSE: do not requeue, the
-                                                // driver retains and
-                                                // completes this itself
+    WdfRequestStopAcknowledge(Request, FALSE); // driver retains Request
 }
 
 // Called once from DriverEntry (Driver.cpp) - see OnSuspendResume's header
