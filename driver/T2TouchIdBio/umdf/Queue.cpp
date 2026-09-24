@@ -976,14 +976,21 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
     VerifyConfig cfg;
     cfg.macosUserId = kDefaultMacosUserId;
     cfg.matchWindow = kCaptureMatchWindow;
-    // Post-resume (and only then): force ResetSensor + LoadCalibration once.
-    // Steady-state keeps the verified skip=true defaults for ~200ms less
-    // per-touch latency (VerificationEngine.h). Atomic exchange so concurrent
-    // CAPTURE workers do not both pay the full warmup.
-    if (g_needPostResumeWarmup.exchange(false, std::memory_order_relaxed)) {
+    // Post-resume / post-boot: force ResetSensor + LoadCalibration until a
+    // CAPTURE actually finishes with a user-visible outcome (Match/NoMatch/…).
+    // Do NOT clear the flag on Cancelled/TransportError — after sleep WBF
+    // often issues CAPTURE then CancelIoEx before the user can touch (engine
+    // Deactivate + credential UI lag). Clearing on that cancel left every
+    // later CAPTURE on skip=true while SEP was still in MatchingCancelled
+    // residue; PIN-unlock + re-lock "fixed" it only because a fresh Activate
+    // eventually got a full session. Hardware log 24.09.2026.
+    const bool postResumeWarmup =
+        g_needPostResumeWarmup.load(std::memory_order_relaxed);
+    if (postResumeWarmup) {
         cfg.skipResetSensor = false;
         cfg.skipLoadCalibration = false;
-        T2BioLog("CAPTURE_DATA(verify): post-resume WarmUp armed (reset+calibration once)");
+        T2BioLog("CAPTURE_DATA(verify): post-resume WarmUp armed (reset+calibration; "
+                 "flag kept until non-cancel outcome)");
     }
     std::optional<std::array<uint8_t, 16>> matchedUuid;
     VerifyOutcome outcome = VerifyOutcome::TransportError;   // also what a failed connect completes as
@@ -1059,7 +1066,24 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
         }
         // Any cancel ends the "real + one replay" pair; next CAPTURE must verify.
         ClearMatchReplay();
+        // Keep post-resume WarmUp for the next CAPTURE (see arming comment above).
+        if (postResumeWarmup &&
+            (outcome == VerifyOutcome::Cancelled ||
+             outcome == VerifyOutcome::TransportError)) {
+            g_needPostResumeWarmup.store(true, std::memory_order_relaxed);
+            T2BioLog("CAPTURE_DATA(verify): post-resume WarmUp retained after cancel/transport");
+        }
         return;
+    }
+
+    // Real terminal outcome (Match, NoMatch, bad capture, etc.): SEP path
+    // was exercised; drop the forced WarmUp for steady-state latency.
+    if (outcome != VerifyOutcome::Cancelled &&
+        outcome != VerifyOutcome::TransportError) {
+        g_needPostResumeWarmup.store(false, std::memory_order_relaxed);
+    } else if (postResumeWarmup) {
+        g_needPostResumeWarmup.store(true, std::memory_order_relaxed);
+        T2BioLog("CAPTURE_DATA(verify): post-resume WarmUp retained after cancel/transport");
     }
 
     const HRESULT hr = MapVerifyOutcomeToHresult(outcome);
