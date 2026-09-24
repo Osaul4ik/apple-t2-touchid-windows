@@ -796,9 +796,12 @@ bool ConnectForCapture(t2::bridgexpc::Connection* outConn)
 // way: retry with backoff, cancel-aware, and only give up (-> the old
 // DEVICE_FAILURE) after kConnectRetryWindowMs so a T2 that is genuinely gone
 // (NCM driver failed, no adapter) does not scan forever.
-constexpr ULONGLONG kConnectRetryWindowMs = 120000;
-constexpr DWORD kConnectRetryFirstMs = 500;
-constexpr DWORD kConnectRetryMaxMs = 5000;
+// P3.12: sticky NCM + PortCache → steady-state connect 0–16 ms on hardware.
+// 120s was pre-cache; 30s still covers cold-boot NCM lag without a long hang
+// when the adapter is truly missing.
+constexpr ULONGLONG kConnectRetryWindowMs = 30000;
+constexpr DWORD kConnectRetryFirstMs = 200;
+constexpr DWORD kConnectRetryMaxMs = 2000;
 
 enum class ConnectWait { Connected, Cancelled, GaveUp };
 
