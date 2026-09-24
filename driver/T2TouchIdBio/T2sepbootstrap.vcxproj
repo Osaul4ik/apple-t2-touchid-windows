@@ -54,15 +54,10 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <AdditionalLibraryDirectories>$(VcpkgInstalledDir)\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <!-- Ws2_32.lib / Rpcrt4.lib / setupapi.lib come in automatically via
-           #pragma comment(lib, ...) baked into Connection.obj/Client.obj
-           inside T2TouchIdProtocol.lib, same as tools/t2touchid. crypt32.lib
-           comes from T2SepBootstrapService.cpp's own #pragma comment; only
-           plist and advapi32 (SCM API - RegisterServiceCtrlHandlerExW /
-           SetServiceStatus / StartServiceCtrlDispatcherW) need listing
-           explicitly, since neither has such a pragma anywhere in this
-           translation unit's dependency chain. -->
-      <AdditionalDependencies>$(PlistLibName);advapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <!-- Ws2_32 / Rpcrt4 / setupapi come via #pragma in protocol objs.
+           crypt32 / cfgmgr32 via #pragma in T2SepBootstrapService.cpp;
+           listed here too so link succeeds if pragmas are stripped. -->
+      <AdditionalDependencies>$(PlistLibName);advapi32.lib;crypt32.lib;cfgmgr32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>

@@ -1,0 +1,4 @@
+LIBRARY	T2TouchIdSensorAdapter
+
+EXPORTS
+    WbioQuerySensorInterface

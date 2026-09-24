@@ -26,15 +26,17 @@ PnpLockdown = 1
 [SourceDisksFiles]
 T2TouchIdBio.dll = 1,,
 T2TouchIdEngineAdapter.dll = 1,,
+T2TouchIdSensorAdapter.dll = 1,,
 
 [DestinationDirs]
 UMDriverCopy = 13
 ; Engine adapter is loaded by wbiosrvc by file name from System32\WinBioPlugIns
 ; (same layout as the Microsoft WBDI sample INF: DIRID 11 = System32).
 WinBioEngineAdapterCopy = 11,WinBioPlugIns
+WinBioSensorAdapterCopy = 11,WinBioPlugIns
 
 [T2TouchIdBio_Install.NT]
-CopyFiles = UMDriverCopy, WinBioEngineAdapterCopy
+CopyFiles = UMDriverCopy, WinBioEngineAdapterCopy, WinBioSensorAdapterCopy
 
 [T2TouchIdBio_Install.NT.HW]
 AddReg = T2TouchIdBio_HwAddReg, T2TouchIdBio_PlugInAddReg, T2TouchIdBio_DatabaseAddReg
@@ -49,8 +51,7 @@ HKR,,Exclusive,0x00010001,1
 ; WBF biometric unit (Microsoft "Installing a Biometric Driver", steps 4-5).
 ; Without these two sections WBF has no unit configuration for the device and
 ; Settings -> Sign-in options reports "no compatible devices" even though the
-; device node is healthy. Sensor + storage adapters are the in-box ones; the
-; engine adapter is OURS (driver\T2TouchIdBio\EngineAdapter, design doc 7.4)
+; device node is healthy. Storage is in-box; sensor + engine adapters are OURS (driver\T2TouchIdBio\EngineAdapter, design doc 7.4)
 ; and is copied to System32\WinBioPlugIns by [WinBioEngineAdapterCopy] below.
 ; Missing/unloadable engine DLL = the unit cannot be configured and WBF logs
 ; Event 1109 in Biometrics/Operational (0x80070002 when the file is absent).
@@ -60,7 +61,7 @@ HKR,,Exclusive,0x00010001,1
 HKR,WinBio\Configurations,DefaultConfiguration,,"0"
 HKR,WinBio\Configurations\0,SensorMode,0x00010001,1
 HKR,WinBio\Configurations\0,SystemSensor,0x00010001,1
-HKR,WinBio\Configurations\0,SensorAdapterBinary,,"WinBioSensorAdapter.dll"
+HKR,WinBio\Configurations\0,SensorAdapterBinary,,"T2TouchIdSensorAdapter.dll"
 HKR,WinBio\Configurations\0,EngineAdapterBinary,,"T2TouchIdEngineAdapter.dll"
 HKR,WinBio\Configurations\0,StorageAdapterBinary,,"WinBioStorageAdapter.dll"
 HKR,WinBio\Configurations\0,DatabaseId,,"%DatabaseId%"
@@ -99,6 +100,9 @@ T2TouchIdBio.dll
 
 [WinBioEngineAdapterCopy]
 T2TouchIdEngineAdapter.dll
+
+[WinBioSensorAdapterCopy]
+T2TouchIdSensorAdapter.dll
 
 [Strings]
 ; Unique per vendor database (docs: do not reuse the sample GUID).

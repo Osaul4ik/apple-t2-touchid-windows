@@ -298,9 +298,6 @@ constexpr ULONGLONG kMatchReplayTtlMs = 500;
 // Starts true: WUDFHost may load long after bridgeOS is "warm", but the first
 // Hello capture of this host process still needs a known-good sensor arm.
 std::atomic<bool> g_needPostResumeWarmup{true};
-// Bumped on every resume. VerificationEngine accepts Match only after FingerOn
-// under the current generation (blocks unlock from a pre-sleep finger on thaw).
-std::atomic<uint32_t> g_resumeGeneration{0};
 
 void ArmMatchReplay(const std::optional<std::array<uint8_t, 16>>& uuid)
 {
@@ -399,8 +396,9 @@ HANDLE GetCaptureCancelEvent()
 // (a touch/match belonging to the pre-sleep session gets treated as a valid
 // sign-in the instant the system resumes).
 //
-// CAPTURE retained across Sx (no cancel). Security: g_resumeGeneration +
-// FingerOn gate in VerificationEngine rejects Match until post-resume touch.
+// Suspend cancels pending CAPTURE (security: no Match across Sx).
+// Post-resume re-arm is owned by our Sensor Adapter (variant 1), not by
+// retaining CAPTURE or match-filters in Verify.
 HPOWERNOTIFY g_suspendResumeNotify = nullptr;
 
 ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_ PVOID Setting)
@@ -414,10 +412,12 @@ ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_
             g_stickyNcm.valid = false;
         }
         g_needPostResumeWarmup.store(true, std::memory_order_relaxed);
-        T2BioLog("OnSuspendResume: PBT_APMSUSPEND - hygiene only (CAPTURE retained; Match gated by resume FingerOn)");
+        HANDLE cancelEvent = GetCaptureCancelEvent();
+        if (cancelEvent) {
+            SetEvent(cancelEvent);
+        }
+        T2BioLog("OnSuspendResume: PBT_APMSUSPEND - CAPTURE cancel (no match across Sx)");
     } else if (Type == PBT_APMRESUMESUSPEND || Type == PBT_APMRESUMEAUTOMATIC) {
-        const uint32_t gen =
-            g_resumeGeneration.fetch_add(1, std::memory_order_relaxed) + 1;
         g_needPostResumeWarmup.store(true, std::memory_order_relaxed);
         ClearMatchReplay();
         {
@@ -429,8 +429,7 @@ ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_
             ResetEvent(cancelEvent);
         }
         g_captureBusy.store(false, std::memory_order_relaxed);
-        T2BioLog("OnSuspendResume: resume gen=%u - WarmUp armed, Match needs FingerOn under this gen",
-                 static_cast<unsigned>(gen));
+        T2BioLog("OnSuspendResume: resume - WarmUp armed, cancel cleared, captureBusy released");
     }
     return 0;
 }
@@ -970,7 +969,6 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
     VerifyConfig cfg;
     cfg.macosUserId = kDefaultMacosUserId;
     cfg.matchWindow = kCaptureMatchWindow;
-    cfg.resumeGeneration = &g_resumeGeneration;
     // Post-resume / post-boot: force ResetSensor + LoadCalibration until a
     // CAPTURE actually finishes with a user-visible outcome (Match/NoMatch/…).
     // Do NOT clear the flag on Cancelled/TransportError — after sleep WBF
@@ -1378,24 +1376,15 @@ extern "C" VOID T2BioEvtIoStop(_In_ WDFQUEUE Queue,
 {
     UNREFERENCED_PARAMETER(Queue);
 
-    T2BioLog("EvtIoStop: ActionFlags=0x%08x cancelable=%d suspend=%d purge=%d",
+    T2BioLog("EvtIoStop: ActionFlags=0x%08x cancelable=%d",
              static_cast<unsigned>(ActionFlags),
-             (ActionFlags & WdfRequestStopRequestCancelable) ? 1 : 0,
-             (ActionFlags & WdfRequestStopActionSuspend) ? 1 : 0,
-             (ActionFlags & WdfRequestStopActionPurge) ? 1 : 0);
+             (ActionFlags & WdfRequestStopRequestCancelable) ? 1 : 0);
 
-    // Suspend: retain CAPTURE (Match gated by resume FingerOn). Purge: cancel.
-    const bool isSuspend = (ActionFlags & WdfRequestStopActionSuspend) != 0;
-    const bool isPurge = (ActionFlags & WdfRequestStopActionPurge) != 0;
-    if (!isSuspend && isPurge &&
-        (ActionFlags & WdfRequestStopRequestCancelable)) {
+    if (ActionFlags & WdfRequestStopRequestCancelable) {
         HANDLE cancelEvent = GetCaptureCancelEvent();
         if (cancelEvent) {
             SetEvent(cancelEvent);
-            T2BioLog("EvtIoStop: purge - cancel signaled");
         }
-    } else if (isSuspend) {
-        T2BioLog("EvtIoStop: suspend - retaining CAPTURE (Match gated post-resume)");
     }
 
     WdfRequestStopAcknowledge(Request, FALSE);
