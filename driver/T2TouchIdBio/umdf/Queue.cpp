@@ -319,6 +319,32 @@ constexpr ULONGLONG kResumeHygieneDebounceMs = 2000;
 // resume that never had a matching suspend cancel (spurious AUTOMATIC).
 std::atomic<bool> g_suspendInterruptedCapture{false};
 
+// Power-suspend: the capture worker must NOT CompleteCaptureData until after
+// resume. Completing mid-Sx (even as BAD_CAPTURE/READY) races LogonUI teardown
+// and produces SensorStopV2_Internal + Engine Deactivate with no follow-up
+// CAPTURE — fingerprint dead until PIN path. Worker waits on this event after
+// SEP Cancel; OnSuspendResume(resume) signals it.
+HANDLE g_resumeContinueEvent = nullptr;
+
+HANDLE GetResumeContinueEvent()
+{
+    HANDLE existing = g_resumeContinueEvent;
+    if (existing) {
+        return existing;
+    }
+    HANDLE created = CreateEventW(nullptr, /*manualReset=*/TRUE, /*initialState=*/FALSE, nullptr);
+    if (!created) {
+        return nullptr;
+    }
+    HANDLE prior = InterlockedCompareExchangePointer(
+        reinterpret_cast<PVOID*>(&g_resumeContinueEvent), created, nullptr);
+    if (prior) {
+        CloseHandle(created);
+        return prior;
+    }
+    return created;
+}
+
 void ArmMatchReplay(const std::optional<std::array<uint8_t, 16>>& uuid)
 {
     std::lock_guard<std::mutex> lock(g_recentMatch.mu);
@@ -452,6 +478,12 @@ ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_
         if (g_captureBusy.load(std::memory_order_relaxed)) {
             g_suspendInterruptedCapture.store(true, std::memory_order_relaxed);
         }
+        // Arm "wait for resume before CompleteCaptureData" BEFORE cancel so the
+        // worker cannot race past the wait with a stale signaled event.
+        HANDLE resumeEv = GetResumeContinueEvent();
+        if (resumeEv) {
+            ResetEvent(resumeEv);
+        }
         HANDLE cancelEvent = GetCaptureCancelEvent();
         if (cancelEvent) {
             SetEvent(cancelEvent); // same wakeup EvtCaptureCancel/T2BioEvtIoStop
@@ -460,14 +492,11 @@ ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_
         // Give the capture worker a short window to observe cancelEvent and
         // run CancelGuard (cmd 0x0c) WHILE the socket is still open. Hardware
         // log 25.09.2026: ForceClose-first left CancelMatch on a dead socket
-        // (WSAENOTSOCK 10038) so SEP stayed in match/capture mode across Sx
-        // and the next post-resume verify often never produced a usable touch.
-        // 120ms covers kCancelPollSlice (50ms) + Cancel best-effort (~300ms
-        // capped here by the remaining budget before freeze).
+        // (WSAENOTSOCK 10038). 120ms covers kCancelPollSlice + Cancel send.
         Sleep(120);
         // Force-close whatever is still in-flight so a blocked ReadFrame
-        // (identity/StartMatch without a cancel poll, or stuck WarmUp) cannot
-        // hold the process through freeze.
+        // cannot hold the process through freeze. Worker then blocks on
+        // resumeEv before completing the IOCTL (see HandleCaptureVerify).
         t2::bridgexpc::Connection::ForceCloseActive();
     } else if (Type == PBT_APMRESUMESUSPEND || Type == PBT_APMRESUMEAUTOMATIC) {
         // Debounce: both RESUMESUSPEND and RESUMEAUTOMATIC fire on a typical
@@ -515,6 +544,11 @@ ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_
                      "captureBusy left intact (no interrupted capture), power-cancel cleared");
         }
         g_powerSuspendCancel.store(false, std::memory_order_relaxed);
+        // Unblock any capture worker that deferred CompleteCaptureData across Sx.
+        HANDLE resumeEv = GetResumeContinueEvent();
+        if (resumeEv) {
+            SetEvent(resumeEv);
+        }
     }
     return 0; // return value is unused for suspend/resume notifications
 }
@@ -1155,19 +1189,31 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
     }
 
     // Power suspend woke us via cancelEvent and/or ForceCloseActive.
-    // That is not a real CancelIoEx / unlock-session teardown — completing
-    // as WINBIO_E_CANCELED would make WBF drop the biometric unlock session.
-    // Map to a soft "bad capture" with SENSOR_READY (not DEVICE_FAILURE /
-    // SENSOR_FAILURE): hardware log 25.09.2026 showed repeated 0x80098036 +
-    // SensorStopV2_Internal after power-cancel, after which WBF Deactivate'd
-    // and sometimes stopped re-arming a usable CAPTURE until PIN path.
+    // That is not a real CancelIoEx / unlock-session teardown.
+    // CRITICAL (25.09.2026 hardware): completing CAPTURE_DATA *during* Sx —
+    // even as BAD_CAPTURE + READY — still yields SensorStopV2_Internal and
+    // Engine Deactivate with no follow-up CAPTURE after resume (fingerprint
+    // dead until PIN). Defer CompleteCaptureData until PBT_APMRESUME* signals
+    // g_resumeContinueEvent so WBF sees the completion on the awake side.
     bool powerSuspendPath = false;
     if (g_powerSuspendCancel.exchange(false, std::memory_order_relaxed)) {
         powerSuspendPath = true;
-        T2BioLog("CAPTURE_DATA(verify): power-suspend path (raw outcome=%d) -> "
-                 "BAD_CAPTURE + SENSOR_READY (keep unlock session, avoid DEVICE_FAILURE)",
-                 static_cast<int>(outcome));
         outcome = VerifyOutcome::Timeout; // maps to WINBIO_E_BAD_CAPTURE
+        HANDLE resumeEv = GetResumeContinueEvent();
+        if (resumeEv) {
+            T2BioLog("CAPTURE_DATA(verify): power-suspend — SEP cancelled; "
+                     "deferring CAPTURE complete until resume (raw outcome was cancelled/transport)");
+            // Process is about to freeze; this wait ends on resume (or after a
+            // long bound if the resume notification was lost).
+            const DWORD waitRc = WaitForSingleObject(resumeEv, 120000);
+            T2BioLog("CAPTURE_DATA(verify): resume-continue wait done rc=%lu -> "
+                     "BAD_CAPTURE + SENSOR_READY",
+                     static_cast<unsigned long>(waitRc));
+            ResetEvent(resumeEv);
+        } else {
+            T2BioLog("CAPTURE_DATA(verify): power-suspend path without resume event — "
+                     "completing immediately as BAD_CAPTURE + READY");
+        }
     }
 
     // Real terminal outcome (Match, NoMatch, bad capture, etc.): SEP path
@@ -1549,5 +1595,10 @@ extern "C" VOID T2BioUnregisterSuspendResumeNotification(VOID)
     if (g_suspendResumeNotify) {
         PowerUnregisterSuspendResumeNotification(g_suspendResumeNotify);
         g_suspendResumeNotify = nullptr;
+    }
+    if (g_resumeContinueEvent) {
+        SetEvent(g_resumeContinueEvent); // unblock any waiter on unload
+        CloseHandle(g_resumeContinueEvent);
+        g_resumeContinueEvent = nullptr;
     }
 }
