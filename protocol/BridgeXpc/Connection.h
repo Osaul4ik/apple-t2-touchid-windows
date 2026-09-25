@@ -58,10 +58,16 @@ public:
     // in the connection's pending-event queue so WaitForEvent() can deliver
     // them later. This mirrors Linux biometric_command(), which returns the
     // events observed while waiting for a command reply to the caller.
+    // cancelEvent (optional): when non-null, the reply wait is sliced into
+    // kCancelPollSlice chunks and the event is polled between them — same
+    // contract as WaitForEvent. Needed so PBT_APMSUSPEND / CancelIoEx can
+    // abort an in-flight identity/StartMatch command instead of waiting up
+    // to the full ioTimeout (5s) with the process about to freeze for sleep.
     bool SendBiometricCommand(const std::vector<uint8_t>& innerBmMessage,
                                uint32_t outputCapacity,
                                std::vector<uint8_t>* outReply,
-                               std::chrono::milliseconds timeout);
+                               std::chrono::milliseconds timeout,
+                               HANDLE cancelEvent = nullptr);
 
     // Blocking receive loop used during an active match session. First
     // drains any event already retained in pendingEvents_ (acked while
@@ -129,6 +135,16 @@ public:
     // stop waiting on it (and may open a fresh connection) instead of
     // treating it like an idle wait. Cleared by Connect().
     bool ConnectionLost() const { return connectionLost_; }
+
+    // Process-wide registry of the Connection currently owned by an in-flight
+    // CAPTURE/Verify. OnSuspendResume calls ForceCloseActive() so a blocking
+    // recv() mid-command is interrupted (closesocket) before the process is
+    // frozen for sleep — cancelEvent alone cannot break an un-sliced ReadFrame.
+    // At most one CAPTURE is in flight (Queue.cpp g_captureBusy), so a single
+    // pointer is sufficient. Register/Unregister are idempotent.
+    static void RegisterActive(Connection* conn);
+    static void UnregisterActive(Connection* conn);
+    static void ForceCloseActive();
 
 private:
     SOCKET socket_ = INVALID_SOCKET;

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Connection.cpp
 #include "Connection.h"
+#include <mutex>
 #include "Log.h"
 #include "Winsock.h"
 #include <ws2tcpip.h>
@@ -35,9 +36,61 @@ static std::string NewRequestUuid() {
     return result;
 }
 
+// Single in-flight CAPTURE connection (Queue.cpp g_captureBusy guarantees at
+// most one). Protected by g_activeMu; ForceCloseActive is called from the
+// PowerRegisterSuspendResumeNotification callback on a different thread.
+static std::mutex g_activeMu;
+static Connection* g_activeConn = nullptr;
+
+// design doc §9.4: how long a signaled cancelEvent can be left unnoticed
+// while WaitForEvent / SendBiometricCommand is blocked inside ReadFrame.
+// 50ms: suspend-cancel and CancelIoEx free the capture slot quickly enough
+// that a process freeze for sleep cannot strand an active StartMatch; still
+// large enough not to busy-poll an idle touch wait.
+static constexpr std::chrono::milliseconds kCancelPollSlice{50};
+
+
+void Connection::RegisterActive(Connection* conn) {
+    std::lock_guard<std::mutex> lock(g_activeMu);
+    g_activeConn = conn;
+}
+
+void Connection::UnregisterActive(Connection* conn) {
+    std::lock_guard<std::mutex> lock(g_activeMu);
+    if (g_activeConn == conn) {
+        g_activeConn = nullptr;
+    }
+}
+
+void Connection::ForceCloseActive() {
+    // Take the pointer under the lock, then close outside so Close()/Unregister
+    // cannot deadlock on the same mutex. closesocket unblocks any recv() in
+    // ReadFrame on the capture worker thread within one SO_RCVTIMEO slice.
+    Connection* conn = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_activeMu);
+        conn = g_activeConn;
+        g_activeConn = nullptr; // prevent double-close races
+    }
+    if (!conn) {
+        return;
+    }
+    T2_LOG("connect", L"ForceCloseActive: shutting down in-flight BridgeXPC socket "
+           L"(power-suspend / cancel path)");
+    conn->connectionLost_ = true;
+    if (conn->socket_ != INVALID_SOCKET) {
+        // SD_BOTH so a blocked recv returns promptly; closesocket follows.
+        shutdown(conn->socket_, SD_BOTH);
+        closesocket(conn->socket_);
+        conn->socket_ = INVALID_SOCKET;
+    }
+    conn->pendingEvents_.clear();
+}
+
 Connection::~Connection() { Close(); }
 
 void Connection::Close() {
+    UnregisterActive(this);
     if (socket_ != INVALID_SOCKET) {
         closesocket(socket_);
         socket_ = INVALID_SOCKET;
@@ -182,6 +235,7 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
     }
 
     T2_LOG("connect", L"handshake OK, BridgeXPCVersion=%lld", static_cast<long long>(bridgeXpcVersion));
+    RegisterActive(this);
     return ConnectResult::Ok;
 }
 
@@ -292,7 +346,8 @@ bool Connection::SetClientVersion(int64_t version, std::chrono::milliseconds tim
 bool Connection::SendBiometricCommand(const std::vector<uint8_t>& innerBmMessage,
                                        uint32_t outputCapacity,
                                        std::vector<uint8_t>* outReply,
-                                       std::chrono::milliseconds timeout) {
+                                       std::chrono::milliseconds timeout,
+                                       HANDLE cancelEvent) {
     std::string reqId = NewRequestUuid();
     if (reqId.empty()) return false;
     // VERIFIED FROM SOURCE: outer payload is exactly
@@ -325,6 +380,17 @@ bool Connection::SendBiometricCommand(const std::vector<uint8_t>& innerBmMessage
     // matching reply arrives or the deadline passes.
     auto deadline = std::chrono::steady_clock::now() + timeout;
     for (;;) {
+        if (cancelEvent && Connection::IsEventSignaled(cancelEvent)) {
+            T2_LOG("sendBiometricCommand", L"cancelEvent signaled while waiting for reply "
+                   L"(reqId=%s) - aborting command", Widen(reqId).c_str());
+            connectionLost_ = true; // treat as dead session; caller maps to Cancelled
+            return false;
+        }
+        if (connectionLost_) {
+            T2_LOG("sendBiometricCommand", L"connection already lost (ForceCloseActive?) "
+                   L"(reqId=%s) - aborting command", Widen(reqId).c_str());
+            return false;
+        }
         auto now = std::chrono::steady_clock::now();
         if (now >= deadline) {
             T2_LOG("sendBiometricCommand", L"deadline reached waiting for reply "
@@ -333,13 +399,36 @@ bool Connection::SendBiometricCommand(const std::vector<uint8_t>& innerBmMessage
             return false;
         }
         auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+        // Slice ReadFrame when cancelable so we re-check cancelEvent / ForceClose
+        // at least every kCancelPollSlice (same rationale as WaitForEvent).
+        const auto readTimeout = (cancelEvent && kCancelPollSlice < remaining)
+                                      ? kCancelPollSlice
+                                      : remaining;
 
         RawFrame reply;
-        if (!ReadFrame(&reply, remaining)) {
+        if (!ReadFrame(&reply, readTimeout)) {
+            // Idle slice with cancelEvent in play: keep looping (re-check cancel).
+            if (cancelEvent && readTimeout == kCancelPollSlice &&
+                std::chrono::steady_clock::now() < deadline && !connectionLost_) {
+                continue;
+            }
             T2_LOG("sendBiometricCommand", L"ReadFrame failed/timed out (reqId=%s, "
                    "%lldms remained) - WSAGetLastError=%d",
-                   Widen(reqId).c_str(), static_cast<long long>(remaining.count()),
+                   Widen(reqId).c_str(), static_cast<long long>(
+                       std::chrono::duration_cast<std::chrono::milliseconds>(
+                           deadline - std::chrono::steady_clock::now()).count()),
                    WSAGetLastError());
+            // ForceCloseActive sets connectionLost_ before closesocket; peer
+            // reset is also a hard loss. Ordinary full-timeout without cancel
+            // stays a soft failure (no connectionLost_) as before.
+            if (connectionLost_) {
+                return false;
+            }
+            const int wsa = WSAGetLastError();
+            if (wsa == WSAECONNRESET || wsa == WSAECONNABORTED || wsa == WSAENOTSOCK ||
+                wsa == WSAESHUTDOWN) {
+                connectionLost_ = true;
+            }
             return false;
         }
         if (reply.type != FrameType::Message) {
@@ -543,16 +632,6 @@ size_t Connection::DiscardPendingEvents() {
     }
     return n;
 }
-
-// design doc §9.4: how long a signaled cancelEvent can be left unnoticed
-// while WaitForEvent is blocked inside ReadFrame. Small enough that a
-// CancelIoEx-driven unlock (Win+L, or LogonUI completing a password
-// fallback) frees g_captureBusy (Queue.cpp) fast enough for the very next
-// CAPTURE_DATA — the actual bug this is fixing — well under the second;
-// large enough not to turn an idle "waiting for a finger" session into a
-// busy-poll. Not tied to kCaptureMatchWindow — that one bounds the whole
-// session, this one bounds cancel latency within it.
-static constexpr std::chrono::milliseconds kCancelPollSlice{200};
 
 bool Connection::WaitForEvent(std::vector<uint8_t>* outEventPayload,
                                std::chrono::steady_clock::time_point deadline,

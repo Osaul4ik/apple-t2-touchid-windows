@@ -209,6 +209,9 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     std::vector<IdentityRecordV1> identities;
     std::vector<uint8_t> firstUserRaw;
     if (!RunLinuxReadySequence(conn, &identities, &firstUserRaw)) {
+        if (cancelEvent && bridgexpc::Connection::IsEventSignaled(cancelEvent)) {
+            return VerifyOutcome::Cancelled;
+        }
         return VerifyOutcome::TransportError;
     }
     if (identities.empty()) {
@@ -236,26 +239,36 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     auto readGlobalIdentityList = [&](std::vector<uint8_t>* outRaw) -> bool {
         auto globalCmd = EncodeBmCommand(Command::GlobalIdentityList, /*version=*/1, /*value=*/0);
         return conn->SendBiometricCommand(globalCmd, kGlobalIdentityListOutputCapacity, outRaw,
-                                           config_.ioTimeout);
+                                           config_.ioTimeout, cancelEvent);
     };
     auto readUserIdentityList = [&](std::vector<uint8_t>* outRaw) -> bool {
         std::vector<uint8_t> idReq(4);
         std::memcpy(idReq.data(), &config_.macosUserId, 4);
         auto idCmd = EncodeBmCommand(Command::IdentityList, /*version=*/1, /*value=*/0, idReq);
-        return conn->SendBiometricCommand(idCmd, kIdentityListOutputCapacity, outRaw, config_.ioTimeout);
+        return conn->SendBiometricCommand(idCmd, kIdentityListOutputCapacity, outRaw,
+                                          config_.ioTimeout, cancelEvent);
     };
 
     std::vector<uint8_t> firstGlobalRaw, repeatUserRaw, repeatGlobalRaw;
     if (!readGlobalIdentityList(&firstGlobalRaw)) {
         T2_LOG("verify", L"GlobalIdentityList (cmd 0x51, first read) failed");
+        if (cancelEvent && bridgexpc::Connection::IsEventSignaled(cancelEvent)) {
+            return VerifyOutcome::Cancelled;
+        }
         return VerifyOutcome::TransportError;
     }
     if (!readUserIdentityList(&repeatUserRaw)) {
         T2_LOG("verify", L"IdentityList (cmd 0x42, repeat read) failed");
+        if (cancelEvent && bridgexpc::Connection::IsEventSignaled(cancelEvent)) {
+            return VerifyOutcome::Cancelled;
+        }
         return VerifyOutcome::TransportError;
     }
     if (!readGlobalIdentityList(&repeatGlobalRaw)) {
         T2_LOG("verify", L"GlobalIdentityList (cmd 0x51, repeat read) failed");
+        if (cancelEvent && bridgexpc::Connection::IsEventSignaled(cancelEvent)) {
+            return VerifyOutcome::Cancelled;
+        }
         return VerifyOutcome::TransportError;
     }
 
@@ -368,7 +381,7 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
                sizeof(MatchInitDataV1) + sizeof(uint32_t) + identities.size() * sizeof(IdentityRecordV1));
         auto startCmd = EncodeBmCommand(Command::StartMatch, 1, 0, matchInitData);
         std::vector<uint8_t> startReply;
-        return conn->SendBiometricCommand(startCmd, 0, &startReply, config_.ioTimeout);
+        return conn->SendBiometricCommand(startCmd, 0, &startReply, config_.ioTimeout, cancelEvent);
     };
 
     // Same reasoning as the check at the top: a cancel that landed during the
@@ -380,6 +393,19 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     }
 
     if (!sendStartMatch()) {
+        // ForceCloseActive / cancel mid-StartMatch surface as ConnectionLost
+        // or a failed send; treat a concurrent cancel as Cancelled so Queue
+        // can map power-suspend to TransportError.
+        if (cancelEvent && bridgexpc::Connection::IsEventSignaled(cancelEvent)) {
+            return VerifyOutcome::Cancelled;
+        }
+        if (conn->ConnectionLost()) {
+            // Suspend ForceClose or peer drop during StartMatch.
+            if (cancelEvent && bridgexpc::Connection::IsEventSignaled(cancelEvent)) {
+                return VerifyOutcome::Cancelled;
+            }
+            return VerifyOutcome::TransportError;
+        }
         return VerifyOutcome::TransportError;
     }
 

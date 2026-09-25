@@ -307,6 +307,18 @@ std::atomic<bool> g_needPostResumeWarmup{true};
 // and when the cancel is consumed.
 std::atomic<bool> g_powerSuspendCancel{false};
 
+// Debounce PBT_APMRESUMESUSPEND + PBT_APMRESUMEAUTOMATIC (both fire on a
+// typical wake). Applying hygiene twice races a CAPTURE that started between
+// the two callbacks: the second pass would clear g_captureBusy under a live
+// worker. One resume cycle per suspend is enough.
+std::atomic<ULONGLONG> g_lastResumeHygieneMs{0};
+constexpr ULONGLONG kResumeHygieneDebounceMs = 2000;
+
+// Set on suspend after ForceCloseActive; resume only force-clears busy when
+// a suspend actually interrupted a capture. Avoids clearing busy on a
+// resume that never had a matching suspend cancel (spurious AUTOMATIC).
+std::atomic<bool> g_suspendInterruptedCapture{false};
+
 void ArmMatchReplay(const std::optional<std::array<uint8_t, 16>>& uuid)
 {
     std::lock_guard<std::mutex> lock(g_recentMatch.mu);
@@ -437,23 +449,43 @@ ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_
         // and completes as TransportError, not WINBIO_E_CANCELED (which
         // would tear down the unlock session).
         g_powerSuspendCancel.store(true, std::memory_order_relaxed);
+        if (g_captureBusy.load(std::memory_order_relaxed)) {
+            g_suspendInterruptedCapture.store(true, std::memory_order_relaxed);
+        }
         HANDLE cancelEvent = GetCaptureCancelEvent();
         if (cancelEvent) {
             SetEvent(cancelEvent); // same wakeup EvtCaptureCancel/T2BioEvtIoStop
                                     // use - see header comment above
         }
+        // Force-close the in-flight BridgeXPC socket so a blocking ReadFrame
+        // inside SendBiometricCommand (identity gate / StartMatch, up to 5s)
+        // cannot hold the process through freeze. cancelEvent alone only
+        // aborts waits that poll it; closesocket unblocks the rest.
+        t2::bridgexpc::Connection::ForceCloseActive();
     } else if (Type == PBT_APMRESUMESUSPEND || Type == PBT_APMRESUMEAUTOMATIC) {
+        // Debounce: both RESUMESUSPEND and RESUMEAUTOMATIC fire on a typical
+        // wake. Second pass must not clear busy under a CAPTURE that already
+        // started after the first hygiene pass.
+        const ULONGLONG nowMs = GetTickCount64();
+        const ULONGLONG lastMs = g_lastResumeHygieneMs.load(std::memory_order_relaxed);
+        if (lastMs != 0 && (nowMs - lastMs) < kResumeHygieneDebounceMs) {
+            T2BioLog("OnSuspendResume: resume debounced (type=%lu, %llu ms since last hygiene)",
+                     static_cast<unsigned long>(Type),
+                     static_cast<unsigned long long>(nowMs - lastMs));
+            return 0;
+        }
+        g_lastResumeHygieneMs.store(nowMs, std::memory_order_relaxed);
+
         // Resume hygiene (no service restarts — WBF owns Activate/CAPTURE):
         // 1) Force WarmUp on the next real verify (SEP cancel residue after Sx).
         // 2) Drop sticky NCM / match-replay (adapter and session are new).
         // 3) Reset the process-wide cancel event — leave it signaled and the
         //    first post-resume CAPTURE can observe a stale cancel before its
         //    own ResetEvent runs (worker scheduling).
-        // 4) Clear g_captureBusy — if the cancel worker was frozen mid-unwind
-        //    across Sx, busy stays true forever and WBF only sees
-        //    DATA_COLLECTION_IN_PROGRESS (or stops arming). Hardware log
-        //    24.09.2026: ~14s with zero CAPTURE after resume until a full
-        //    Deactivate/Activate cycle (PIN path).
+        // 4) Clear g_captureBusy only if suspend actually interrupted a
+        //    capture — otherwise a race with a brand-new CAPTURE loses the
+        //    busy guard. Hardware log 24.09.2026: ~14s with zero CAPTURE
+        //    after resume when busy stuck true across Sx.
         // 5) Drop g_powerSuspendCancel — any further cancelEvent signal is a
         //    real CancelIoEx again.
         g_needPostResumeWarmup.store(true, std::memory_order_relaxed);
@@ -466,9 +498,16 @@ ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_
         if (cancelEvent) {
             ResetEvent(cancelEvent);
         }
-        g_captureBusy.store(false, std::memory_order_relaxed);
+        const bool interrupted = g_suspendInterruptedCapture.exchange(false, std::memory_order_relaxed);
+        if (interrupted) {
+            g_captureBusy.store(false, std::memory_order_relaxed);
+            T2BioLog("OnSuspendResume: resume - WarmUp armed, cancel cleared, "
+                     "captureBusy force-released (suspend interrupted capture), power-cancel cleared");
+        } else {
+            T2BioLog("OnSuspendResume: resume - WarmUp armed, cancel cleared, "
+                     "captureBusy left intact (no interrupted capture), power-cancel cleared");
+        }
         g_powerSuspendCancel.store(false, std::memory_order_relaxed);
-        T2BioLog("OnSuspendResume: resume - WarmUp armed, cancel cleared, captureBusy released, power-cancel cleared");
     }
     return 0; // return value is unused for suspend/resume notifications
 }
@@ -1108,16 +1147,23 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
         return;
     }
 
-    // Power suspend woke us via cancelEvent (g_powerSuspendCancel). That is
-    // not a real CancelIoEx / unlock-session teardown — completing as
-    // WINBIO_E_CANCELED would make WBF drop the biometric unlock session
-    // ("скасування сесії розблокування після сну"). Map to TransportError so
-    // WBF sees a temporary device failure and re-arms CAPTURE after resume.
-    if (outcome == VerifyOutcome::Cancelled &&
-        g_powerSuspendCancel.exchange(false, std::memory_order_relaxed)) {
-        T2BioLog("CAPTURE_DATA(verify): power-suspend cancel -> TransportError "
-                 "(keep unlock session, do not report WINBIO_E_CANCELED)");
-        outcome = VerifyOutcome::TransportError;
+    // Power suspend woke us via cancelEvent and/or ForceCloseActive.
+    // That is not a real CancelIoEx / unlock-session teardown — completing
+    // as WINBIO_E_CANCELED would make WBF drop the biometric unlock session
+    // ("скасування сесії розблокування після сну"). Map Cancelled ->
+    // TransportError so WBF sees a temporary device failure and re-arms
+    // CAPTURE after resume. If ForceClose already produced TransportError,
+    // keep it and only consume the flag.
+    if (g_powerSuspendCancel.exchange(false, std::memory_order_relaxed)) {
+        if (outcome == VerifyOutcome::Cancelled) {
+            T2BioLog("CAPTURE_DATA(verify): power-suspend cancel -> TransportError "
+                     "(keep unlock session, do not report WINBIO_E_CANCELED)");
+            outcome = VerifyOutcome::TransportError;
+        } else {
+            T2BioLog("CAPTURE_DATA(verify): power-suspend path (outcome=%d already "
+                     "non-Cancelled; kept, unlock session preserved)",
+                     static_cast<int>(outcome));
+        }
     }
 
     // Real terminal outcome (Match, NoMatch, bad capture, etc.): SEP path
