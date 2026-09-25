@@ -980,10 +980,55 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
     // Suspended: reject NEW CAPTURE without SEP work. Do not use S_OK (spin)
     // or CANCELED in a tight loop (also spun). INVALID_DEVICE_STATE tells WBF
     // the unit is not capturable until resume clears g_suspended.
+    //
+    // 25.09.2026 BUGFIX: g_suspended is set/cleared purely from this
+    // process's own PowerRegisterSuspendResumeNotification broadcast
+    // (OnSuspendResume above), which is NOT synchronized with the real
+    // hardware. T2TouchIdTransport is a real, power-managed PCI function
+    // driver whose D0Entry runs synchronously with the PnP/Power manager -
+    // it (and the SEP behind it) can be fully Ready again many seconds
+    // before this process's own resume broadcast is even scheduled/
+    // delivered (a root-enumerated WUDFHost-hosted virtual device has no
+    // wake/idle policy - see the EvtIoStop comment above - so its resume
+    // notice depends entirely on this process's callback thread getting
+    // CPU time, which can lag far behind the real hardware after a system
+    // sleep or a Fast-Startup/hibernate boot). Hardware log, 25.09.2026:
+    // hundreds of CAPTURE_DATA calls rejected with INVALID_DEVICE_STATE
+    // over 40+ seconds while T2TouchIdTransport had already finished
+    // D0Entry -> Ready (and, on a later cycle, even completed a real
+    // match) - this is exactly the "error on the lock screen after a cold
+    // boot / after waking from sleep" symptom, and it is WBF re-issuing
+    // CAPTURE_DATA in a tight loop against a stale local flag, not an
+    // actual sensor failure.
+    //
+    // Before trusting the flag, cross-check it against the always-current,
+    // authoritative signal CheckSepReady() already uses for
+    // GET_SENSOR_STATUS (T2SepBootstrapService's reported status, read
+    // straight from T2TouchIdTransport). If the real hardware is already
+    // live, self-correct instead of continuing to fail closed on a flag
+    // that has simply not caught up yet.
     if (g_suspended.load(std::memory_order_acquire)) {
-        T2BioLog("CAPTURE_DATA(verify): suspended - INVALID_DEVICE_STATE (no SEP)");
-        CompleteCaptureData(Request, WINBIO_E_INVALID_DEVICE_STATE, WINBIO_SENSOR_FAILURE, 0, {});
-        return;
+        WINBIO_SENSOR_STATUS liveSensorStatus{};
+        HRESULT liveHresult = S_OK;
+        if (CheckSepReady(&liveSensorStatus, &liveHresult)) {
+            T2BioLog("CAPTURE_DATA(verify): g_suspended is stale (SEP already live per "
+                     "T2TouchIdTransport) - self-correcting and proceeding with capture");
+            g_suspended.store(false, std::memory_order_release);
+            // The stale flag means our own resume notice never ran, so the
+            // usual post-resume ResetSensor+LoadCalibration WarmUp
+            // (OnSuspendResume's PBT_APMRESUMESUSPEND/RESUMEAUTOMATIC
+            // branch) never armed either. Force it here so this capture
+            // still gets the full re-sync instead of trusting whatever
+            // state the SEP was left in.
+            g_needPostResumeWarmup.store(true, std::memory_order_relaxed);
+            // No replay could legitimately exist yet for this newly-
+            // recovered session - safety net, mirrors OnSuspendResume.
+            ClearMatchReplay();
+        } else {
+            T2BioLog("CAPTURE_DATA(verify): suspended - INVALID_DEVICE_STATE (no SEP)");
+            CompleteCaptureData(Request, WINBIO_E_INVALID_DEVICE_STATE, WINBIO_SENSOR_FAILURE, 0, {});
+            return;
+        }
     }
 
     // design doc §9.4: register this specific request as cancelable BEFORE

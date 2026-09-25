@@ -348,10 +348,35 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     // Events queued during StartMatch's OWN SendBiometricCommand call just
     // below are unaffected - they land in pendingEvents_ after this point,
     // same as the reference's own per-call `events` for cmd 4.
+    // 25.09.2026 BUGFIX (auto-unlock from a touch made while the machine was
+    // going to sleep): true only once a genuine, live FingerOn(63) has been
+    // observed for the CURRENT StartMatch attempt. DiscardPendingEvents()
+    // above only flushes whatever bridgeOS has ALREADY queued at the instant
+    // it runs - an event bridgeOS generated during/just before suspend can
+    // still arrive on the wire *after* that flush point (bridgeOS/the SEP
+    // keep running semi-independently of the Intel host's own Sx state, and
+    // NCM/BridgeXPC delivery has its own buffering/lag - see
+    // docs/Windows-hello-design.MD). The existing "MATCH discarded - Sx
+    // boundary" check (Queue.cpp) only catches a Match delivered to an
+    // attempt that itself straddled a NEW suspend; it cannot catch a stale
+    // match_result belonging to an OLD, already-cancelled session leaking
+    // into a brand-new, fully-post-resume attempt, because that attempt
+    // never crosses an Sx boundary of its own. The wire protocol carries no
+    // session/match ID the host can check, so the only reliable signal that
+    // a match_result really belongs to THIS touch is that a FingerOn for
+    // THIS attempt preceded it - true of every real match in every hardware
+    // capture on file (FingerOn -> ImageCaptured -> ImageWasAccepted ->
+    // match_result, in that order, every time). Reset on every StartMatch
+    // send (initial attempt and every NO_MATCH restart) so a leftover
+    // FingerOn from an earlier attempt in this same Verify() call can't
+    // vouch for a later one either.
+    bool sawFingerOnThisAttempt = false;
+
     // Sends (or re-sends) StartMatch for one attempt. Broken out of the
     // original single call so a bad touch (NO_MATCH) can restart a fresh
     // match session below without duplicating this block.
     auto sendStartMatch = [&]() -> bool {
+        sawFingerOnThisAttempt = false;
         const size_t discardedPreMatchEvents = conn->DiscardPendingEvents();
         if (discardedPreMatchEvents > 0) {
             T2_LOG("verify",
@@ -469,7 +494,10 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
                 StatusEventBody body = ParseStatusEventBody(eventData);
                 if (body.statusCode) {
                     const uint32_t code = *body.statusCode;
-                    if (code == 63) fingerTouchCycles++;
+                    if (code == 63) {
+                        fingerTouchCycles++;
+                        sawFingerOnThisAttempt = true; // see the 25.09.2026 comment above
+                    }
                     if (StatusCodeIsImagePipeline(code)) imagePipelineEvents++;
                     if (!StatusCodeName(code)) unnamedStatusEvents++;
                 }
@@ -514,6 +542,17 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
 
         MatchResult mr = ParseMatchResult(embeddedType, eventData, identities);
         if (mr.outcome == MatchOutcome::Match) {
+            if (!sawFingerOnThisAttempt) {
+                // 25.09.2026 BUGFIX: a match_result with no live FingerOn for
+                // THIS attempt cannot be trusted as this touch's result - see
+                // the comment above sawFingerOnThisAttempt's declaration.
+                // Keep waiting; do not unlock on it.
+                T2_LOG("verify",
+                       L"match_result outcome=MATCH but NO live FingerOn observed for this "
+                       L"attempt - discarding as stale (likely leaked from a touch before/"
+                       L"during suspend) and continuing to wait for a real touch");
+                continue;
+            }
             T2_LOG("verify", L"match_result outcome=MATCH (identity matched, UUID not logged)");
             outcome = VerifyOutcome::Match;
             *outMatchedUuid = mr.matchedIdentityUuid;
