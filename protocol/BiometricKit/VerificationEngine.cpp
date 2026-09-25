@@ -588,6 +588,26 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
 
         MatchResult mr = ParseMatchResult(embeddedType, eventData, identities);
         if (mr.outcome == MatchOutcome::Match) {
+            if (config_.requireFingerLiftSinceResume && fingerTouchCycles == 0) {
+                // 26.09.2026: this is the resume-restart attempt and no
+                // live FingerOn was ever observed in THIS session before
+                // the match_result arrived - almost certainly a
+                // leftover/queued artifact of the aborted pre-suspend
+                // transaction, not a decision on this session's own live
+                // data. Reject it exactly like an ordinary NoMatch: the
+                // caller (Queue.cpp) already restarts a fresh full
+                // Linux-order transaction (reconnect, warm-up, new
+                // StartMatch) on NoMatch, which is exactly what should
+                // happen here too - the machine must not unlock on a
+                // match that never saw a live touch this session.
+                T2_LOG("verify",
+                       L"match_result outcome=MATCH rejected - no live FingerOn observed in "
+                       L"this session (requireFingerLiftSinceResume); treating as NO_MATCH and "
+                       L"requesting a fresh transaction");
+                rejectedTouchAttempts++;
+                outcome = VerifyOutcome::NoMatch;
+                break;
+            }
             T2_LOG("verify", L"match_result outcome=MATCH (identity matched, UUID not logged)");
             outcome = VerifyOutcome::Match;
             *outMatchedUuid = mr.matchedIdentityUuid;

@@ -68,6 +68,30 @@ struct VerifyConfig {
     std::chrono::seconds matchWindow{20};
     std::chrono::milliseconds ioTimeout{5000};
 
+    // 26.09.2026: set true ONLY by Queue.cpp's resume-restart path (the
+    // verify attempt started immediately after OnSuspendResume discarded
+    // the pre-suspend session), never for an ordinary first attempt.
+    // Real-hardware capture: the machine is woken via its power button,
+    // which IS the fingerprint sensor - so gating on "finger was lifted"
+    // (FingerOff) or "finger was placed twice" cannot work, the wake
+    // gesture itself is indistinguishable from a deliberate touch. What
+    // actually happened: a touch begun just before suspend (SEP may
+    // already have started processing it before our Cancel/teardown
+    // reached it) surfaced as a match_result within the FIRST new
+    // post-resume StartMatch session, unlocking the machine with no live
+    // touch belonging to that new session at all. When this flag is set,
+    // Verify() requires at least one live FingerOn(status_code 63) to
+    // have been observed in THIS session before honoring any
+    // match_result as VerifyOutcome::Match; a match_result that arrives
+    // with zero FingerOn seen in this session is almost certainly a
+    // leftover/queued artifact of the aborted pre-suspend transaction,
+    // not a live decision on this session's own data - it is rejected
+    // exactly like an ordinary NoMatch (Queue.cpp already restarts a
+    // fresh full Linux-order transaction on NoMatch). Left false for
+    // every other attempt: an ordinary first touch is trivially preceded
+    // by its own FingerOn already, so this never rejects a real one.
+    bool requireFingerLiftSinceResume = false;
+
     // REVERTED (16.09.2026): defaulted to InlineIdentities (68B, no count)
     // on the strength of the same macOS unified-log capture already
     // discredited above (the pre-match sequence and skipResetSensor/

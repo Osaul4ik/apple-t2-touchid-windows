@@ -1120,8 +1120,22 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
                     outcome = VerifyOutcome::Cancelled;
                     break;
                 }
+                // 26.09.2026: real-hardware capture - a touch begun just
+                // before suspend (SEP may already have started processing
+                // it before our Cancel/session-teardown reached it) can
+                // still surface as a match_result within the FIRST new
+                // post-resume StartMatch session with no live touch
+                // belonging to that new session at all. Wake happens via
+                // the power button, which IS the sensor, so gating on
+                // "finger lifted" doesn't work - gate on "this session
+                // saw its own live FingerOn" instead (VerificationEngine
+                // treats a match with none as NO_MATCH and restarts a
+                // fresh transaction) so a stale pre-suspend result can
+                // never unlock the machine on its own.
+                cfg.requireFingerLiftSinceResume = true;
                 T2BioLog("CAPTURE_DATA(verify): resumed; restarting BiometricKit verify "
-                         "in the same pending WBF request (SEP bootstrap is unchanged)");
+                         "in the same pending WBF request (SEP bootstrap is unchanged; "
+                         "requiring a live FingerOn this session before honoring a match)");
                 continue;
             }
 
