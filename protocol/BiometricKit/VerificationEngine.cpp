@@ -420,6 +420,14 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
         bridgexpc::Connection* conn;
         const std::vector<uint8_t>* cancelCmd;
         ~CancelGuard() {
+            // ForceCloseActive (power-suspend) already tore down the socket —
+            // do not log a guaranteed WriteFrame failure (WSAENOTSOCK).
+            // When cancelEvent woke us with the socket still open, this is
+            // the path that actually delivers Cancel (cmd 0x0c) to SEP.
+            if (conn->ConnectionLost()) {
+                T2_LOG("verify", L"CancelGuard: skip CancelMatch (connection already lost)");
+                return;
+            }
             std::vector<uint8_t> discard;
             conn->SendBiometricCommand(*cancelCmd, 0, &discard, kCancelBestEffortTimeout);
         }

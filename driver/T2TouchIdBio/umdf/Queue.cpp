@@ -457,10 +457,17 @@ ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_
             SetEvent(cancelEvent); // same wakeup EvtCaptureCancel/T2BioEvtIoStop
                                     // use - see header comment above
         }
-        // Force-close the in-flight BridgeXPC socket so a blocking ReadFrame
-        // inside SendBiometricCommand (identity gate / StartMatch, up to 5s)
-        // cannot hold the process through freeze. cancelEvent alone only
-        // aborts waits that poll it; closesocket unblocks the rest.
+        // Give the capture worker a short window to observe cancelEvent and
+        // run CancelGuard (cmd 0x0c) WHILE the socket is still open. Hardware
+        // log 25.09.2026: ForceClose-first left CancelMatch on a dead socket
+        // (WSAENOTSOCK 10038) so SEP stayed in match/capture mode across Sx
+        // and the next post-resume verify often never produced a usable touch.
+        // 120ms covers kCancelPollSlice (50ms) + Cancel best-effort (~300ms
+        // capped here by the remaining budget before freeze).
+        Sleep(120);
+        // Force-close whatever is still in-flight so a blocked ReadFrame
+        // (identity/StartMatch without a cancel poll, or stuck WarmUp) cannot
+        // hold the process through freeze.
         t2::bridgexpc::Connection::ForceCloseActive();
     } else if (Type == PBT_APMRESUMESUSPEND || Type == PBT_APMRESUMEAUTOMATIC) {
         // Debounce: both RESUMESUSPEND and RESUMEAUTOMATIC fire on a typical
@@ -1149,31 +1156,30 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
 
     // Power suspend woke us via cancelEvent and/or ForceCloseActive.
     // That is not a real CancelIoEx / unlock-session teardown — completing
-    // as WINBIO_E_CANCELED would make WBF drop the biometric unlock session
-    // ("скасування сесії розблокування після сну"). Map Cancelled ->
-    // TransportError so WBF sees a temporary device failure and re-arms
-    // CAPTURE after resume. If ForceClose already produced TransportError,
-    // keep it and only consume the flag.
+    // as WINBIO_E_CANCELED would make WBF drop the biometric unlock session.
+    // Map to a soft "bad capture" with SENSOR_READY (not DEVICE_FAILURE /
+    // SENSOR_FAILURE): hardware log 25.09.2026 showed repeated 0x80098036 +
+    // SensorStopV2_Internal after power-cancel, after which WBF Deactivate'd
+    // and sometimes stopped re-arming a usable CAPTURE until PIN path.
+    bool powerSuspendPath = false;
     if (g_powerSuspendCancel.exchange(false, std::memory_order_relaxed)) {
-        if (outcome == VerifyOutcome::Cancelled) {
-            T2BioLog("CAPTURE_DATA(verify): power-suspend cancel -> TransportError "
-                     "(keep unlock session, do not report WINBIO_E_CANCELED)");
-            outcome = VerifyOutcome::TransportError;
-        } else {
-            T2BioLog("CAPTURE_DATA(verify): power-suspend path (outcome=%d already "
-                     "non-Cancelled; kept, unlock session preserved)",
-                     static_cast<int>(outcome));
-        }
+        powerSuspendPath = true;
+        T2BioLog("CAPTURE_DATA(verify): power-suspend path (raw outcome=%d) -> "
+                 "BAD_CAPTURE + SENSOR_READY (keep unlock session, avoid DEVICE_FAILURE)",
+                 static_cast<int>(outcome));
+        outcome = VerifyOutcome::Timeout; // maps to WINBIO_E_BAD_CAPTURE
     }
 
     // Real terminal outcome (Match, NoMatch, bad capture, etc.): SEP path
     // was exercised; drop the forced WarmUp for steady-state latency.
+    // Power-suspend / transport cancel keep WarmUp armed for the next CAPTURE.
     if (outcome != VerifyOutcome::Cancelled &&
-        outcome != VerifyOutcome::TransportError) {
+        outcome != VerifyOutcome::TransportError &&
+        !powerSuspendPath) {
         g_needPostResumeWarmup.store(false, std::memory_order_relaxed);
-    } else if (postResumeWarmup) {
+    } else if (postResumeWarmup || powerSuspendPath) {
         g_needPostResumeWarmup.store(true, std::memory_order_relaxed);
-        T2BioLog("CAPTURE_DATA(verify): post-resume WarmUp retained after cancel/transport");
+        T2BioLog("CAPTURE_DATA(verify): post-resume WarmUp retained after cancel/transport/power");
     }
 
     const HRESULT hr = MapVerifyOutcomeToHresult(outcome);
@@ -1181,11 +1187,14 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
              static_cast<unsigned>(hr));
     // ACCEPT only for a delivered sample (a real Match); see the note in
     // HandleCaptureEnroll. Failures stay FAILURE, everything else READY.
+    // Power-suspend deliberately stays READY (see above).
     const WINBIO_SENSOR_STATUS sensorStatus =
-        (outcome == VerifyOutcome::TransportError || outcome == VerifyOutcome::RejectedByDevice ||
-         outcome == VerifyOutcome::UnstableIdentityInventory)
-            ? WINBIO_SENSOR_FAILURE
-            : (outcome == VerifyOutcome::Match ? WINBIO_SENSOR_ACCEPT : WINBIO_SENSOR_READY);
+        (powerSuspendPath)
+            ? WINBIO_SENSOR_READY
+            : ((outcome == VerifyOutcome::TransportError || outcome == VerifyOutcome::RejectedByDevice ||
+                outcome == VerifyOutcome::UnstableIdentityInventory)
+                   ? WINBIO_SENSOR_FAILURE
+                   : (outcome == VerifyOutcome::Match ? WINBIO_SENSOR_ACCEPT : WINBIO_SENSOR_READY));
     // A sample goes to WBF only for a real Match; every other outcome completes
     // with its error HRESULT and no data (fail-closed: no BIR to misread).
     std::vector<uint8_t> bir;
