@@ -14,7 +14,7 @@ enum class VerifyOutcome {
     NoMatch,
     Timeout,
     TransportError,      // connect/HELO/version negotiation failure
-    RejectedByDevice,     // start-match command itself was rejected (word[0]!=0) — never silent success
+    RejectedByDevice,     // StartMatch's valid BridgeXPC command status was non-zero
     Malformed,
     Busy,                 // Milestone 2 §23: only one active session allowed
     Cancelled,             // design doc §9.4: cancelEvent fired (Windows called
@@ -25,10 +25,6 @@ enum class VerifyOutcome {
                           // WINBIO_E_BAD_CAPTURE, and so g_captureBusy is freed
                           // on a cancel signal rather than only ever on the full
                           // matchWindow elapsing
-    PowerTransition,       // the OS suspend notification interrupted this
-                          // capture; same non-authentication result as cancel,
-                          // but kept distinct so it can never be mapped to a
-                          // fingerprint-quality failure (BAD_CAPTURE)
     UnstableIdentityInventory, // port of Linux FprintMatchGateError("live identity
                           // inventory is unstable"): first/repeat 0x42 or 0x51 snapshot
                           // disagreed — fail-closed, StartMatch never sent
@@ -92,45 +88,11 @@ struct VerifyConfig {
     // match both Linux fprintd and the macOS capture; expose via CLI for A/B.
     uint32_t matchFlags = 0;
 
-    // RE-REVERTED (24.09.2026): back to true/true. The 16.09.2026 revert
-    // below (kept for history) restored Linux parity on the theory that
-    // no real-hardware evidence had confirmed the macOS-log path over
-    // Linux's warm_up(). That evidence now exists: `verify
-    // --no-reset-sensor --no-load-calibration`, three back-to-back runs on
-    // real T2 hardware (no intervening cold boot/sleep), every run logged
-    // "reset=skip cal=skip" and returned verify-match — i.e. ResetSensor
-    // and LoadCalibration are not required per-attempt at all here, not
-    // even once per connection. Consistent with "bridgeOS calibrates at
-    // its own boot" (cmd 0x20 applies calibration state that lives on the
-    // bridge chip, not the host connection) — LoadCalibration alone was
-    // ~200-260ms of the ~290ms fixed overhead measured before StartMatch
-    // on the live WBF capture path (T2TouchIdBio/Queue.cpp), so this
-    // roughly halves per-touch latency there, not just in the CLI.
-    // NOT YET RE-VALIDATED: the three runs above were all against an
-    // already-"warm" bridge session; a genuine cold boot and a sleep/wake
-    // resume (the two paths that actually reach this code from Windows
-    // Hello) have not been separately confirmed with skip=true as the
-    // very first verify after either event. If either turns out to need
-    // ResetSensor/LoadCalibration once (and only once) after such an
-    // event, that would need to be handled at session/connection
-    // lifecycle level (T2TouchIdBio/Queue.cpp or bridgexpc::Connection),
-    // not by flipping these two flags back — see the per-touch cost this
-    // change removes.
-    //
-    // REVERTED (16.09.2026, superseded above): previously defaulted to
-    // true/true on the strength of a macOS unified-log capture (docs/
-    // macos-verified.md §4) showing cmd 2/0x20 absent from a live unlock.
-    // That capture also implied a whole pre-match command sequence (see
-    // the now-removed block in Verify()) that two real-hardware runs
-    // failed to validate — no evidence had then confirmed the macOS-log
-    // path over Linux's own, and Linux's warm_up()
-    // (t2-biometric-ready.sh / t2-fprintd.py _run_probe(), VERIFIED FROM
-    // SOURCE) unconditionally sends both ResetSensor and LoadCalibration
-    // before every identity-list read. Defaulting to skip=false restored
-    // that Linux parity; CLI flags still allow forcing skip=false for an
-    // explicit A/B against Linux's own always-resend behavior.
-    bool skipResetSensor = true;
-    bool skipLoadCalibration = true;
+    // Linux t2-fprintd's production verify passes --reset-sensor,
+    // --cancel-operation and --load-calibration on every probe. Keep the
+    // same command sequence for every Windows verify, including after resume.
+    bool skipResetSensor = false;
+    bool skipLoadCalibration = false;
 };
 
 // One VerificationEngine instance == one in-flight session (Milestone 2
@@ -180,7 +142,8 @@ private:
     // Linux sends before StartMatch.
     bool RunLinuxReadySequence(bridgexpc::Connection* conn,
                                std::vector<IdentityRecordV1>* outIdentities,
-                               std::vector<uint8_t>* outIdentityListRaw = nullptr);
+                               std::vector<uint8_t>* outIdentityListRaw = nullptr,
+                               HANDLE cancelEvent = nullptr);
 
     VerifyConfig config_;
     bool busy_ = false;

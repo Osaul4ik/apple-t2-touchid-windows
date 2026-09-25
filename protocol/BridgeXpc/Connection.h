@@ -49,10 +49,10 @@ public:
 
     // Sends [3,0,innerBmBytes,outputCapacity]. The bridgexpc-level reply is
     // itself [status, blob] (see PlistPayload.h's DecodeStatusBlobPayload);
-    // this unwraps that automatically, fails closed on a non-zero status,
-    // and returns the raw blob bytes in *outReply — callers (identity-list
-    // parsing, VerificationEngine's raw int32 startResult read) do not
-    // need to decode anything further themselves.
+    // this unwraps that automatically and returns raw blob bytes in *outReply.
+    // By default a non-zero command status fails closed. Callers that pass
+    // outCommandStatus can inspect a valid non-zero reply themselves (used by
+    // StartMatch to distinguish device rejection from transport failure).
     // bkremoted can push async, non-reply events ahead of the actual reply.
     // Acknowledge them while waiting for the matching reply, but RETAIN them
     // in the connection's pending-event queue so WaitForEvent() can deliver
@@ -61,7 +61,8 @@ public:
     bool SendBiometricCommand(const std::vector<uint8_t>& innerBmMessage,
                                uint32_t outputCapacity,
                                std::vector<uint8_t>* outReply,
-                               std::chrono::milliseconds timeout);
+                               std::chrono::milliseconds timeout,
+                               int64_t* outCommandStatus = nullptr);
 
     // Blocking receive loop used during an active match session. First
     // drains any event already retained in pendingEvents_ (acked while

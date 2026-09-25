@@ -292,7 +292,9 @@ bool Connection::SetClientVersion(int64_t version, std::chrono::milliseconds tim
 bool Connection::SendBiometricCommand(const std::vector<uint8_t>& innerBmMessage,
                                        uint32_t outputCapacity,
                                        std::vector<uint8_t>* outReply,
-                                       std::chrono::milliseconds timeout) {
+                                       std::chrono::milliseconds timeout,
+                                       int64_t* outCommandStatus) {
+    if (outCommandStatus) *outCommandStatus = 0;
     std::string reqId = NewRequestUuid();
     if (reqId.empty()) return false;
     // VERIFIED FROM SOURCE: outer payload is exactly
@@ -403,8 +405,8 @@ bool Connection::SendBiometricCommand(const std::vector<uint8_t>& innerBmMessage
         // env->payloadPlist is still one level wrapped: every BM command
         // reply's outer payload is [status, blob] (VERIFIED LIVE — see
         // PlistPayload.h's DecodeStatusBlobPayload comment). Callers
-        // (ParseIdentityList, VerificationEngine's raw int32 startResult
-        // read) expect the unwrapped blob, not this bplist-encoded array —
+        // (ParseIdentityList and StartMatch's command-status inspection)
+        // need the unwrapped status/blob values, not this bplist-encoded array —
         // that mismatch, not the async-event issue above, is why
         // identity-list kept failing "not a whole number of 20-byte
         // records" even after the reply itself arrived successfully.
@@ -416,7 +418,15 @@ bool Connection::SendBiometricCommand(const std::vector<uint8_t>& innerBmMessage
                    HexDump(env->payloadPlist).c_str());
             return false;
         }
+        if (outCommandStatus) *outCommandStatus = statusBlob->status;
         if (statusBlob->status != 0) {
+            if (outCommandStatus) {
+                *outReply = std::move(statusBlob->blob);
+                T2_LOG("sendBiometricCommand", L"command returned status=%lld (reqId=%s); "
+                       L"returning it to caller for command-specific handling",
+                       static_cast<long long>(statusBlob->status), Widen(reqId).c_str());
+                return true;
+            }
             T2_LOG("sendBiometricCommand", L"non-zero status=%lld (reqId=%s), "
                    "blob=%zuB %s - treating as failure",
                    static_cast<long long>(statusBlob->status), Widen(reqId).c_str(),

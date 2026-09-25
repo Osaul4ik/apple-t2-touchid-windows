@@ -73,6 +73,28 @@ bool SamePerUserSet(std::vector<std::array<uint8_t, 20>> configured,
     return configured == live;
 }
 
+bool SameGlobalInventory(const std::vector<uint8_t>& firstRaw,
+                         const std::vector<uint8_t>& laterRaw) {
+    if (firstRaw.size() % 40 != 0 || laterRaw.size() % 40 != 0 ||
+        firstRaw.size() != laterRaw.size()) {
+        return false;
+    }
+    std::vector<std::array<uint8_t, 40>> first;
+    std::vector<std::array<uint8_t, 40>> later;
+    first.reserve(firstRaw.size() / 40);
+    later.reserve(laterRaw.size() / 40);
+    for (size_t offset = 0; offset < firstRaw.size(); offset += 40) {
+        std::array<uint8_t, 40> record{};
+        std::memcpy(record.data(), firstRaw.data() + offset, record.size());
+        first.push_back(record);
+        std::memcpy(record.data(), laterRaw.data() + offset, record.size());
+        later.push_back(record);
+    }
+    std::sort(first.begin(), first.end());
+    std::sort(later.begin(), later.end());
+    return first == later;
+}
+
 } // namespace
 
 // Exact port of jmurth1234/t2-touchid-linux:
@@ -96,21 +118,29 @@ bool SamePerUserSet(std::vector<std::array<uint8_t, 20>> configured,
 bool VerificationEngine::RunLinuxReadySequence(
     bridgexpc::Connection* conn,
     std::vector<IdentityRecordV1>* outIdentities,
-    std::vector<uint8_t>* outIdentityListRaw) {
+    std::vector<uint8_t>* outIdentityListRaw,
+    HANDLE cancelEvent) {
+    auto cancelled = [&]() {
+        return cancelEvent && bridgexpc::Connection::IsEventSignaled(cancelEvent);
+    };
+    if (cancelled()) return false;
     int64_t bridgeVersion = 0;
     if (!conn->GetBridgeVersion(&bridgeVersion, config_.ioTimeout)) {
         return false;
     }
+    if (cancelled()) return false;
     int64_t clientVersion = (bridgeVersion < 2) ? bridgeVersion : 2; // min(api_version, 2)
     if (!conn->SetClientVersion(clientVersion, config_.ioTimeout)) {
         return false;
     }
+    if (cancelled()) return false;
 
     std::vector<uint8_t> reply;
 
     if (config_.skipResetSensor) {
         T2_LOG("warmup", L"skipping ResetSensor (macOS live path never issues cmd 2)");
     } else {
+        if (cancelled()) return false;
         auto resetCmd = EncodeBmCommand(Command::ResetSensor, /*version=*/1, /*value=*/2);
         if (!conn->SendBiometricCommand(resetCmd, /*outputCapacity=*/0, &reply, config_.ioTimeout)) {
             T2_LOG("warmup", L"ResetSensor (cmd 2, value=2, capacity=0) failed");
@@ -119,20 +149,24 @@ bool VerificationEngine::RunLinuxReadySequence(
         T2_LOG("warmup", L"ResetSensor OK");
     }
 
+    if (cancelled()) return false;
     auto cancelCmd = EncodeBmCommand(Command::Cancel, /*version=*/1, /*value=*/0);
     conn->SendBiometricCommand(cancelCmd, /*outputCapacity=*/0, &reply, config_.ioTimeout); // best-effort
     T2_LOG("warmup", L"Cancel (cmd 0x0c) issued");
+    if (cancelled()) return false;
 
     if (config_.skipLoadCalibration) {
         T2_LOG("warmup",
                L"skipping LoadCalibration (macOS live path never issues cmd 0x20; "
                L"bridgeOS calibrates at its own boot)");
     } else {
+        if (cancelled()) return false;
         std::vector<uint8_t> fdrBlob;
         if (!conn->GetFdrCalibration(&fdrBlob, config_.ioTimeout)) {
             T2_LOG("warmup", L"GetFdrCalibration (bridge method 11) failed");
             return false;
         }
+        if (cancelled()) return false;
         auto loadCalibrationCmd = EncodeBmCommand(Command::LoadCalibration, /*version=*/1, /*value=*/3, fdrBlob);
         if (!conn->SendBiometricCommand(loadCalibrationCmd, /*outputCapacity=*/0, &reply, config_.ioTimeout)) {
             T2_LOG("warmup", L"LoadCalibration (cmd 0x20, value=3, capacity=0, fdr=%zuB) failed",
@@ -142,6 +176,7 @@ bool VerificationEngine::RunLinuxReadySequence(
         T2_LOG("warmup", L"LoadCalibration OK, fdr=%zuB", fdrBlob.size());
     }
 
+    if (cancelled()) return false;
     std::vector<uint8_t> idReq(4);
     std::memcpy(idReq.data(), &config_.macosUserId, 4);
     auto idCmd = EncodeBmCommand(Command::IdentityList, /*version=*/1, /*value=*/0, idReq);
@@ -150,6 +185,7 @@ bool VerificationEngine::RunLinuxReadySequence(
                kIdentityListOutputCapacity);
         return false;
     }
+    if (cancelled()) return false;
     std::vector<IdentityRecordV1> identities;
     if (!ParseIdentityList(reply, &identities)) {
         T2_LOG("warmup", L"IdentityList reply malformed (reply=%zuB, not a multiple of 20)",
@@ -208,8 +244,9 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     // bridge-xpc-probe.py: "--match-seconds requires a non-empty --identity-list result".
     std::vector<IdentityRecordV1> identities;
     std::vector<uint8_t> firstUserRaw;
-    if (!RunLinuxReadySequence(conn, &identities, &firstUserRaw)) {
-        return VerifyOutcome::TransportError;
+    if (!RunLinuxReadySequence(conn, &identities, &firstUserRaw, cancelEvent)) {
+        return (cancelEvent && bridgexpc::Connection::IsEventSignaled(cancelEvent))
+            ? VerifyOutcome::Cancelled : VerifyOutcome::TransportError;
     }
     if (identities.empty()) {
         T2_LOG("verify", L"identity list empty - refusing StartMatch (Linux requires non-empty)");
@@ -246,17 +283,38 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     };
 
     std::vector<uint8_t> firstGlobalRaw, repeatUserRaw, repeatGlobalRaw;
+    if (cancelEvent && bridgexpc::Connection::IsEventSignaled(cancelEvent)) {
+        return VerifyOutcome::Cancelled;
+    }
     if (!readGlobalIdentityList(&firstGlobalRaw)) {
+        if (cancelEvent && bridgexpc::Connection::IsEventSignaled(cancelEvent)) {
+            return VerifyOutcome::Cancelled;
+        }
         T2_LOG("verify", L"GlobalIdentityList (cmd 0x51, first read) failed");
         return VerifyOutcome::TransportError;
     }
+    if (cancelEvent && bridgexpc::Connection::IsEventSignaled(cancelEvent)) {
+        return VerifyOutcome::Cancelled;
+    }
     if (!readUserIdentityList(&repeatUserRaw)) {
+        if (cancelEvent && bridgexpc::Connection::IsEventSignaled(cancelEvent)) {
+            return VerifyOutcome::Cancelled;
+        }
         T2_LOG("verify", L"IdentityList (cmd 0x42, repeat read) failed");
         return VerifyOutcome::TransportError;
     }
+    if (cancelEvent && bridgexpc::Connection::IsEventSignaled(cancelEvent)) {
+        return VerifyOutcome::Cancelled;
+    }
     if (!readGlobalIdentityList(&repeatGlobalRaw)) {
+        if (cancelEvent && bridgexpc::Connection::IsEventSignaled(cancelEvent)) {
+            return VerifyOutcome::Cancelled;
+        }
         T2_LOG("verify", L"GlobalIdentityList (cmd 0x51, repeat read) failed");
         return VerifyOutcome::TransportError;
+    }
+    if (cancelEvent && bridgexpc::Connection::IsEventSignaled(cancelEvent)) {
+        return VerifyOutcome::Cancelled;
     }
 
     std::vector<std::array<uint8_t, 20>> configuredFirst, configuredRepeat;
@@ -348,10 +406,9 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     // Events queued during StartMatch's OWN SendBiometricCommand call just
     // below are unaffected - they land in pendingEvents_ after this point,
     // same as the reference's own per-call `events` for cmd 4.
-    // Sends (or re-sends) StartMatch for one attempt. Broken out of the
-    // original single call so a bad touch (NO_MATCH) can restart a fresh
-    // match session below without duplicating this block.
-    auto sendStartMatch = [&]() -> bool {
+    // Sends StartMatch for one Linux-order verification transaction.
+    auto sendStartMatch = [&](_Out_ bool* rejectedByDevice) -> bool {
+        *rejectedByDevice = false;
         const size_t discardedPreMatchEvents = conn->DiscardPendingEvents();
         if (discardedPreMatchEvents > 0) {
             T2_LOG("verify",
@@ -368,7 +425,18 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
                sizeof(MatchInitDataV1) + sizeof(uint32_t) + identities.size() * sizeof(IdentityRecordV1));
         auto startCmd = EncodeBmCommand(Command::StartMatch, 1, 0, matchInitData);
         std::vector<uint8_t> startReply;
-        return conn->SendBiometricCommand(startCmd, 0, &startReply, config_.ioTimeout);
+        int64_t startStatus = 0;
+        if (!conn->SendBiometricCommand(startCmd, 0, &startReply,
+                                        config_.ioTimeout, &startStatus)) {
+            return false;
+        }
+        if (startStatus != 0) {
+            T2_LOG("verify", L"StartMatch rejected by BiometricKit status=%lld",
+                   static_cast<long long>(startStatus));
+            *rejectedByDevice = true;
+            return false;
+        }
+        return true;
     };
 
     // Same reasoning as the check at the top: a cancel that landed during the
@@ -379,8 +447,9 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
         return VerifyOutcome::Cancelled;
     }
 
-    if (!sendStartMatch()) {
-        return VerifyOutcome::TransportError;
+    bool startRejected = false;
+    if (!sendStartMatch(&startRejected)) {
+        return startRejected ? VerifyOutcome::RejectedByDevice : VerifyOutcome::TransportError;
     }
 
     // Milestone 2B §11: from here on the StartMatch IPC itself succeeded,
@@ -393,10 +462,15 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     struct CancelGuard {
         bridgexpc::Connection* conn;
         const std::vector<uint8_t>* cancelCmd;
-        ~CancelGuard() {
+        bool active = true;
+        void Arm() { active = true; }
+        void Send() {
+            if (!active) return;
+            active = false;
             std::vector<uint8_t> discard;
             conn->SendBiometricCommand(*cancelCmd, 0, &discard, kCancelBestEffortTimeout);
         }
+        ~CancelGuard() { Send(); }
     } cancelGuard{conn, &cancelCmd};
 
     // design doc §9.4, per explicit direction: this component does not own
@@ -520,41 +594,61 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
             break;
         } else if (mr.outcome == MatchOutcome::NoMatch) {
             rejectedTouchAttempts++;
-            if (cancelEvent) {
-                // design doc §9.4: Windows, not this component, owns the
-                // overall wait — a wrong finger is not a reason to give up
-                // and complete the WBDI CAPTURE_DATA request. Restart the
-                // scan (fresh StartMatch) and keep waiting; only a real
-                // Match or an actual cancel (password fallback, session
-                // end, login succeeded some other way) ends the wait - no
-                // internal deadline of our own. Without this, one bad touch
-                // used to end the entire capture and leave the sensor
-                // waiting for a WBF-issued re-poll that may never come,
-                // matching the "wrong finger, then correct finger does
-                // nothing" symptom this fixes.
-                T2_LOG("verify",
-                       L"match_result outcome=NO_MATCH (attempt #%zu) - wrong finger, "
-                       L"restarting scan immediately; Windows controls the wait, not us",
-                       rejectedTouchAttempts);
-                std::vector<uint8_t> discard;
-                // Same short bound as CancelGuard: a 5s cancel here would stall
-                // the wrong-finger → re-arm path and feel like a hung sensor.
-                conn->SendBiometricCommand(cancelCmd, 0, &discard, kCancelBestEffortTimeout);
-                if (!sendStartMatch()) {
-                    outcome = VerifyOutcome::TransportError;
-                    break;
-                }
-                continue;
-            }
-            // CLI one-shot verify (no cancelEvent): unchanged behavior -
-            // a single NO_MATCH ends this verify() call.
-            T2_LOG("verify", L"match_result outcome=NO_MATCH (no enrolled UUID found in event)");
+            // End this BiometricKit transaction as Linux does: ACK the
+            // verdict, send Cancel, attest identity state, then return
+            // NO_MATCH. Queue.cpp may keep the single WBF request pending,
+            // but the next attempt must execute the complete Linux-order
+            // transaction rather than issuing a bare second StartMatch.
+            T2_LOG("verify", L"match_result outcome=NO_MATCH (attempt #%zu)",
+                   rejectedTouchAttempts);
             outcome = VerifyOutcome::NoMatch;
             break;
         }
         T2_LOG("verify", L"match_result outcome=MALFORMED body=%zuB (min required=%zuB) - "
                L"still waiting, not treated as NO_MATCH",
                eventData.size(), kMinMatchResultEventBytes);
+    }
+
+    // Linux bridge-xpc-probe always sends command 12 after a started match,
+    // then re-reads both identity views and fails closed if they changed.
+    // Do the same before returning a completed verify. A sleep/WBF cancel
+    // still sends command 12, but must not issue inventory traffic while the
+    // system is transitioning or after the caller has abandoned the request.
+    cancelGuard.Send();
+    if (cancelEvent && bridgexpc::Connection::IsEventSignaled(cancelEvent)) {
+        outcome = VerifyOutcome::Cancelled;
+    }
+    if (outcome != VerifyOutcome::Cancelled && outcome != VerifyOutcome::TransportError) {
+        std::vector<uint8_t> postUserRaw;
+        std::vector<uint8_t> postGlobalRaw;
+        if (!readUserIdentityList(&postUserRaw) || !readGlobalIdentityList(&postGlobalRaw)) {
+            T2_LOG("verify", L"post-match identity attestation query failed");
+            outcome = VerifyOutcome::TransportError;
+        } else {
+            std::vector<IdentityRecordV1> postUserIdentities;
+            std::vector<std::array<uint8_t, 20>> postConfiguredGlobal;
+            if (!ParseIdentityList(postUserRaw, &postUserIdentities) ||
+                !ConfiguredGlobalIdentities(postGlobalRaw, config_.macosUserId,
+                                            &postConfiguredGlobal) ||
+                !SamePerUserSet(configuredFirst, postUserIdentities) ||
+                !SamePerUserSet(configuredFirst, identities) ||
+                !SameGlobalInventory(firstGlobalRaw, postGlobalRaw)) {
+                T2_LOG("verify", L"post-match identity inventory malformed or changed");
+                outcome = VerifyOutcome::UnstableIdentityInventory;
+            } else {
+                std::sort(postConfiguredGlobal.begin(), postConfiguredGlobal.end());
+                if (postConfiguredGlobal != configuredFirst) {
+                    T2_LOG("verify", L"post-match configured identity set changed");
+                    outcome = VerifyOutcome::UnstableIdentityInventory;
+                } else {
+                    T2_LOG("verify", L"post-match per-user/global identity inventory unchanged");
+                }
+            }
+        }
+    }
+    if (cancelEvent && bridgexpc::Connection::IsEventSignaled(cancelEvent)) {
+        outcome = VerifyOutcome::Cancelled;
+        outMatchedUuid->reset();
     }
 
     // REMOVED (17.09.2026): no longer relabels Timeout as NoImageCaptured.
