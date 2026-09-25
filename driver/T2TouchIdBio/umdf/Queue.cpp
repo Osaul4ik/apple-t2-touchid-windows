@@ -302,9 +302,10 @@ std::atomic<bool> g_needPostResumeWarmup{true};
 // Set on PBT_APMSUSPEND before we signal cancelEvent. Distinguishes a
 // power-driven wake of the pending CAPTURE from a real CancelIoEx
 // (password fallback / session teardown). Completing the former as
-// WINBIO_E_CANCELED makes WBF drop the unlock session; we map it to
-// TransportError instead so WBF retries after resume. Cleared on resume
-// and when the cancel is consumed.
+// Set on PBT_APMSUSPEND so HandleCaptureVerify can tell power-cancel from
+// a normal CancelIoEx (password fallback). Both complete as CANCELED; the
+// flag only drives logging + post-resume WarmUp retention. Cleared on resume
+// and when consumed by the worker.
 std::atomic<bool> g_powerSuspendCancel{false};
 
 // Debounce PBT_APMRESUMESUSPEND + PBT_APMRESUMEAUTOMATIC (both fire on a
@@ -314,36 +315,9 @@ std::atomic<bool> g_powerSuspendCancel{false};
 std::atomic<ULONGLONG> g_lastResumeHygieneMs{0};
 constexpr ULONGLONG kResumeHygieneDebounceMs = 2000;
 
-// Set on suspend after ForceCloseActive; resume only force-clears busy when
-// a suspend actually interrupted a capture. Avoids clearing busy on a
-// resume that never had a matching suspend cancel (spurious AUTOMATIC).
+// Set on suspend when a CAPTURE was in flight; resume force-clears busy only
+// then (worker may have been frozen mid-unwind).
 std::atomic<bool> g_suspendInterruptedCapture{false};
-
-// Power-suspend: the capture worker must NOT CompleteCaptureData until after
-// resume. Completing mid-Sx (even as BAD_CAPTURE/READY) races LogonUI teardown
-// and produces SensorStopV2_Internal + Engine Deactivate with no follow-up
-// CAPTURE — fingerprint dead until PIN path. Worker waits on this event after
-// SEP Cancel; OnSuspendResume(resume) signals it.
-HANDLE g_resumeContinueEvent = nullptr;
-
-HANDLE GetResumeContinueEvent()
-{
-    HANDLE existing = g_resumeContinueEvent;
-    if (existing) {
-        return existing;
-    }
-    HANDLE created = CreateEventW(nullptr, /*manualReset=*/TRUE, /*initialState=*/FALSE, nullptr);
-    if (!created) {
-        return nullptr;
-    }
-    HANDLE prior = InterlockedCompareExchangePointer(
-        reinterpret_cast<PVOID*>(&g_resumeContinueEvent), created, nullptr);
-    if (prior) {
-        CloseHandle(created);
-        return prior;
-    }
-    return created;
-}
 
 void ArmMatchReplay(const std::optional<std::array<uint8_t, 16>>& uuid)
 {
@@ -471,32 +445,23 @@ ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_
             std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
             g_stickyNcm.valid = false;
         }
-        // Mark before SetEvent so the worker that wakes sees power-cancel
-        // and completes as TransportError, not WINBIO_E_CANCELED (which
-        // would tear down the unlock session).
+        // Mark before SetEvent so the worker that wakes can distinguish
+        // power-cancel from a normal CancelIoEx for logging/WarmUp.
+        // WBF contract: sleep ends the current capture session. Cancel SEP,
+        // complete CAPTURE as CANCELED (not Match, not a re-armed StartMatch).
+        // A new CAPTURE must come from LogonUI/WBF after resume.
         g_powerSuspendCancel.store(true, std::memory_order_relaxed);
         if (g_captureBusy.load(std::memory_order_relaxed)) {
             g_suspendInterruptedCapture.store(true, std::memory_order_relaxed);
         }
-        // Arm "wait for resume before CompleteCaptureData" BEFORE cancel so the
-        // worker cannot race past the wait with a stale signaled event.
-        HANDLE resumeEv = GetResumeContinueEvent();
-        if (resumeEv) {
-            ResetEvent(resumeEv);
-        }
         HANDLE cancelEvent = GetCaptureCancelEvent();
         if (cancelEvent) {
-            SetEvent(cancelEvent); // same wakeup EvtCaptureCancel/T2BioEvtIoStop
-                                    // use - see header comment above
+            SetEvent(cancelEvent);
         }
-        // Give the capture worker a short window to observe cancelEvent and
-        // run CancelGuard (cmd 0x0c) WHILE the socket is still open. Hardware
-        // log 25.09.2026: ForceClose-first left CancelMatch on a dead socket
-        // (WSAENOTSOCK 10038). 120ms covers kCancelPollSlice + Cancel send.
+        // Let the worker observe cancelEvent and CancelGuard (cmd 0x0c) on a
+        // live socket, then complete the IOCTL before process freeze.
+        // 120ms ≈ kCancelPollSlice + Cancel send (hardware 25.09.2026).
         Sleep(120);
-        // Force-close whatever is still in-flight so a blocked ReadFrame
-        // cannot hold the process through freeze. Worker then blocks on
-        // resumeEv before completing the IOCTL (see HandleCaptureVerify).
         t2::bridgexpc::Connection::ForceCloseActive();
     } else if (Type == PBT_APMRESUMESUSPEND || Type == PBT_APMRESUMEAUTOMATIC) {
         // Debounce: both RESUMESUSPEND and RESUMEAUTOMATIC fire on a typical
@@ -544,11 +509,6 @@ ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_
                      "captureBusy left intact (no interrupted capture), power-cancel cleared");
         }
         g_powerSuspendCancel.store(false, std::memory_order_relaxed);
-        // Unblock any capture worker that deferred CompleteCaptureData across Sx.
-        HANDLE resumeEv = GetResumeContinueEvent();
-        if (resumeEv) {
-            SetEvent(resumeEv);
-        }
     }
     return 0; // return value is unused for suspend/resume notifications
 }
@@ -1188,40 +1148,24 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
         return;
     }
 
-    // Power suspend woke us via cancelEvent and/or ForceCloseActive.
-    // That is not a real CancelIoEx / unlock-session teardown.
-    // CRITICAL (25.09.2026 hardware): completing CAPTURE_DATA *during* Sx —
-    // even as BAD_CAPTURE + READY — still yields SensorStopV2_Internal and
-    // Engine Deactivate with no follow-up CAPTURE after resume (fingerprint
-    // dead until PIN). Defer CompleteCaptureData until PBT_APMRESUME* signals
-    // g_resumeContinueEvent so WBF sees the completion on the awake side.
+    // Power suspend (WBF model): the capture session ends at Sx. SEP was
+    // cancelled above; complete this CAPTURE as Cancelled → WINBIO_E_CANCELED
+    // with SENSOR_READY. Do NOT deliver Match, do NOT re-arm StartMatch on
+    // this IOCTL, do NOT hold the request across sleep. After resume, WBF/
+    // LogonUI must issue a brand-new CAPTURE; g_needPostResumeWarmup forces
+    // Reset+calibration on that next request.
     bool powerSuspendPath = false;
     if (g_powerSuspendCancel.exchange(false, std::memory_order_relaxed)) {
         powerSuspendPath = true;
-        outcome = VerifyOutcome::Timeout; // maps to WINBIO_E_BAD_CAPTURE
-        HANDLE resumeEv = GetResumeContinueEvent();
-        if (resumeEv) {
-            T2BioLog("CAPTURE_DATA(verify): power-suspend — SEP cancelled; "
-                     "deferring CAPTURE complete until resume (raw outcome was cancelled/transport)");
-            // Process is about to freeze; this wait ends on resume (or after a
-            // long bound if the resume notification was lost).
-            const DWORD waitRc = WaitForSingleObject(resumeEv, 120000);
-            T2BioLog("CAPTURE_DATA(verify): resume-continue wait done rc=%lu -> "
-                     "BAD_CAPTURE + SENSOR_READY",
-                     static_cast<unsigned long>(waitRc));
-            ResetEvent(resumeEv);
-        } else {
-            T2BioLog("CAPTURE_DATA(verify): power-suspend path without resume event — "
-                     "completing immediately as BAD_CAPTURE + READY");
-        }
+        outcome = VerifyOutcome::Cancelled;
+        T2BioLog("CAPTURE_DATA(verify): power-suspend — SEP cancelled; "
+                 "completing CAPTURE as CANCELED + SENSOR_READY (new CAPTURE after resume)");
     }
 
-    // Real terminal outcome (Match, NoMatch, bad capture, etc.): SEP path
-    // was exercised; drop the forced WarmUp for steady-state latency.
-    // Power-suspend / transport cancel keep WarmUp armed for the next CAPTURE.
+    // Real terminal outcome clears forced WarmUp. Cancel / transport / power
+    // keep it so the next CAPTURE re-arms the sensor after Sx.
     if (outcome != VerifyOutcome::Cancelled &&
-        outcome != VerifyOutcome::TransportError &&
-        !powerSuspendPath) {
+        outcome != VerifyOutcome::TransportError) {
         g_needPostResumeWarmup.store(false, std::memory_order_relaxed);
     } else if (postResumeWarmup || powerSuspendPath) {
         g_needPostResumeWarmup.store(true, std::memory_order_relaxed);
@@ -1229,18 +1173,16 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
     }
 
     const HRESULT hr = MapVerifyOutcomeToHresult(outcome);
-    T2BioLog("CAPTURE_DATA(verify): outcome=%d -> hresult=0x%08x", static_cast<int>(outcome),
-             static_cast<unsigned>(hr));
-    // ACCEPT only for a delivered sample (a real Match); see the note in
-    // HandleCaptureEnroll. Failures stay FAILURE, everything else READY.
-    // Power-suspend deliberately stays READY (see above).
+    T2BioLog("CAPTURE_DATA(verify): outcome=%d -> hresult=0x%08x%s",
+             static_cast<int>(outcome), static_cast<unsigned>(hr),
+             powerSuspendPath ? " (power-suspend)" : "");
+    // ACCEPT only for a delivered sample (a real Match). Power-suspend and
+    // ordinary cancel stay READY so the unit is not marked failed.
     const WINBIO_SENSOR_STATUS sensorStatus =
-        (powerSuspendPath)
-            ? WINBIO_SENSOR_READY
-            : ((outcome == VerifyOutcome::TransportError || outcome == VerifyOutcome::RejectedByDevice ||
-                outcome == VerifyOutcome::UnstableIdentityInventory)
-                   ? WINBIO_SENSOR_FAILURE
-                   : (outcome == VerifyOutcome::Match ? WINBIO_SENSOR_ACCEPT : WINBIO_SENSOR_READY));
+        (outcome == VerifyOutcome::TransportError || outcome == VerifyOutcome::RejectedByDevice ||
+         outcome == VerifyOutcome::UnstableIdentityInventory)
+            ? WINBIO_SENSOR_FAILURE
+            : (outcome == VerifyOutcome::Match ? WINBIO_SENSOR_ACCEPT : WINBIO_SENSOR_READY);
     // A sample goes to WBF only for a real Match; every other outcome completes
     // with its error HRESULT and no data (fail-closed: no BIR to misread).
     std::vector<uint8_t> bir;
@@ -1595,10 +1537,5 @@ extern "C" VOID T2BioUnregisterSuspendResumeNotification(VOID)
     if (g_suspendResumeNotify) {
         PowerUnregisterSuspendResumeNotification(g_suspendResumeNotify);
         g_suspendResumeNotify = nullptr;
-    }
-    if (g_resumeContinueEvent) {
-        SetEvent(g_resumeContinueEvent); // unblock any waiter on unload
-        CloseHandle(g_resumeContinueEvent);
-        g_resumeContinueEvent = nullptr;
     }
 }
