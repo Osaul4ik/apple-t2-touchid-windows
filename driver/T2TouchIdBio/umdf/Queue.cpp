@@ -600,7 +600,7 @@ private:
 // second suspend starts while this worker is clearing the prior suspend's
 // internal SEP-cancel signal.
 bool WaitForSystemResume(_In_ CancelableScope& cancelScope,
-                         _In_ HANDLE cancelEvent,
+                         _In_opt_ HANDLE cancelEvent,
                          _Inout_ ULONGLONG* handledGeneration)
 {
     HANDLE resumeEvent = GetSystemResumeEvent();
