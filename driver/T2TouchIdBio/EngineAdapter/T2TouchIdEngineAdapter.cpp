@@ -884,13 +884,39 @@ HRESULT WINAPI EngineNotifyPowerChange(
     if (ctx == nullptr) {
         return TraceRet("NotifyPowerChange", E_POINTER);
     }
-    // Any power broadcast: drop volatile pipeline state. Persistent templates
-    // live in the storage adapter and are intentionally left alone.
+
+    // PIBIO_ENGINE_NOTIFY_POWER_CHANGE_FN defines exactly these events.
+    // In particular, value 10 in the supplied trace is
+    // PBT_APMPOWERSTATUSCHANGE (battery/AC change), not a resume event.
+    // Microsoft requires adapters to query the current power status for it.
+    if (PowerEventType == PBT_APMPOWERSTATUSCHANGE) {
+        SYSTEM_POWER_STATUS powerStatus{};
+        if (!GetSystemPowerStatus(&powerStatus)) {
+            const HRESULT hr = HRESULT_FROM_WIN32(GetLastError());
+            EngLog("     GetSystemPowerStatus failed hr=0x%08lx",
+                   static_cast<unsigned long>(hr));
+            return TraceRet("NotifyPowerChange", hr);
+        }
+        EngLog("     power status: AC=%u battery=%u percent=%u",
+               static_cast<unsigned>(powerStatus.ACLineStatus),
+               static_cast<unsigned>(powerStatus.BatteryFlag),
+               static_cast<unsigned>(powerStatus.BatteryLifePercent));
+        // A power-source change does not invalidate an accepted biometric
+        // sample. Clearing it here could race WBF's capture/identify sequence.
+        return TraceRet("NotifyPowerChange", S_OK);
+    }
+
+    if (PowerEventType != PBT_APMSUSPEND &&
+        PowerEventType != PBT_APMRESUMEAUTOMATIC) {
+        return TraceRet("NotifyPowerChange", E_INVALIDARG);
+    }
+
+    // Suspend/resume invalidates volatile pipeline data. Persistent templates
+    // live in the storage adapter and are intentionally left alone. WBF owns
+    // subsequent Activate/CAPTURE requests; this callback must not synthesize
+    // an authentication attempt or carry a pre-sleep verdict across sessions.
     ClearSample(ctx);
-    if (PowerEventType == PBT_APMSUSPEND ||
-        PowerEventType == PBT_APMRESUMESUSPEND ||
-        PowerEventType == PBT_APMRESUMEAUTOMATIC ||
-        PowerEventType == PBT_APMRESUMECRITICAL) {
+    {
         ResetEnrollment(ctx);
         EngLog("     cleared sample/enrollment for power event %lu",
                static_cast<unsigned long>(PowerEventType));

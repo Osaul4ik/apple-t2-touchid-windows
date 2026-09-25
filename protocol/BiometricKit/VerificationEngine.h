@@ -25,6 +25,10 @@ enum class VerifyOutcome {
                           // WINBIO_E_BAD_CAPTURE, and so g_captureBusy is freed
                           // on a cancel signal rather than only ever on the full
                           // matchWindow elapsing
+    PowerTransition,       // the OS suspend notification interrupted this
+                          // capture; same non-authentication result as cancel,
+                          // but kept distinct so it can never be mapped to a
+                          // fingerprint-quality failure (BAD_CAPTURE)
     UnstableIdentityInventory, // port of Linux FprintMatchGateError("live identity
                           // inventory is unstable"): first/repeat 0x42 or 0x51 snapshot
                           // disagreed — fail-closed, StartMatch never sent

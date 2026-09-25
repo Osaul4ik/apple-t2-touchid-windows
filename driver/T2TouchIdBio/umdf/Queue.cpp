@@ -273,6 +273,12 @@ constexpr std::chrono::seconds kCaptureMatchWindow{60};
 // than one worker thread at once).
 std::atomic<bool> g_captureBusy{false};
 
+// Incremented before the suspend callback signals the pending capture. A
+// capture compares this generation after it unwinds so a sleep cancellation
+// remains distinguishable from a user/LogonUI cancellation all the way to the
+// WBDI completion mapping.
+std::atomic<ULONGLONG> g_suspendGeneration{0};
+
 // 20.09.2026: WBF issues exactly TWO CAPTURE_DATA verify requests per unlock
 // (hardware log: Match → complete → new CAPTURE begin within 15–30 ms). The
 // second is not a second finger touch — framework double-check. Answer #1
@@ -407,9 +413,11 @@ HANDLE GetCaptureCancelEvent()
 // the blocked VerificationEngine::Verify() wait notices within
 // kCancelPollSlice and unwinds through HandleCaptureVerify's own normal
 // completion path (Cancelled outcome) *before* the process is frozen for
-// the sleep - so no CAPTURE_DATA is ever left straddling a suspend/resume
-// boundary, and the next touch after resume starts a brand-new capture the
-// way WBF expects.
+// sleep. The WBDI request completes with WINBIO_E_CANCELED, not BAD_CAPTURE:
+// a power transition did not produce a fingerprint sample. After resume this
+// driver only arms one-shot warm-up for the next real WBF request. WBF/LogonUI
+// owns whether and when that new CAPTURE_DATA request is issued; the driver
+// must not invent an authentication request or synthesize a match.
 HPOWERNOTIFY g_suspendResumeNotify = nullptr;
 
 ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_ PVOID Setting)
@@ -419,6 +427,7 @@ ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_
     if (Type == PBT_APMSUSPEND) {
         T2BioLog("OnSuspendResume: PBT_APMSUSPEND - waking any pending CAPTURE_DATA "
                  "before the process is frozen for sleep");
+        g_suspendGeneration.fetch_add(1, std::memory_order_relaxed);
         ClearMatchReplay(); // never replay a pre-sleep Match after resume
         {
             // NCM/ifIndex may change across Sx; force rediscovery on resume.
@@ -453,7 +462,7 @@ ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_
             ResetEvent(cancelEvent);
         }
         g_captureBusy.store(false, std::memory_order_relaxed);
-        T2BioLog("OnSuspendResume: resume - WarmUp armed, cancel cleared, captureBusy released");
+        T2BioLog("OnSuspendResume: resume - WarmUp armed, cancel cleared, captureBusy released; awaiting WBF CAPTURE_DATA");
     }
     return 0; // return value is unused for suspend/resume notifications
 }
@@ -676,6 +685,10 @@ HRESULT MapVerifyOutcomeToHresult(VerifyOutcome outcome)
     // (see EvtCaptureCancel below) — this is the outcome that used to be
     // unreachable because nothing ever signaled g_captureCancelEvent.
     case VerifyOutcome::Cancelled:                return WINBIO_E_CANCELED;
+    // Sleep/resume is not a failed fingerprint sample. Returning BAD_CAPTURE
+    // caused the WBF session to be torn down on the affected build; report a
+    // canceled operation so only WBF can decide when to issue a fresh capture.
+    case VerifyOutcome::PowerTransition:           return WINBIO_E_CANCELED;
     }
     return E_FAIL;
 }
@@ -1003,6 +1016,8 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
     // eventually got a full session. Hardware log 24.09.2026.
     const bool postResumeWarmup =
         g_needPostResumeWarmup.load(std::memory_order_relaxed);
+    const ULONGLONG suspendGenerationAtStart =
+        g_suspendGeneration.load(std::memory_order_relaxed);
     if (postResumeWarmup) {
         cfg.skipResetSensor = false;
         cfg.skipLoadCalibration = false;
@@ -1051,6 +1066,13 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
         Sleep(200);
     }
 
+    if (outcome == VerifyOutcome::Cancelled &&
+        g_suspendGeneration.load(std::memory_order_relaxed) != suspendGenerationAtStart) {
+        outcome = VerifyOutcome::PowerTransition;
+        T2BioLog("CAPTURE_DATA(verify): suspend generation changed during capture; "
+                 "completing as WINBIO_E_CANCELED + SENSOR_READY");
+    }
+
     if (!cancelScope.Release()) {
         // Same reasoning as the connect-phase check above: Request is
         // already completed. outcome is almost certainly Cancelled too
@@ -1086,6 +1108,7 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
         // Keep post-resume WarmUp for the next CAPTURE (see arming comment above).
         if (postResumeWarmup &&
             (outcome == VerifyOutcome::Cancelled ||
+             outcome == VerifyOutcome::PowerTransition ||
              outcome == VerifyOutcome::TransportError)) {
             g_needPostResumeWarmup.store(true, std::memory_order_relaxed);
             T2BioLog("CAPTURE_DATA(verify): post-resume WarmUp retained after cancel/transport");
@@ -1096,6 +1119,7 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
     // Real terminal outcome (Match, NoMatch, bad capture, etc.): SEP path
     // was exercised; drop the forced WarmUp for steady-state latency.
     if (outcome != VerifyOutcome::Cancelled &&
+        outcome != VerifyOutcome::PowerTransition &&
         outcome != VerifyOutcome::TransportError) {
         g_needPostResumeWarmup.store(false, std::memory_order_relaxed);
     } else if (postResumeWarmup) {
