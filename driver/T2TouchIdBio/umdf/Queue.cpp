@@ -421,10 +421,9 @@ ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_
     UNREFERENCED_PARAMETER(Context);
     UNREFERENCED_PARAMETER(Setting);
     if (Type == PBT_APMSUSPEND) {
-        // 1) Gate: no new SEP work until resume (WBF re-CAPTURE in transition).
-        // 2) gen++: in-flight Match completing after this is discarded.
-        // 3) cancel + clear replay: pre-sleep CAPTURE/pair cannot unlock.
-        // WarmUp is NOT armed here — only on resume.
+        // Reference (Sleep_fix 7fb89e7 + gen): hygiene only.
+        // Official WBDI power cancel is SensorAdapter CancelIoEx / WBF RESET.
+        // UMDF SetEvent here completed CAPTURE → WBF StartCapture spin → SensorStopV2.
         g_suspended.store(true, std::memory_order_release);
         g_sxGeneration.fetch_add(1, std::memory_order_acq_rel);
         ClearMatchReplay();
@@ -432,11 +431,7 @@ ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_
             std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
             g_stickyNcm.valid = false;
         }
-        HANDLE cancelEvent = GetCaptureCancelEvent();
-        if (cancelEvent) {
-            SetEvent(cancelEvent);
-        }
-        T2BioLog("OnSuspendResume: PBT_APMSUSPEND - suspended=1, CAPTURE cancel (gen=%llu)",
+        T2BioLog("OnSuspendResume: PBT_APMSUSPEND - hygiene only (gen=%llu, no CAPTURE cancel)",
                  static_cast<unsigned long long>(g_sxGeneration.load(std::memory_order_relaxed)));
     } else if (Type == PBT_APMRESUMESUSPEND || Type == PBT_APMRESUMEAUTOMATIC) {
         g_suspended.store(false, std::memory_order_release);
@@ -973,15 +968,9 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
         }
     }
 
-    // Sleep transition / Sx: WBF re-issues CAPTURE after our suspend cancel.
-    // No SEP. Must NOT complete with S_OK+empty — that made WBF spin
-    // StartCapture hundreds of times (log: silent READY loop → SensorStopV2).
-    // CANCELED matches EvtCaptureCancel and stops the re-arm loop.
-    if (g_suspended.load(std::memory_order_acquire)) {
-        T2BioLog("CAPTURE_DATA(verify): suspended - CANCELED (no SEP, no S_OK spin)");
-        CompleteCaptureData(Request, WINBIO_E_CANCELED, WINBIO_SENSOR_READY, 0, {});
-        return;
-    }
+    // No early complete while g_suspended: any complete (CANCELED/S_OK) here
+    // re-armed WBF StartCapture in a spin. Match is fail-closed via gen /
+    // g_suspended at BIR delivery below. CAPTURE may wait through Sx.
 
     // design doc §9.4: register this specific request as cancelable BEFORE
     // doing anything that can block (Connect included — a cancel arriving
@@ -1432,18 +1421,13 @@ extern "C" VOID T2BioEvtIoStop(_In_ WDFQUEUE Queue,
                                _In_ ULONG ActionFlags)
 {
     UNREFERENCED_PARAMETER(Queue);
+    UNREFERENCED_PARAMETER(ActionFlags);
 
-    T2BioLog("EvtIoStop: ActionFlags=0x%08x cancelable=%d",
-             static_cast<unsigned>(ActionFlags),
-             (ActionFlags & WdfRequestStopRequestCancelable) ? 1 : 0);
-
-    if (ActionFlags & WdfRequestStopRequestCancelable) {
-        HANDLE cancelEvent = GetCaptureCancelEvent();
-        if (cancelEvent) {
-            SetEvent(cancelEvent);
-        }
-    }
-
+    // Acknowledge only — do not SetEvent(cancel). Cancelling CAPTURE here or
+    // on PBT_APMSUSPEND makes WBF re-arm in a loop (CANCELED/S_OK both spun).
+    // CAPTURE may straddle Sx; gen invalidates Match; resume signals cancel.
+    T2BioLog("EvtIoStop: ActionFlags=0x%08x - acknowledge only (no cancel)",
+             static_cast<unsigned>(ActionFlags));
     WdfRequestStopAcknowledge(Request, FALSE);
 }
 
