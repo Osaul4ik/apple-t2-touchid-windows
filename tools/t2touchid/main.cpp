@@ -1047,9 +1047,6 @@ static int CmdVerify(int argc, wchar_t* argv[]) {
         case VerifyOutcome::Cancelled:
             std::wcout << L"verify-cancelled\n";
             return 1;
-        case VerifyOutcome::PowerTransition:
-            std::wcout << L"verify-cancelled: system power transition interrupted capture\n";
-            return 1;
     }
     return 1;
 }
