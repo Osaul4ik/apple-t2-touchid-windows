@@ -430,13 +430,30 @@ HANDLE GetSystemResumeEvent()
     return h;
 }
 
-void BeginCaptureSuspend(_In_z_ const char* source)
+// Shared invalidation logic for both a real system suspend and a plain
+// screen lock (WTS_SESSION_LOCK) that happens without a suspend - see
+// BeginCaptureSessionLock's header comment below for why a screen lock
+// needs the exact same "new session" boundary BeginCaptureSuspend already
+// gives suspend/resume. resetResumeEvent=false is what makes a lock-only
+// call cheap: WaitForSystemResume() then returns almost immediately (the
+// resume event was never reset) instead of blocking for an actual OS
+// resume - the generation bump alone is what HandleCaptureVerify's
+// "power transition invalidated SEP result" branch actually keys off (see
+// that loop's own g_suspendGeneration/resumePending check), so nothing
+// else in that loop needs to know why the generation moved.
+// clearStickyEndpoint=false is the other lock-only difference: a screen
+// lock does not tear down the BridgeXPC/NCM link the way a real suspend
+// can, so keeping the cached endpoint avoids paying full discovery+connect
+// latency on every lock screen.
+void InvalidateActiveCapture(_In_z_ const char* source, bool resetResumeEvent, bool clearStickyEndpoint)
 {
-    HANDLE resumeEvent = GetSystemResumeEvent();
-    if (resumeEvent) ResetEvent(resumeEvent);
+    if (resetResumeEvent) {
+        HANDLE resumeEvent = GetSystemResumeEvent();
+        if (resumeEvent) ResetEvent(resumeEvent);
+    }
     g_suspendGeneration.fetch_add(1, std::memory_order_acq_rel);
     ClearMatchReplay();
-    {
+    if (clearStickyEndpoint) {
         std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
         g_stickyNcm.valid = false;
     }
@@ -444,6 +461,37 @@ void BeginCaptureSuspend(_In_z_ const char* source)
     if (cancelEvent) SetEvent(cancelEvent); // interrupts only the active BiometricKit operation
     T2BioLog("%s: invalidated active fingerprint result; aborting BiometricKit match; "
              "keeping WBF CAPTURE_DATA pending", source);
+}
+
+void BeginCaptureSuspend(_In_z_ const char* source)
+{
+    InvalidateActiveCapture(source, /*resetResumeEvent=*/true, /*clearStickyEndpoint=*/true);
+}
+
+// 26.09.2026: screen-lock invalidation boundary. This driver deliberately
+// keeps ONE pending WBF CAPTURE_DATA request alive across lock/unlock (and
+// across suspend/resume) instead of letting WinBio Service open a fresh
+// WinBio session per lock screen the way a compliant driver normally would
+// - that workaround is what avoids the D0Exit-orphaned-IOCTL crash
+// (Code 43) the suspend/resume path above was originally built to fix. The
+// side effect is that this driver must manually reconstruct the "new
+// session" boundary WBS would otherwise give it for free - and until now
+// it only did that at OS suspend/resume, not at a plain screen lock with
+// no suspend (e.g. lock -> fingerprint unlock -> THEN the machine actually
+// sleeps: the suspend hook above fires too late in that sequence to catch
+// the stale unlock). Hooking WTS_SESSION_LOCK (see
+// T2BioRegisterSessionLockNotification further down this file) and routing
+// it through the exact same generation-bump path as BeginCaptureSuspend
+// closes that gap with zero changes to HandleCaptureVerify/
+// WaitForSystemResume: that loop already re-checks g_suspendGeneration
+// after every attempt regardless of what triggered the bump, and
+// cfg.rejectOrdinalAtOrBelow (re-read from g_lastObservedSepOrdinal fresh
+// before every engine.Verify() call) is what actually keeps a stale
+// pre-lock touch from surfacing as the post-lock result - not a
+// finger-lift flag, see that field's own declaration comment.
+void BeginCaptureSessionLock(_In_z_ const char* source)
+{
+    InvalidateActiveCapture(source, /*resetResumeEvent=*/false, /*clearStickyEndpoint=*/false);
 }
 
 // 24.09.2026: EvtIoStop (below in this file / Driver.cpp) turned out to be
@@ -1660,4 +1708,140 @@ extern "C" VOID T2BioUnregisterSuspendResumeNotification(VOID)
         PowerUnregisterSuspendResumeNotification(g_suspendResumeNotify);
         g_suspendResumeNotify = nullptr;
     }
+}
+
+// ---------------------------------------------------------------------
+// Screen-lock invalidation boundary (WTS_SESSION_LOCK) - see
+// BeginCaptureSessionLock's header comment above for why this driver needs
+// it in addition to the suspend/resume hook above.
+//
+// WTSRegisterSessionNotification needs either an HWND pumping
+// WM_WTSSESSION_CHANGE, or a process registered with SCM via
+// RegisterServiceCtrlHandlerEx for SERVICE_CONTROL_SESSION_CHANGE. This
+// driver is a plugin DLL living inside the shared WUDFHost.exe process (see
+// Driver.cpp's DebugView comment) - it is not itself an SCM service, so the
+// HWND route is used here: a dedicated background thread creates a hidden
+// message-only window and pumps its own message loop watching for
+// WM_WTSSESSION_CHANGE.
+//
+// UNVALIDATED: this has not been tried in this process/hosting model
+// before. Confirm on real hardware that a message-only window created
+// inside WUDFHost.exe actually receives session broadcast messages before
+// building anything else on top of it. If it does not, the fallback
+// options are (i) whether WUDFHost.exe already runs an SCM-visible service
+// context this driver could piggyback SERVICE_CONTROL_SESSION_CHANGE on, or
+// (ii) polling WTSQuerySessionInformation on a timer as a much uglier last
+// resort - do not reach for (ii) without first genuinely trying this.
+namespace {
+
+constexpr wchar_t kSessionLockWindowClass[] = L"T2TouchIdBio_SessionLockWnd";
+// Custom message rather than WM_CLOSE/DestroyWindow from another thread:
+// DestroyWindow must run on the window's own thread, so shutdown posts this
+// and lets the pump thread destroy its own window.
+constexpr UINT kSessionLockShutdownMessage = WM_APP + 1;
+
+HANDLE g_sessionLockThread = nullptr;
+DWORD g_sessionLockThreadId = 0;
+std::atomic<HWND> g_sessionLockWindow{nullptr};
+
+LRESULT CALLBACK SessionLockWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    if (msg == kSessionLockShutdownMessage) {
+        DestroyWindow(hwnd);
+        return 0;
+    }
+    if (msg == WM_WTSSESSION_CHANGE) {
+        if (wParam == WTS_SESSION_LOCK) {
+            std::lock_guard<std::mutex> commitLock(g_captureRequestCommitMu);
+            BeginCaptureSessionLock("SessionLockNotify(WTS_SESSION_LOCK)");
+        }
+        // WTS_SESSION_UNLOCK and every other change type are intentionally
+        // ignored - only a lock is a new invalidation boundary; an unlock
+        // has nothing left to invalidate.
+        return 0;
+    }
+    if (msg == WM_DESTROY) {
+        WTSUnRegisterSessionNotification(hwnd);
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+DWORD WINAPI SessionLockThreadProc(LPVOID)
+{
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc = SessionLockWndProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = kSessionLockWindowClass;
+    // Registering the same class twice (e.g. a second DriverEntry in the
+    // same WUDFHost.exe process after a device restart) is expected and
+    // harmless - ignore ERROR_CLASS_ALREADY_EXISTS.
+    if (!RegisterClassW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        T2BioLog("SessionLockThreadProc: RegisterClassW failed, error=%lu",
+                 static_cast<unsigned long>(GetLastError()));
+        return 0;
+    }
+
+    HWND hwnd = CreateWindowExW(0, kSessionLockWindowClass, L"", 0, 0, 0, 0, 0,
+                                 HWND_MESSAGE, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!hwnd) {
+        T2BioLog("SessionLockThreadProc: CreateWindowExW failed, error=%lu",
+                 static_cast<unsigned long>(GetLastError()));
+        return 0;
+    }
+
+    if (!WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION)) {
+        T2BioLog("SessionLockThreadProc: WTSRegisterSessionNotification failed, error=%lu",
+                 static_cast<unsigned long>(GetLastError()));
+        DestroyWindow(hwnd);
+        return 0;
+    }
+
+    g_sessionLockWindow.store(hwnd, std::memory_order_release);
+    T2BioLog("SessionLockThreadProc: WTSRegisterSessionNotification ok, pumping messages");
+
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    g_sessionLockWindow.store(nullptr, std::memory_order_release);
+    T2BioLog("SessionLockThreadProc: message loop exited");
+    return 0;
+}
+
+}  // namespace
+
+// Called once from DriverEntry (Driver.cpp), after the suspend/resume hook.
+// Registration failure is logged and otherwise ignored (not fatal to the
+// driver's core WBDI function - it only means the extra screen-lock
+// invalidation boundary is unavailable this boot; the suspend/resume hook
+// above still protects the actual-suspend case on its own).
+extern "C" VOID T2BioRegisterSessionLockNotification(VOID)
+{
+    g_sessionLockThread = CreateThread(nullptr, 0, SessionLockThreadProc, nullptr, 0,
+                                        &g_sessionLockThreadId);
+    if (!g_sessionLockThread) {
+        T2BioLog("T2BioRegisterSessionLockNotification: CreateThread failed, error=%lu",
+                 static_cast<unsigned long>(GetLastError()));
+    }
+}
+
+// Called from EvtDriverUnload (Driver.cpp), before the process may unload
+// this DLL. Posts the window its own shutdown message and waits, bounded,
+// for the pump thread to unwind.
+extern "C" VOID T2BioUnregisterSessionLockNotification(VOID)
+{
+    if (!g_sessionLockThread) {
+        return;
+    }
+    HWND hwnd = g_sessionLockWindow.load(std::memory_order_acquire);
+    if (hwnd) {
+        PostMessageW(hwnd, kSessionLockShutdownMessage, 0, 0);
+    }
+    WaitForSingleObject(g_sessionLockThread, 3000);
+    CloseHandle(g_sessionLockThread);
+    g_sessionLockThread = nullptr;
 }

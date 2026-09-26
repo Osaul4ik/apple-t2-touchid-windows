@@ -49,6 +49,10 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject,
     // root-enumerated device. Registered once here rather than in
     // EvtDeviceAdd since it does not depend on the device at all.
     T2BioRegisterSuspendResumeNotification();
+    // Second, independent invalidation boundary - a plain screen lock with
+    // no suspend. See BeginCaptureSessionLock's header comment (Queue.cpp)
+    // for why the suspend/resume hook above alone is not enough.
+    T2BioRegisterSessionLockNotification();
     T2BioLog("DriverEntry ok");
     return status;
 }
@@ -56,6 +60,8 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject,
 extern "C" VOID T2BioEvtDriverUnload(_In_ WDFDRIVER Driver)
 {
     UNREFERENCED_PARAMETER(Driver);
+    // Reverse of DriverEntry's registration order.
+    T2BioUnregisterSessionLockNotification();
     T2BioUnregisterSuspendResumeNotification();
     T2BioLog("EvtDriverUnload ok");
 }

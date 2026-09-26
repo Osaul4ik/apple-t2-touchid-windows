@@ -29,6 +29,12 @@
 // header comment for why this driver needs one instead of relying on
 // EvtIoStop/EvtDeviceD0Exit alone. Link dependency: PowrProf.lib.
 #include <powrprof.h>
+// WTSRegisterSessionNotification (Queue.cpp, T2BioRegisterSessionLockNotification):
+// the screen-lock invalidation boundary, in addition to the process-wide
+// suspend/resume hook above - see that function's header comment for why a
+// plain screen lock needs its own invalidation path. Link dependency:
+// Wtsapi32.lib.
+#include <wtsapi32.h>
 #include <wdf.h>
 #include <strsafe.h>
 #include <winbio_types.h>
@@ -92,6 +98,15 @@ EXTERN_C_END
 EXTERN_C_START
 VOID T2BioRegisterSuspendResumeNotification(VOID);
 VOID T2BioUnregisterSuspendResumeNotification(VOID);
+EXTERN_C_END
+
+// Screen-lock invalidation boundary (WTS_SESSION_LOCK, Queue.cpp) - the
+// second invalidation path, alongside the suspend/resume hook above, for a
+// plain screen lock that happens without a suspend. Called from
+// DriverEntry / T2BioEvtDriverUnload (Driver.cpp).
+EXTERN_C_START
+VOID T2BioRegisterSessionLockNotification(VOID);
+VOID T2BioUnregisterSessionLockNotification(VOID);
 EXTERN_C_END
 
 // Debug-only trace; visible in DebugView (Capture Global Win32) because

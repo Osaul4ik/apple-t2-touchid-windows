@@ -102,7 +102,7 @@
            OnSuspendResume) - see the comment there for why this driver needs
            a process-wide suspend notification instead of relying on
            EvtIoStop/EvtDeviceD0Exit. -->
-      <AdditionalDependencies>ws2_32.lib;PowrProf.lib;$(VcpkgInstalledDir)\lib\$(PlistLibName);%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>ws2_32.lib;PowrProf.lib;Wtsapi32.lib;$(VcpkgInstalledDir)\lib\$(PlistLibName);%(AdditionalDependencies)
       <AdditionalLibraryDirectories>$(VcpkgInstalledDir)\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
     <DriverSign>
