@@ -102,7 +102,12 @@
            OnSuspendResume) - see the comment there for why this driver needs
            a process-wide suspend notification instead of relying on
            EvtIoStop/EvtDeviceD0Exit. -->
-      <AdditionalDependencies>ws2_32.lib;PowrProf.lib;Wtsapi32.lib;$(VcpkgInstalledDir)\lib\$(PlistLibName);%(AdditionalDependencies)</AdditionalDependencies>
+      <!-- user32.lib is required for the message-only window + pump used by
+           SessionLockThreadProc (RegisterClassW/CreateWindowExW/GetMessageW/
+           TranslateMessage/DispatchMessageW/DefWindowProcW/PostMessageW/
+           DestroyWindow/PostQuitMessage) so WTSRegisterSessionNotification
+           can deliver WM_WTSSESSION_CHANGE for WTS_SESSION_LOCK. -->
+      <AdditionalDependencies>ws2_32.lib;PowrProf.lib;Wtsapi32.lib;user32.lib;$(VcpkgInstalledDir)\lib\$(PlistLibName);%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalLibraryDirectories>$(VcpkgInstalledDir)\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
     <DriverSign>
