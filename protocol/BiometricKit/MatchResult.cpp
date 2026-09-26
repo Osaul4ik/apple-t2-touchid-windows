@@ -43,25 +43,53 @@ namespace t2::biometrickit {
 bool ParseStatusEventHeader(const std::vector<uint8_t>& data,
                              uint32_t* outEmbeddedType,
                              std::vector<uint8_t>* outEventData,
-                             uint64_t* outSequence) {
+                             uint64_t* outEnvelopeOrdinal) {
     if (data.size() < kStatusEventHeaderBytes) {
         return false; // malformed: caller must keep waiting, never guess NoMatch
     }
     // VERIFIED FROM SOURCE: struct.unpack_from("<QIIQ", data) ==
     // (sequence, embedded_type, version, ordinal). Historically only
-    // embedded_type (bytes [8:12)) was needed by this project; 26.09.2026
-    // adds sequence (bytes [0:8)) for VerifyConfig::rejectSequenceAtOrBelow.
-    // `version` [12:16) and `ordinal` [16:24) still have no established use
-    // here (do not confuse this envelope-level `ordinal` with the
-    // status-event status_code field StatusOrdinalHypothesis() takes — same
-    // wire term, unrelated value, see that function's own comment).
-    uint64_t sequence = 0;
-    std::memcpy(&sequence, data.data() + 0, sizeof(sequence));
+    // embedded_type (bytes [8:12)) was needed by this project.
+    //
+    // 26.09.2026, CORRECTED same day: an earlier revision of this comment
+    // added `sequence` (bytes [0:8)) as VerifyConfig::rejectSequenceAtOrBelow's
+    // anti-replay signal, on the strength of this struct layout alone,
+    // without decoding real hardware data first. Real captures (Ukrainian
+    // hardware report, 26.09.2026) decode that field as 0 in EVERY event of
+    // every kind (status/statistics/match_result) - it is not populated by
+    // this bridge daemon at all, so a check keyed on it rejects a
+    // never-before-seen match_result with the same false "already observed"
+    // verdict (0 <= 0) as a genuine replay, permanently: the very first
+    // touch after driver load fails identically to a stale post-suspend
+    // one. This is now believed to be the SAME field bridge-xpc-probe.py's
+    // own decoder either never populates or never reads meaningfully.
+    //
+    // `ordinal` (bytes [16:24)) is what actually varies: decoding the same
+    // hardware capture, ordinal increases monotonically across every event
+    // in a session AND across a full reconnect (new TCP connection, new
+    // StartMatch, no suspend involved) - values around 8.7e10 rising by
+    // ~2000-8e6 per event, never resetting to a small number on the new
+    // connection. That is the real anti-replay signal:
+    // VerifyConfig::rejectOrdinalAtOrBelow is fed from this field, not from
+    // `sequence`, as of this fix (renamed from rejectSequenceAtOrBelow the
+    // same day, once the mistake was found, so the field name doesn't keep
+    // pointing at the wrong 8 bytes). `version` [12:16) still has no
+    // established use here. Do NOT confuse this envelope-level `ordinal`
+    // with the status-event status_code field StatusOrdinalHypothesis()
+    // takes — same wire term, unrelated value and unrelated byte range, see
+    // that function's own comment.
+    //
+    // Reconnect-survival is now hardware-confirmed (above); suspend/resume
+    // survival specifically is NOT yet confirmed against a real sleep/wake
+    // capture — flagged for the next hardware verification pass, same as
+    // the field it replaces.
+    uint64_t envelopeOrdinal = 0;
+    std::memcpy(&envelopeOrdinal, data.data() + 16, sizeof(envelopeOrdinal));
     uint32_t embeddedType = 0;
     std::memcpy(&embeddedType, data.data() + 8, sizeof(embeddedType));
     *outEmbeddedType = embeddedType;
-    if (outSequence) {
-        *outSequence = sequence;
+    if (outEnvelopeOrdinal) {
+        *outEnvelopeOrdinal = envelopeOrdinal;
     }
     outEventData->assign(data.begin() + kStatusEventHeaderBytes, data.end());
     return true;

@@ -71,24 +71,25 @@ struct VerifyConfig {
     // 26.09.2026 (root-cause pass, replaces two earlier, empirically
     // insufficient attempts at this same bug — see history below):
     // set by Queue.cpp fresh before EVERY StartMatch attempt, from
-    // g_lastObservedSepSequence — the highest `sequence` field (MatchResult.h
-    // ParseStatusEventHeader) this process has observed in ANY event, ever,
-    // surviving suspend/resume and every reconnect.
+    // g_lastObservedSepOrdinal — the highest `ordinal` field (MatchResult.h
+    // ParseStatusEventHeader's 24-byte envelope header, bytes [16:24)) this
+    // process has observed in ANY event, ever, confirmed surviving a full
+    // reconnect on real hardware (suspend/resume specifically not yet
+    // confirmed the same way — see ParseStatusEventHeader's own comment).
     //
     // VerificationEngine::Verify rejects a match_result outright — treats it
-    // exactly like NoMatch — unless its OWN sequence number is strictly
-    // greater than this value. `sequence` is the SEP's own monotonic count
-    // of events it emits; it is not reset by our software tearing down and
-    // reopening the BridgeXPC TCP connection (that reconnect is a
-    // software-side convenience — see Connection.h's "one connection per
-    // attempt" note — not a SEP-side state boundary). An event whose
-    // sequence we've already seen (or a lower one) being handed to us again
-    // is therefore not a new touch: it is *the same SEP-side event*,
-    // delivered more than once. This is a fact derived from data the SEP
-    // itself produced, not a guess about elapsed time or how many attempts
-    // have run.
+    // exactly like NoMatch — unless its OWN `ordinal` is strictly greater
+    // than this value. `ordinal` is the SEP's own monotonic count of events
+    // it emits; it is not reset by our software tearing down and reopening
+    // the BridgeXPC TCP connection (that reconnect is a software-side
+    // convenience — see Connection.h's "one connection per attempt" note —
+    // not a SEP-side state boundary). An event whose `ordinal` we've already
+    // seen (or a lower one) being handed to us again is therefore not a new
+    // touch: it is *the same SEP-side event*, delivered more than once.
+    // This is a fact derived from data the SEP itself produced, not a guess
+    // about elapsed time or how many attempts have run.
     //
-    // History, so the next person doesn't retry either of these: (1) an
+    // History, so the next person doesn't retry any of these: (1) an
     // earlier revision keyed this off "zero live FingerOn(status_code 63)
     // events this session" — hardware log showed the SEP replays the
     // pre-suspend touch's FULL FingerOn->ImageCaptured->FingerOff->
@@ -98,24 +99,32 @@ struct VerifyConfig {
     // after it (an attempt-count bound); a later hardware reproduction
     // (several touches right before sleep, wake with no further touch,
     // unlock succeeding on the SECOND post-resume attempt) showed one
-    // discard cycle is not always enough — the SEP can keep replaying stale
-    // state into more than one attempt, and neither "one attempt" nor any
-    // other fixed count is something this protocol lets us prove is
-    // sufficient. A wall-clock window has the identical problem one level
-    // removed (still a guess, just measured in ms instead of attempts).
-    // Sequence comparison has no such bound to guess: however many events
-    // it takes the SEP to move past whatever it was replaying, they all
-    // fail this check until a value we have never seen shows up.
+    // discard cycle is not always enough. A wall-clock window has the
+    // identical problem one level removed (still a guess, just measured in
+    // ms instead of attempts). (3) THIS field was first wired up to the
+    // header's `sequence` bytes [0:8) rather than `ordinal` bytes [16:24) —
+    // same struct, wrong 8 bytes — on the strength of the struct-layout
+    // comment alone, without decoding real hardware data first. `sequence`
+    // turned out to be 0 in every event this bridge daemon emits, so the
+    // very first check after driver load already failed closed
+    // (0 <= 0 is true) and no fingerprint unlock could ever succeed again,
+    // suspend/resume or not — reported same day. `ordinal` is confirmed (by
+    // decoding a real hardware capture) to actually vary and increase
+    // monotonically. Comparison-by-value has no attempt-count or
+    // elapsed-time bound to guess, but it is only as good as extracting the
+    // right bytes — this file's own history is the reminder to verify
+    // against real captured data, not just the reverse-engineered struct
+    // layout comment, before trusting a new field.
     //
     // Known remaining gap (unavoidable with this protocol, not a threshold
     // to tune): a touch the SEP finished scoring but whose event never
     // reached us at all before the pre-suspend connection was torn down
-    // leaves us with no sequence sample for it — we cannot compare against
+    // leaves us with no `ordinal` sample for it — we cannot compare against
     // an event we never saw. Nothing purely software-side closes this
-    // without a SEP-side "give me your current sequence counter" primitive,
+    // without a SEP-side "give me your current ordinal counter" primitive,
     // which this reverse-engineered protocol is not known to expose. Flag
     // for further hardware investigation, not assumed solved by this change.
-    uint64_t rejectSequenceAtOrBelow = 0;
+    uint64_t rejectOrdinalAtOrBelow = 0;
 
     // REVERTED (16.09.2026): defaulted to InlineIdentities (68B, no count)
     // on the strength of the same macOS unified-log capture already
@@ -180,17 +189,17 @@ public:
     // request/reply round-trips, not the long touch-and-wait) is not, same
     // scope the design doc itself describes for this mechanism.
     //
-    // outHighestSequenceSeen (26.09.2026, optional, defaults to nullptr for
-    // the CLI): set to the highest event `sequence` number (MatchResult.h)
+    // outHighestOrdinalSeen (26.09.2026, optional, defaults to nullptr for
+    // the CLI): set to the highest event `ordinal` value (MatchResult.h)
     // observed anywhere in this call, win or lose — updated as events
     // stream in, so it is always current by the time Verify returns, on
     // every exit path (deadline, cancel, transport loss, or a real verdict).
-    // The caller (Queue.cpp) folds this into g_lastObservedSepSequence so
-    // the NEXT attempt's config_.rejectSequenceAtOrBelow reflects it.
+    // The caller (Queue.cpp) folds this into g_lastObservedSepOrdinal so
+    // the NEXT attempt's config_.rejectOrdinalAtOrBelow reflects it.
     VerifyOutcome Verify(bridgexpc::Connection* conn,
                          std::optional<std::array<uint8_t, 16>>* outMatchedUuid,
                          HANDLE cancelEvent = nullptr,
-                         uint64_t* outHighestSequenceSeen = nullptr);
+                         uint64_t* outHighestOrdinalSeen = nullptr);
 
 private:
     // Shared prefix of WarmUp and Verify. Byte-identical to the Linux

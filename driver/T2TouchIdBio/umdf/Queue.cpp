@@ -282,36 +282,45 @@ std::mutex g_captureRequestCommitMu;
 // restart the SEP match under the same still-pending WBDI request.
 std::atomic<ULONGLONG> g_suspendGeneration{0};
 
-// 26.09.2026: lifecycle tracking, not a clock. Every BridgeXPC status-
-// callback event (status/statistics/match_result alike) carries its own
-// 24-byte header - sequence:u64le, embedded_type:u32le, version:u32le,
-// ordinal:u64le (MatchResult.h/.cpp, VERIFIED FROM SOURCE) - and `sequence`
-// was parsed and thrown away. That field is the SEP's OWN monotonic count
-// of events it has emitted, independent of our software's TCP reconnects:
-// it is the one piece of data in this protocol that can prove "this
-// specific event was generated before/after point X" as a fact, not a
-// guess. g_lastObservedSepSequence is the high-water mark of every such
-// sequence number this process has ever seen (surviving suspend, resume,
-// and every reconnect - never reset). VerificationEngine.cpp rejects any
-// match_result whose sequence does not exceed this mark BEFORE evaluating
-// it: an event we've already observed (by sequence number) offered to us
-// again is provably a replay, not a new touch, regardless of how much
-// wall-clock time sits between the two deliveries. See VerifyConfig::
-// rejectSequenceAtOrBelow for where this is fed to the engine, and its own
-// comment for the one gap this does NOT close (a completion the SEP scored
-// but whose event never reached us at all before the pre-suspend
-// connection was torn down - we have no sequence sample for it to compare
-// against, because we never saw it).
-std::atomic<uint64_t> g_lastObservedSepSequence{0};
+// 26.09.2026, corrected same day: lifecycle tracking, not a clock. Every
+// BridgeXPC status-callback event (status/statistics/match_result alike)
+// carries its own 24-byte header - sequence:u64le, embedded_type:u32le,
+// version:u32le, ordinal:u64le (MatchResult.h/.cpp, VERIFIED FROM SOURCE).
+// The first version of this fix used `sequence` (bytes [0:8)) on the
+// strength of that struct-layout comment alone; decoding a real hardware
+// capture the same day showed `sequence` is 0 in EVERY event this bridge
+// daemon emits, so the very first fingerprint touch after driver load
+// already failed the "> last observed" check (0 <= 0) and no unlock could
+// ever succeed again - reported immediately from real hardware. `ordinal`
+// (bytes [16:24)) is the field that actually varies: the same hardware
+// capture shows it increasing monotonically across a whole session AND
+// surviving a full reconnect (new TCP connection, new StartMatch, no
+// suspend involved) - it is the SEP's own count, independent of our
+// software's TCP churn, and the one piece of data in this protocol that
+// can prove "this specific event was generated before/after point X" as a
+// fact, not a guess. g_lastObservedSepOrdinal is the high-water mark of
+// every `ordinal` value this process has ever seen (reconnect-survival
+// hardware-confirmed; suspend/resume survival specifically not yet
+// confirmed the same way - see ParseStatusEventHeader's own comment).
+// VerificationEngine.cpp rejects any match_result whose `ordinal` does not
+// exceed this mark BEFORE evaluating it: an event we've already observed
+// (by that value) offered to us again is provably a replay, not a new
+// touch, regardless of how much wall-clock time sits between the two
+// deliveries. See VerifyConfig::rejectOrdinalAtOrBelow for where this is
+// fed to the engine, and its own comment for the one gap this does NOT
+// close (a completion the SEP scored but whose event never reached us at
+// all before the pre-suspend connection was torn down - we have no
+// `ordinal` sample for it to compare against, because we never saw it).
+std::atomic<uint64_t> g_lastObservedSepOrdinal{0};
 
 // Atomic "raise the high-water mark, never lower it" - the usual
 // compare_exchange retry-loop idiom for a monotonic max.
-void ObserveSepSequence(uint64_t sequence)
+void ObserveSepOrdinal(uint64_t ordinal)
 {
-    uint64_t prev = g_lastObservedSepSequence.load(std::memory_order_relaxed);
-    while (sequence > prev &&
-           !g_lastObservedSepSequence.compare_exchange_weak(
-               prev, sequence, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+    uint64_t prev = g_lastObservedSepOrdinal.load(std::memory_order_relaxed);
+    while (ordinal > prev &&
+           !g_lastObservedSepOrdinal.compare_exchange_weak(
+               prev, ordinal, std::memory_order_acq_rel, std::memory_order_relaxed)) {
         // prev now holds the current value; retry if still stale.
     }
 }
@@ -488,7 +497,7 @@ ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_
             std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
             g_stickyNcm.valid = false;
         }
-        // No clock to arm here anymore - g_lastObservedSepSequence (declared
+        // No clock to arm here anymore - g_lastObservedSepOrdinal (declared
         // above) is keyed off the SEP's own event sequence numbers, not off
         // when resume happened, so resume itself needs no bookkeeping beyond
         // what BeginCaptureSuspend/the generation counter already do.
@@ -1110,12 +1119,12 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
         // A suspend happened before this request ever reached StartMatch
         // (e.g. CAPTURE_DATA arrived right as the machine went to sleep -
         // any touches during that window belong to no live session of
-        // ours). No separate handling needed here: cfg.rejectSequenceAtOrBelow
-        // is set from g_lastObservedSepSequence fresh before every
+        // ours). No separate handling needed here: cfg.rejectOrdinalAtOrBelow
+        // is set from g_lastObservedSepOrdinal fresh before every
         // engine.Verify() call below regardless of how this loop got here.
         T2BioLog("CAPTURE_DATA(verify): suspend/resume spanned this request before its "
                  "first attempt; rejecting any match_result at or below the last "
-                 "observed SEP sequence number");
+                 "observed SEP ordinal");
     }
     // A lost TCP session is retried only for genuine connection loss. Power
     // transitions restart the outer loop and do not consume this retry budget.
@@ -1143,22 +1152,22 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
 
                 // 26.09.2026: re-read fresh before EVERY StartMatch attempt
                 // (not just the first one after resume) - see
-                // g_lastObservedSepSequence's declaration. Whatever sequence
-                // number this attempt's own events turn out to carry, the
-                // engine below rejects a match_result unless its sequence
-                // exceeds this mark - i.e. unless the SEP has never before
-                // handed us this exact event.
-                cfg.rejectSequenceAtOrBelow = g_lastObservedSepSequence.load(std::memory_order_acquire);
+                // g_lastObservedSepOrdinal's declaration. Whatever `ordinal`
+                // this attempt's own events turn out to carry, the engine
+                // below rejects a match_result unless its `ordinal` exceeds
+                // this mark - i.e. unless the SEP has never before handed us
+                // this exact event.
+                cfg.rejectOrdinalAtOrBelow = g_lastObservedSepOrdinal.load(std::memory_order_acquire);
                 VerificationEngine engine(cfg);
                 matchedUuid.reset();
-                uint64_t highestSequenceSeen = 0;
-                outcome = engine.Verify(&conn, &matchedUuid, cancelEvent, &highestSequenceSeen);
-                // Every sequence number this attempt observed - accepted,
+                uint64_t highestOrdinalSeen = 0;
+                outcome = engine.Verify(&conn, &matchedUuid, cancelEvent, &highestOrdinalSeen);
+                // Every `ordinal` value this attempt observed - accepted,
                 // rejected-as-stale, or irrelevant status/statistics noise -
                 // is now something we've seen. Raise the mark unconditionally,
                 // regardless of outcome, so it can never be handed to us
                 // again as if it were new.
-                ObserveSepSequence(highestSequenceSeen);
+                ObserveSepOrdinal(highestOrdinalSeen);
                 if (outcome != VerifyOutcome::TransportError || !conn.ConnectionLost() ||
                     t2::bridgexpc::Connection::IsEventSignaled(cancelEvent)) {
                     // A real StartMatch cycle just ran against the resumed
@@ -1201,16 +1210,16 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
                 // still surface as a match_result within a post-resume
                 // StartMatch session with no live touch belonging to that
                 // new session at all, and can take more than one such
-                // session to stop happening. cfg.rejectSequenceAtOrBelow,
-                // re-read from g_lastObservedSepSequence fresh before the
+                // session to stop happening. cfg.rejectOrdinalAtOrBelow,
+                // re-read from g_lastObservedSepOrdinal fresh before the
                 // next engine.Verify() call above, is what actually
                 // protects this and every attempt after it - by proof
-                // (the event's own sequence number), not by attempt count
+                // (the event's own `ordinal` value), not by attempt count
                 // or elapsed time.
                 T2BioLog("CAPTURE_DATA(verify): resumed; restarting BiometricKit verify "
                          "in the same pending WBF request (SEP bootstrap is unchanged; "
                          "rejecting any match_result at or below the last observed "
-                         "SEP sequence number)");
+                         "SEP ordinal)");
                 continue;
             }
 

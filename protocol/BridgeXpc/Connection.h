@@ -106,7 +106,7 @@ public:
     // sequence header any other event does (MatchResult.h
     // ParseStatusEventHeader) — a stale pre-suspend event sitting in this
     // queue at warm-up time is exactly the kind of thing
-    // VerifyConfig::rejectSequenceAtOrBelow needs to know about, even
+    // VerifyConfig::rejectOrdinalAtOrBelow needs to know about, even
     // though its CONTENTS correctly never reach the match loop. This class
     // stays plist/BiometricKit-agnostic (it does not link that layer), so
     // it hands back the raw discarded payloads for the caller (which

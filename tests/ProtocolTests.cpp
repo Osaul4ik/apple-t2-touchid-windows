@@ -174,24 +174,31 @@ static void TestStatusEventHeader_ExtractsEmbeddedTypeAndSlicesBody() {
     CHECK(outData[0] == 0xC0);
 }
 
-// 26.09.2026: sequence is bytes [0:8) of the same <QIIQ> header, u64le -
-// VerifyConfig::rejectSequenceAtOrBelow depends on this being extracted
-// correctly and independently of embedded_type (bytes [8:12)).
-static void TestStatusEventHeader_ExtractsSequence() {
+// 26.09.2026, corrected same day: `ordinal` is bytes [16:24) of the same
+// <QIIQ> header, u64le - VerifyConfig::rejectOrdinalAtOrBelow depends on
+// this being extracted correctly and independently of embedded_type
+// (bytes [8:12)) AND of `sequence` (bytes [0:8), which real hardware
+// shows is always 0 - see next test - and must NOT be what gets compared).
+static void TestStatusEventHeader_ExtractsOrdinal() {
     std::vector<uint8_t> data(24, 0);
-    const uint64_t sequence = 0x1122334455667788ULL;
-    std::memcpy(data.data() + 0, &sequence, sizeof(sequence));
+    const uint64_t sequence = 0x1122334455667788ULL; // deliberately nonzero here
+    std::memcpy(data.data() + 0, &sequence, sizeof(sequence)); // to prove this
     uint32_t embeddedType = biometrickit::kEmbeddedTypeStatus;
     std::memcpy(data.data() + 8, &embeddedType, sizeof(embeddedType));
+    const uint64_t ordinal = 0x8877665544332211ULL;
+    std::memcpy(data.data() + 16, &ordinal, sizeof(ordinal));
 
     uint32_t outType = 0;
     std::vector<uint8_t> outData;
-    uint64_t outSequence = 0;
-    CHECK(biometrickit::ParseStatusEventHeader(data, &outType, &outData, &outSequence));
+    uint64_t outOrdinal = 0;
+    CHECK(biometrickit::ParseStatusEventHeader(data, &outType, &outData, &outOrdinal));
     CHECK(outType == biometrickit::kEmbeddedTypeStatus);
-    CHECK(outSequence == sequence);
+    // Confirms extraction targets exactly bytes [16:24), not whichever
+    // nonzero 8 bytes happens to be lying around.
+    CHECK(outOrdinal == ordinal);
+    CHECK(outOrdinal != sequence);
 
-    // Omitting outSequence (nullptr, the default) must still succeed and
+    // Omitting outOrdinal (nullptr, the default) must still succeed and
     // must not touch embeddedType/outData - existing callers with the old
     // 3-arg call shape (this file's own two tests above, and WarmUp's
     // identity-list reads) must keep working unchanged.
@@ -199,6 +206,46 @@ static void TestStatusEventHeader_ExtractsSequence() {
     std::vector<uint8_t> outData2;
     CHECK(biometrickit::ParseStatusEventHeader(data, &outType2, &outData2));
     CHECK(outType2 == biometrickit::kEmbeddedTypeStatus);
+}
+
+// 26.09.2026: regression test for the exact bug reported same day - a
+// prior revision of ParseStatusEventHeader read `sequence` (bytes [0:8))
+// instead of `ordinal` (bytes [16:24)) as the anti-replay value, and real
+// hardware captures decode `sequence` as 0 in every single event, which
+// made every match_result look "already seen" (0 <= 0) forever, breaking
+// fingerprint unlock entirely - not just after suspend/resume. This is the
+// literal `data` field (post bplist-decode) of a real FingerOn status
+// event from that hardware report, decoded with Python's plistlib +
+// struct.unpack_from("<QIIQ", ...) against the raw wire bytes to confirm
+// the true field values before writing this assertion:
+//   sequence=0 embedded_type=0xE3FF8001 version=1 ordinal=87461954433
+// If a future change reintroduces reading bytes [0:8) here, this test
+// fails the same way the real bug did: outOrdinal comes back 0.
+static void TestStatusEventHeader_RealCapture_OrdinalIsNonzero() {
+    // The `data` field bytes.fromhex(...) extracted from bplist payload
+    // 62706c6973743030a50102030405140000000000000000000000000000000912
+    // e3ff80004f102800000000000000000180ffe3010000008183235d140000005a
+    // 00000000000000000000000000000013000000145d23b11913000000b3aca07c
+    // fa080e1f244f580000000000000101000000000000000600000000000000000
+    // 000000000000061 (waitForEvent reqId=257E6F97..., +46402ms).
+    std::vector<uint8_t> data = {
+        0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00, // sequence = 0
+        0x01,0x80,0xff,0xe3,                     // embedded_type = 0xE3FF8001
+        0x01,0x00,0x00,0x00,                     // version = 1
+        0x81,0x83,0x23,0x5d,0x14,0x00,0x00,0x00, // ordinal = 87461954433
+    };
+    CHECK(data.size() == 24);
+
+    uint32_t outType = 0;
+    std::vector<uint8_t> outData;
+    uint64_t outOrdinal = 0;
+    CHECK(biometrickit::ParseStatusEventHeader(data, &outType, &outData, &outOrdinal));
+    CHECK(outType == biometrickit::kEmbeddedTypeStatus);
+    CHECK(outOrdinal == 87461954433ULL);
+    // The bug this guards against: reading bytes [0:8) instead would give
+    // outOrdinal == 0 here, indistinguishable from "never seen an event
+    // yet" and rejecting every fresh match forever.
+    CHECK(outOrdinal != 0);
 }
 
 // --- PlistPayload: §3 encode/decode round trip ---
@@ -356,7 +403,8 @@ int wmain() {
 
     TestStatusEventHeader_TooShort();
     TestStatusEventHeader_ExtractsEmbeddedTypeAndSlicesBody();
-    TestStatusEventHeader_ExtractsSequence();
+    TestStatusEventHeader_ExtractsOrdinal();
+    TestStatusEventHeader_RealCapture_OrdinalIsNonzero();
 
     TestPlistPayload_EnvelopeRoundTrip();
     TestPlistPayload_BiometricCommandShape();

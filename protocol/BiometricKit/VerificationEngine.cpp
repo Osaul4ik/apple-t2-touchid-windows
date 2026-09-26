@@ -220,20 +220,20 @@ bool VerificationEngine::WarmUp(bridgexpc::Connection* conn,
 VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
                                           std::optional<std::array<uint8_t, 16>>* outMatchedUuid,
                                           HANDLE cancelEvent,
-                                          uint64_t* outHighestSequenceSeen) {
+                                          uint64_t* outHighestOrdinalSeen) {
     if (busy_) {
         return VerifyOutcome::Busy;
     }
     busy_ = true;
     struct BusyGuard { bool* b; ~BusyGuard() { *b = false; } } guard{&busy_};
-    if (outHighestSequenceSeen) {
-        *outHighestSequenceSeen = 0;
+    if (outHighestOrdinalSeen) {
+        *outHighestOrdinalSeen = 0;
     }
     // 26.09.2026: local accumulator the sendStartMatch lambda and the main
     // event loop below both update by reference, kept in sync with
-    // *outHighestSequenceSeen at every point either of them touches it so
+    // *outHighestOrdinalSeen at every point either of them touches it so
     // the caller sees a live value regardless of which exit path is taken.
-    uint64_t highestSequenceSeen = 0;
+    uint64_t highestOrdinalSeen = 0;
 
     // 20.09.2026: the caller (Queue.cpp) can be cancelled by Windows while it
     // is still discovering/connecting (a multi-second window). If that
@@ -428,21 +428,21 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
             // 26.09.2026: their CONTENT is still correctly ignored (Linux
             // parity, per the comment above), but a stale pre-suspend event
             // sitting in this queue at warm-up time still carries a real
-            // SEP sequence number - fold it into the high-water mark before
+            // SEP `ordinal` value - fold it into the high-water mark before
             // it's thrown away, same as every other event this call sees.
             for (const auto& raw : discardedPayloads) {
                 auto discardedStatusData = bridgexpc::DecodeStatusEventData(raw);
                 if (!discardedStatusData) continue;
                 uint32_t discardedEmbeddedType = 0;
                 std::vector<uint8_t> discardedEventData;
-                uint64_t discardedSequence = 0;
+                uint64_t discardedOrdinal = 0;
                 if (ParseStatusEventHeader(*discardedStatusData, &discardedEmbeddedType,
-                                            &discardedEventData, &discardedSequence)) {
-                    highestSequenceSeen = (std::max)(highestSequenceSeen, discardedSequence);
+                                            &discardedEventData, &discardedOrdinal)) {
+                    highestOrdinalSeen = (std::max)(highestOrdinalSeen, discardedOrdinal);
                 }
             }
-            if (outHighestSequenceSeen) {
-                *outHighestSequenceSeen = highestSequenceSeen;
+            if (outHighestOrdinalSeen) {
+                *outHighestOrdinalSeen = highestOrdinalSeen;
             }
         }
         auto matchInitData = EncodeMatchInitData(config_.matchFlags, config_.macosUserId,
@@ -563,18 +563,18 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
         }
         uint32_t embeddedType = 0;
         std::vector<uint8_t> eventData;
-        uint64_t eventSequence = 0;
-        if (!ParseStatusEventHeader(*statusData, &embeddedType, &eventData, &eventSequence)) {
+        uint64_t eventOrdinal = 0;
+        if (!ParseStatusEventHeader(*statusData, &embeddedType, &eventData, &eventOrdinal)) {
             continue;
         }
         // 26.09.2026: update on every event this loop sees, before any
-        // branch or early exit below, so *outHighestSequenceSeen is always
+        // branch or early exit below, so *outHighestOrdinalSeen is always
         // current at whatever point this function returns (deadline,
         // cancel, transport loss, or a real verdict) - see the field's own
         // comment on why the caller needs this even on non-Match outcomes.
-        highestSequenceSeen = (std::max)(highestSequenceSeen, eventSequence);
-        if (outHighestSequenceSeen) {
-            *outHighestSequenceSeen = highestSequenceSeen;
+        highestOrdinalSeen = (std::max)(highestOrdinalSeen, eventOrdinal);
+        if (outHighestOrdinalSeen) {
+            *outHighestOrdinalSeen = highestOrdinalSeen;
         }
         if (embeddedType != kEmbeddedTypeMatchResult) {
             const wchar_t* kind = EmbeddedTypeName(embeddedType);
@@ -627,23 +627,25 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
 
         MatchResult mr = ParseMatchResult(embeddedType, eventData, identities);
         if (mr.outcome == MatchOutcome::Match) {
-            if (eventSequence <= config_.rejectSequenceAtOrBelow) {
+            if (eventOrdinal <= config_.rejectOrdinalAtOrBelow) {
                 // 26.09.2026, root-cause fix - see VerifyConfig::
-                // rejectSequenceAtOrBelow's own comment for the full
+                // rejectOrdinalAtOrBelow's own comment for the full
                 // history and reasoning. This exact match_result event
-                // (by the SEP's own sequence number, not by session/
+                // (by the SEP's own `ordinal` value, not by session/
                 // fingerTouchCycles/attempt-count/elapsed-time proxies
-                // that all turned out to be gameable) has already been
-                // observed once before - by this process, at some earlier
-                // point that predates it. Handing it to us again cannot be
-                // a fresh touch; treat it exactly like NO_MATCH.
+                // that all turned out to be gameable, and not by the
+                // header's `sequence` field either - see that comment for
+                // why) has already been observed once before - by this
+                // process, at some earlier point that predates it. Handing
+                // it to us again cannot be a fresh touch; treat it exactly
+                // like NO_MATCH.
                 T2_LOG("verify",
-                       L"match_result outcome=MATCH rejected: sequence=%llu does not exceed "
-                       L"the last observed SEP sequence (%llu) - this event was already seen "
+                       L"match_result outcome=MATCH rejected: ordinal=%llu does not exceed "
+                       L"the last observed SEP ordinal (%llu) - this event was already seen "
                        L"before, not produced by a live touch in this session; treating as "
                        L"NO_MATCH and requesting a fresh transaction",
-                       static_cast<unsigned long long>(eventSequence),
-                       static_cast<unsigned long long>(config_.rejectSequenceAtOrBelow));
+                       static_cast<unsigned long long>(eventOrdinal),
+                       static_cast<unsigned long long>(config_.rejectOrdinalAtOrBelow));
                 rejectedTouchAttempts++;
                 outcome = VerifyOutcome::NoMatch;
                 break;
