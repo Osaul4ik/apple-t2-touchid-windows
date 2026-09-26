@@ -1,234 +1,187 @@
 // SPDX-License-Identifier: GPL-2.0-only
-// VerificationEngine.h
+// Commands.h — T2BiometricKit
+//
+// All structures/IDs VERIFIED FROM SOURCE (Milestone 1, section 7).
+// Only commands Milestone 2 section 16 lists are implemented; adding a new
+// command ID requires updating docs/linux-reference-analysis.md provenance
+// first, per the "no undocumented protocol" rule.
+
 #pragma once
-#include "Commands.h"
-#include "MatchResult.h"
-#include "../BridgeXpc/Connection.h"
-#include <chrono>
+#include <cstdint>
 #include <vector>
+#include <array>
 
 namespace t2::biometrickit {
 
-enum class VerifyOutcome {
-    Match,
-    NoMatch,
-    Timeout,
-    TransportError,      // connect/HELO/version negotiation failure
-    RejectedByDevice,     // StartMatch's valid BridgeXPC command status was non-zero
-    Malformed,
-    Busy,                 // Milestone 2 §23: only one active session allowed
-    Cancelled,             // design doc §9.4: cancelEvent fired (Windows called
-                          // CancelIoEx on the pending WBDI request, e.g. LogonUI
-                          // ending the session on a password-fallback login) —
-                          // distinct from Timeout so Queue.cpp can complete the
-                          // IOCTL with WINBIO_E_CANCELED instead of
-                          // WINBIO_E_BAD_CAPTURE, and so g_captureBusy is freed
-                          // on a cancel signal rather than only ever on the full
-                          // matchWindow elapsing
-    UnstableIdentityInventory, // port of Linux FprintMatchGateError("live identity
-                          // inventory is unstable"): first/repeat 0x42 or 0x51 snapshot
-                          // disagreed — fail-closed, StartMatch never sent
-    // REMOVED (17.09.2026): NoImageCaptured used to relabel an ordinary
-    // Timeout whenever sawFingerOn && imagePipelineEvents==0 — i.e.
-    // whenever status codes 55/72/95 (ImageCaptured/ImageForProcessing/
-    // ImageWasAccepted) never appeared. VERIFIED FROM SOURCE
-    // (jmurth1234/t2-touchid-linux, src/t2-fprintd.py verdict_from_result):
-    // the reference's own production verify path never inspects, waits
-    // for, or requires those three status codes anywhere — it only scans
-    // match_events for event_kind=="match_result" and falls through to
-    // "verify-no-match" otherwise. The 55/72/95 sequence this project used
-    // to gate on came solely from a macOS unified-log capture of
-    // biometrickitd's own internal statusMessage: prints, never confirmed
-    // as something a remote BridgeXPC client (this driver included) is
-    // even supposed to receive. Keeping a distinct outcome for their
-    // absence manufactured a diagnosis the reference itself doesn't make.
-    // A timeout with sawFingerOn is now just Timeout, same as Linux calls
-    // it verify-no-match; fingerTouchCycles/imagePipelineEvents are still
-    // logged in the session summary for information, not used to pick the
-    // outcome.
+#pragma pack(push, 1)
+struct BmHeader {
+    uint16_t magic;   // 0x4D42 ("BM")
+    uint16_t command;
+    uint16_t version;
+    uint16_t value;
+    // variable-length data follows
 };
 
-struct VerifyConfig {
-    uint32_t macosUserId = 501;              // configurable, NOT hardcoded per Milestone 1 §6 finding
-    // VERIFIED FROM SOURCE: t2-fprintd.py's own argparse default for
-    // --match-seconds is 20.0 (main(), "--match-seconds", type=float,
-    // default=20.0), and _run_probe() never overrides it for a normal
-    // verify() call - so every real verification on the reference
-    // implementation runs with a 20s window, not 10s. This value was
-    // previously an unverified placeholder (nothing in docs/ ever cited a
-    // source for "10"). A 16.09.2026 hardware capture (3 back-to-back
-    // `verify` runs, all timing out with only status/statistics events)
-    // cut off at almost exactly 10s elapsed in every run - consistent with
-    // this mismatch ending the match window, and the client's own Cancel
-    // (cmd 0x0c), before SEP's normal idle/poll cycle for that session
-    // would have run its course on real macOS. Still cannot rule out "no
-    // finger was on the sensor during the window" as an independent or
-    // additional cause - this fix addresses a real, source-verified
-    // discrepancy, not a confirmed root cause.
-    std::chrono::seconds matchWindow{20};
-    std::chrono::milliseconds ioTimeout{5000};
+struct IdentityRecordV1 {
+    uint32_t userId;
+    std::array<uint8_t, 16> uuid; // opaque; never logged in full (Milestone 1 §7, §14)
+};
+static_assert(sizeof(uint32_t) + 16 == 20, "identity_record_v1_t must be 20 bytes");
 
-    // 26.09.2026 (root-cause pass, replaces two earlier, empirically
-    // insufficient attempts at this same bug — see history below):
-    // set by Queue.cpp fresh before EVERY StartMatch attempt, from
-    // g_lastObservedSepOrdinal — the highest `ordinal` field (MatchResult.h
-    // ParseStatusEventHeader's 24-byte envelope header, bytes [16:24)) this
-    // process has observed in ANY event, ever, confirmed surviving a full
-    // reconnect on real hardware (suspend/resume specifically not yet
-    // confirmed the same way — see ParseStatusEventHeader's own comment).
-    //
-    // VerificationEngine::Verify rejects a match_result outright — treats it
-    // exactly like NoMatch — unless its OWN `ordinal` is strictly greater
-    // than this value. `ordinal` is the SEP's own monotonic count of events
-    // it emits; it is not reset by our software tearing down and reopening
-    // the BridgeXPC TCP connection (that reconnect is a software-side
-    // convenience — see Connection.h's "one connection per attempt" note —
-    // not a SEP-side state boundary). An event whose `ordinal` we've already
-    // seen (or a lower one) being handed to us again is therefore not a new
-    // touch: it is *the same SEP-side event*, delivered more than once.
-    // This is a fact derived from data the SEP itself produced, not a guess
-    // about elapsed time or how many attempts have run.
-    //
-    // History, so the next person doesn't retry any of these: (1) an
-    // earlier revision keyed this off "zero live FingerOn(status_code 63)
-    // events this session" — hardware log showed the SEP replays the
-    // pre-suspend touch's FULL FingerOn->ImageCaptured->FingerOff->
-    // match_result burst into the new session, so "this session saw a live
-    // FingerOn" proved nothing. (2) the revision after that rejected
-    // exactly the FIRST post-resume match_result and trusted every attempt
-    // after it (an attempt-count bound); a later hardware reproduction
-    // (several touches right before sleep, wake with no further touch,
-    // unlock succeeding on the SECOND post-resume attempt) showed one
-    // discard cycle is not always enough. A wall-clock window has the
-    // identical problem one level removed (still a guess, just measured in
-    // ms instead of attempts). (3) THIS field was first wired up to the
-    // header's `sequence` bytes [0:8) rather than `ordinal` bytes [16:24) —
-    // same struct, wrong 8 bytes — on the strength of the struct-layout
-    // comment alone, without decoding real hardware data first. `sequence`
-    // turned out to be 0 in every event this bridge daemon emits, so the
-    // very first check after driver load already failed closed
-    // (0 <= 0 is true) and no fingerprint unlock could ever succeed again,
-    // suspend/resume or not — reported same day. `ordinal` is confirmed (by
-    // decoding a real hardware capture) to actually vary and increase
-    // monotonically. Comparison-by-value has no attempt-count or
-    // elapsed-time bound to guess, but it is only as good as extracting the
-    // right bytes — this file's own history is the reminder to verify
-    // against real captured data, not just the reverse-engineered struct
-    // layout comment, before trusting a new field.
-    //
-    // Known remaining gap (unavoidable with this protocol, not a threshold
-    // to tune): a touch the SEP finished scoring but whose event never
-    // reached us at all before the pre-suspend connection was torn down
-    // leaves us with no `ordinal` sample for it — we cannot compare against
-    // an event we never saw. Nothing purely software-side closes this
-    // without a SEP-side "give me your current ordinal counter" primitive,
-    // which this reverse-engineered protocol is not known to expose. Flag
-    // for further hardware investigation, not assumed solved by this change.
-    uint64_t rejectOrdinalAtOrBelow = 0;
+// LEGACY LAYOUT ONLY - see MatchIdentityLayout below.
+//
+// UNVERIFIED / DISTRUSTED framing below — see MatchResult.cpp's DISTRUST
+// NOTICE. This struct was derived from the Linux reference's "68-byte
+// match options structure". The claim that follows — that a
+// 16.09.2026 macOS unified-log capture on the same machine (bridgeOS
+// 23P5067, uid 501, 3 enrolled identities) shows biometrickitd issuing
+// start-match differently — has no corroboration in t2-touchid-linux and
+// is kept only as a documented, explicitly-selectable A/B experiment, not
+// as a claim to build on. VerifyConfig's actual default (LegacyCounted,
+// in VerificationEngine.h) is the Linux-verified one, matching
+// bridge-xpc-probe.py's own `--identity-blob-format=counted` default:
+//
+//   performCommand:version:inValue:inData:inSize: 4 1 0 <ptr> 68
+//
+// i.e. the WHOLE inner payload of command 4 is 68 bytes - not 68 bytes of
+// options plus a counted identity blob (which is 68 + 4 + 3*20 = 132
+// bytes, exactly what this project was sending). 68 == 8 + 3*20 == a small
+// fixed header plus the three identity records verbatim, which also
+// explains why the Linux-derived struct appeared to carry "60 reserved
+// bytes": on a machine with three enrolled fingers those 60 bytes ARE the
+// identity array.
+struct MatchInitDataV1 {
+    uint32_t flags;
+    uint32_t macosUserId;
+    std::array<uint8_t, 60> reserved{};
+};
+static_assert(sizeof(MatchInitDataV1) == 68, "match_init_data_v1_t must be 68 bytes");
 
-    // REVERTED (16.09.2026): defaulted to InlineIdentities (68B, no count)
-    // on the strength of the same macOS unified-log capture already
-    // discredited above (the pre-match sequence and skipResetSensor/
-    // skipLoadCalibration derived from it). The comment this replaces
-    // already records that this WAS A/B tested on real hardware against
-    // LegacyCounted and the two produced "a bit-identical failure shape" —
-    // i.e. switching does not reopen a previously-ruled-out cause, it just
-    // stops preferring the macOS-shaped payload over Linux's own. Default
-    // is now LegacyCounted (132B: 68-byte options + uint32 count + N*20B
-    // records), matching bridge-xpc-probe.py's own default exactly
-    // (VERIFIED FROM SOURCE: `--identity-blob-format` argparse default is
-    // `"counted"`). InlineIdentities/PaddedNoIdentities remain available via
-    // --match-layout for explicit A/B, now as the non-default variants.
-    MatchIdentityLayout matchLayout = MatchIdentityLayout::LegacyCounted; // Linux-verified default
+// Fixed header that precedes the inline identity records in the layout the
+// macOS capture shows on the wire.
+struct MatchOptionsV1 {
+    uint32_t flags;
+    uint32_t macosUserId;
+};
+static_assert(sizeof(MatchOptionsV1) == 8, "match_options_v1_t must be 8 bytes");
 
-    // MatchInitDataV1 / MatchOptionsV1 flags field. Linux probe default is 0;
-    // its help text notes "use 1 for an unlock match". Keep 0 as default to
-    // match both Linux fprintd and the macOS capture; expose via CLI for A/B.
-    uint32_t matchFlags = 0;
+// The selected-identities blob appended after MatchInitDataV1 starts with
+// its own uint32 record count, followed by count * IdentityRecordV1 records.
+// This is distinct from the 68-byte match options structure itself.
+#pragma pack(pop)
 
-    // 27.09.2026: switched back to false/false (send both, every verify).
-    // VERIFIED FROM SOURCE (t2-fprintd.py _run_probe(), the actual function
-    // every real fprintd.verify() call goes through - not a one-time
-    // warm-up script): its bridge-xpc-probe.py command line unconditionally
-    // includes --reset-sensor and --load-calibration alongside
-    // --identity-list on every single probe, with no code path that omits
-    // them. So "skip by default" was never actually Linux parity - it
-    // matched a 3-run real-hardware A/B showing the sensor still matches
-    // without them, and a macOS unified-log capture that also never showed
-    // cmd 2/cmd 0x20 (both already flagged elsewhere as not necessarily the
-    // same wire trace bkremoted's clients require), but it diverged from
-    // what the reference's own production Python actually sends. Per the
-    // user's explicit "робити як в лінуксі" (do it like Linux), these are
-    // now unconditionally sent again, matching _run_probe's real argv
-    // byte-for-byte: ResetSensor(2,2) -> Cancel(12) -> LoadCalibration(0x20,
-    // fdr) -> IdentityList(0x42) before StartMatch. --no-reset-sensor /
-    // --no-load-calibration remain available on the CLI for an explicit A/B
-    // against this default if the no-match_result investigation needs it.
-    bool skipResetSensor = false;
-    bool skipLoadCalibration = false;
+// How the start-match (cmd 4) payload is serialized.
+//
+//  InlineIdentities    8-byte MatchOptionsV1 + N * IdentityRecordV1; no
+//                      count field, no padding. For N == 3 this is 68
+//                      bytes, matching the UNVERIFIED/DISTRUSTED macOS
+//                      capture claim above. Kept only as an explicitly
+//                      selectable A/B experiment — NOT the default.
+//  PaddedNoIdentities  the 68-byte MatchInitDataV1 alone, identities not
+//                      sent at all. Also 68 bytes on the wire, so even the
+//                      distrusted capture claim cannot tell it apart from
+//                      InlineIdentities by size - kept as an explicitly
+//                      selectable A/B variant, same caveat as above.
+//  LegacyCounted       MatchInitDataV1 + uint32 count + N records
+//                      (132 bytes for N == 3). This is what
+//                      bridge-xpc-probe.py itself sends by default
+//                      (VERIFIED FROM SOURCE) and is VerifyConfig's actual
+//                      default (VerificationEngine.h). A/B-tested against
+//                      InlineIdentities on real hardware with "a
+//                      bit-identical failure shape" — i.e. the choice
+//                      between these three layouts is not what's blocking
+//                      verify.
+enum class MatchIdentityLayout {
+    InlineIdentities,
+    PaddedNoIdentities,
+    LegacyCounted,
 };
 
-// One VerificationEngine instance == one in-flight session (Milestone 2
-// §23 concurrency rule enforced by the diagnostic tool holding a single
-// instance and refusing to start a second one while IsBusy()).
-class VerificationEngine {
-public:
-    explicit VerificationEngine(const VerifyConfig& config) : config_(config) {}
+constexpr uint16_t kBmMagic = 0x4D42;
 
-    bool IsBusy() const { return busy_; }
-
-    // Exact port of t2-biometric-ready.sh warm_up() / bridge-xpc-probe.py
-    // argv `--initialize --reset-sensor --cancel-operation
-    // --load-calibration --identity-list`. No StartMatch (cmd 4), no
-    // sensor-readiness (cmd 0x53). Linux runs this on its own TCP
-    // connection and then disconnects, BEFORE fprintd's first verify.
-    // outIdentities is optional (CmdIdentities); WarmUp itself does not
-    // require a non-empty list — the Linux ready script doesn't either.
-    bool WarmUp(bridgexpc::Connection* conn,
-                std::vector<IdentityRecordV1>* outIdentities = nullptr);
-
-    // Full sequence per t2-fprintd.py T2Backend::_run_probe():
-    // connect -> HELO -> getBridgeVersion -> setClientVersion -> reset ->
-    // cancel -> load FDR calibration -> load calibration into sensor ->
-    // identity list -> start match -> event loop -> verdict -> cancel/stop
-    // -> disconnect. Every step's failure maps to a fail-closed outcome;
-    // nothing here ever converts a transport success into an implicit MATCH.
-    //
-    // cancelEvent (design doc §9.4): optional, defaults to nullptr so the
-    // CLI's one-shot `verify` (fixed matchWindow, no external cancel
-    // source) is unaffected. When the WBDI caller (Queue.cpp) has one — an
-    // event it signals from its WdfRequestMarkCancelable cancel routine —
-    // it is forwarded to every Connection::WaitForEvent call in the match
-    // loop below. Only the event-loop wait is covered; RunLinuxReadySequence
-    // (reset/load-calibration/identity-list, all short fixed-timeout
-    // request/reply round-trips, not the long touch-and-wait) is not, same
-    // scope the design doc itself describes for this mechanism.
-    //
-    // outHighestOrdinalSeen (26.09.2026, optional, defaults to nullptr for
-    // the CLI): set to the highest event `ordinal` value (MatchResult.h)
-    // observed anywhere in this call, win or lose — updated as events
-    // stream in, so it is always current by the time Verify returns, on
-    // every exit path (deadline, cancel, transport loss, or a real verdict).
-    // The caller (Queue.cpp) folds this into g_lastObservedSepOrdinal so
-    // the NEXT attempt's config_.rejectOrdinalAtOrBelow reflects it.
-    VerifyOutcome Verify(bridgexpc::Connection* conn,
-                         std::optional<std::array<uint8_t, 16>>* outMatchedUuid,
-                         HANDLE cancelEvent = nullptr,
-                         uint64_t* outHighestOrdinalSeen = nullptr);
-
-private:
-    // Shared prefix of WarmUp and Verify. Byte-identical to the Linux
-    // flag sequence above. Returns false on any transport/parse failure.
-    // outIdentityListRaw, if non-null, receives the unparsed cmd 0x42
-    // blob so Verify can byte-compare it against the repeated 0x42 that
-    // Linux sends before StartMatch.
-    bool RunLinuxReadySequence(bridgexpc::Connection* conn,
-                               std::vector<IdentityRecordV1>* outIdentities,
-                               std::vector<uint8_t>* outIdentityListRaw = nullptr,
-                               HANDLE cancelEvent = nullptr);
-
-    VerifyConfig config_;
-    bool busy_ = false;
+enum class Command : uint16_t {
+    ProtocolVersion   = 1,
+    ResetSensor       = 2,
+    StartMatch        = 4,
+    Cancel            = 0x0c,
+    LoadCalibration   = 0x20,
+    SksLockState      = 0x27, // Linux probe number
+    SensorInfo        = 0x35,
+    CatacombUuid      = 0x38,
+    // REMOVED (17.09.2026): this used to also declare GetSksLockStateMac=39,
+    // GetBiometrickitdInfo=40, GetProtectedConfig=46, GetEnabledForUnlock=48
+    // for a pre-StartMatch probe sequence. That sequence, and the four
+    // constants, came only from an unconfirmed claim (an alleged macOS
+    // unified-log capture) that is not corroborated anywhere in
+    // jmurth1234/t2-touchid-linux — grep across that project's source and
+    // docs finds no trace of these opcodes, this sequence, or the
+    // entitlement-gap theory attached to them. t2-fprintd.py/
+    // bridge-xpc-probe.py's own StartMatch path (VERIFIED FROM SOURCE)
+    // never sends any of this. Per explicit instruction: do not trust that
+    // source; treat Linux as the reference. See VerificationEngine.cpp for
+    // where the call sequence itself was already removed.
+    CatacombHash      = 0x3a,
+    CatacombState     = 0x3c,
+    IdentityList      = 0x42,
+    GlobalIdentityList = 0x51,
+    SensorReadiness   = 0x53,
 };
+
+// VERIFIED FROM SOURCE (jmurth1234/t2-touchid-linux,
+// src/bridge-xpc-probe.py --identity-list):
+//   biometric_command(sock, 0x42, data=pack("<I", uid), output_capacity=20 * 10)
+// Ten identity_record_v1_t slots. t2-biometric-ready.sh uses this exact
+// capacity; do not substitute 4096.
+constexpr uint32_t kIdentityListOutputCapacity = 20 * 10;
+
+// VERIFIED FROM SOURCE (bridge-xpc-probe.py resolve-any / --global-identity-list):
+//   biometric_command(sock, 0x51, output_capacity=40 * 10)
+constexpr uint32_t kGlobalIdentityListOutputCapacity = 40 * 10;
+
+constexpr uint32_t kEmbeddedTypeStatus      = 0xE3FF8001;
+constexpr uint32_t kEmbeddedTypeMatchResult = 0xE3FF8002;
+constexpr uint32_t kEmbeddedTypeStatistics  = 0xE3FF8004;
+
+// VERIFIED FROM SOURCE (jmurth1234/t2-touchid-linux,
+// enrollment_research/FINDINGS.md, "Raw service-envelope map" — recovered
+// from the matching daemon's 16-entry jump table, NOT scoped to
+// enrollment specifically; this is the complete envelope-type space, only
+// three of which (8001/8002/8004 above) this project previously named).
+// Added so a hardware capture can show a real name instead of "unknown"
+// if one of these ever arrives — no byte-level body of any of these is
+// parsed or assumed here, only the type is named.
+constexpr uint32_t kEmbeddedTypeEnrollmentResult      = 0xE3FF8003;
+constexpr uint32_t kEmbeddedTypeSensorStatus          = 0xE3FF8005;
+constexpr uint32_t kEmbeddedTypeButtonState1          = 0xE3FF8006;
+constexpr uint32_t kEmbeddedTypeButtonState2          = 0xE3FF8007;
+constexpr uint32_t kEmbeddedTypeKernelLog             = 0xE3FF8008;
+constexpr uint32_t kEmbeddedTypeSensorRecoveryReason  = 0xE3FF8009;
+constexpr uint32_t kEmbeddedTypeSksLockStateUpdate    = 0xE3FF800A;
+constexpr uint32_t kEmbeddedTypeMatchEvent            = 0xE3FF800B;
+constexpr uint32_t kEmbeddedTypeAccessoryListChange   = 0xE3FF800C;
+constexpr uint32_t kEmbeddedTypeSensorInitTemplateSync = 0xE3FF800D;
+constexpr uint32_t kEmbeddedTypeDeviceAuthRequired    = 0xE3FF800E;
+constexpr uint32_t kEmbeddedTypeAccessoryImageInfo    = 0xE3FF800F;
+constexpr uint32_t kEmbeddedTypeMesaHardwarePassReport = 0xE3FF8010;
+
+// Serializes a BM-wrapped command: magic|command|version|value|data.
+std::vector<uint8_t> EncodeBmCommand(Command command, uint16_t version, uint16_t value,
+                                      const std::vector<uint8_t>& data = {});
+
+// Serializes match_init_data_v1 + identity records. identities is capped
+// at a sane local maximum (256) independent of any device-reported count,
+// per "never trust remote length before allocation".
+std::vector<uint8_t> EncodeMatchInitData(uint32_t flags, uint32_t macosUserId,
+                                          const std::vector<IdentityRecordV1>& identities,
+                                          MatchIdentityLayout layout =
+                                              MatchIdentityLayout::LegacyCounted);
+
+// Diagnostic-only name for a layout, for logging the wire format actually used.
+const wchar_t* MatchIdentityLayoutName(MatchIdentityLayout layout);
+
+// Parses a raw identity-list reply body into 20-byte records. Returns false
+// (and an empty vector) on any length mismatch — never truncates silently.
+bool ParseIdentityList(const std::vector<uint8_t>& replyBody,
+                        std::vector<IdentityRecordV1>* outIdentities);
 
 } // namespace t2::biometrickit
