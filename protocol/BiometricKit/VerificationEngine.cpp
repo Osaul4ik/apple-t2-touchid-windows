@@ -385,14 +385,11 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     // (VERIFIED FROM SOURCE: biometric_command(sock, 4, data=match_data) is
     // the very next call after the identity/stability gate, no Cancel, no
     // wait, nothing else between). config_.skipResetSensor/
-    // skipLoadCalibration briefly defaulted to false for the same reason
-    // (Linux's warm_up always sends both), based on a real-hardware A/B
-    // (three back-to-back `verify --no-reset-sensor --no-load-calibration`
-    // runs, all verify-match) that gave the confirmation that was missing
-    // here — but VerificationEngine.h's defaults did not get updated to
-    // true/true at the time; 26.09.2026 fixed that mismatch. See the
-    // header for why this still needs a fresh hardware confirmation pass
-    // before being trusted long-term.
+    // skipLoadCalibration are false by default again as of 27.09.2026 - see
+    // VerificationEngine.h for why (t2-fprintd.py's actual production
+    // _run_probe() always sends --reset-sensor/--load-calibration; the
+    // in-between true/true default only matched a real-hardware A/B
+    // showing it still works without them, not the reference source).
 
     // start match (cmd 4) — Linux counted default: II60x + count + records
     // (132 B for 3 identities). Override with --match-layout inline|padded.

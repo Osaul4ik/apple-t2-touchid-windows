@@ -971,22 +971,25 @@ static int CmdVerify(int argc, wchar_t* argv[]) {
             // Linux: --match-processed-flags (default 0; "use 1 for an unlock match")
             cfg.matchFlags = static_cast<uint32_t>(_wtoi(argv[++i]));
         } else if (a == L"--no-reset-sensor") {
-            // Redundant with the current default (VerifyConfig::
-            // skipResetSensor = true, 24.09.2026) — kept as an explicit,
-            // self-documenting no-op for scripts/muscle memory.
+            // Explicit opt-OUT of the current default (VerifyConfig::
+            // skipResetSensor = false, 27.09.2026, matching t2-fprintd.py's
+            // real _run_probe() which always sends --reset-sensor). Use
+            // this to A/B against that default, e.g. re-running the
+            // 24.09.2026 real-hardware skip test.
             cfg.skipResetSensor = true;
         } else if (a == L"--no-load-calibration") {
-            // Same: redundant with the current default. bridgeOS
-            // calibrates at its own boot; cmd 0x20 is not required per
-            // verify attempt (real-hardware A/B, 24.09.2026).
+            // Same: explicit opt-OUT of the current default. bridgeOS
+            // calibrates at its own boot, and a real-hardware A/B once
+            // showed verify still matches without this — but
+            // t2-fprintd.py's actual production probe always sends
+            // --load-calibration, which is now this driver's default too.
             cfg.skipLoadCalibration = true;
         } else if (a == L"--reset-sensor") {
-            // Explicit opt-OUT of the current default — forces ResetSensor
-            // back on, e.g. for an A/B against Linux's always-resend warm_up.
+            // Redundant with the current default — kept as an explicit,
+            // self-documenting no-op for scripts/muscle memory.
             cfg.skipResetSensor = false;
         } else if (a == L"--load-calibration") {
-            // Explicit opt-OUT of the current default — forces LoadCalibration
-            // back on, same reason as --reset-sensor above.
+            // Same: redundant with the current default.
             cfg.skipLoadCalibration = false;
         }
     }
