@@ -146,24 +146,26 @@ struct VerifyConfig {
     // match both Linux fprintd and the macOS capture; expose via CLI for A/B.
     uint32_t matchFlags = 0;
 
-    // 26.09.2026: switched to true/true. Linux t2-fprintd's production
-    // verify does pass --reset-sensor/--load-calibration on every probe,
-    // and that was the reason these two defaulted to false (send both,
-    // every time) for a while - but VerificationEngine.cpp's own 24.09.2026
-    // comment records a real-hardware A/B (three back-to-back
-    // `verify --no-reset-sensor --no-load-calibration` runs, all
-    // verify-match) that this header's defaults never actually picked up,
-    // leaving every verify cycle paying an extra GetFdrCalibration round
-    // trip + LoadCalibration + ResetSensor it did not need (hardware log,
-    // 26.09.2026: ~200-300ms per touch just on that). Matches the macOS
-    // live path (which never issues cmd 2 or cmd 0x20 either - see the
-    // skip-branch log lines in RunLinuxReadySequence). NEEDS A FRESH
-    // real-hardware confirmation run before shipping - this repo's own
-    // rule is to verify against a real capture, not just a comment,
-    // before trusting a change like this; the same A/B this comment cites
-    // is the bar to clear again.
-    bool skipResetSensor = true;
-    bool skipLoadCalibration = true;
+    // 27.09.2026: switched back to false/false (send both, every verify).
+    // VERIFIED FROM SOURCE (t2-fprintd.py _run_probe(), the actual function
+    // every real fprintd.verify() call goes through - not a one-time
+    // warm-up script): its bridge-xpc-probe.py command line unconditionally
+    // includes --reset-sensor and --load-calibration alongside
+    // --identity-list on every single probe, with no code path that omits
+    // them. So "skip by default" was never actually Linux parity - it
+    // matched a 3-run real-hardware A/B showing the sensor still matches
+    // without them, and a macOS unified-log capture that also never showed
+    // cmd 2/cmd 0x20 (both already flagged elsewhere as not necessarily the
+    // same wire trace bkremoted's clients require), but it diverged from
+    // what the reference's own production Python actually sends. Per the
+    // user's explicit "робити як в лінуксі" (do it like Linux), these are
+    // now unconditionally sent again, matching _run_probe's real argv
+    // byte-for-byte: ResetSensor(2,2) -> Cancel(12) -> LoadCalibration(0x20,
+    // fdr) -> IdentityList(0x42) before StartMatch. --no-reset-sensor /
+    // --no-load-calibration remain available on the CLI for an explicit A/B
+    // against this default if the no-match_result investigation needs it.
+    bool skipResetSensor = false;
+    bool skipLoadCalibration = false;
 };
 
 // One VerificationEngine instance == one in-flight session (Milestone 2
