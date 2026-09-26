@@ -1050,8 +1050,15 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
     VerifyConfig cfg;
     cfg.macosUserId = kDefaultMacosUserId;
     cfg.matchWindow = kCaptureMatchWindow;
-    ULONGLONG handledSuspendGeneration =
+    // Snapshot BEFORE the initial wait, not after it. WaitForSystemResume()
+    // always writes the CURRENT (already post-resume) generation into its
+    // out-param, even when it blocked through an entire sleep right here -
+    // so comparing against a generation taken after that call is a no-op:
+    // it trivially equals itself and the mid-loop check below never fires
+    // for a suspend that spanned this request's very first attempt.
+    const ULONGLONG entryGeneration =
         g_suspendGeneration.load(std::memory_order_acquire);
+    ULONGLONG handledSuspendGeneration = entryGeneration;
     std::optional<std::array<uint8_t, 16>> matchedUuid;
     VerifyOutcome outcome = VerifyOutcome::TransportError;   // also what a failed connect completes as
 
@@ -1061,6 +1068,15 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
     // request. A genuine WBF CancelIoEx still completes the request promptly.
     if (!WaitForSystemResume(cancelScope, cancelEvent, &handledSuspendGeneration)) {
         outcome = VerifyOutcome::Cancelled;
+    } else if (handledSuspendGeneration != entryGeneration) {
+        // A suspend happened before this request ever reached StartMatch
+        // (e.g. CAPTURE_DATA arrived right as the machine went to sleep -
+        // any touches during that window belong to no live session of
+        // ours). Same distrust as the mid-loop path: the first StartMatch
+        // must see its own live FingerOn or its match_result is NoMatch.
+        cfg.requireFingerLiftSinceResume = true;
+        T2BioLog("CAPTURE_DATA(verify): suspend/resume spanned this request before its "
+                 "first attempt; requiring a live FingerOn this session before honoring a match");
     }
     // A lost TCP session is retried only for genuine connection loss. Power
     // transitions restart the outer loop and do not consume this retry budget.
