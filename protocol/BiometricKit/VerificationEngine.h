@@ -68,28 +68,28 @@ struct VerifyConfig {
     std::chrono::seconds matchWindow{20};
     std::chrono::milliseconds ioTimeout{5000};
 
-    // 26.09.2026: set true ONLY by Queue.cpp's resume-restart path (the
-    // verify attempt started immediately after OnSuspendResume discarded
-    // the pre-suspend session), never for an ordinary first attempt.
-    // Real-hardware capture: the machine is woken via its power button,
-    // which IS the fingerprint sensor - so gating on "finger was lifted"
-    // (FingerOff) or "finger was placed twice" cannot work, the wake
-    // gesture itself is indistinguishable from a deliberate touch. What
-    // actually happened: a touch begun just before suspend (SEP may
-    // already have started processing it before our Cancel/teardown
-    // reached it) surfaced as a match_result within the FIRST new
-    // post-resume StartMatch session, unlocking the machine with no live
-    // touch belonging to that new session at all. When this flag is set,
-    // Verify() requires at least one live FingerOn(status_code 63) to
-    // have been observed in THIS session before honoring any
-    // match_result as VerifyOutcome::Match; a match_result that arrives
-    // with zero FingerOn seen in this session is almost certainly a
-    // leftover/queued artifact of the aborted pre-suspend transaction,
-    // not a live decision on this session's own data - it is rejected
-    // exactly like an ordinary NoMatch (Queue.cpp already restarts a
-    // fresh full Linux-order transaction on NoMatch). Left false for
-    // every other attempt: an ordinary first touch is trivially preceded
-    // by its own FingerOn already, so this never rejects a real one.
+    // 26.09.2026, weakened 27.09.2026: set true ONLY by Queue.cpp's
+    // resume-restart path, for exactly the first StartMatch attempt after
+    // OnSuspendResume discarded the pre-suspend session; Queue.cpp clears
+    // it again right after that one attempt, win or lose.
+    //
+    // Originally this only rejected a match_result seen with ZERO live
+    // FingerOn(status_code 63) in this session. Hardware log (27.09.2026):
+    // touched the sensor several times WHILE the lid was closing, machine
+    // slept, then woke via spacebar with NO further touch at all - the
+    // first post-resume StartMatch still produced its OWN full
+    // FingerOn -> ImageCaptured -> FingerOff -> match_result burst about
+    // 1s after StartMatch was sent, and unlocked. The SEP itself replayed
+    // the pre-suspend touch's status events into the new session, not
+    // just the match_result - so "this session saw a live FingerOn" is
+    // not evidence of anything; the SEP can fabricate that too. This flag
+    // now rejects the FIRST post-resume match_result unconditionally,
+    // regardless of fingerTouchCycles: Queue.cpp already restarts a fresh
+    // full Linux-order transaction on NoMatch, and only the attempt AFTER
+    // that one (by which point one full Cancel+StartMatch cycle has run
+    // against the resumed link) is trusted normally. Unproven whether one
+    // discard cycle is enough to flush whatever the SEP is holding -
+    // verify on hardware.
     bool requireFingerLiftSinceResume = false;
 
     // REVERTED (16.09.2026): defaulted to InlineIdentities (68B, no count)

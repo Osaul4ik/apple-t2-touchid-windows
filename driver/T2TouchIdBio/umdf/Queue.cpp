@@ -1107,6 +1107,14 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
                 outcome = engine.Verify(&conn, &matchedUuid, cancelEvent);
                 if (outcome != VerifyOutcome::TransportError || !conn.ConnectionLost() ||
                     t2::bridgexpc::Connection::IsEventSignaled(cancelEvent)) {
+                    // A real StartMatch cycle just ran against the resumed
+                    // link and produced a real verdict (Match/NoMatch/
+                    // Cancelled) - the one-shot distrust has done its job
+                    // for this attempt. Do NOT keep rejecting every match
+                    // for the rest of this pending WBF request: only a
+                    // bare TransportError+ConnectionLost retry (no
+                    // StartMatch reached) leaves it armed.
+                    cfg.requireFingerLiftSinceResume = false;
                     connectionRetryExhausted = false;
                     break;
                 }

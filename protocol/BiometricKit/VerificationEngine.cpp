@@ -588,22 +588,23 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
 
         MatchResult mr = ParseMatchResult(embeddedType, eventData, identities);
         if (mr.outcome == MatchOutcome::Match) {
-            if (config_.requireFingerLiftSinceResume && fingerTouchCycles == 0) {
-                // 26.09.2026: this is the resume-restart attempt and no
-                // live FingerOn was ever observed in THIS session before
-                // the match_result arrived - almost certainly a
-                // leftover/queued artifact of the aborted pre-suspend
-                // transaction, not a decision on this session's own live
-                // data. Reject it exactly like an ordinary NoMatch: the
-                // caller (Queue.cpp) already restarts a fresh full
-                // Linux-order transaction (reconnect, warm-up, new
-                // StartMatch) on NoMatch, which is exactly what should
-                // happen here too - the machine must not unlock on a
-                // match that never saw a live touch this session.
+            if (config_.requireFingerLiftSinceResume) {
+                // 27.09.2026: unconditional now - see header comment. The
+                // SEP can replay the aborted pre-suspend touch's own
+                // FingerOn/ImageCaptured/FingerOff into THIS session's
+                // event stream, so fingerTouchCycles > 0 here is no longer
+                // treated as proof of a live touch. Reject exactly like an
+                // ordinary NoMatch regardless of what this session's
+                // stream showed: the caller (Queue.cpp) already restarts a
+                // fresh full Linux-order transaction (reconnect, warm-up,
+                // new StartMatch) on NoMatch, and clears this flag so only
+                // THIS one attempt pays the distrust.
                 T2_LOG("verify",
-                       L"match_result outcome=MATCH rejected - no live FingerOn observed in "
-                       L"this session (requireFingerLiftSinceResume); treating as NO_MATCH and "
-                       L"requesting a fresh transaction");
+                       L"match_result outcome=MATCH rejected unconditionally - first attempt "
+                       L"after resume (requireFingerLiftSinceResume), fingerTouchCycles=%zu "
+                       L"proves nothing (SEP can replay pre-suspend touch events); treating as "
+                       L"NO_MATCH and requesting a fresh transaction",
+                       fingerTouchCycles);
                 rejectedTouchAttempts++;
                 outcome = VerifyOutcome::NoMatch;
                 break;
