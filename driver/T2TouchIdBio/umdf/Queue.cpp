@@ -10,6 +10,7 @@
 #include <vector>
 #include <cstddef>
 #include <thread>
+#include <cstring>
 
 // ---------------------------------------------------------------------------
 // Type names below were checked against winbio_ioctl.h / winbio_types.h of
@@ -281,6 +282,11 @@ std::mutex g_captureRequestCommitMu;
 // capture worker uses this generation to discard every pre-sleep outcome and
 // restart the SEP match under the same still-pending WBDI request.
 std::atomic<ULONGLONG> g_suspendGeneration{0};
+
+// Display off (power button) arrives BEFORE PBT_APMSUSPEND. Blocking Match
+// success while the panel is off closes the race where a touch unlocks
+// just before the machine actually sleeps.
+std::atomic<bool> g_displayOffBarrier{false};
 
 // 26.09.2026, corrected same day: lifecycle tracking, not a clock. Every
 // BridgeXPC status-callback event (status/statistics/match_result alike)
@@ -1114,7 +1120,8 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
     // one-shot replay — return the same result, no sensor session.
     {
         std::optional<std::array<uint8_t, 16>> replayUuid;
-        if (ConsumeMatchReplay(&replayUuid)) {
+        if (!g_displayOffBarrier.load(std::memory_order_acquire) &&
+            ConsumeMatchReplay(&replayUuid)) {
             T2BioLog("CAPTURE_DATA(verify): replaying Match (WBF 2nd CAPTURE of pair) - no sensor session");
             const std::vector<uint8_t> payload = t2::biometrickit::SerializeVendorPayload(
                 VerifyOutcome::Match, kDefaultMacosUserId, replayUuid,
@@ -1321,6 +1328,14 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
         // Any cancel ends the "real + one replay" pair; next CAPTURE must verify.
         ClearMatchReplay();
         return;
+    }
+
+    if (outcome == VerifyOutcome::Match &&
+        g_displayOffBarrier.load(std::memory_order_acquire)) {
+        T2BioLog("CAPTURE_DATA(verify): display-off barrier — discarding Match (no unlock)");
+        outcome = VerifyOutcome::Cancelled;
+        matchedUuid.reset();
+        ClearMatchReplay();
     }
 
     const HRESULT hr = MapVerifyOutcomeToHresult(outcome);
@@ -1744,11 +1759,46 @@ HANDLE g_sessionLockThread = nullptr;
 DWORD g_sessionLockThreadId = 0;
 std::atomic<HWND> g_sessionLockWindow{nullptr};
 
+// GUID_CONSOLE_DISPLAY_STATE {6FE69556-704A-47A0-8F24-C28D936FDA47}
+// 0=off, 1=on, 2=dimmed. Power button turns the panel off before APMSUSPEND.
+static const GUID kGuidConsoleDisplayState =
+    {0x6fe69556, 0x704a, 0x47a0, {0x8f, 0x24, 0xc2, 0x8d, 0x93, 0x6f, 0xda, 0x47}};
+
+HPOWERNOTIFY g_displayStateNotify = nullptr;
+
+void OnConsoleDisplayState(DWORD state)
+{
+    if (state == 0) {
+        g_displayOffBarrier.store(true, std::memory_order_release);
+        ClearMatchReplay();
+        HANDLE cancelEvent = GetCaptureCancelEvent();
+        if (cancelEvent) {
+            SetEvent(cancelEvent);
+        }
+        g_suspendGeneration.fetch_add(1, std::memory_order_acq_rel);
+        T2BioLog("ConsoleDisplayState=OFF: barrier on, match cancelled (power-button race)");
+    } else {
+        g_displayOffBarrier.store(false, std::memory_order_release);
+        T2BioLog("ConsoleDisplayState=%lu: barrier off", static_cast<unsigned long>(state));
+    }
+}
+
 LRESULT CALLBACK SessionLockWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     if (msg == kSessionLockShutdownMessage) {
         DestroyWindow(hwnd);
         return 0;
+    }
+    if (msg == WM_POWERBROADCAST && wParam == PBT_POWERSETTINGCHANGE) {
+        const POWERBROADCAST_SETTING* s =
+            reinterpret_cast<const POWERBROADCAST_SETTING*>(lParam);
+        if (s && IsEqualGUID(s->PowerSetting, kGuidConsoleDisplayState) &&
+            s->DataLength >= sizeof(DWORD)) {
+            DWORD state = 0;
+            memcpy(&state, s->Data, sizeof(DWORD));
+            OnConsoleDisplayState(state);
+        }
+        return TRUE;
     }
     if (msg == WM_WTSSESSION_CHANGE) {
         if (wParam == WTS_SESSION_LOCK) {
@@ -1798,6 +1848,15 @@ DWORD WINAPI SessionLockThreadProc(LPVOID)
         return 0;
     }
 
+    g_displayStateNotify = RegisterPowerSettingNotification(
+        hwnd, &kGuidConsoleDisplayState, DEVICE_NOTIFY_WINDOW_HANDLE);
+    if (!g_displayStateNotify) {
+        T2BioLog("SessionLockThreadProc: RegisterPowerSettingNotification(DISPLAY_STATE) failed, error=%lu",
+                 static_cast<unsigned long>(GetLastError()));
+    } else {
+        T2BioLog("SessionLockThreadProc: RegisterPowerSettingNotification(DISPLAY_STATE) ok");
+    }
+
     g_sessionLockWindow.store(hwnd, std::memory_order_release);
     T2BioLog("SessionLockThreadProc: WTSRegisterSessionNotification ok, pumping messages");
 
@@ -1836,6 +1895,10 @@ extern "C" VOID T2BioUnregisterSessionLockNotification(VOID)
 {
     if (!g_sessionLockThread) {
         return;
+    }
+    if (g_displayStateNotify) {
+        UnregisterPowerSettingNotification(g_displayStateNotify);
+        g_displayStateNotify = nullptr;
     }
     HWND hwnd = g_sessionLockWindow.load(std::memory_order_acquire);
     if (hwnd) {
