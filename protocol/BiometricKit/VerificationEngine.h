@@ -146,11 +146,24 @@ struct VerifyConfig {
     // match both Linux fprintd and the macOS capture; expose via CLI for A/B.
     uint32_t matchFlags = 0;
 
-    // Linux t2-fprintd's production verify passes --reset-sensor,
-    // --cancel-operation and --load-calibration on every probe. Keep the
-    // same command sequence for every Windows verify, including after resume.
-    bool skipResetSensor = false;
-    bool skipLoadCalibration = false;
+    // 26.09.2026: switched to true/true. Linux t2-fprintd's production
+    // verify does pass --reset-sensor/--load-calibration on every probe,
+    // and that was the reason these two defaulted to false (send both,
+    // every time) for a while - but VerificationEngine.cpp's own 24.09.2026
+    // comment records a real-hardware A/B (three back-to-back
+    // `verify --no-reset-sensor --no-load-calibration` runs, all
+    // verify-match) that this header's defaults never actually picked up,
+    // leaving every verify cycle paying an extra GetFdrCalibration round
+    // trip + LoadCalibration + ResetSensor it did not need (hardware log,
+    // 26.09.2026: ~200-300ms per touch just on that). Matches the macOS
+    // live path (which never issues cmd 2 or cmd 0x20 either - see the
+    // skip-branch log lines in RunLinuxReadySequence). NEEDS A FRESH
+    // real-hardware confirmation run before shipping - this repo's own
+    // rule is to verify against a real capture, not just a comment,
+    // before trusting a change like this; the same A/B this comment cites
+    // is the bar to clear again.
+    bool skipResetSensor = true;
+    bool skipLoadCalibration = true;
 };
 
 // One VerificationEngine instance == one in-flight session (Milestone 2

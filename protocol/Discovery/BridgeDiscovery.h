@@ -45,6 +45,12 @@ bool PickDefaultT2Endpoint(NcmEndpoint* outEndpoint);
 // real candidate sits near the top of the ephemeral range and a single
 // short-timeout pass is flaky under USB NCM jitter).
 //
+// 26.09.2026: the cache fast path is trusted (it is right almost every
+// time) but is no longer allowed to block indefinitely on a dead cache
+// entry — the whole cached-port attempt is capped at kCacheTrustBudgetMs
+// (BridgeDiscovery.cpp), so a genuinely stale cache falls through to the
+// full scan in well under a second instead of up to ~5.5s.
+//
 // Requires endpoint.peerSource != PeerSource::None (a real neighbor-table
 // entry or a caller-supplied override) — unlike the CLI this never sends
 // its own ff02::1 discovery ping; the driver is expected to be invoked only

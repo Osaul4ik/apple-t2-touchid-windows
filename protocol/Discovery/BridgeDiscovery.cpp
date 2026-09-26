@@ -25,6 +25,19 @@ constexpr std::chrono::milliseconds kRemoteXpcCheckTimeout{2000};
 // the cached BridgeXPC port; path B: RSD replay on the cached RemoteXPC
 // port), minus every std::wcout diagnostic line — silent by design, see
 // header comment.
+// 26.09.2026: the cache is trusted (it is right the overwhelming majority
+// of the time - see the "no scan needed" log line all over a normal
+// session), so this always tries it first. But "trusted" must not mean
+// "worth an unbounded wait": path A alone used to allow up to 1500ms, and
+// path B (RSD probe + reconnect) up to another 4000ms (2000+2000) - so a
+// truly stale cached port (adapter gone after a real suspend, T2 side
+// rebooted, NCM re-enumerated with a new port) could delay the fallback
+// full scan by up to 5.5s. kCacheTrustBudgetMs bounds the WHOLE cached-port
+// attempt (path A + path B combined): once it is used up, give up on the
+// cache and let the caller's full scan run instead of continuing to wait
+// on a port that has already shown it is not answering.
+constexpr ULONGLONG kCacheTrustBudgetMs = 500;
+
 bool TryCachedBridgePort(const NcmEndpoint& ep, t2::bridgexpc::Connection* conn,
                           uint16_t* outPort) {
     using namespace t2::bridgexpc;
@@ -39,8 +52,9 @@ bool TryCachedBridgePort(const NcmEndpoint& ep, t2::bridgexpc::Connection* conn,
         return false;
     }
 
+    const ULONGLONG budgetStart = GetTickCount64();
     ConnectResult crA = conn->Connect(ep.peerLinkLocal, ep.ifIndex, svcPort,
-                                       std::chrono::milliseconds(1500));
+                                       std::chrono::milliseconds(kCacheTrustBudgetMs));
     if (crA == ConnectResult::Ok) {
         T2_LOG("discovery", L"cached port %u answered with HELO - no scan needed",
                static_cast<unsigned>(svcPort));
@@ -50,18 +64,32 @@ bool TryCachedBridgePort(const NcmEndpoint& ep, t2::bridgexpc::Connection* conn,
     T2_LOG("discovery", L"cached port %u (rsd %u) did not answer, ConnectResult=%d",
            static_cast<unsigned>(svcPort), static_cast<unsigned>(rsdPort), static_cast<int>(crA));
 
+    const ULONGLONG elapsedMs = GetTickCount64() - budgetStart;
+    if (elapsedMs >= kCacheTrustBudgetMs) {
+        T2_LOG("discovery", L"cache trust budget (%llu ms) used up on path A alone - full port scan follows",
+               static_cast<unsigned long long>(kCacheTrustBudgetMs));
+        return false;
+    }
+
     if (rsdPort != 0) {
-        uint16_t advertised = 0;
-        if (ProbeServiceOnPort(ep, rsdPort, kBiometricKitService, kRemoteXpcCheckTimeout,
-                                &advertised)) {
-            ConnectResult crB = conn->Connect(ep.peerLinkLocal, ep.ifIndex, advertised,
-                                               kRemoteXpcCheckTimeout);
-            if (crB == ConnectResult::Ok) {
-                if (advertised != svcPort) {
-                    SaveCachedPort(ep, advertised, rsdPort);
+        // Split whatever is left of the budget between the RSD probe and the
+        // reconnect it may lead to, instead of giving each its own full
+        // kRemoteXpcCheckTimeout (that pair used to be able to cost 4000ms
+        // on top of path A). Not worth attempting on scraps of budget.
+        const auto halfRemaining = std::chrono::milliseconds((kCacheTrustBudgetMs - elapsedMs) / 2);
+        if (halfRemaining.count() >= 20) {
+            uint16_t advertised = 0;
+            if (ProbeServiceOnPort(ep, rsdPort, kBiometricKitService, halfRemaining,
+                                    &advertised)) {
+                ConnectResult crB = conn->Connect(ep.peerLinkLocal, ep.ifIndex, advertised,
+                                                   halfRemaining);
+                if (crB == ConnectResult::Ok) {
+                    if (advertised != svcPort) {
+                        SaveCachedPort(ep, advertised, rsdPort);
+                    }
+                    *outPort = advertised;
+                    return true;
                 }
-                *outPort = advertised;
-                return true;
             }
         }
     }

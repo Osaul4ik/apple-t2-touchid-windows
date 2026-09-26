@@ -386,10 +386,13 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     // the very next call after the identity/stability gate, no Cancel, no
     // wait, nothing else between). config_.skipResetSensor/
     // skipLoadCalibration briefly defaulted to false for the same reason
-    // (Linux's warm_up always sends both) — see VerificationEngine.h for
-    // the 24.09.2026 re-revert back to true/true, once real-hardware A/B
+    // (Linux's warm_up always sends both), based on a real-hardware A/B
     // (three back-to-back `verify --no-reset-sensor --no-load-calibration`
-    // runs, all verify-match) gave the confirmation that was missing here.
+    // runs, all verify-match) that gave the confirmation that was missing
+    // here — but VerificationEngine.h's defaults did not get updated to
+    // true/true at the time; 26.09.2026 fixed that mismatch. See the
+    // header for why this still needs a fresh hardware confirmation pass
+    // before being trusted long-term.
 
     // start match (cmd 4) — Linux counted default: II60x + count + records
     // (132 B for 3 identities). Override with --match-layout inline|padded.
