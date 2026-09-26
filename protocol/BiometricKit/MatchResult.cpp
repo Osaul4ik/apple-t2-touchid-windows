@@ -42,16 +42,27 @@ namespace t2::biometrickit {
 
 bool ParseStatusEventHeader(const std::vector<uint8_t>& data,
                              uint32_t* outEmbeddedType,
-                             std::vector<uint8_t>* outEventData) {
+                             std::vector<uint8_t>* outEventData,
+                             uint64_t* outSequence) {
     if (data.size() < kStatusEventHeaderBytes) {
         return false; // malformed: caller must keep waiting, never guess NoMatch
     }
     // VERIFIED FROM SOURCE: struct.unpack_from("<QIIQ", data) ==
-    // (sequence, embedded_type, version, ordinal); only embedded_type
-    // (bytes [8:12)) is needed by this project.
+    // (sequence, embedded_type, version, ordinal). Historically only
+    // embedded_type (bytes [8:12)) was needed by this project; 26.09.2026
+    // adds sequence (bytes [0:8)) for VerifyConfig::rejectSequenceAtOrBelow.
+    // `version` [12:16) and `ordinal` [16:24) still have no established use
+    // here (do not confuse this envelope-level `ordinal` with the
+    // status-event status_code field StatusOrdinalHypothesis() takes — same
+    // wire term, unrelated value, see that function's own comment).
+    uint64_t sequence = 0;
+    std::memcpy(&sequence, data.data() + 0, sizeof(sequence));
     uint32_t embeddedType = 0;
     std::memcpy(&embeddedType, data.data() + 8, sizeof(embeddedType));
     *outEmbeddedType = embeddedType;
+    if (outSequence) {
+        *outSequence = sequence;
+    }
     outEventData->assign(data.begin() + kStatusEventHeaderBytes, data.end());
     return true;
 }

@@ -68,29 +68,54 @@ struct VerifyConfig {
     std::chrono::seconds matchWindow{20};
     std::chrono::milliseconds ioTimeout{5000};
 
-    // 26.09.2026, weakened 27.09.2026: set true ONLY by Queue.cpp's
-    // resume-restart path, for exactly the first StartMatch attempt after
-    // OnSuspendResume discarded the pre-suspend session; Queue.cpp clears
-    // it again right after that one attempt, win or lose.
+    // 26.09.2026 (root-cause pass, replaces two earlier, empirically
+    // insufficient attempts at this same bug — see history below):
+    // set by Queue.cpp fresh before EVERY StartMatch attempt, from
+    // g_lastObservedSepSequence — the highest `sequence` field (MatchResult.h
+    // ParseStatusEventHeader) this process has observed in ANY event, ever,
+    // surviving suspend/resume and every reconnect.
     //
-    // Originally this only rejected a match_result seen with ZERO live
-    // FingerOn(status_code 63) in this session. Hardware log (27.09.2026):
-    // touched the sensor several times WHILE the lid was closing, machine
-    // slept, then woke via spacebar with NO further touch at all - the
-    // first post-resume StartMatch still produced its OWN full
-    // FingerOn -> ImageCaptured -> FingerOff -> match_result burst about
-    // 1s after StartMatch was sent, and unlocked. The SEP itself replayed
-    // the pre-suspend touch's status events into the new session, not
-    // just the match_result - so "this session saw a live FingerOn" is
-    // not evidence of anything; the SEP can fabricate that too. This flag
-    // now rejects the FIRST post-resume match_result unconditionally,
-    // regardless of fingerTouchCycles: Queue.cpp already restarts a fresh
-    // full Linux-order transaction on NoMatch, and only the attempt AFTER
-    // that one (by which point one full Cancel+StartMatch cycle has run
-    // against the resumed link) is trusted normally. Unproven whether one
-    // discard cycle is enough to flush whatever the SEP is holding -
-    // verify on hardware.
-    bool requireFingerLiftSinceResume = false;
+    // VerificationEngine::Verify rejects a match_result outright — treats it
+    // exactly like NoMatch — unless its OWN sequence number is strictly
+    // greater than this value. `sequence` is the SEP's own monotonic count
+    // of events it emits; it is not reset by our software tearing down and
+    // reopening the BridgeXPC TCP connection (that reconnect is a
+    // software-side convenience — see Connection.h's "one connection per
+    // attempt" note — not a SEP-side state boundary). An event whose
+    // sequence we've already seen (or a lower one) being handed to us again
+    // is therefore not a new touch: it is *the same SEP-side event*,
+    // delivered more than once. This is a fact derived from data the SEP
+    // itself produced, not a guess about elapsed time or how many attempts
+    // have run.
+    //
+    // History, so the next person doesn't retry either of these: (1) an
+    // earlier revision keyed this off "zero live FingerOn(status_code 63)
+    // events this session" — hardware log showed the SEP replays the
+    // pre-suspend touch's FULL FingerOn->ImageCaptured->FingerOff->
+    // match_result burst into the new session, so "this session saw a live
+    // FingerOn" proved nothing. (2) the revision after that rejected
+    // exactly the FIRST post-resume match_result and trusted every attempt
+    // after it (an attempt-count bound); a later hardware reproduction
+    // (several touches right before sleep, wake with no further touch,
+    // unlock succeeding on the SECOND post-resume attempt) showed one
+    // discard cycle is not always enough — the SEP can keep replaying stale
+    // state into more than one attempt, and neither "one attempt" nor any
+    // other fixed count is something this protocol lets us prove is
+    // sufficient. A wall-clock window has the identical problem one level
+    // removed (still a guess, just measured in ms instead of attempts).
+    // Sequence comparison has no such bound to guess: however many events
+    // it takes the SEP to move past whatever it was replaying, they all
+    // fail this check until a value we have never seen shows up.
+    //
+    // Known remaining gap (unavoidable with this protocol, not a threshold
+    // to tune): a touch the SEP finished scoring but whose event never
+    // reached us at all before the pre-suspend connection was torn down
+    // leaves us with no sequence sample for it — we cannot compare against
+    // an event we never saw. Nothing purely software-side closes this
+    // without a SEP-side "give me your current sequence counter" primitive,
+    // which this reverse-engineered protocol is not known to expose. Flag
+    // for further hardware investigation, not assumed solved by this change.
+    uint64_t rejectSequenceAtOrBelow = 0;
 
     // REVERTED (16.09.2026): defaulted to InlineIdentities (68B, no count)
     // on the strength of the same macOS unified-log capture already
@@ -154,9 +179,18 @@ public:
     // (reset/load-calibration/identity-list, all short fixed-timeout
     // request/reply round-trips, not the long touch-and-wait) is not, same
     // scope the design doc itself describes for this mechanism.
+    //
+    // outHighestSequenceSeen (26.09.2026, optional, defaults to nullptr for
+    // the CLI): set to the highest event `sequence` number (MatchResult.h)
+    // observed anywhere in this call, win or lose — updated as events
+    // stream in, so it is always current by the time Verify returns, on
+    // every exit path (deadline, cancel, transport loss, or a real verdict).
+    // The caller (Queue.cpp) folds this into g_lastObservedSepSequence so
+    // the NEXT attempt's config_.rejectSequenceAtOrBelow reflects it.
     VerifyOutcome Verify(bridgexpc::Connection* conn,
                          std::optional<std::array<uint8_t, 16>>* outMatchedUuid,
-                         HANDLE cancelEvent = nullptr);
+                         HANDLE cancelEvent = nullptr,
+                         uint64_t* outHighestSequenceSeen = nullptr);
 
 private:
     // Shared prefix of WarmUp and Verify. Byte-identical to the Linux

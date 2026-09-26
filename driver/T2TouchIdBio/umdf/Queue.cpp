@@ -282,6 +282,40 @@ std::mutex g_captureRequestCommitMu;
 // restart the SEP match under the same still-pending WBDI request.
 std::atomic<ULONGLONG> g_suspendGeneration{0};
 
+// 26.09.2026: lifecycle tracking, not a clock. Every BridgeXPC status-
+// callback event (status/statistics/match_result alike) carries its own
+// 24-byte header - sequence:u64le, embedded_type:u32le, version:u32le,
+// ordinal:u64le (MatchResult.h/.cpp, VERIFIED FROM SOURCE) - and `sequence`
+// was parsed and thrown away. That field is the SEP's OWN monotonic count
+// of events it has emitted, independent of our software's TCP reconnects:
+// it is the one piece of data in this protocol that can prove "this
+// specific event was generated before/after point X" as a fact, not a
+// guess. g_lastObservedSepSequence is the high-water mark of every such
+// sequence number this process has ever seen (surviving suspend, resume,
+// and every reconnect - never reset). VerificationEngine.cpp rejects any
+// match_result whose sequence does not exceed this mark BEFORE evaluating
+// it: an event we've already observed (by sequence number) offered to us
+// again is provably a replay, not a new touch, regardless of how much
+// wall-clock time sits between the two deliveries. See VerifyConfig::
+// rejectSequenceAtOrBelow for where this is fed to the engine, and its own
+// comment for the one gap this does NOT close (a completion the SEP scored
+// but whose event never reached us at all before the pre-suspend
+// connection was torn down - we have no sequence sample for it to compare
+// against, because we never saw it).
+std::atomic<uint64_t> g_lastObservedSepSequence{0};
+
+// Atomic "raise the high-water mark, never lower it" - the usual
+// compare_exchange retry-loop idiom for a monotonic max.
+void ObserveSepSequence(uint64_t sequence)
+{
+    uint64_t prev = g_lastObservedSepSequence.load(std::memory_order_relaxed);
+    while (sequence > prev &&
+           !g_lastObservedSepSequence.compare_exchange_weak(
+               prev, sequence, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+        // prev now holds the current value; retry if still stale.
+    }
+}
+
 // 20.09.2026: WBF issues exactly TWO CAPTURE_DATA verify requests per unlock
 // (hardware log: Match → complete → new CAPTURE begin within 15–30 ms). The
 // second is not a second finger touch — framework double-check. Answer #1
@@ -454,6 +488,10 @@ ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_
             std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
             g_stickyNcm.valid = false;
         }
+        // No clock to arm here anymore - g_lastObservedSepSequence (declared
+        // above) is keyed off the SEP's own event sequence numbers, not off
+        // when resume happened, so resume itself needs no bookkeeping beyond
+        // what BeginCaptureSuspend/the generation counter already do.
         HANDLE resumeEvent = GetSystemResumeEvent();
         if (resumeEvent) {
             SetEvent(resumeEvent);
@@ -1072,11 +1110,12 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
         // A suspend happened before this request ever reached StartMatch
         // (e.g. CAPTURE_DATA arrived right as the machine went to sleep -
         // any touches during that window belong to no live session of
-        // ours). Same distrust as the mid-loop path: the first StartMatch
-        // must see its own live FingerOn or its match_result is NoMatch.
-        cfg.requireFingerLiftSinceResume = true;
+        // ours). No separate handling needed here: cfg.rejectSequenceAtOrBelow
+        // is set from g_lastObservedSepSequence fresh before every
+        // engine.Verify() call below regardless of how this loop got here.
         T2BioLog("CAPTURE_DATA(verify): suspend/resume spanned this request before its "
-                 "first attempt; requiring a live FingerOn this session before honoring a match");
+                 "first attempt; rejecting any match_result at or below the last "
+                 "observed SEP sequence number");
     }
     // A lost TCP session is retried only for genuine connection loss. Power
     // transitions restart the outer loop and do not consume this retry budget.
@@ -1102,19 +1141,31 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
                     break;
                 }
 
+                // 26.09.2026: re-read fresh before EVERY StartMatch attempt
+                // (not just the first one after resume) - see
+                // g_lastObservedSepSequence's declaration. Whatever sequence
+                // number this attempt's own events turn out to carry, the
+                // engine below rejects a match_result unless its sequence
+                // exceeds this mark - i.e. unless the SEP has never before
+                // handed us this exact event.
+                cfg.rejectSequenceAtOrBelow = g_lastObservedSepSequence.load(std::memory_order_acquire);
                 VerificationEngine engine(cfg);
                 matchedUuid.reset();
-                outcome = engine.Verify(&conn, &matchedUuid, cancelEvent);
+                uint64_t highestSequenceSeen = 0;
+                outcome = engine.Verify(&conn, &matchedUuid, cancelEvent, &highestSequenceSeen);
+                // Every sequence number this attempt observed - accepted,
+                // rejected-as-stale, or irrelevant status/statistics noise -
+                // is now something we've seen. Raise the mark unconditionally,
+                // regardless of outcome, so it can never be handed to us
+                // again as if it were new.
+                ObserveSepSequence(highestSequenceSeen);
                 if (outcome != VerifyOutcome::TransportError || !conn.ConnectionLost() ||
                     t2::bridgexpc::Connection::IsEventSignaled(cancelEvent)) {
                     // A real StartMatch cycle just ran against the resumed
                     // link and produced a real verdict (Match/NoMatch/
-                    // Cancelled) - the one-shot distrust has done its job
-                    // for this attempt. Do NOT keep rejecting every match
-                    // for the rest of this pending WBF request: only a
-                    // bare TransportError+ConnectionLost retry (no
-                    // StartMatch reached) leaves it armed.
-                    cfg.requireFingerLiftSinceResume = false;
+                    // Cancelled). Only a bare TransportError+ConnectionLost
+                    // retry (no StartMatch reached) skips straight to the
+                    // next attempt without this counting as one.
                     connectionRetryExhausted = false;
                     break;
                 }
@@ -1147,19 +1198,19 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
                 // 26.09.2026: real-hardware capture - a touch begun just
                 // before suspend (SEP may already have started processing
                 // it before our Cancel/session-teardown reached it) can
-                // still surface as a match_result within the FIRST new
-                // post-resume StartMatch session with no live touch
-                // belonging to that new session at all. Wake happens via
-                // the power button, which IS the sensor, so gating on
-                // "finger lifted" doesn't work - gate on "this session
-                // saw its own live FingerOn" instead (VerificationEngine
-                // treats a match with none as NO_MATCH and restarts a
-                // fresh transaction) so a stale pre-suspend result can
-                // never unlock the machine on its own.
-                cfg.requireFingerLiftSinceResume = true;
+                // still surface as a match_result within a post-resume
+                // StartMatch session with no live touch belonging to that
+                // new session at all, and can take more than one such
+                // session to stop happening. cfg.rejectSequenceAtOrBelow,
+                // re-read from g_lastObservedSepSequence fresh before the
+                // next engine.Verify() call above, is what actually
+                // protects this and every attempt after it - by proof
+                // (the event's own sequence number), not by attempt count
+                // or elapsed time.
                 T2BioLog("CAPTURE_DATA(verify): resumed; restarting BiometricKit verify "
                          "in the same pending WBF request (SEP bootstrap is unchanged; "
-                         "requiring a live FingerOn this session before honoring a match)");
+                         "rejecting any match_result at or below the last observed "
+                         "SEP sequence number)");
                 continue;
             }
 

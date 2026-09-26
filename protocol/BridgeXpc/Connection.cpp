@@ -541,7 +541,7 @@ bool Connection::GetFdrCalibration(std::vector<uint8_t>* outBlob, std::chrono::m
     }
 }
 
-size_t Connection::DiscardPendingEvents() {
+size_t Connection::DiscardPendingEvents(std::vector<std::vector<uint8_t>>* outDiscardedPayloads) {
     const size_t n = pendingEvents_.size();
     if (n > 0) {
         T2_LOG("discardPending",
@@ -549,6 +549,9 @@ size_t Connection::DiscardPendingEvents() {
                L"LoadCalibration/identity warm-up (Linux keeps these "
                L"out of the match event stream)",
                n);
+        if (outDiscardedPayloads) {
+            outDiscardedPayloads->assign(pendingEvents_.begin(), pendingEvents_.end());
+        }
         pendingEvents_.clear();
     }
     return n;

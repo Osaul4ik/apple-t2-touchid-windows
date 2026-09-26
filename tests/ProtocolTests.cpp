@@ -174,6 +174,33 @@ static void TestStatusEventHeader_ExtractsEmbeddedTypeAndSlicesBody() {
     CHECK(outData[0] == 0xC0);
 }
 
+// 26.09.2026: sequence is bytes [0:8) of the same <QIIQ> header, u64le -
+// VerifyConfig::rejectSequenceAtOrBelow depends on this being extracted
+// correctly and independently of embedded_type (bytes [8:12)).
+static void TestStatusEventHeader_ExtractsSequence() {
+    std::vector<uint8_t> data(24, 0);
+    const uint64_t sequence = 0x1122334455667788ULL;
+    std::memcpy(data.data() + 0, &sequence, sizeof(sequence));
+    uint32_t embeddedType = biometrickit::kEmbeddedTypeStatus;
+    std::memcpy(data.data() + 8, &embeddedType, sizeof(embeddedType));
+
+    uint32_t outType = 0;
+    std::vector<uint8_t> outData;
+    uint64_t outSequence = 0;
+    CHECK(biometrickit::ParseStatusEventHeader(data, &outType, &outData, &outSequence));
+    CHECK(outType == biometrickit::kEmbeddedTypeStatus);
+    CHECK(outSequence == sequence);
+
+    // Omitting outSequence (nullptr, the default) must still succeed and
+    // must not touch embeddedType/outData - existing callers with the old
+    // 3-arg call shape (this file's own two tests above, and WarmUp's
+    // identity-list reads) must keep working unchanged.
+    uint32_t outType2 = 0;
+    std::vector<uint8_t> outData2;
+    CHECK(biometrickit::ParseStatusEventHeader(data, &outType2, &outData2));
+    CHECK(outType2 == biometrickit::kEmbeddedTypeStatus);
+}
+
 // --- PlistPayload: §3 encode/decode round trip ---
 
 static void TestPlistPayload_EnvelopeRoundTrip() {
@@ -329,6 +356,7 @@ int wmain() {
 
     TestStatusEventHeader_TooShort();
     TestStatusEventHeader_ExtractsEmbeddedTypeAndSlicesBody();
+    TestStatusEventHeader_ExtractsSequence();
 
     TestPlistPayload_EnvelopeRoundTrip();
     TestPlistPayload_BiometricCommandShape();

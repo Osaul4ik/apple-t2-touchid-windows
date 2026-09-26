@@ -219,12 +219,21 @@ bool VerificationEngine::WarmUp(bridgexpc::Connection* conn,
 
 VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
                                           std::optional<std::array<uint8_t, 16>>* outMatchedUuid,
-                                          HANDLE cancelEvent) {
+                                          HANDLE cancelEvent,
+                                          uint64_t* outHighestSequenceSeen) {
     if (busy_) {
         return VerifyOutcome::Busy;
     }
     busy_ = true;
     struct BusyGuard { bool* b; ~BusyGuard() { *b = false; } } guard{&busy_};
+    if (outHighestSequenceSeen) {
+        *outHighestSequenceSeen = 0;
+    }
+    // 26.09.2026: local accumulator the sendStartMatch lambda and the main
+    // event loop below both update by reference, kept in sync with
+    // *outHighestSequenceSeen at every point either of them touches it so
+    // the caller sees a live value regardless of which exit path is taken.
+    uint64_t highestSequenceSeen = 0;
 
     // 20.09.2026: the caller (Queue.cpp) can be cancelled by Windows while it
     // is still discovering/connecting (a multi-second window). If that
@@ -409,12 +418,32 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     // Sends StartMatch for one Linux-order verification transaction.
     auto sendStartMatch = [&](_Out_ bool* rejectedByDevice) -> bool {
         *rejectedByDevice = false;
-        const size_t discardedPreMatchEvents = conn->DiscardPendingEvents();
+        std::vector<std::vector<uint8_t>> discardedPayloads;
+        const size_t discardedPreMatchEvents = conn->DiscardPendingEvents(&discardedPayloads);
         if (discardedPreMatchEvents > 0) {
             T2_LOG("verify",
                    L"discarded %zu pre-StartMatch event(s) accumulated since the last "
                    L"attempt (Linux never attributes these to the match session)",
                    discardedPreMatchEvents);
+            // 26.09.2026: their CONTENT is still correctly ignored (Linux
+            // parity, per the comment above), but a stale pre-suspend event
+            // sitting in this queue at warm-up time still carries a real
+            // SEP sequence number - fold it into the high-water mark before
+            // it's thrown away, same as every other event this call sees.
+            for (const auto& raw : discardedPayloads) {
+                auto discardedStatusData = bridgexpc::DecodeStatusEventData(raw);
+                if (!discardedStatusData) continue;
+                uint32_t discardedEmbeddedType = 0;
+                std::vector<uint8_t> discardedEventData;
+                uint64_t discardedSequence = 0;
+                if (ParseStatusEventHeader(*discardedStatusData, &discardedEmbeddedType,
+                                            &discardedEventData, &discardedSequence)) {
+                    highestSequenceSeen = (std::max)(highestSequenceSeen, discardedSequence);
+                }
+            }
+            if (outHighestSequenceSeen) {
+                *outHighestSequenceSeen = highestSequenceSeen;
+            }
         }
         auto matchInitData = EncodeMatchInitData(config_.matchFlags, config_.macosUserId,
                                                   identities, config_.matchLayout);
@@ -534,8 +563,18 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
         }
         uint32_t embeddedType = 0;
         std::vector<uint8_t> eventData;
-        if (!ParseStatusEventHeader(*statusData, &embeddedType, &eventData)) {
+        uint64_t eventSequence = 0;
+        if (!ParseStatusEventHeader(*statusData, &embeddedType, &eventData, &eventSequence)) {
             continue;
+        }
+        // 26.09.2026: update on every event this loop sees, before any
+        // branch or early exit below, so *outHighestSequenceSeen is always
+        // current at whatever point this function returns (deadline,
+        // cancel, transport loss, or a real verdict) - see the field's own
+        // comment on why the caller needs this even on non-Match outcomes.
+        highestSequenceSeen = (std::max)(highestSequenceSeen, eventSequence);
+        if (outHighestSequenceSeen) {
+            *outHighestSequenceSeen = highestSequenceSeen;
         }
         if (embeddedType != kEmbeddedTypeMatchResult) {
             const wchar_t* kind = EmbeddedTypeName(embeddedType);
@@ -588,23 +627,23 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
 
         MatchResult mr = ParseMatchResult(embeddedType, eventData, identities);
         if (mr.outcome == MatchOutcome::Match) {
-            if (config_.requireFingerLiftSinceResume) {
-                // 27.09.2026: unconditional now - see header comment. The
-                // SEP can replay the aborted pre-suspend touch's own
-                // FingerOn/ImageCaptured/FingerOff into THIS session's
-                // event stream, so fingerTouchCycles > 0 here is no longer
-                // treated as proof of a live touch. Reject exactly like an
-                // ordinary NoMatch regardless of what this session's
-                // stream showed: the caller (Queue.cpp) already restarts a
-                // fresh full Linux-order transaction (reconnect, warm-up,
-                // new StartMatch) on NoMatch, and clears this flag so only
-                // THIS one attempt pays the distrust.
+            if (eventSequence <= config_.rejectSequenceAtOrBelow) {
+                // 26.09.2026, root-cause fix - see VerifyConfig::
+                // rejectSequenceAtOrBelow's own comment for the full
+                // history and reasoning. This exact match_result event
+                // (by the SEP's own sequence number, not by session/
+                // fingerTouchCycles/attempt-count/elapsed-time proxies
+                // that all turned out to be gameable) has already been
+                // observed once before - by this process, at some earlier
+                // point that predates it. Handing it to us again cannot be
+                // a fresh touch; treat it exactly like NO_MATCH.
                 T2_LOG("verify",
-                       L"match_result outcome=MATCH rejected unconditionally - first attempt "
-                       L"after resume (requireFingerLiftSinceResume), fingerTouchCycles=%zu "
-                       L"proves nothing (SEP can replay pre-suspend touch events); treating as "
+                       L"match_result outcome=MATCH rejected: sequence=%llu does not exceed "
+                       L"the last observed SEP sequence (%llu) - this event was already seen "
+                       L"before, not produced by a live touch in this session; treating as "
                        L"NO_MATCH and requesting a fresh transaction",
-                       fingerTouchCycles);
+                       static_cast<unsigned long long>(eventSequence),
+                       static_cast<unsigned long long>(config_.rejectSequenceAtOrBelow));
                 rejectedTouchAttempts++;
                 outcome = VerifyOutcome::NoMatch;
                 break;

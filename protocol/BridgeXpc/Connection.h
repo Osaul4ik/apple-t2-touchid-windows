@@ -101,7 +101,18 @@ public:
     // belonged to the match session is a Windows-only divergence that can
     // leave the sensor state machine in an unexpected ordinal sequence.
     // Returns how many events were dropped (for logging).
-    size_t DiscardPendingEvents();
+    //
+    // 26.09.2026: each discarded event still carries the same 24-byte
+    // sequence header any other event does (MatchResult.h
+    // ParseStatusEventHeader) — a stale pre-suspend event sitting in this
+    // queue at warm-up time is exactly the kind of thing
+    // VerifyConfig::rejectSequenceAtOrBelow needs to know about, even
+    // though its CONTENTS correctly never reach the match loop. This class
+    // stays plist/BiometricKit-agnostic (it does not link that layer), so
+    // it hands back the raw discarded payloads for the caller (which
+    // already depends on both layers) to decode — see
+    // VerificationEngine.cpp's call site.
+    size_t DiscardPendingEvents(std::vector<std::vector<uint8_t>>* outDiscardedPayloads = nullptr);
 
     void Close();
 

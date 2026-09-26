@@ -56,13 +56,22 @@ constexpr size_t kStatusEventHeaderBytes = 24;
 constexpr size_t kStatusEventBodyFixedFieldsBytes = 16;
 
 // Splits raw status-event `data` bytes (as extracted by
-// bridgexpc::DecodeStatusEventData) into embedded_type and the remaining
-// event body. Returns false if data is shorter than the fixed 24-byte
-// header — the caller must treat that as fail-closed, never as an
-// implicit NoMatch.
+// bridgexpc::DecodeStatusEventData) into embedded_type, the remaining
+// event body, and — 26.09.2026 — the header's own `sequence` field
+// (bytes [0:8), u64le). This is the SEP's own monotonic count of events it
+// has emitted; unlike embedded_type it was previously extracted from the
+// wire and immediately discarded. It is the one field in this protocol
+// that can prove causal ordering ("this event was generated before/after
+// that one") from data the SEP itself produced, rather than from our
+// software's clock or attempt count — see VerifyConfig::rejectSequenceAtOrBelow
+// for why that distinction matters. outSequence may be null for callers
+// (WarmUp's identity-list reads, RunLinuxReadySequence) that have no use
+// for it. Returns false if data is shorter than the fixed 24-byte header —
+// the caller must treat that as fail-closed, never as an implicit NoMatch.
 bool ParseStatusEventHeader(const std::vector<uint8_t>& data,
                              uint32_t* outEmbeddedType,
-                             std::vector<uint8_t>* outEventData);
+                             std::vector<uint8_t>* outEventData,
+                             uint64_t* outSequence = nullptr);
 
 // VERIFIED FROM SOURCE (bridge-xpc-probe.py summarize_event, embedded_type
 // == 0xE3FF8001 branch): this is the COMPLETE set of fields the reference
