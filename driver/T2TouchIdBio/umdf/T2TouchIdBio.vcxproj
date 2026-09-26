@@ -117,9 +117,11 @@
          into this project rather than referenced as a .lib - see the
          Link/AdditionalDependencies comment above for why, and the open
          risk that goes with it. Keep this list in sync with
-         protocol/T2TouchIdProtocol.vcxproj's own ClCompile ItemGroup minus
-         AppleKeyStore/Client.cpp (CAPTURE_DATA never touches AppleKeyStore -
-         that's the T2SepBootstrap service's job, design doc 9.2). -->
+         protocol/T2TouchIdProtocol.vcxproj's own ClCompile ItemGroup, plus
+         AppleKeyStore/Client.cpp below (CAPTURE_DATA itself never touches
+         AppleKeyStore for enrollment/unlock - that's the T2SepBootstrap
+         service's job, design doc 9.2 - but it does need Client.cpp for the
+         CheckSepReady readiness gate; see the comment on that include). -->
     <ClCompile Include="..\..\..\protocol\BiometricKit\Commands.cpp" />
     <ClCompile Include="..\..\..\protocol\BiometricKit\MatchResult.cpp" />
     <ClCompile Include="..\..\..\protocol\BiometricKit\VerificationEngine.cpp" />

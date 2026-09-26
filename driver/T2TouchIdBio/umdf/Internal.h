@@ -98,6 +98,11 @@ EXTERN_C_END
 EXTERN_C_START
 VOID T2BioRegisterSuspendResumeNotification(VOID);
 VOID T2BioUnregisterSuspendResumeNotification(VOID);
+// Must be called from T2BioEvtDriverUnload BEFORE the two Unregister* calls
+// above/below: capture workers are detached threads running code from this
+// DLL (StartCaptureWorker, Queue.cpp), so the host must not be allowed to
+// unload us while one is still unwinding. See its definition in Queue.cpp.
+VOID T2BioDrainCaptureWorkers(VOID);
 EXTERN_C_END
 
 // Screen-lock invalidation boundary (WTS_SESSION_LOCK, Queue.cpp) - the

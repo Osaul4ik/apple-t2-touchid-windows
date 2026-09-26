@@ -60,7 +60,11 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject,
 extern "C" VOID T2BioEvtDriverUnload(_In_ WDFDRIVER Driver)
 {
     UNREFERENCED_PARAMETER(Driver);
-    // Reverse of DriverEntry's registration order.
+    // Must run first: detached capture-worker threads (StartCaptureWorker,
+    // Queue.cpp) execute code from this DLL, so none may still be unwinding
+    // when the host is free to unload us. Then reverse of DriverEntry's
+    // registration order.
+    T2BioDrainCaptureWorkers();
     T2BioUnregisterSessionLockNotification();
     T2BioUnregisterSuspendResumeNotification();
     T2BioLog("EvtDriverUnload ok");
