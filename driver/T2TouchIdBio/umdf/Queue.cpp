@@ -10,7 +10,6 @@
 #include <vector>
 #include <cstddef>
 #include <thread>
-#include <cstring>
 
 // ---------------------------------------------------------------------------
 // Type names below were checked against winbio_ioctl.h / winbio_types.h of
@@ -283,10 +282,29 @@ std::mutex g_captureRequestCommitMu;
 // restart the SEP match under the same still-pending WBDI request.
 std::atomic<ULONGLONG> g_suspendGeneration{0};
 
-// Display off (power button) arrives BEFORE PBT_APMSUSPEND. Blocking Match
-// success while the panel is off closes the race where a touch unlocks
-// just before the machine actually sleeps.
-std::atomic<bool> g_displayOffBarrier{false};
+// Sleep path only (not idle display-off while the PC stays awake):
+//  - g_sleepBarrier: set on PBT_APMSUSPEND, cleared on resume.
+//  - g_powerButtonGraceUntil: brief window after panel OFF so a power-button
+//    touch cannot Match before APMSUSPEND arrives; expires if no sleep.
+std::atomic<bool> g_sleepBarrier{false};
+std::atomic<ULONGLONG> g_powerButtonGraceUntil{0};
+constexpr ULONGLONG kPowerButtonGraceMs = 3000;
+
+static bool DisplayBlocksSuccess()
+{
+    if (g_sleepBarrier.load(std::memory_order_acquire)) {
+        return true;
+    }
+    const ULONGLONG until = g_powerButtonGraceUntil.load(std::memory_order_acquire);
+    if (until == 0) {
+        return false;
+    }
+    if (GetTickCount64() >= until) {
+        g_powerButtonGraceUntil.store(0, std::memory_order_release);
+        return false;
+    }
+    return true;
+}
 
 // 26.09.2026, corrected same day: lifecycle tracking, not a clock. Every
 // BridgeXPC status-callback event (status/statistics/match_result alike)
@@ -537,9 +555,12 @@ ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_
     UNREFERENCED_PARAMETER(Context);
     UNREFERENCED_PARAMETER(Setting);
     if (Type == PBT_APMSUSPEND) {
+        g_sleepBarrier.store(true, std::memory_order_release);
+        g_powerButtonGraceUntil.store(0, std::memory_order_release); // suspend owns the barrier
         std::lock_guard<std::mutex> commitLock(g_captureRequestCommitMu);
         BeginCaptureSuspend("OnSuspendResume(PBT_APMSUSPEND)");
     } else if (Type == PBT_APMRESUMESUSPEND || Type == PBT_APMRESUMEAUTOMATIC) {
+        g_sleepBarrier.store(false, std::memory_order_release);
         // Resume hygiene (no service restarts — WBF owns Activate/CAPTURE):
         // 1) Drop sticky NCM / match-replay (adapter and connection may change).
         // 2) Wake the still-pending capture worker. It clears the suspend
@@ -738,6 +759,30 @@ bool WaitForSystemResume(_In_ CancelableScope& cancelScope,
         }
         WaitForSingleObject(resumeEvent, 100);
     }
+}
+
+
+// Display OFF (power button): do not open SEP / StartMatch. Keep CAPTURE_DATA
+// pending until the panel is on again (or WBF CancelIoEx). cancelEvent may
+// already be set by OnConsoleDisplayState — that is intentional SEP abort,
+// not WBF cancel; clear it once the barrier lifts.
+bool WaitUntilDisplayAllowsScan(_In_ CancelableScope& cancelScope,
+                                _In_opt_ HANDLE cancelEvent)
+{
+    if (!DisplayBlocksSuccess()) {
+        return !cancelScope.IsCancelled();
+    }
+    T2BioLog("CAPTURE_DATA(verify): sleep/power-button path — no SEP commands; CAPTURE stays pending");
+    while (DisplayBlocksSuccess()) {
+        if (cancelScope.IsCancelled()) {
+            return false;
+        }
+        Sleep(50);
+    }
+    if (cancelEvent) {
+        ResetEvent(cancelEvent);
+    }
+    return !cancelScope.IsCancelled();
 }
 
 enum class SlotWait { Acquired, StillBusy, RequestCancelled };
@@ -1120,7 +1165,7 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
     // one-shot replay — return the same result, no sensor session.
     {
         std::optional<std::array<uint8_t, 16>> replayUuid;
-        if (!g_displayOffBarrier.load(std::memory_order_acquire) &&
+        if (!DisplayBlocksSuccess() &&
             ConsumeMatchReplay(&replayUuid)) {
             T2BioLog("CAPTURE_DATA(verify): replaying Match (WBF 2nd CAPTURE of pair) - no sensor session");
             const std::vector<uint8_t> payload = t2::biometrickit::SerializeVendorPayload(
@@ -1164,11 +1209,11 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
     std::optional<std::array<uint8_t, 16>> matchedUuid;
     VerifyOutcome outcome = VerifyOutcome::TransportError;   // also what a failed connect completes as
 
-    // Keep the WBF request pending across system sleep. Suspend signals the
-    // session wait so it sends SEP Cancel and unwinds; after resume this loop
-    // starts a new connection and a new StartMatch in the SAME capture
-    // request. A genuine WBF CancelIoEx still completes the request promptly.
-    if (!WaitForSystemResume(cancelScope, cancelEvent, &handledSuspendGeneration)) {
+    // Keep the WBF request pending across system sleep / display-off.
+    // Never open SEP while the panel is off (power-button path).
+    if (!WaitUntilDisplayAllowsScan(cancelScope, cancelEvent)) {
+        outcome = VerifyOutcome::Cancelled;
+    } else if (!WaitForSystemResume(cancelScope, cancelEvent, &handledSuspendGeneration)) {
         outcome = VerifyOutcome::Cancelled;
     } else if (handledSuspendGeneration != entryGeneration) {
         // A suspend happened before this request ever reached StartMatch
@@ -1188,6 +1233,11 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
         for (;;) {
             bool connectionRetryExhausted = true;
             for (int attempt = 1; attempt <= kMaxSessionAttempts; ++attempt) {
+                if (!WaitUntilDisplayAllowsScan(cancelScope, cancelEvent)) {
+                    outcome = VerifyOutcome::Cancelled;
+                    connectionRetryExhausted = false;
+                    break;
+                }
                 t2::bridgexpc::Connection conn;
                 const ConnectWait cw = ConnectForCaptureWithRetry(cancelEvent, &conn);
                 if (cw == ConnectWait::Cancelled) {
@@ -1248,13 +1298,17 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
             const HANDLE resumeEvent = GetSystemResumeEvent();
             const bool resumePending = !resumeEvent ||
                 WaitForSingleObject(resumeEvent, 0) != WAIT_OBJECT_0;
-            if (currentGeneration != handledSuspendGeneration || resumePending) {
-                // Discard every outcome from the pre-sleep SEP session,
-                // including a raced Match. The same WBF request stays pending.
+            // Display-off or suspend: never deliver Match; keep CAPTURE pending.
+            if (currentGeneration != handledSuspendGeneration || resumePending ||
+                DisplayBlocksSuccess()) {
                 ClearMatchReplay();
                 matchedUuid.reset();
-                T2BioLog("CAPTURE_DATA(verify): power transition invalidated SEP result; "
-                         "waiting for resume and starting a fresh match");
+                T2BioLog("CAPTURE_DATA(verify): sleep path — Match not delivered; "
+                         "CAPTURE stays pending until scan is allowed again");
+                if (!WaitUntilDisplayAllowsScan(cancelScope, cancelEvent)) {
+                    outcome = VerifyOutcome::Cancelled;
+                    break;
+                }
                 if (!WaitForSystemResume(cancelScope, cancelEvent, &handledSuspendGeneration)) {
                     outcome = VerifyOutcome::Cancelled;
                     break;
@@ -1330,13 +1384,9 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
         return;
     }
 
-    if (outcome == VerifyOutcome::Match &&
-        g_displayOffBarrier.load(std::memory_order_acquire)) {
-        T2BioLog("CAPTURE_DATA(verify): display-off barrier — discarding Match (no unlock)");
-        outcome = VerifyOutcome::Cancelled;
-        matchedUuid.reset();
-        ClearMatchReplay();
-    }
+    // Match under display-off is already handled inside the loop (park + restart).
+    // Never complete CAPTURE as CANCELED solely for display-off — that breaks
+    // the pending WBF contact after sleep.
 
     const HRESULT hr = MapVerifyOutcomeToHresult(outcome);
     T2BioLog("CAPTURE_DATA(verify): outcome=%d -> hresult=0x%08x", static_cast<int>(outcome),
@@ -1759,8 +1809,7 @@ HANDLE g_sessionLockThread = nullptr;
 DWORD g_sessionLockThreadId = 0;
 std::atomic<HWND> g_sessionLockWindow{nullptr};
 
-// GUID_CONSOLE_DISPLAY_STATE {6FE69556-704A-47A0-8F24-C28D936FDA47}
-// 0=off, 1=on, 2=dimmed. Power button turns the panel off before APMSUSPEND.
+// GUID_CONSOLE_DISPLAY_STATE: 0=off, 1=on, 2=dimmed.
 static const GUID kGuidConsoleDisplayState =
     {0x6fe69556, 0x704a, 0x47a0, {0x8f, 0x24, 0xc2, 0x8d, 0x93, 0x6f, 0xda, 0x47}};
 
@@ -1769,17 +1818,23 @@ HPOWERNOTIFY g_displayStateNotify = nullptr;
 void OnConsoleDisplayState(DWORD state)
 {
     if (state == 0) {
-        g_displayOffBarrier.store(true, std::memory_order_release);
-        ClearMatchReplay();
-        HANDLE cancelEvent = GetCaptureCancelEvent();
-        if (cancelEvent) {
-            SetEvent(cancelEvent);
+        // Idle dim vs power-button: we cannot tell yet. Arm a short grace so a
+        // power-button finger cannot unlock before APMSUSPEND; if sleep never
+        // comes, grace expires and fingerprint works with the panel still off.
+        if (!g_sleepBarrier.load(std::memory_order_acquire)) {
+            g_powerButtonGraceUntil.store(GetTickCount64() + kPowerButtonGraceMs,
+                                          std::memory_order_release);
+            ClearMatchReplay();
+            if (HANDLE ev = GetCaptureCancelEvent()) {
+                SetEvent(ev);
+            }
+            g_suspendGeneration.fetch_add(1, std::memory_order_acq_rel);
+            T2BioLog("ConsoleDisplayState=OFF: power-button grace %llums (idle will expire)",
+                     static_cast<unsigned long long>(kPowerButtonGraceMs));
         }
-        g_suspendGeneration.fetch_add(1, std::memory_order_acq_rel);
-        T2BioLog("ConsoleDisplayState=OFF: barrier on, match cancelled (power-button race)");
     } else {
-        g_displayOffBarrier.store(false, std::memory_order_release);
-        T2BioLog("ConsoleDisplayState=%lu: barrier off", static_cast<unsigned long>(state));
+        g_powerButtonGraceUntil.store(0, std::memory_order_release);
+        T2BioLog("ConsoleDisplayState=%lu: grace cleared", static_cast<unsigned long>(state));
     }
 }
 
@@ -1795,7 +1850,7 @@ LRESULT CALLBACK SessionLockWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         if (s && IsEqualGUID(s->PowerSetting, kGuidConsoleDisplayState) &&
             s->DataLength >= sizeof(DWORD)) {
             DWORD state = 0;
-            memcpy(&state, s->Data, sizeof(DWORD));
+            RtlCopyMemory(&state, s->Data, sizeof(DWORD));
             OnConsoleDisplayState(state);
         }
         return TRUE;
@@ -1851,10 +1906,10 @@ DWORD WINAPI SessionLockThreadProc(LPVOID)
     g_displayStateNotify = RegisterPowerSettingNotification(
         hwnd, &kGuidConsoleDisplayState, DEVICE_NOTIFY_WINDOW_HANDLE);
     if (!g_displayStateNotify) {
-        T2BioLog("SessionLockThreadProc: RegisterPowerSettingNotification(DISPLAY_STATE) failed, error=%lu",
+        T2BioLog("SessionLockThreadProc: DISPLAY_STATE notify failed, error=%lu",
                  static_cast<unsigned long>(GetLastError()));
     } else {
-        T2BioLog("SessionLockThreadProc: RegisterPowerSettingNotification(DISPLAY_STATE) ok");
+        T2BioLog("SessionLockThreadProc: DISPLAY_STATE notify ok");
     }
 
     g_sessionLockWindow.store(hwnd, std::memory_order_release);
