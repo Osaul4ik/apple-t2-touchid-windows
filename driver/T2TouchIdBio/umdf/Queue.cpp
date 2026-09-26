@@ -290,6 +290,12 @@ std::atomic<bool> g_sleepBarrier{false};
 std::atomic<ULONGLONG> g_powerButtonGraceUntil{0};
 constexpr ULONGLONG kPowerButtonGraceMs = 3000;
 
+// S5 / reboot: set on WM_QUERYENDSESSION / WM_ENDSESSION (SessionLockWndProc).
+// Unlike sleep, a pending CAPTURE_DATA must NOT stay open across shutdown —
+// an in-flight BridgeXPC/SEP StartMatch hangs the T2 (Touch Bar stays lit)
+// and blocks the power transition. Once set, never cleared this boot.
+std::atomic<bool> g_systemShuttingDown{false};
+
 static bool DisplayBlocksSuccess()
 {
     if (g_sleepBarrier.load(std::memory_order_acquire)) {
@@ -304,6 +310,11 @@ static bool DisplayBlocksSuccess()
         return false;
     }
     return true;
+}
+
+static bool SystemIsShuttingDown()
+{
+    return g_systemShuttingDown.load(std::memory_order_acquire);
 }
 
 // 26.09.2026, corrected same day: lifecycle tracking, not a clock. Every
@@ -652,6 +663,40 @@ VOID EvtCaptureCancel(_In_ WDFREQUEST Request)
     }
 }
 
+// Shutdown / reboot (S5): abort BiometricKit and FORCE-complete every tracked
+// CAPTURE_DATA. Sleep keeps the WBF request pending; shutdown must not —
+// otherwise an in-flight StartMatch hangs the T2 (Touch Bar lit) and the
+// power manager waits on outstanding I/O forever. Called from
+// SessionLockWndProc on WM_QUERYENDSESSION / WM_ENDSESSION and from EvtIoStop
+// when the queue is purged (device removal / host teardown during power-off).
+void BeginCaptureShutdown(_In_z_ const char* source)
+{
+    g_systemShuttingDown.store(true, std::memory_order_release);
+    g_sleepBarrier.store(true, std::memory_order_release); // blocks DisplayBlocksSuccess / StartMatch
+    InvalidateActiveCapture(source, /*resetResumeEvent=*/true, /*clearStickyEndpoint=*/true);
+
+    std::vector<WDFREQUEST> toComplete;
+    {
+        std::lock_guard<std::mutex> lock(g_cancelTrackMu);
+        for (auto& e : g_cancelTracks) {
+            int expected = 0;
+            if (e.second->owner.compare_exchange_strong(expected, 1)) {
+                toComplete.push_back(e.first);
+            }
+        }
+    }
+    std::lock_guard<std::mutex> commitLock(g_captureRequestCommitMu);
+    for (WDFREQUEST req : toComplete) {
+        T2BioLog("%s: force-completing pending CAPTURE_DATA with STATUS_CANCELLED "
+                 "(shutdown — do not open SEP)", source);
+        WdfRequestComplete(req, STATUS_CANCELLED);
+    }
+    if (toComplete.empty()) {
+        T2BioLog("%s: no in-flight CAPTURE_DATA to complete; new captures will be rejected",
+                 source);
+    }
+}
+
 // Marks a request cancelable for the duration of a wait and settles who
 // completes it (see CancelTrack). Arm() once, then Release() exactly once.
 class CancelableScope {
@@ -731,7 +776,7 @@ bool WaitForSystemResume(_In_ CancelableScope& cancelScope,
     }
 
     for (;;) {
-        if (cancelScope.IsCancelled()) {
+        if (SystemIsShuttingDown() || cancelScope.IsCancelled()) {
             return false;
         }
 
@@ -742,7 +787,7 @@ bool WaitForSystemResume(_In_ CancelableScope& cancelScope,
             if (cancelEvent) {
                 ResetEvent(cancelEvent);
             }
-            if (cancelScope.IsCancelled()) {
+            if (SystemIsShuttingDown() || cancelScope.IsCancelled()) {
                 return false;
             }
             const ULONGLONG generationAfter =
@@ -766,15 +811,19 @@ bool WaitForSystemResume(_In_ CancelableScope& cancelScope,
 // pending until the panel is on again (or WBF CancelIoEx). cancelEvent may
 // already be set by OnConsoleDisplayState — that is intentional SEP abort,
 // not WBF cancel; clear it once the barrier lifts.
+// Shutdown is different: leave immediately (do not hold CAPTURE across S5).
 bool WaitUntilDisplayAllowsScan(_In_ CancelableScope& cancelScope,
                                 _In_opt_ HANDLE cancelEvent)
 {
+    if (SystemIsShuttingDown()) {
+        return false;
+    }
     if (!DisplayBlocksSuccess()) {
         return !cancelScope.IsCancelled();
     }
     T2BioLog("CAPTURE_DATA(verify): sleep/power-button path — no SEP commands; CAPTURE stays pending");
     while (DisplayBlocksSuccess()) {
-        if (cancelScope.IsCancelled()) {
+        if (SystemIsShuttingDown() || cancelScope.IsCancelled()) {
             return false;
         }
         Sleep(50);
@@ -782,7 +831,7 @@ bool WaitUntilDisplayAllowsScan(_In_ CancelableScope& cancelScope,
     if (cancelEvent) {
         ResetEvent(cancelEvent);
     }
-    return !cancelScope.IsCancelled();
+    return !SystemIsShuttingDown() && !cancelScope.IsCancelled();
 }
 
 enum class SlotWait { Acquired, StillBusy, RequestCancelled };
@@ -1161,11 +1210,18 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
              static_cast<unsigned>(kDefaultMacosUserId),
              static_cast<long long>(kCaptureMatchWindow.count()));
 
+    if (SystemIsShuttingDown()) {
+        T2BioLog("CAPTURE_DATA(verify): system shutting down — no SEP");
+        std::lock_guard<std::mutex> commitLock(g_captureRequestCommitMu);
+        WdfRequestComplete(Request, STATUS_CANCELLED);
+        return;
+    }
+
     // Fast path: second CAPTURE of the WBF pair. Real Match already armed a
     // one-shot replay — return the same result, no sensor session.
     {
         std::optional<std::array<uint8_t, 16>> replayUuid;
-        if (!DisplayBlocksSuccess() &&
+        if (!DisplayBlocksSuccess() && !SystemIsShuttingDown() &&
             ConsumeMatchReplay(&replayUuid)) {
             T2BioLog("CAPTURE_DATA(verify): replaying Match (WBF 2nd CAPTURE of pair) - no sensor session");
             const std::vector<uint8_t> payload = t2::biometrickit::SerializeVendorPayload(
@@ -1419,6 +1475,15 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
 // worker thread (StartCaptureWorker), never inside the WDF callback.
 void ProcessCapture(_In_ WDFREQUEST Request, const CaptureKey& key)
 {
+    // Shutdown: never open SEP / BridgeXPC. Complete immediately so the power
+    // transition is not blocked by an unbounded verify wait.
+    if (SystemIsShuttingDown()) {
+        T2BioLog("CAPTURE_DATA: system shutting down — reject without SEP");
+        std::lock_guard<std::mutex> commitLock(g_captureRequestCommitMu);
+        WdfRequestComplete(Request, STATUS_CANCELLED);
+        return;
+    }
+
     CaptureBusyGuard guard;
     if (!guard.acquired) {
         switch (WaitForCancelledPredecessor(Request, guard)) {
@@ -1689,7 +1754,29 @@ extern "C" VOID T2BioEvtIoStop(_In_ WDFQUEUE Queue,
 
     const bool suspend = (ActionFlags & WdfRequestStopActionSuspend) != 0;
     const bool purge = (ActionFlags & WdfRequestStopActionPurge) != 0;
-    if (suspend && !purge) {
+    if (purge) {
+        // Device/queue teardown (including host shutdown): force-complete any
+        // Arm'd CAPTURE so power-off is not blocked by an unbounded verify.
+        BeginCaptureShutdown("EvtIoStop(Purge)");
+        // If this Request was force-completed above, do not touch it again.
+        // Otherwise keep ownership; worker exits via SystemIsShuttingDown.
+        bool completedByShutdown = false;
+        {
+            std::lock_guard<std::mutex> lock(g_cancelTrackMu);
+            for (const auto& e : g_cancelTracks) {
+                if (e.first == Request &&
+                    e.second->owner.load(std::memory_order_acquire) == 1) {
+                    completedByShutdown = true;
+                    break;
+                }
+            }
+        }
+        if (!completedByShutdown) {
+            WdfRequestStopAcknowledge(Request, FALSE);
+        }
+        return;
+    }
+    if (suspend) {
         // Keep this exact WBF request under driver ownership. The active
         // BiometricKit operation is interrupted; EvtIoResume wakes its worker
         // to continue the still-pending request after D0 returns.
@@ -1697,8 +1784,9 @@ extern "C" VOID T2BioEvtIoStop(_In_ WDFQUEUE Queue,
         BeginCaptureSuspend("EvtIoStop(Suspend)");
         WdfRequestStopAcknowledge(Request, FALSE);
         return;
-    } else if (ActionFlags & WdfRequestStopRequestCancelable) {
-        // Removal/purge or another non-power stop is a real request stop.
+    }
+    if (ActionFlags & WdfRequestStopRequestCancelable) {
+        // Non-power stop while cancelable: wake the worker; keep ownership.
         std::lock_guard<std::mutex> commitLock(g_captureRequestCommitMu);
         HANDLE cancelEvent = GetCaptureCancelEvent();
         if (cancelEvent) {
@@ -1844,6 +1932,22 @@ LRESULT CALLBACK SessionLockWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         DestroyWindow(hwnd);
         return 0;
     }
+    // S5 / reboot: Windows Hello may still issue or hold CAPTURE_DATA while
+    // the machine is powering off. Sleep keeps the request pending; shutdown
+    // must force-complete it and refuse new SEP sessions (otherwise T2 hangs
+    // with Touch Bar lit and the system never powers off).
+    if (msg == WM_QUERYENDSESSION) {
+        T2BioLog("SessionLockWndProc: WM_QUERYENDSESSION — abort CAPTURE, no SEP on shutdown");
+        BeginCaptureShutdown("WM_QUERYENDSESSION");
+        return TRUE; // allow the session to end
+    }
+    if (msg == WM_ENDSESSION) {
+        if (wParam) { // TRUE = session is ending
+            T2BioLog("SessionLockWndProc: WM_ENDSESSION (ending) — abort CAPTURE");
+            BeginCaptureShutdown("WM_ENDSESSION");
+        }
+        return 0;
+    }
     if (msg == WM_POWERBROADCAST && wParam == PBT_POWERSETTINGCHANGE) {
         const POWERBROADCAST_SETTING* s =
             reinterpret_cast<const POWERBROADCAST_SETTING*>(lParam);
@@ -1888,13 +1992,23 @@ DWORD WINAPI SessionLockThreadProc(LPVOID)
         return 0;
     }
 
-    HWND hwnd = CreateWindowExW(0, kSessionLockWindowClass, L"", 0, 0, 0, 0, 0,
-                                 HWND_MESSAGE, nullptr, GetModuleHandleW(nullptr), nullptr);
+    // Top-level hidden window (not HWND_MESSAGE): message-only windows do not
+    // receive WM_QUERYENDSESSION / WM_ENDSESSION, which we need to abort
+    // CAPTURE_DATA on shutdown/reboot before SEP StartMatch hangs the T2.
+    HWND hwnd = CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        kSessionLockWindowClass,
+        L"T2TouchIdBio SessionLock",
+        WS_POPUP,
+        0, 0, 0, 0,
+        nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
     if (!hwnd) {
         T2BioLog("SessionLockThreadProc: CreateWindowExW failed, error=%lu",
                  static_cast<unsigned long>(GetLastError()));
         return 0;
     }
+    // Stay invisible; no taskbar entry (WS_EX_TOOLWINDOW).
+    ShowWindow(hwnd, SW_HIDE);
 
     if (!WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION)) {
         T2BioLog("SessionLockThreadProc: WTSRegisterSessionNotification failed, error=%lu",
