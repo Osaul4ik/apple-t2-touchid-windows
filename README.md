@@ -94,7 +94,7 @@ Milestone 2 (Windows implementation) has real hardware results:
 | CDC-NCM / IPv6 link to the T2 | **Confirmed on hardware** — inbox `UsbNcm` bound via `T2NCM/apple-t2-ncm.inf` |
 | RemoteXPC / BridgeXPC discovery | **Confirmed on hardware** |
 | BiometricKit real MATCH/NO_MATCH | **Confirmed on hardware** |
-| Windows Hello sign-in (WBDI/UMDF biometric driver) | **Work in progress** — see `driver/T2TouchIdBio/docs/Windows-hello-design.MD` |
+| Windows Hello sign-in (WBDI/UMDF biometric driver) | **Work in progress** |
 
 ## Repository layout
 
