@@ -135,6 +135,22 @@ inline void EnsureTunnelIpv4Neighbor(unsigned long ifIndex, const in_addr& peer4
     }
 }
 
+
+// Push peer fe80 into T2Ncm.sys so TX rewrite works immediately (no RX wait).
+inline void PushTunnelPeerToDriver(const in6_addr& peer6) {
+    HANDLE h = CreateFileW(L"\\\\.\\T2Ncm", GENERIC_WRITE,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    DWORD returned = 0;
+    const DWORD code = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x902, METHOD_BUFFERED, FILE_WRITE_ACCESS);
+    DeviceIoControl(h, code, (LPVOID)&peer6, (DWORD)sizeof(peer6),
+                    nullptr, 0, &returned, nullptr);
+    CloseHandle(h);
+}
+
 // Call before AF_INET connect in tunnel mode.
 inline void PrepareTunnelPeer(unsigned long ifIndex, const in6_addr& peer6) {
     UCHAR mac[6]{};
