@@ -781,7 +781,8 @@ jobs:
         Copy-Item -Path "tools\InstallDriver.bat" -Destination "final\InstallDriver.bat" -Force
         Copy-Item -Path "tools\InstallCert.bat" -Destination "$inst\InstallCert.bat" -Force
         Copy-Item -Path "tools\Install-T2TouchIdBio.ps1" -Destination "$inst\Install-T2TouchIdBio.ps1" -Force
-        Write-Host "OK: InstallDriver.bat in package root; InstallCert.bat + Install-T2TouchIdBio.ps1 in Inst\."
+        Copy-Item -Path "tools\Set-T2NcmStaticIp.ps1" -Destination "$inst\Set-T2NcmStaticIp.ps1" -Force
+        Write-Host "OK: InstallDriver.bat in package root; InstallCert.bat + Install-T2TouchIdBio.ps1 + Set-T2NcmStaticIp.ps1 in Inst\."
       shell: pwsh
 
     # =====================================================================
@@ -847,6 +848,7 @@ jobs:
           "InstallDriver.bat",
           "Inst\InstallCert.bat",
           "Inst\Install-T2TouchIdBio.ps1",
+          "Inst\Set-T2NcmStaticIp.ps1",
           "SEP\$env:SEP_DRIVER_NAME.inf",
           "NCM\apple-t2-ncm.inf", "NCM\apple-t2-ncm-ctrl-stub.inf", "NCM\apple-t2-composite.inf",
           "Bio\$env:BIO_UMDF_NAME.inf"

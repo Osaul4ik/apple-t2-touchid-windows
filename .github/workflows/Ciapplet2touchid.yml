@@ -6,8 +6,8 @@ name: CI Apple T2 TouchId (CodeQL + PREfast + Build + Package)
 #
 # apple-t2-touchid/
 #   InstallDriver.bat  (з tools/; ставить сертифікат, SEP, NCM, Bio по порядку)
-#   Inst/           InstallCert.bat, Install-T2TouchIdBio.ps1 (з tools/) і
-#                   <CertCN>.cer
+#   Inst/           InstallCert.bat, Install-T2TouchIdBio.ps1, Set-T2NcmStaticIp.ps1
+#                   (усі з tools/) і <CertCN>.cer
 #   SEP/            T2TouchIdTransport.sys, .inf, .cat, T2SepBootstrap.exe,
 #                   T2SepCoInstaller.dll, t2touchid.exe + vcpkg runtime dll(s)
 #                   (plist-2.0.dll etc. - also listed in the .inf's
@@ -923,7 +923,11 @@ jobs:
         Copy-Item -Path "tools\InstallDriver.bat" -Destination "final\InstallDriver.bat" -Force
         Copy-Item -Path "tools\InstallCert.bat" -Destination "$inst\InstallCert.bat" -Force
         Copy-Item -Path "tools\Install-T2TouchIdBio.ps1" -Destination "$inst\Install-T2TouchIdBio.ps1" -Force
-        Write-Host "OK: InstallDriver.bat in package root; InstallCert.bat + Install-T2TouchIdBio.ps1 in Inst\."
+        # Assigns the static IPv4 tunnel address (169.254.84.1/16) to the
+        # Apple T2 NCM adapter - InstallDriver.bat's new step 5/6 calls this
+        # from Inst\, same layout as Install-T2TouchIdBio.ps1 above.
+        Copy-Item -Path "tools\Set-T2NcmStaticIp.ps1" -Destination "$inst\Set-T2NcmStaticIp.ps1" -Force
+        Write-Host "OK: InstallDriver.bat in package root; InstallCert.bat + Install-T2TouchIdBio.ps1 + Set-T2NcmStaticIp.ps1 in Inst\."
       shell: pwsh
 
     # =====================================================================
@@ -1003,6 +1007,7 @@ jobs:
           "InstallDriver.bat",
           "Inst\InstallCert.bat",
           "Inst\Install-T2TouchIdBio.ps1",
+          "Inst\Set-T2NcmStaticIp.ps1",
           "SEP\$env:SEP_DRIVER_NAME.inf",
           "NCM\apple-t2-ncm.inf", "NCM\apple-t2-ncm-ctrl-stub.inf", "NCM\apple-t2-composite.inf",
           "Bio\$env:BIO_UMDF_NAME.inf"

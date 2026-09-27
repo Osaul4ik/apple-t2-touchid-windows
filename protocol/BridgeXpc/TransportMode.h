@@ -32,6 +32,7 @@
 #include <cstdint>
 #include <cstring>
 #include "Log.h"
+#include "Winsock.h"
 
 #pragma comment(lib, "Iphlpapi.lib")
 
