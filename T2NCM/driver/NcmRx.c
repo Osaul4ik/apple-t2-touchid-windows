@@ -593,7 +593,7 @@ T2NcmRxParseNtb(
                 RtlCopyMemory(DeviceContext->RxLastFrameSrc, deliver + 6, 6);
                 DeviceContext->RxLastFrameEtherType =
                     (USHORT)((deliver[12] << 8) | deliver[13]); // network byte order
-                DeviceContext->RxLastFrameLength = tunLen;
+                DeviceContext->RxLastFrameLength = (tunLen > 0xFFFFu) ? (USHORT)0xFFFF : (USHORT)tunLen;
 
                 InterlockedIncrement64(&DeviceContext->RxFramesParsed);
 

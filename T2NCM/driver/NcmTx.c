@@ -459,8 +459,8 @@ T2NcmTxSubmitNetBuffer(
         {
             frameLength = tunLen;
             {
-                PT2NCM_WIRE_NDP16_ENTRY_TX entries =
-                    (PT2NCM_WIRE_NDP16_ENTRY_TX)(buffer + ndpOffset + T2NCM_TX_NDP16_HEADER_LEN);
+                T2NCM_WIRE_NDP16_ENTRY_TX* entries =
+                    (T2NCM_WIRE_NDP16_ENTRY_TX*)(buffer + ndpOffset + T2NCM_TX_NDP16_HEADER_LEN);
                 entries[0].wDatagramLength = (USHORT)frameLength;
             }
         }

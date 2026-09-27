@@ -258,8 +258,8 @@ BOOLEAN T2NcmTunnelRewriteRxIpv6ToIpv4(
     payloadLen = T2NcmReadBe16(Frame + 14 + 4);
     if (nextHdr != T2NCM_IPPROTO_TCP && nextHdr != T2NCM_IPPROTO_UDP)
         return TRUE;
-    if (fl < 14 + 40 + payloadLen)
-        payloadLen = (USHORT)(fl - 14 - 40);
+    if (fl < 14ul + 40ul + (ULONG)payloadLen)
+        payloadLen = (USHORT)(fl - 14ul - 40ul);
 
     src6 = Frame + 14 + 8;
     // Map peer (src) to 169.254.x.y — same algorithm as userspace MapPeerToIpv4.
