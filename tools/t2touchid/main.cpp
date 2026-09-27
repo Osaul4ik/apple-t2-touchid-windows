@@ -22,6 +22,7 @@
 #include "../../protocol/Discovery/RemoteXpc.h"
 #include "../../protocol/BridgeXpc/Log.h"
 #include "../../protocol/BridgeXpc/TransportMode.h"
+#include "../../T2NCM/driver/Public.h"
 #include <iostream>
 #include <string>
 #include <fstream>
@@ -492,6 +493,59 @@ static bool TryCachedBridgePort(const t2::discovery::NcmEndpoint& ep,
     std::wcout << L"cached BridgeXPC port " << svcPort << L": direct HELO failed (result="
                << static_cast<int>(crA) << L") - falling back to full scan.\n";
     return false;
+}
+
+// Reads T2Ncm.sys's own RX/TX counters via IOCTL_T2NCM_GET_STATUS (0x900,
+// Public.h). Regular NDIS-path sends never touch TxFramesSent/TxNtbsSent/
+// TxFramesRejected - those three are diagnostic-only, populated solely by
+// IOCTL_T2NCM_SEND_TEST_FRAME (see Public.h's own comment on that IOCTL) -
+// so they are NOT printed here; printing them would just show permanent
+// zeros for a normal session and could be misread as "nothing was ever
+// sent". The RX counters, by contrast, DO reflect real bulk-IN traffic,
+// which is exactly what's needed to tell apart the three ways a tunnel
+// connect() can go silent: nothing arrives at all (RxNtbsReceived flat -
+// T2 never replied, or the SYN never actually made it out), arrives and
+// the driver's own filter drops it (RxFramesParsed up, RxFramesIndicated
+// flat, RxFramesFiltered up), or arrives and is handed to NDIS fine
+// (RxFramesIndicated up) - meaning the loss is above the driver, in the
+// TCP/IP stack's handling of the rewritten frame. Run this once before a
+// tunnel connect attempt and once right after; the deltas say which case
+// this is.
+static int CmdNcmStatus() {
+    HANDLE h = CreateFileW(L"\\\\.\\T2Ncm", GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        std::wcout << L"cannot open \\\\.\\T2Ncm (GetLastError=" << GetLastError()
+                   << L") - is the driver loaded and are you Administrator?\n";
+        return 1;
+    }
+    T2NCM_STATUS status{};
+    DWORD returned = 0;
+    const DWORD code = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x900, METHOD_BUFFERED, FILE_READ_ACCESS);
+    BOOL ok = DeviceIoControl(h, code, nullptr, 0, &status, sizeof(status), &returned, nullptr);
+    CloseHandle(h);
+    if (!ok) {
+        std::wcout << L"IOCTL_T2NCM_GET_STATUS failed, GetLastError=" << GetLastError() << L"\n";
+        return 1;
+    }
+    std::wcout << L"LifecycleState        " << status.LifecycleState << L"\n";
+    std::wcout << L"NdisAdapterReady      " << (status.NdisAdapterReady ? L"yes" : L"no") << L"\n";
+    std::wcout << L"DataPathRunning       " << (status.DataPathRunning ? L"yes" : L"no") << L"\n";
+    std::wcout << L"PowerState            " << status.PowerState << L" (0=Unspecified,1=D0,2..5=D1..D3)\n";
+    std::wcout << L"CdcPacketFilter       0x" << std::hex << status.CdcPacketFilter << std::dec
+               << (status.CdcPacketFilterApplied ? L" (applied)" : L" (NOT applied)") << L"\n";
+    std::wcout << L"OutstandingRxNbls     " << status.OutstandingRxNbls << L"\n";
+    std::wcout << L"OutstandingTxRequests " << status.OutstandingTxRequests << L"\n";
+    std::wcout << L"RxNtbsReceived        " << status.RxNtbsReceived << L"\n";
+    std::wcout << L"RxFramesParsed        " << status.RxFramesParsed << L"\n";
+    std::wcout << L"RxFramesFiltered      " << status.RxFramesFiltered << L"\n";
+    std::wcout << L"RxFramesIndicated     " << status.RxFramesIndicated << L"\n";
+    std::wcout << L"RxFramesRejected      " << status.RxFramesRejected << L"\n";
+    std::wcout << L"RxLastFrameEtherType  0x" << std::hex << status.RxLastFrameEtherType << std::dec << L"\n";
+    std::wcout << L"RxLastFrameLength     " << status.RxLastFrameLength << L"\n";
+    std::wcout << L"DrainTimeoutCount     " << status.DrainTimeoutCount << L"\n";
+    return 0;
 }
 
 static int CmdNetwork(int argc, wchar_t* argv[]) {
@@ -1136,6 +1190,7 @@ int wmain(int argc, wchar_t* argv[]) {
     if (cmd == L"identities") return CmdIdentities(argc, argv);
     if (cmd == L"warmup") return CmdWarmup(argc, argv);
     if (cmd == L"verify") return CmdVerify(argc, argv);
+    if (cmd == L"ncmstatus") return CmdNcmStatus();
 
     Client client;
     AksResult openResult = client.Open();
