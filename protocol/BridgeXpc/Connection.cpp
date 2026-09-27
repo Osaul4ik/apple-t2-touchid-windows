@@ -6,7 +6,6 @@
 #include "Winsock.h"
 #include <ws2tcpip.h>
 #include <rpc.h>
-#include <algorithm>
 #include <cctype>
 #pragma comment(lib, "Ws2_32.lib")
 #pragma comment(lib, "Rpcrt4.lib")
@@ -207,7 +206,13 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
         addr.sin6_port = htons(port);
         addr.sin6_addr = linkLocalAddress;
         addr.sin6_scope_id = interfaceIndex;
-        const auto v6Timeout = std::min(connectTimeout, kIpv6FirstConnectTimeout);
+        // Deliberately NOT std::min(...) — same macro hazard documented at
+        // WaitForEvent's own remaining/kCancelPollSlice clamp further down
+        // this file (<windows.h>'s function-like `min` macro, no NOMINMAX
+        // in this build): a plain comparison sidesteps it entirely.
+        const auto v6Timeout = (connectTimeout < kIpv6FirstConnectTimeout)
+                                    ? connectTimeout
+                                    : kIpv6FirstConnectTimeout;
         if (ConnectWithTimeout(socket_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr), v6Timeout)) {
             SetSocketTimeout(socket_, SO_RCVTIMEO, connectTimeout);
             SetSocketTimeout(socket_, SO_SNDTIMEO, connectTimeout);
@@ -262,7 +267,8 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
                 std::chrono::steady_clock::now() - attemptStart);
             const auto remaining = connectTimeout - elapsed;
             constexpr std::chrono::milliseconds kMinTunnelBudget{300};
-            tunnelTimeout = std::max(remaining, kMinTunnelBudget);
+            // Same std::max(...) macro hazard as above — plain comparison.
+            tunnelTimeout = (remaining > kMinTunnelBudget) ? remaining : kMinTunnelBudget;
         }
         if (!ConnectWithTimeout(socket_, reinterpret_cast<sockaddr*>(&addr4), sizeof(addr4),
                                  tunnelTimeout)) {
