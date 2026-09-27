@@ -4,6 +4,7 @@
 // (same select()-based non-blocking-connect pattern, same IPV6_UNICAST_IF
 // scoping) rather than inventing a second style for the same problem.
 #include "RemoteXpc.h"
+#include "../BridgeXpc/TransportMode.h"
 #include "../BridgeXpc/Winsock.h"
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -523,25 +524,41 @@ bool RemoteXpcConnection::ReadDataFrame(uint32_t wantStreamId, std::vector<uint8
 RemoteXpcResult RemoteXpcConnection::Connect(const NcmEndpoint& endpoint, uint16_t port,
                                               std::chrono::milliseconds connectTimeout) {
     if (!t2::EnsureWinsock()) return RemoteXpcResult::ConnectFailed;
-    socket_ = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+    const bool tunnel =
+        t2::transport::ReadTransportMode() == t2::transport::TransportMode::Ipv4Tunnel;
+    socket_ = socket(tunnel ? AF_INET : AF_INET6, SOCK_STREAM, IPPROTO_TCP);
     if (socket_ == INVALID_SOCKET) return RemoteXpcResult::ConnectFailed;
 
-    DWORD ifIndex = endpoint.ifIndex;
-    setsockopt(socket_, IPPROTO_IPV6, IPV6_UNICAST_IF,
-               reinterpret_cast<const char*>(&ifIndex), sizeof(ifIndex));
+    if (tunnel) {
+        DWORD ifIndexNet = htonl(static_cast<DWORD>(endpoint.ifIndex));
+        setsockopt(socket_, IPPROTO_IP, IP_UNICAST_IF,
+                   reinterpret_cast<const char*>(&ifIndexNet), sizeof(ifIndexNet));
+    } else {
+        DWORD ifIndex = endpoint.ifIndex;
+        setsockopt(socket_, IPPROTO_IPV6, IPV6_UNICAST_IF,
+                   reinterpret_cast<const char*>(&ifIndex), sizeof(ifIndex));
+    }
     BOOL nodelay = TRUE;
     setsockopt(socket_, IPPROTO_TCP, TCP_NODELAY,
                reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
     u_long nonblock = 1;
     ioctlsocket(socket_, FIONBIO, &nonblock);
 
-    sockaddr_in6 addr{};
-    addr.sin6_family = AF_INET6;
-    addr.sin6_port = htons(port);
-    addr.sin6_addr = endpoint.peerLinkLocal;
-    addr.sin6_scope_id = endpoint.ifIndex;
-
-    int cr = connect(socket_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    int cr;
+    if (tunnel) {
+        sockaddr_in addr4{};
+        addr4.sin_family = AF_INET;
+        addr4.sin_port = htons(port);
+        addr4.sin_addr = t2::transport::MapPeerToIpv4(endpoint.peerLinkLocal);
+        cr = connect(socket_, reinterpret_cast<sockaddr*>(&addr4), sizeof(addr4));
+    } else {
+        sockaddr_in6 addr{};
+        addr.sin6_family = AF_INET6;
+        addr.sin6_port = htons(port);
+        addr.sin6_addr = endpoint.peerLinkLocal;
+        addr.sin6_scope_id = endpoint.ifIndex;
+        cr = connect(socket_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    }
     if (cr != 0) {
         int err = WSAGetLastError();
         if (err != WSAEWOULDBLOCK && err != WSAEINPROGRESS) {

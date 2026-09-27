@@ -5,6 +5,7 @@
 // Connect, then recv only (peer SETTINGS first). No client preface.
 #include "PortScan.h"
 #include "../BridgeXpc/Winsock.h"
+#include "../BridgeXpc/TransportMode.h"
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <vector>
@@ -41,12 +42,20 @@ bool WaitReadable(SOCKET s, unsigned timeoutMs) {
 ProbeResult ProbePort(const NcmEndpoint& ep, uint16_t port,
                       unsigned connectTimeoutMs, unsigned recvTimeoutMs) {
     ProbeResult r;
-    SOCKET s = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+    const bool tunnel =
+        t2::transport::ReadTransportMode() == t2::transport::TransportMode::Ipv4Tunnel;
+    SOCKET s = socket(tunnel ? AF_INET : AF_INET6, SOCK_STREAM, IPPROTO_TCP);
     if (s == INVALID_SOCKET) return r;
 
-    DWORD ifIndex = ep.ifIndex;
-    setsockopt(s, IPPROTO_IPV6, IPV6_UNICAST_IF,
-               reinterpret_cast<const char*>(&ifIndex), sizeof(ifIndex));
+    if (tunnel) {
+        DWORD ifIndexNet = htonl(static_cast<DWORD>(ep.ifIndex));
+        setsockopt(s, IPPROTO_IP, IP_UNICAST_IF,
+                   reinterpret_cast<const char*>(&ifIndexNet), sizeof(ifIndexNet));
+    } else {
+        DWORD ifIndex = ep.ifIndex;
+        setsockopt(s, IPPROTO_IPV6, IPV6_UNICAST_IF,
+                   reinterpret_cast<const char*>(&ifIndex), sizeof(ifIndex));
+    }
 
     // Disable Nagle — small control frames.
     BOOL nodelay = TRUE;
@@ -56,13 +65,21 @@ ProbeResult ProbePort(const NcmEndpoint& ep, uint16_t port,
     u_long nonblock = 1;
     ioctlsocket(s, FIONBIO, &nonblock);
 
-    sockaddr_in6 addr{};
-    addr.sin6_family = AF_INET6;
-    addr.sin6_port = htons(port);
-    addr.sin6_addr = ep.peerLinkLocal;
-    addr.sin6_scope_id = ep.ifIndex;
-
-    int cr = connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    int cr;
+    if (tunnel) {
+        sockaddr_in addr4{};
+        addr4.sin_family = AF_INET;
+        addr4.sin_port = htons(port);
+        addr4.sin_addr = t2::transport::MapPeerToIpv4(ep.peerLinkLocal);
+        cr = connect(s, reinterpret_cast<sockaddr*>(&addr4), sizeof(addr4));
+    } else {
+        sockaddr_in6 addr{};
+        addr.sin6_family = AF_INET6;
+        addr.sin6_port = htons(port);
+        addr.sin6_addr = ep.peerLinkLocal;
+        addr.sin6_scope_id = ep.ifIndex;
+        cr = connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    }
     if (cr != 0) {
         int err = WSAGetLastError();
         if (err != WSAEWOULDBLOCK && err != WSAEINPROGRESS) {

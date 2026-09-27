@@ -92,6 +92,7 @@
     <ClCompile Include="NcmProtocol.c" />
     <ClCompile Include="NcmRx.c" />
     <ClCompile Include="NcmTx.c" />
+    <ClCompile Include="Tunnel.c" />
     <ClCompile Include="NdisMiniport.c" />
     <ClCompile Include="Power.c" />
     <!-- CtrlStub.c is deliberately NOT here: it builds into a separate

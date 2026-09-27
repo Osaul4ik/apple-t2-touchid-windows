@@ -240,6 +240,11 @@ typedef struct _T2NCM_DEVICE_CONTEXT
     // downstream mistakes a generated address for hardware truth.
     BOOLEAN              MacAddressIsPermanent;
 
+    // IPv4 tunnel (Cisco blocks IPv6): host uses 169.254/16; wire stays IPv6.
+    // PeerIpv6 is learned from the first inbound IPv6 frame source.
+    BOOLEAN              TunnelPeerIpv6Valid;
+    UCHAR                TunnelPeerIpv6[16];
+
     // ---- NDIS ----
     NDIS_HANDLE          MiniportAdapterHandle;   // from MiniportInitializeEx
     NDIS_HANDLE          RxNblPool;               // NET_BUFFER_LIST pool for indications
