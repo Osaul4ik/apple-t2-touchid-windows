@@ -253,6 +253,21 @@ typedef struct _T2NCM_DEVICE_CONTEXT
     // instead of once per outage.
     BOOLEAN              TunnelTxPeerUnknownLogged;
 
+    // Windows' real link-local source address on this adapter (learned
+    // passively from a native, un-rewritten outbound IPv6 frame — the
+    // adapter has RandomizeIdentifier semantics by default, so this is
+    // NOT derivable from PermanentMacAddress via modified-EUI-64; using
+    // T2NcmMacToLinkLocal as the TX source instead of this learned value
+    // produces a source address Windows never joined the solicited-node
+    // multicast group for, so the T2's Neighbor Solicitation for it
+    // never gets an answer and RX stays silent forever). Falls back to
+    // the synthesized EUI-64 address only until this is learned.
+    BOOLEAN              TunnelLocalIpv6Valid;
+    UCHAR                TunnelLocalIpv6[16];
+    // Mirrors TunnelTxPeerUnknownLogged: log the "local address not
+    // learned yet" condition once per outage, not once per frame.
+    BOOLEAN              TunnelLocalIpv6UnknownLogged;
+
     // ---- NDIS ----
     NDIS_HANDLE          MiniportAdapterHandle;   // from MiniportInitializeEx
     NDIS_HANDLE          RxNblPool;               // NET_BUFFER_LIST pool for indications

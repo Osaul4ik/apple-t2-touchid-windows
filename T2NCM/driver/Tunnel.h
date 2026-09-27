@@ -34,3 +34,13 @@ VOID T2NcmTunnelNotePeerFromIpv6Frame(
     _In_ ULONG FrameLength
     );
 
+// TX: if Frame is a native (already-IPv6, not synthesized by us) outbound
+// frame, remember its source address as Windows' real link-local address
+// on this adapter. Called from T2NcmTunnelRewriteTxIpv4ToIpv6 on every
+// outbound frame that isn't the 169.254/16 IPv4 traffic that function
+// rewrites, so it costs nothing extra on the IPv4-tunnel path.
+VOID T2NcmTunnelNoteLocalFromIpv6Frame(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext,
+    _In_reads_bytes_(FrameLength) const UCHAR* Frame,
+    _In_ ULONG FrameLength
+    );

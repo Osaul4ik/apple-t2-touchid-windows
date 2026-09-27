@@ -197,6 +197,42 @@ VOID T2NcmTunnelNotePeerFromIpv6Frame(
     DeviceContext->TunnelPeerIpv6Valid = TRUE;
 }
 
+VOID T2NcmTunnelNoteLocalFromIpv6Frame(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext,
+    _In_reads_bytes_(FrameLength) const UCHAR* Frame,
+    _In_ ULONG FrameLength)
+{
+    const UCHAR* newLocal;
+    BOOLEAN wasValid;
+
+    if (FrameLength < 14 + 40)
+        return;
+    if (T2NcmReadBe16(Frame + 12) != T2NCM_ETH_TYPE_IPV6)
+        return;
+    if ((Frame[14] >> 4) != 6)
+        return;
+
+    newLocal = Frame + 14 + 8; // source address of an outbound v6 frame == us
+    if (newLocal[0] != 0xFE || (newLocal[1] & 0xC0) != 0x80)
+        return; // only care about link-local (fe80::/10); ignore the rest
+
+    wasValid = DeviceContext->TunnelLocalIpv6Valid;
+    if (!wasValid || !RtlEqualMemory(DeviceContext->TunnelLocalIpv6, newLocal, 16)) {
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
+            "T2Ncm: tunnel local address %s (from native outbound v6 frame): "
+            "%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x\n",
+            wasValid ? "changed to" : "learned",
+            newLocal[0], newLocal[1], newLocal[2], newLocal[3],
+            newLocal[4], newLocal[5], newLocal[6], newLocal[7],
+            newLocal[8], newLocal[9], newLocal[10], newLocal[11],
+            newLocal[12], newLocal[13], newLocal[14], newLocal[15]));
+        DeviceContext->TunnelLocalIpv6UnknownLogged = FALSE; // give the next outage its own log line
+    }
+
+    RtlCopyMemory(DeviceContext->TunnelLocalIpv6, newLocal, 16);
+    DeviceContext->TunnelLocalIpv6Valid = TRUE;
+}
+
 BOOLEAN T2NcmTunnelRewriteTxIpv4ToIpv6(
     _In_ PT2NCM_DEVICE_CONTEXT DeviceContext,
     _Inout_updates_bytes_(BufferCapacity) PUCHAR Frame,
@@ -219,6 +255,18 @@ BOOLEAN T2NcmTunnelRewriteTxIpv4ToIpv6(
 
     if (!DeviceContext->TunnelModeEnabled)
         return TRUE;
+
+    // Any frame that is already IPv6 here is native traffic Windows built
+    // itself (this function only ever produces IPv6 as output, never takes
+    // it as input) — its source is Windows' real address on this adapter.
+    // Learn it before the ethType==IPv4 check below returns early for it.
+    {
+        ULONG probeLen = *FrameLength;
+        USHORT probeEth = (probeLen >= 14) ? T2NcmReadBe16(Frame + 12) : 0;
+        if (probeEth == T2NCM_ETH_TYPE_IPV6)
+            T2NcmTunnelNoteLocalFromIpv6Frame(DeviceContext, Frame, probeLen);
+    }
+
     if (!DeviceContext->TunnelPeerIpv6Valid) {
         // Log once per outage, not once per frame — this is exactly the
         // state a stuck port scan looks like from the driver's side (every
@@ -259,10 +307,32 @@ BOOLEAN T2NcmTunnelRewriteTxIpv4ToIpv6(
         return FALSE;
 
     RtlCopyMemory(dst6, DeviceContext->TunnelPeerIpv6, 16);
-    if (DeviceContext->MacAddressValid)
+    if (DeviceContext->TunnelLocalIpv6Valid) {
+        // Real address Windows actually has bound to this adapter (learned
+        // from a native outbound v6 frame). Modern Windows randomizes the
+        // link-local interface identifier, so this is NOT the modified-
+        // EUI-64 address T2NcmMacToLinkLocal would synthesize from the
+        // MAC — using that synthesized address instead would send every
+        // tunneled packet from an address Windows never actually owns, so
+        // the T2's Neighbor Solicitation for it can never be answered and
+        // no reply ever gets routed back (RX stays silent forever).
+        RtlCopyMemory(src6, DeviceContext->TunnelLocalIpv6, 16);
+    } else if (DeviceContext->MacAddressValid) {
+        // Haven't seen a native v6 frame yet (e.g. right after tunnel mode
+        // was enabled) — fall back to the synthesized address so TX isn't
+        // dropped outright; RX will still fail until the real address is
+        // learned. Log this once per outage so it's visible why.
+        if (!DeviceContext->TunnelLocalIpv6UnknownLogged) {
+            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
+                "T2Ncm: tunnel TX using synthesized (not yet real) local IPv6 "
+                "- waiting on a native outbound v6 frame to learn Windows' "
+                "actual link-local address\n"));
+            DeviceContext->TunnelLocalIpv6UnknownLogged = TRUE;
+        }
         T2NcmMacToLinkLocal(DeviceContext->PermanentMacAddress, src6);
-    else
+    } else {
         RtlZeroMemory(src6, 16), src6[0] = 0xFE, src6[1] = 0x80;
+    }
 
     // Move L4 payload to make room for IPv6 header (40 vs 20).
     RtlMoveMemory(Frame + 14 + 40, Frame + 14 + ipHdrLen, payloadLen);
