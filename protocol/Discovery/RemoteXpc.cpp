@@ -530,6 +530,10 @@ RemoteXpcResult RemoteXpcConnection::Connect(const NcmEndpoint& endpoint, uint16
     if (socket_ == INVALID_SOCKET) return RemoteXpcResult::ConnectFailed;
 
     if (tunnel) {
+        // Same seed PortScan.cpp / Connection.cpp do before their own
+        // AF_INET connect(): without it this targets an unresolved
+        // 169.254.x.y and dies on an ARP request T2Ncm.sys never answers.
+        t2::transport::PrepareTunnelPeer(endpoint.ifIndex, endpoint.peerLinkLocal);
         DWORD ifIndexNet = htonl(static_cast<DWORD>(endpoint.ifIndex));
         setsockopt(socket_, IPPROTO_IP, IP_UNICAST_IF,
                    reinterpret_cast<const char*>(&ifIndexNet), sizeof(ifIndexNet));

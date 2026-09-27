@@ -155,6 +155,21 @@ std::vector<PortCandidate> ScanHttp2Preface(const NcmEndpoint& endpoint,
     if (endpoint.ifIndex == 0) return hits;
     if (options.portEnd < options.portBegin) return hits;
 
+    // Seed T2Ncm peer IPv6 + static IPv4 neighbor (ARP) BEFORE any AF_INET
+    // probe connect() below. Without this, every ProbePort() tunnel-mode
+    // connect() targets a 169.254.x.y address Windows has never resolved:
+    // it falls back to broadcasting an ARP request over the NCM link, which
+    // T2Ncm.sys never answers (Tunnel.c only rewrites TCP/UDP-over-IP, not
+    // ARP frames) and the T2 itself doesn't understand, so the ARP entry
+    // stays incomplete and every connect() dies silently — the whole
+    // 16384-port range comes back tcp=0 even though the peer is reachable
+    // over native IPv6. Connection.cpp's real BridgeXPC connect already did
+    // this before its own AF_INET connect; the scanner needs the same seed
+    // before it starts probing, not after.
+    if (t2::transport::ReadTransportMode() == t2::transport::TransportMode::Ipv4Tunnel) {
+        t2::transport::PrepareTunnelPeer(endpoint.ifIndex, endpoint.peerLinkLocal);
+    }
+
     const unsigned total =
         static_cast<unsigned>(options.portEnd - options.portBegin) + 1;
     std::atomic<unsigned> next{0};
