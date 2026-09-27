@@ -97,7 +97,7 @@ static VOID T2NcmMacToLinkLocal(_In_reads_bytes_(6) const UCHAR* Mac, _Out_write
     Ip6[15] = Mac[5];
 }
 
-BOOLEAN T2NcmTunnelModeEnabled(VOID)
+VOID T2NcmTunnelRefreshMode(_In_ PT2NCM_DEVICE_CONTEXT DeviceContext)
 {
     UNICODE_STRING path = RTL_CONSTANT_STRING(L"\\Registry\\Machine\\SOFTWARE\\T2TouchId\\Network");
     OBJECT_ATTRIBUTES oa;
@@ -107,18 +107,32 @@ BOOLEAN T2NcmTunnelModeEnabled(VOID)
     ULONG resultLen = 0;
     PKEY_VALUE_PARTIAL_INFORMATION info = (PKEY_VALUE_PARTIAL_INFORMATION)buf;
     UNICODE_STRING valueName = RTL_CONSTANT_STRING(L"TransportMode");
+    BOOLEAN enabled = FALSE;
+
+    // PASSIVE_LEVEL only — never call from SendNetBufferLists / RX DPC.
+    NT_ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
 
     InitializeObjectAttributes(&oa, &path, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
     status = ZwOpenKey(&key, KEY_READ, &oa);
-    if (!NT_SUCCESS(status))
-        return FALSE;
+    if (NT_SUCCESS(status))
+    {
+        status = ZwQueryValueKey(key, &valueName, KeyValuePartialInformation,
+                                 buf, sizeof(buf), &resultLen);
+        ZwClose(key);
+        if (NT_SUCCESS(status) && info->Type == REG_DWORD &&
+            info->DataLength >= sizeof(ULONG) &&
+            (*(ULONG*)info->Data) == 1ul)
+        {
+            enabled = TRUE;
+        }
+    }
 
-    status = ZwQueryValueKey(key, &valueName, KeyValuePartialInformation, buf, sizeof(buf), &resultLen);
-    ZwClose(key);
-    if (!NT_SUCCESS(status) || info->Type != REG_DWORD || info->DataLength < sizeof(ULONG))
-        return FALSE;
-    return (*(ULONG*)info->Data) == 1ul;
+    DeviceContext->TunnelModeEnabled = enabled;
+    T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
+        "T2Ncm: TunnelModeEnabled=%u (cached from registry, PASSIVE)\n",
+        enabled ? 1u : 0u));
 }
+
 
 VOID T2NcmTunnelNotePeerFromIpv6Frame(
     _In_ PT2NCM_DEVICE_CONTEXT DeviceContext,
@@ -155,7 +169,7 @@ BOOLEAN T2NcmTunnelRewriteTxIpv4ToIpv6(
     UCHAR* tcp;
     USHORT oldCheck;
 
-    if (!T2NcmTunnelModeEnabled())
+    if (!DeviceContext->TunnelModeEnabled)
         return TRUE;
     if (!DeviceContext->TunnelPeerIpv6Valid)
         return TRUE; // peer unknown yet — leave frame (will fail until RX learns)
@@ -240,7 +254,7 @@ BOOLEAN T2NcmTunnelRewriteRxIpv6ToIpv4(
     UCHAR* tcp;
     USHORT csum;
 
-    if (!T2NcmTunnelModeEnabled())
+    if (!DeviceContext->TunnelModeEnabled)
         return TRUE;
 
     fl = *FrameLength;

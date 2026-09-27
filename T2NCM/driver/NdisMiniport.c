@@ -10,6 +10,7 @@
 #include "NcmRx.h"
 #include "NcmTx.h"
 #include "Power.h"
+#include "Tunnel.h"
 
 #define T2NCM_VENDOR_DRIVER_VERSION  0x00020000  // 2.0
 #define T2NCM_NDIS_MAJOR_VERSION     6
@@ -661,6 +662,9 @@ T2NcmMiniportInitializeEx(
         context->PermanentMacAddress[4], context->PermanentMacAddress[5],
         context->MacAddressIsPermanent));
 
+    // Cache TransportMode at PASSIVE — never ZwOpenKey on the send path.
+    T2NcmTunnelRefreshMode(context);
+
     return NDIS_STATUS_SUCCESS;
 
 Fail:
@@ -842,6 +846,9 @@ T2NcmMiniportRestart(
     // otherwise be discarded as "paused" even though NDIS has asked for
     // traffic.
     InterlockedExchange(&context->DataPathRunning, 1);
+
+    // Refresh tunnel flag at PASSIVE (Restart is PASSIVE_LEVEL).
+    T2NcmTunnelRefreshMode(context);
 
     // Re-assert the device-side packet filter. T2NcmPowerArmHardware
     // already sent it after the alt-1 switch, but a restart can also

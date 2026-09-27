@@ -241,7 +241,9 @@ typedef struct _T2NCM_DEVICE_CONTEXT
     BOOLEAN              MacAddressIsPermanent;
 
     // IPv4 tunnel (Cisco blocks IPv6): host uses 169.254/16; wire stays IPv6.
+    // TunnelModeEnabled is cached at PASSIVE (never ZwOpenKey on TX/RX DPC).
     // PeerIpv6 is learned from the first inbound IPv6 frame source.
+    BOOLEAN              TunnelModeEnabled;
     BOOLEAN              TunnelPeerIpv6Valid;
     UCHAR                TunnelPeerIpv6[16];
 
