@@ -10,7 +10,23 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+// Guarded on _WINIOCTL_: this only needs to run for a standalone consumer
+// where WIN32_LEAN_AND_MEAN (set above) kept <windows.h> from pulling in
+// <winioctl.h> at all. If something earlier in this translation unit already
+// included <winioctl.h> - e.g. driver/T2TouchIdTransport/public.h, reached
+// via protocol/AppleKeyStore/Client.h - _WINIOCTL_ is already set and the
+// CTL_CODE/FILE_DEVICE_UNKNOWN macros this file needs are already available,
+// so re-including here would add nothing. It would, however, re-run
+// winioctl.h's GUID_DEVINTERFACE_* block, which sits OUTSIDE that guard and
+// re-executes on every textual inclusion regardless: if INITGUID happened to
+// be active during an earlier inclusion in this TU (as it is inside
+// public.h, to instantiate its own custom GUID), that block's DEFINE_GUID
+// stays in "instantiate" mode for the rest of the file, and a further
+// inclusion here would redefine GUID_DEVINTERFACE_DISK and friends a second
+// time -> C2374 "redefinition; multiple initialization".
+#ifndef _WINIOCTL_
 #include <winioctl.h>
+#endif
 #include <iphlpapi.h>
 #include <netioapi.h>
 #include <cstdint>

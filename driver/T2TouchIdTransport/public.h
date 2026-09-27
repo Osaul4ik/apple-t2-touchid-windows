@@ -17,23 +17,29 @@
 // toolset defines it for every translation unit (T2TouchIdBio compiles
 // protocol/AppleKeyStore/Client.cpp, which is where that surfaced). Include
 // it here so the header does not depend on the includer's macros.
-#if !defined(_NTDDK_) && !defined(_WDMDDK_)
+//
+// Guarded on _WINIOCTL_ (not just kernel/user mode) because winioctl.h's own
+// GUID_DEVINTERFACE_* block sits OUTSIDE its "#ifndef _WINIOCTL_" guard,
+// gated only on "#ifdef DEFINE_GUID" - so a second textual #include
+// <winioctl.h> in the same translation unit re-runs that block using
+// whatever DEFINE_GUID currently expands to, REGARDLESS of the include
+// guard. With INITGUID active (as it is right here) that means a second,
+// real re-initialization of GUID_DEVINTERFACE_DISK and friends -> C2374
+// "redefinition; multiple initialization". Skipping the include when
+// _WINIOCTL_ is already set costs nothing (all the macros below still come
+// from whichever earlier <windows.h>/<winioctl.h> already ran) and is what
+// actually prevents that collision - unlike #undef INITGUID afterward,
+// which does NOT work: DEFINE_GUID is a macro redefinition performed once by
+// <guiddef.h> when <initguid.h> runs, not a live "#ifdef INITGUID" check
+// re-evaluated at each DEFINE_GUID call site, so undefining INITGUID later
+// does not revert it for the rest of the file.
+#if !defined(_NTDDK_) && !defined(_WDMDDK_) && !defined(_WINIOCTL_)
 #include <winioctl.h>
 #endif
 
 // {6E0F1A7C-6B7A-4E7A-9C6D-2C6B1E7F3A10}
 DEFINE_GUID(GUID_DEVINTERFACE_T2TOUCHID_TRANSPORT,
     0x6e0f1a7c, 0x6b7a, 0x4e7a, 0x9c, 0x6d, 0x2c, 0x6b, 0x1e, 0x7f, 0x3a, 0x10);
-
-// Scope INITGUID to just this header (same pattern as
-// driver/T2TouchIdBio/umdf/Internal.h). Without this #undef, INITGUID stays
-// defined for the rest of the translation unit, so any later independent
-// <winioctl.h> include in the same TU (e.g. protocol/BridgeXpc/TransportMode.h)
-// re-runs winioctl.h's DEFINE_GUID block and collides with the definitions
-// already emitted above - that's the C2374 "redefinition; multiple
-// initialization" seen in tools/t2touchid (main.cpp includes this header via
-// Client.h, then includes TransportMode.h later in the same file).
-#undef INITGUID
 
 #define T2_AKS_MAX_BODY_SIZE   (0x4000 - 0x50 - sizeof(UINT32)) // OOL_SIZE - V2 wire header
 
