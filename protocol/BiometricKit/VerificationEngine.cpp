@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstring>
 #include <string>
+#include <mutex>
 
 using t2::log::HexDump;
 
@@ -21,6 +22,62 @@ namespace {
 // destructor can see it — MSVC C2326 rejects a function-local constexpr
 // from a local-class member function.
 constexpr std::chrono::milliseconds kCancelBestEffortTimeout{300};
+
+// ---------------------------------------------------------------------------
+// Active StartMatch session (Linux parity for suspend / CancelIoEx).
+//
+// After StartMatch succeeds the SEP may be in capture mode until cmd 0x0c.
+// InvalidateActiveCapture / EvtCaptureCancel used to only SetEvent(cancelEvent);
+// the worker then sent Cancel via CancelGuard *after* waking — racing NCM
+// MiniportPause on suspend. Register the live Connection here so the power
+// path can send 0x0c on the open socket *before* SetEvent (and before Dx).
+// All access is under g_activeMatchMu; SendBiometricCommand may run on the
+// suspend thread while the worker is blocked in WaitForEvent (recv) — same
+// best-effort contract as tearing the socket on sleep.
+// ---------------------------------------------------------------------------
+std::mutex g_activeMatchMu;
+bridgexpc::Connection* g_activeMatchConn = nullptr;
+bool g_activeMatchNeedsCancel = false;
+
+void RegisterActiveMatchSession(bridgexpc::Connection* conn)
+{
+    std::lock_guard<std::mutex> lock(g_activeMatchMu);
+    g_activeMatchConn = conn;
+    g_activeMatchNeedsCancel = true;
+}
+
+// Sends cmd 0x0c once if a live match was registered. Clears the need-cancel
+// flag so CancelGuard / a second BestEffort call do not double-send. Connection
+// pointer is cleared only when the worker unregisters (Verify exit).
+bool SendCancelOnActiveMatch_Locked()
+{
+    if (!g_activeMatchNeedsCancel || g_activeMatchConn == nullptr) {
+        return false;
+    }
+    g_activeMatchNeedsCancel = false;
+    auto cancelCmd = EncodeBmCommand(Command::Cancel, /*version=*/1, /*value=*/0);
+    std::vector<uint8_t> discard;
+    const bool ok = g_activeMatchConn->SendBiometricCommand(
+        cancelCmd, /*outputCapacity=*/0, &discard, kCancelBestEffortTimeout);
+    T2_LOG("verify",
+           L"BestEffortCancelActiveMatch: cmd 0x0c %s (Linux parity before cancelEvent/SetEvent)",
+           ok ? L"OK" : L"failed/best-effort");
+    return ok;
+}
+
+void UnregisterActiveMatchSession(bridgexpc::Connection* conn)
+{
+    std::lock_guard<std::mutex> lock(g_activeMatchMu);
+    if (g_activeMatchConn == conn) {
+        // If StartMatch was live and cancel never went out (e.g. process tear),
+        // try once more while the pointer is still valid.
+        if (g_activeMatchNeedsCancel) {
+            (void)SendCancelOnActiveMatch_Locked();
+        }
+        g_activeMatchConn = nullptr;
+        g_activeMatchNeedsCancel = false;
+    }
+}
 
 bool Uuid16IsZero(const uint8_t* p) {
     for (int i = 0; i < 16; i++) {
@@ -350,10 +407,8 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     T2_LOG("verify", L"identity inventory stable across 0x42->0x51->0x42->0x51 (%zu configured)",
            configuredFirst.size());
 
-    // Kept for the CancelGuard below (post-match cleanup on every exit
-    // path), and now also reused directly on each NO_MATCH restart —
-    // unrelated to the removed pre-match sequence.
-    auto cancelCmd = EncodeBmCommand(Command::Cancel, 1, 0);
+    // Cancel (cmd 0x0c) after StartMatch is owned by CancelGuard /
+    // BestEffortCancelActiveMatch (Linux parity) — no pre-built cancelCmd here.
 
     // REVERTED (16.09.2026): the macOS-log-derived pre-match sequence that
     // used to live here (GetEnabledForUnlock/GetSksLockStateMac/
@@ -488,42 +543,47 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     // IMPORTANT (20.09.2026 hardware): do NOT use config_.ioTimeout (5s) here.
     // Cancel is best-effort teardown — see kCancelBestEffortTimeout above.
     // Same bound is used on the NoMatch restart path below.
+    // Register before any WaitForEvent so suspend/CancelIoEx can send 0x0c
+    // on this socket before SetEvent (see BestEffortCancelActiveMatch).
+    RegisterActiveMatchSession(conn);
     struct CancelGuard {
         bridgexpc::Connection* conn;
-        const std::vector<uint8_t>* cancelCmd;
         bool active = true;
         void Arm() { active = true; }
         void Send() {
             if (!active) return;
             active = false;
-            std::vector<uint8_t> discard;
-            conn->SendBiometricCommand(*cancelCmd, 0, &discard, kCancelBestEffortTimeout);
+            // Prefer the shared path (idempotent if suspend already cancelled).
+            // Clear registration under the same lock — do not call
+            // UnregisterActiveMatchSession here (it would re-enter the mutex).
+            {
+                std::lock_guard<std::mutex> lock(g_activeMatchMu);
+                if (g_activeMatchConn == conn && g_activeMatchNeedsCancel) {
+                    (void)SendCancelOnActiveMatch_Locked();
+                } else if (g_activeMatchConn != conn && g_activeMatchConn != nullptr) {
+                    // Another session owns the slot; still best-effort on *this* conn.
+                    auto cancelCmd = EncodeBmCommand(Command::Cancel, 1, 0);
+                    std::vector<uint8_t> discard;
+                    conn->SendBiometricCommand(cancelCmd, 0, &discard, kCancelBestEffortTimeout);
+                }
+                // else: already cancelled by BestEffortCancelActiveMatch, or no session.
+                if (g_activeMatchConn == conn) {
+                    g_activeMatchConn = nullptr;
+                    g_activeMatchNeedsCancel = false;
+                }
+            }
         }
         ~CancelGuard() { Send(); }
-    } cancelGuard{conn, &cancelCmd};
+    } cancelGuard{conn};
 
-    // design doc §9.4, per explicit direction: this component does not own
-    // the wait duration at all when Windows Hello is driving it (cancelEvent
-    // present) - Windows issues CAPTURE_DATA and we simply wait; a wrong
-    // finger restarts the scan immediately; the wait ends only on a real
-    // Match or on Windows' own cancel (login finished some other way,
-    // password fallback, session torn down). No self-imposed deadline, no
-    // "safety net" second-guessing that contract - if Windows fails to ever
-    // send a cancel, that is a bug to fix at that layer, not something to
-    // paper over here with an internal timeout (a prior attempt at exactly
-    // that safety net was observed, on real hardware, to do more harm than
-    // good: it kept g_captureBusy held for its full duration on a capture
-    // Windows had simply stopped caring about, delaying the next real
-    // capture). The CLI one-shot `verify` (no cancelEvent) is unaffected -
-    // it keeps its fixed config_.matchWindow deadline exactly as before.
-    // Parenthesize the call so <windows.h>'s function-like `max(a,b)` macro
-    // (this TU is deliberately built without NOMINMAX - see Connection.cpp
-    // for why) never sees `max(` as a token and tries to expand it; that is
-    // exactly what produced warning C4003 / errors C2589,C2059,C2737,C3536
-    // here (the same class of bug Connection.cpp's ReadFrame clamp already
-    // works around for std::min).
-    constexpr auto kNoDeadline = (steady_clock::time_point::max)();
-    const auto deadline = cancelEvent ? kNoDeadline : (steady_clock::now() + config_.matchWindow);
+    // Match wait is always bounded by config_.matchWindow (Linux
+    // --match-seconds). cancelEvent still ends the wait early (WBF CancelIoEx
+    // or suspend). Wrong-finger is one transaction → NoMatch → CAPTURE
+    // completes; Hello may issue a new CAPTURE (re-open verify).
+    // Linux parity: always bound the match wait (t2-fprintd --match-seconds,
+    // default 20s). cancelEvent still aborts early (CancelIoEx / suspend).
+    // After Timeout the CAPTURE completes; WBF may open a new verify.
+    const auto deadline = steady_clock::now() + config_.matchWindow;
     VerifyOutcome outcome = VerifyOutcome::Timeout; // default if loop exits via deadline
 
     size_t imagePipelineEvents = 0;
@@ -544,6 +604,10 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
             // just a poll (mirrors the same check inside WaitForEvent) —
             // not a second, independent wait.
             if (cancelEvent && bridgexpc::Connection::IsEventSignaled(cancelEvent)) {
+                // Send 0x0c immediately (not only in ~CancelGuard) so SEP leaves
+                // capture mode before we unwind — same ordering as Linux cmd 12
+                // before session teardown.
+                cancelGuard.Send();
                 outcome = VerifyOutcome::Cancelled;
             } else if (conn->ConnectionLost()) {
                 // 20.09.2026: the BridgeXPC TCP session died under us (peer
@@ -728,6 +792,16 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
            static_cast<int>(outcome));
 
     return outcome;
+}
+
+
+void BestEffortCancelActiveMatch()
+{
+    std::lock_guard<std::mutex> lock(g_activeMatchMu);
+    if (!g_activeMatchNeedsCancel || g_activeMatchConn == nullptr) {
+        return;
+    }
+    (void)SendCancelOnActiveMatch_Locked();
 }
 
 } // namespace t2::biometrickit

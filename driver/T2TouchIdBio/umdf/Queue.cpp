@@ -221,15 +221,11 @@ void HandleGetSensorStatus(_In_ WDFREQUEST Request)
 // KNOWN GAPS vs the design doc, left explicit rather than silently patched
 // over (matching this project's own fail-closed / no-guessing style):
 //
-//   - Section 9.4 (cancel-on-CancelIo, unbounded wait for the lock screen)
-//     IS implemented (EvtCaptureCancel/WdfRequestMarkCancelable below), and
-//     VerificationEngine::Verify() now waits with NO internal deadline at
-//     all whenever a cancelEvent is supplied (always true here) - a
-//     wrong-finger NO_MATCH restarts the scan immediately instead of ending
-//     the capture, and the wait otherwise ends only on a real Match or on
-//     Windows' own CancelIoEx. kCaptureMatchWindow below is therefore not a
-//     wait bound in normal operation at all; it only matters as a
-//     last-resort fallback if the cancelEvent itself failed to be created.
+//   - Section 9.4 (cancel-on-CancelIo) IS implemented
+//     (EvtCaptureCancel/WdfRequestMarkCancelable). Match wait is bounded
+//     like Linux (--match-seconds, kCaptureMatchWindow=20s): one StartMatch
+//     transaction, then CAPTURE completes (Match / NoMatch / Timeout) so
+//     WBF may open a new CAPTURE. CancelIoEx still ends the wait early.
 //   - Section 4's multi-user case (several macOS fingers under different
 //     macosUserId on one T2) is not handled: kDefaultMacosUserId is the
 //     only identity this build ever asks the SEP about. Per design doc 4
@@ -257,15 +253,13 @@ using t2::biometrickit::IdentityRecordV1;
 // macOS user id was actually enrolled, until a real settings UI exists.
 constexpr uint32_t kDefaultMacosUserId = 501;
 
-// No longer a "safety net" for the normal Hello wait: VerificationEngine::
-// Verify() now waits with NO deadline at all whenever cancelEvent is
-// non-null (the case here) - Windows alone decides when CAPTURE_DATA ends,
-// via CancelIoEx, per explicit design direction (§9.4). This constant only
-// still matters as a last-resort fallback bound for the (unexpected) case
-// where GetCaptureCancelEvent() returns null - e.g. the process-wide cancel
-// event failed to create at startup - so the capture does not wait forever
-// with no way to be cancelled at all in that specific failure mode.
-constexpr std::chrono::seconds kCaptureMatchWindow{60};
+// Linux parity (t2-fprintd.py --match-seconds default=20.0): each BiometricKit
+// verify is one bounded transaction (StartMatch → events → Cancel), not an
+// unbounded wait. After Match / NoMatch / Timeout the CAPTURE_DATA completes
+// and Windows Hello may open a fresh CAPTURE (re-open verify). CancelIoEx
+// still ends the wait early. Suspend still aborts the live match (cmd 0x0c)
+// without requiring an infinite hold on SEP.
+constexpr std::chrono::seconds kCaptureMatchWindow{20};
 
 // Only one CAPTURE_DATA may be in flight at a time (design doc 6, mirroring
 // VerificationEngine::IsBusy()'s existing single-session rule at the WBDI
@@ -492,10 +486,17 @@ void InvalidateActiveCapture(_In_z_ const char* source, bool resetResumeEvent, b
         std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
         g_stickyNcm.valid = false;
     }
+    // Linux parity: if StartMatch is live on an open BridgeXPC socket, send
+    // biometric Cancel (cmd 0x0c) *before* waking the worker. Otherwise the
+    // worker's CancelGuard races NCM MiniportPause / D0Exit and the cancel
+    // may never reach SEP (Touch Bar left in capture mode).
+    t2::biometrickit::BestEffortCancelActiveMatch();
+
     HANDLE cancelEvent = GetCaptureCancelEvent();
-    if (cancelEvent) SetEvent(cancelEvent); // interrupts only the active BiometricKit operation
-    T2BioLog("%s: invalidated active fingerprint result; aborting BiometricKit match; "
-             "keeping WBF CAPTURE_DATA pending", source);
+    if (cancelEvent) SetEvent(cancelEvent); // interrupts WaitForEvent if still blocked
+    T2BioLog("%s: invalidated active fingerprint result; aborting BiometricKit match "
+             "(cmd 0x0c best-effort if session was live); keeping WBF CAPTURE_DATA pending",
+             source);
 }
 
 void BeginCaptureSuspend(_In_z_ const char* source)
@@ -638,6 +639,8 @@ std::vector<std::pair<WDFREQUEST, CancelTrack*>> g_cancelTracks;
 VOID EvtCaptureCancel(_In_ WDFREQUEST Request)
 {
     T2BioLog("CAPTURE_DATA: EvtCaptureCancel fired (Windows called CancelIoEx)");
+    // Same ordering as suspend: cmd 0x0c on the live socket first, then wake.
+    t2::biometrickit::BestEffortCancelActiveMatch();
     HANDLE cancelEvent = GetCaptureCancelEvent();
     if (cancelEvent) {
         SetEvent(cancelEvent); // wakes the blocked Verify()/WaitForEvent() loop
@@ -1397,10 +1400,16 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
                 break;
             }
             if (outcome == VerifyOutcome::NoMatch) {
-                T2BioLog("CAPTURE_DATA(verify): no match; starting the next complete "
-                         "Linux-order BiometricKit verify under the same pending WBF request");
-                continue;
+                // Linux fprintd ends the verify transaction on no-match; the
+                // client may start a new one. Complete this CAPTURE so WBF can
+                // re-issue CAPTURE_DATA (re-open verify) instead of holding one
+                // IOCTL open across unbounded retries.
+                T2BioLog("CAPTURE_DATA(verify): no match — completing CAPTURE "
+                         "(WBF may open a new verify, Linux-style)");
+                break;
             }
+            // Timeout / Match / Rejected / Unstable / Malformed: end this CAPTURE.
+            // Timeout is the normal "finger not presented within matchWindow" path.
             break;
         }
     }
@@ -1530,8 +1539,8 @@ void ProcessCapture(_In_ WDFREQUEST Request, const CaptureKey& key)
 }
 
 // 24.09.2026: CAPTURE_DATA(verify) must not wait inside EvtIoDeviceControl.
-// By design it stays pending with no deadline (design doc 9.4) - and while it
-// did so on the framework's callback thread, Windows' CancelIoEx (Win+L,
+// It can stay pending up to matchWindow (and across display-off park) on a
+// worker thread; if it ran on the framework callback thread, CancelIoEx (Win+L,
 // switching to the lock screen, password fallback) apparently could not be
 // serviced: hardware log, 24.09.2026 - the fourth CAPTURE sat in StartMatch,
 // Win+L did nothing, no EvtCaptureCancel was logged, and the cancel only
@@ -1713,13 +1722,13 @@ extern "C" VOID T2BioEvtIoDeviceControl(_In_ WDFQUEUE Queue,
 // queue: wait for every outstanding request to complete, be acknowledged,
 // or be requeued before letting the device leave D0.
 //
-// The one request ever left outstanding here is CAPTURE_DATA(verify)
-// (HandleCaptureVerify above): by design (§9.4) it blocks with NO deadline
-// until a touch or Windows' own CancelIoEx. A system sleep triggers
-// neither, so with no EvtIoStop, sleep entry wound up waiting on a
-// fingerprint touch that was never coming (hardware log: last CAPTURE_DATA
-// sits in StartMatch, then two "IPC detected that the message to host timed
-// out"). UMDF eventually kills the stalled WUDFHost.exe host process
+// The one request that can still be outstanding across a power transition is
+// CAPTURE_DATA(verify) (HandleCaptureVerify): it may be in StartMatch or
+// parked for display-off. A system sleep does not deliver CancelIoEx, so with
+// no EvtIoStop, sleep entry used to wait on a fingerprint touch that was
+// never coming (hardware log: last CAPTURE_DATA sits in StartMatch, then two
+// "IPC detected that the message to host timed out"). UMDF eventually kills
+// the stalled WUDFHost.exe host process
 // (Event 10110, Problem=3, ExitCode=259); enough of those and Device
 // Manager gives up on the device for the rest of the boot (Event 10111,
 // RestartCount=5) -> Code 43, fingerprint unlock dead until reboot.

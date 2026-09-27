@@ -194,15 +194,10 @@ public:
     // -> disconnect. Every step's failure maps to a fail-closed outcome;
     // nothing here ever converts a transport success into an implicit MATCH.
     //
-    // cancelEvent (design doc §9.4): optional, defaults to nullptr so the
-    // CLI's one-shot `verify` (fixed matchWindow, no external cancel
-    // source) is unaffected. When the WBDI caller (Queue.cpp) has one — an
-    // event it signals from its WdfRequestMarkCancelable cancel routine —
-    // it is forwarded to every Connection::WaitForEvent call in the match
-    // loop below. Only the event-loop wait is covered; RunLinuxReadySequence
-    // (reset/load-calibration/identity-list, all short fixed-timeout
-    // request/reply round-trips, not the long touch-and-wait) is not, same
-    // scope the design doc itself describes for this mechanism.
+    // cancelEvent: optional early abort (WBF CancelIoEx / suspend). Defaults
+    // to nullptr for CLI one-shot verify. When set, WaitForEvent still ends
+    // at matchWindow if nothing arrives — Linux-style bounded transaction.
+    // RunLinuxReadySequence remains short fixed-timeout round-trips only.
     //
     // outHighestOrdinalSeen (26.09.2026, optional, defaults to nullptr for
     // the CLI): set to the highest event `ordinal` value (MatchResult.h)
@@ -230,5 +225,13 @@ private:
     VerifyConfig config_;
     bool busy_ = false;
 };
+
+// Best-effort biometric Cancel (cmd 0x0c) on the in-flight StartMatch session,
+// if any. Safe to call from a power/suspend or CancelIoEx path *before*
+// signaling cancelEvent: when a BridgeXPC connection still has an active match,
+// this mirrors Linux (bridge-xpc-probe always sends cmd 12 on the live socket
+// before tearing the session down). No-op if no match is registered.
+// Double-call is idempotent (second call is a no-op until the next StartMatch).
+void BestEffortCancelActiveMatch();
 
 } // namespace t2::biometrickit
