@@ -25,6 +25,16 @@
 DEFINE_GUID(GUID_DEVINTERFACE_T2TOUCHID_TRANSPORT,
     0x6e0f1a7c, 0x6b7a, 0x4e7a, 0x9c, 0x6d, 0x2c, 0x6b, 0x1e, 0x7f, 0x3a, 0x10);
 
+// Scope INITGUID to just this header (same pattern as
+// driver/T2TouchIdBio/umdf/Internal.h). Without this #undef, INITGUID stays
+// defined for the rest of the translation unit, so any later independent
+// <winioctl.h> include in the same TU (e.g. protocol/BridgeXpc/TransportMode.h)
+// re-runs winioctl.h's DEFINE_GUID block and collides with the definitions
+// already emitted above - that's the C2374 "redefinition; multiple
+// initialization" seen in tools/t2touchid (main.cpp includes this header via
+// Client.h, then includes TransportMode.h later in the same file).
+#undef INITGUID
+
 #define T2_AKS_MAX_BODY_SIZE   (0x4000 - 0x50 - sizeof(UINT32)) // OOL_SIZE - V2 wire header
 
 // Allow-listed AppleKeyStore operations. Values match the Linux reference
