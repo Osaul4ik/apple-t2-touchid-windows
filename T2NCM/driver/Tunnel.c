@@ -233,6 +233,24 @@ VOID T2NcmTunnelNoteLocalFromIpv6Frame(
     DeviceContext->TunnelLocalIpv6Valid = TRUE;
 }
 
+VOID T2NcmTunnelNoteLocalFromIpv4Frame(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext,
+    _In_reads_bytes_(4) const UCHAR* SrcIpv4)
+{
+    BOOLEAN wasValid = DeviceContext->TunnelLocalIpv4Valid;
+
+    if (!wasValid || !RtlEqualMemory(DeviceContext->TunnelLocalIpv4, SrcIpv4, 4)) {
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
+            "T2Ncm: tunnel local IPv4 %s (from host's own outbound frame): "
+            "%u.%u.%u.%u\n",
+            wasValid ? "changed to" : "learned",
+            SrcIpv4[0], SrcIpv4[1], SrcIpv4[2], SrcIpv4[3]));
+    }
+
+    RtlCopyMemory(DeviceContext->TunnelLocalIpv4, SrcIpv4, 4);
+    DeviceContext->TunnelLocalIpv4Valid = TRUE;
+}
+
 BOOLEAN T2NcmTunnelRewriteTxIpv4ToIpv6(
     _In_ PT2NCM_DEVICE_CONTEXT DeviceContext,
     _Inout_updates_bytes_(BufferCapacity) PUCHAR Frame,
@@ -292,6 +310,12 @@ BOOLEAN T2NcmTunnelRewriteTxIpv4ToIpv6(
         return TRUE;
     if (Frame[14 + 16] != 169 || Frame[14 + 17] != 254)
         return TRUE; // not APIPA dest
+
+    // This is genuinely Windows' own frame, source address and all —
+    // learn it as our real APIPA address before anything below rewrites
+    // the header. See TunnelLocalIpv4 in driver.h for why this can't
+    // just be hardcoded to a fixed 169.254.x.y.
+    T2NcmTunnelNoteLocalFromIpv4Frame(DeviceContext, Frame + 14 + 12);
 
     ihl = Frame[14] & 0x0F;
     ipHdrLen = (ULONG)ihl * 4;
@@ -422,8 +446,16 @@ BOOLEAN T2NcmTunnelRewriteRxIpv6ToIpv4(
         src4[0] = 169; src4[1] = 254;
         src4[2] = (UCHAR)a; src4[3] = (UCHAR)b;
     }
-    // Host APIPA: fixed 169.254.84.1 (GUI documents assigning this on the adapter).
-    dst4[0] = 169; dst4[1] = 254; dst4[2] = 84; dst4[3] = 1;
+    // Host APIPA: prefer the address learned from the host's own outbound
+    // traffic (see TunnelLocalIpv4 in driver.h) — standard Windows APIPA
+    // autoconfiguration does not pick a fixed address, so a hardcoded
+    // 169.254.84.1 here only works if that exact address was statically
+    // assigned. Fall back to it only until something real is learned.
+    if (DeviceContext->TunnelLocalIpv4Valid) {
+        RtlCopyMemory(dst4, DeviceContext->TunnelLocalIpv4, 4);
+    } else {
+        dst4[0] = 169; dst4[1] = 254; dst4[2] = 84; dst4[3] = 1;
+    }
 
     newFl = 14 + 20 + payloadLen;
     // Collapse: move L4 down over the extra 20 bytes of IPv6.

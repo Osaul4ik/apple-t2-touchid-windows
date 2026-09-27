@@ -268,6 +268,23 @@ typedef struct _T2NCM_DEVICE_CONTEXT
     // learned yet" condition once per outage, not once per frame.
     BOOLEAN              TunnelLocalIpv6UnknownLogged;
 
+    // Windows' real IPv4 address on this adapter (APIPA, 169.254/16),
+    // learned passively from the source address of the host's own
+    // outbound 169.254/16 frame in T2NcmTunnelRewriteTxIpv4ToIpv6 —
+    // BEFORE that function overwrites the header. Used by the RX
+    // rewrite as the destination address of every inbound datagram it
+    // hands to NDIS. Standard Windows APIPA autoconfiguration picks a
+    // pseudo-random address in 169.254/16, not a fixed one, so a
+    // hardcoded destination (e.g. 169.254.84.1) only matches by luck or
+    // manual static configuration; on any mismatch the TCP/IP stack
+    // silently drops every inbound datagram as "not for this host"
+    // after NDIS has already indicated it — which looks exactly like
+    // RxFramesIndicated climbing normally while every connect() still
+    // times out. Falls back to a fixed 169.254.84.1 only until this is
+    // learned (matches the documented manual-assignment convention).
+    BOOLEAN              TunnelLocalIpv4Valid;
+    UCHAR                TunnelLocalIpv4[4];
+
     // ---- NDIS ----
     NDIS_HANDLE          MiniportAdapterHandle;   // from MiniportInitializeEx
     NDIS_HANDLE          RxNblPool;               // NET_BUFFER_LIST pool for indications

@@ -44,3 +44,13 @@ VOID T2NcmTunnelNoteLocalFromIpv6Frame(
     _In_reads_bytes_(FrameLength) const UCHAR* Frame,
     _In_ ULONG FrameLength
     );
+
+// TX: given the host's own outbound 169.254/16 frame BEFORE rewrite,
+// remember its IPv4 source address as Windows' real APIPA address on
+// this adapter. Called from T2NcmTunnelRewriteTxIpv4ToIpv6 once the
+// frame has already been identified as IPv4-to-169.254/16, so it costs
+// nothing on any other path.
+VOID T2NcmTunnelNoteLocalFromIpv4Frame(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext,
+    _In_reads_bytes_(4) const UCHAR* SrcIpv4
+    );
