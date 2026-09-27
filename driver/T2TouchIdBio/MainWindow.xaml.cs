@@ -34,7 +34,66 @@ namespace T2TouchId.SepVaultGui
             InitializeComponent();
             LoadSepStatus();
             LoadLogFlags();
+            LoadTransportMode();
         }
+
+
+        // ---- Network transport mode (HKLM\SOFTWARE\T2TouchId\Network) ----
+        private const string NetworkRegPath = @"SOFTWARE\T2TouchId\Network";
+        private bool _transportLoading;
+
+        private void LoadTransportMode()
+        {
+            _transportLoading = true;
+            try
+            {
+                bool tunnel = false;
+                try
+                {
+                    using var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(NetworkRegPath, false);
+                    if (key?.GetValue("TransportMode") is int i)
+                        tunnel = i == 1;
+                }
+                catch { /* default native */ }
+                Ipv4TunnelCheck.IsChecked = tunnel;
+                TransportStatusText.Text = tunnel
+                    ? "Режим: IPv4 tunnel (TransportMode=1)."
+                    : "Режим: Native IPv6 (TransportMode=0).";
+                TransportStatusText.Foreground = new SolidColorBrush(Color.FromRgb(0x66, 0x66, 0x66));
+            }
+            finally
+            {
+                _transportLoading = false;
+            }
+        }
+
+        private void OnTransportModeChanged(object sender, RoutedEventArgs e)
+        {
+            if (_transportLoading) return;
+            try
+            {
+                using var key = Microsoft.Win32.Registry.LocalMachine.CreateSubKey(NetworkRegPath, true);
+                if (key == null)
+                    throw new UnauthorizedAccessException();
+                int mode = Ipv4TunnelCheck.IsChecked == true ? 1 : 0;
+                key.SetValue("TransportMode", mode, Microsoft.Win32.RegistryValueKind.DWord);
+                TransportStatusText.Text = mode == 1
+                    ? "Збережено: IPv4 tunnel. Перезапустіть T2TouchIdBio (і за потреби T2Ncm), додайте 169.254.84.1 на адаптер T2Ncm."
+                    : "Збережено: Native IPv6.";
+                TransportStatusText.Foreground = DotOk;
+            }
+            catch (UnauthorizedAccessException)
+            {
+                TransportStatusText.Text = "Немає прав на HKLM — запустіть GUI від імені адміністратора.";
+                TransportStatusText.Foreground = DotError;
+            }
+            catch (Exception ex)
+            {
+                TransportStatusText.Text = "Помилка запису: " + ex.Message;
+                TransportStatusText.Foreground = DotError;
+            }
+        }
+
 
         private void OnRefreshStatus(object sender, RoutedEventArgs e) => LoadSepStatus();
 

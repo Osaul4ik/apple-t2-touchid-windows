@@ -111,6 +111,18 @@
                 </StackPanel>
             </Border>
 
+            <Border Style="{StaticResource Card}">
+                <StackPanel>
+                    <TextBlock Style="{StaticResource SectionHeader}" Text="Мережа — BridgeXPC транспорт"/>
+                    <TextBlock TextWrapping="Wrap" Foreground="#666666" FontSize="12" Margin="0,0,0,10"
+                               Text="Якщо Cisco/WFP ріже весь IPv6, увімкніть IPv4 tunnel: userspace AF_INET (169.254.x.y), T2Ncm переписує в IPv6 на USB. HKLM\SOFTWARE\T2TouchId\Network\TransportMode. Потрібен адмін; після зміни — перезапуск Bio/NCM."/>
+                    <CheckBox x:Name="Ipv4TunnelCheck" Content="IPv4 tunnel (обхід блокування IPv6)" Margin="0,0,0,6" Checked="OnTransportModeChanged" Unchecked="OnTransportModeChanged"/>
+                    <TextBlock TextWrapping="Wrap" Foreground="#666666" FontSize="11" Margin="0,0,0,4"
+                               Text="Рекомендовано на інтерфейсі T2Ncm: IPv4 169.254.84.1/16 і neighbor 169.254.x.y → MAC T2 (після першого RX tunnel сам запам'ятає peer fe80)."/>
+                    <TextBlock x:Name="TransportStatusText" TextWrapping="Wrap" Foreground="#666666" FontSize="11"/>
+                </StackPanel>
+            </Border>
+
             <!-- ===================== Vault import card ===================== -->
             <Border Style="{StaticResource Card}">
                 <StackPanel>

@@ -16,6 +16,7 @@
 // trade than one memcpy per frame on a 480 Mbit/s link.
 
 #include "NcmRx.h"
+#include "Tunnel.h"
 #include "Device.h"
 #include "NdisMiniport.h"
 
@@ -567,19 +568,36 @@ T2NcmRxParseNtb(
             {
                 const UCHAR* frame = Buffer + entry.wDatagramIndex;
                 PNET_BUFFER_LIST nbl;
+                UCHAR tunFrame[T2NCM_MAX_FRAME_SIZE];
+                ULONG tunLen = entry.wDatagramLength;
+                const UCHAR* deliver = frame;
+
+                if (tunLen <= sizeof(tunFrame))
+                {
+                    RtlCopyMemory(tunFrame, frame, tunLen);
+                    if (T2NcmTunnelRewriteRxIpv6ToIpv4(DeviceContext, tunFrame, &tunLen))
+                    {
+                        deliver = tunFrame;
+                    }
+                    else
+                    {
+                        tunLen = entry.wDatagramLength;
+                        deliver = frame;
+                    }
+                }
 
                 // Diagnostic snapshot, kept from the pre-NDIS milestone: it
                 // is still the quickest way to tell "the parser is fine and
                 // NDIS is dropping them" apart from "nothing is arriving".
-                RtlCopyMemory(DeviceContext->RxLastFrameDest, frame, 6);
-                RtlCopyMemory(DeviceContext->RxLastFrameSrc, frame + 6, 6);
+                RtlCopyMemory(DeviceContext->RxLastFrameDest, deliver, 6);
+                RtlCopyMemory(DeviceContext->RxLastFrameSrc, deliver + 6, 6);
                 DeviceContext->RxLastFrameEtherType =
-                    (USHORT)((frame[12] << 8) | frame[13]); // network byte order
-                DeviceContext->RxLastFrameLength = entry.wDatagramLength;
+                    (USHORT)((deliver[12] << 8) | deliver[13]); // network byte order
+                DeviceContext->RxLastFrameLength = tunLen;
 
                 InterlockedIncrement64(&DeviceContext->RxFramesParsed);
 
-                if (!T2NcmRxAcceptsFrame(DeviceContext, frame))
+                if (!T2NcmRxAcceptsFrame(DeviceContext, deliver))
                 {
                     InterlockedIncrement64(&DeviceContext->RxFramesFiltered);
                     // Filtered out by OID_GEN_CURRENT_PACKET_FILTER. Not an
@@ -588,7 +606,7 @@ T2NcmRxParseNtb(
                     continue;
                 }
 
-                nbl = T2NcmRxBuildNbl(DeviceContext, frame, entry.wDatagramLength);
+                nbl = T2NcmRxBuildNbl(DeviceContext, deliver, tunLen);
                 if (nbl == NULL)
                 {
                     InterlockedIncrement64(&DeviceContext->InDiscards);
@@ -606,7 +624,7 @@ T2NcmRxParseNtb(
                 nblTail = nbl;
                 NET_BUFFER_LIST_NEXT_NBL(nbl) = NULL;
 
-                InterlockedAdd64(&DeviceContext->InOctets, (LONG64)entry.wDatagramLength);
+                InterlockedAdd64(&DeviceContext->InOctets, (LONG64)tunLen);
                 if (frame[0] & 0x01)
                 {
                     if (frame[0] == 0xFF && frame[1] == 0xFF && frame[2] == 0xFF &&

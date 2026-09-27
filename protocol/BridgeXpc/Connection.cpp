@@ -2,6 +2,7 @@
 // Connection.cpp
 #include "Connection.h"
 #include "Log.h"
+#include "TransportMode.h"
 #include "Winsock.h"
 #include <ws2tcpip.h>
 #include <rpc.h>
@@ -119,36 +120,74 @@ static std::vector<uint8_t> BuildClientHeloBody(int64_t bridgeXpcVersion) {
 ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned long interfaceIndex,
                                    uint16_t port, std::chrono::milliseconds connectTimeout) {
     connectionLost_ = false;
-    T2_LOG("connect", L"connect begin: ifIndex=%lu port=%u timeout=%lldms",
+    const auto mode = t2::transport::ReadTransportMode();
+    const bool tunnel = (mode == t2::transport::TransportMode::Ipv4Tunnel);
+    T2_LOG("connect", L"connect begin: ifIndex=%lu port=%u timeout=%lldms mode=%s",
            interfaceIndex, static_cast<unsigned>(port),
-           static_cast<long long>(connectTimeout.count()));
+           static_cast<long long>(connectTimeout.count()),
+           tunnel ? L"Ipv4Tunnel" : L"NativeIpv6");
     if (!t2::EnsureWinsock()) {
         T2_LOG("connect", L"WSAStartup failed");
         return ConnectResult::ConnectFailed;
     }
-    socket_ = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
-    if (socket_ == INVALID_SOCKET) {
-        T2_LOG("connect", L"socket() failed, WSAGetLastError=%d", WSAGetLastError());
-        return ConnectResult::ConnectFailed;
+
+    if (tunnel) {
+        const in_addr peer4 = t2::transport::MapPeerToIpv4(linkLocalAddress);
+        socket_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (socket_ == INVALID_SOCKET) {
+            T2_LOG("connect", L"socket(AF_INET) failed, WSAGetLastError=%d", WSAGetLastError());
+            return ConnectResult::ConnectFailed;
+        }
+        SetSocketTimeout(socket_, SO_RCVTIMEO, connectTimeout);
+        SetSocketTimeout(socket_, SO_SNDTIMEO, connectTimeout);
+        // Force the T2 NCM interface (Cisco/VPN often has a default route that
+        // would otherwise steal 169.254/16).
+        DWORD ifIndexNet = htonl(static_cast<DWORD>(interfaceIndex));
+        if (setsockopt(socket_, IPPROTO_IP, IP_UNICAST_IF,
+                       reinterpret_cast<const char*>(&ifIndexNet),
+                       sizeof(ifIndexNet)) != 0) {
+            T2_LOG("connect", L"IP_UNICAST_IF ifIndex=%lu failed WSA=%d (continuing)",
+                   interfaceIndex, WSAGetLastError());
+        }
+        sockaddr_in addr4{};
+        addr4.sin_family = AF_INET;
+        addr4.sin_port = htons(port);
+        addr4.sin_addr = peer4;
+        T2_LOG("connect", L"Ipv4Tunnel peer %u.%u.%u.%u:%u ifIndex=%lu",
+               peer4.S_un.S_un_b.s_b1, peer4.S_un.S_un_b.s_b2,
+               peer4.S_un.S_un_b.s_b3, peer4.S_un.S_un_b.s_b4,
+               static_cast<unsigned>(port), interfaceIndex);
+        if (connect(socket_, reinterpret_cast<sockaddr*>(&addr4), sizeof(addr4)) != 0) {
+            T2_LOG("connect", L"connect(AF_INET) failed WSA=%d — need T2Ncm tunnel rewrite + "
+                   L"IPv4 neighbor for mapped 169.254 address",
+                   WSAGetLastError());
+            Close();
+            return ConnectResult::ConnectFailed;
+        }
+        T2_LOG("connect", L"TCP connected (IPv4 tunnel): ifIndex=%lu port=%u (waiting for peer HELO)",
+               interfaceIndex, static_cast<unsigned>(port));
+    } else {
+        socket_ = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+        if (socket_ == INVALID_SOCKET) {
+            T2_LOG("connect", L"socket(AF_INET6) failed, WSAGetLastError=%d", WSAGetLastError());
+            return ConnectResult::ConnectFailed;
+        }
+        SetSocketTimeout(socket_, SO_RCVTIMEO, connectTimeout);
+        SetSocketTimeout(socket_, SO_SNDTIMEO, connectTimeout);
+        sockaddr_in6 addr{};
+        addr.sin6_family = AF_INET6;
+        addr.sin6_port = htons(port);
+        addr.sin6_addr = linkLocalAddress;
+        addr.sin6_scope_id = interfaceIndex;
+        if (connect(socket_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+            T2_LOG("connect", L"connect() to port %u ifIndex=%lu failed, WSAGetLastError=%d",
+                   port, interfaceIndex, WSAGetLastError());
+            Close();
+            return ConnectResult::ConnectFailed;
+        }
+        T2_LOG("connect", L"TCP connected: ifIndex=%lu port=%u (waiting for peer HELO)",
+               interfaceIndex, static_cast<unsigned>(port));
     }
-
-    SetSocketTimeout(socket_, SO_RCVTIMEO, connectTimeout);
-    SetSocketTimeout(socket_, SO_SNDTIMEO, connectTimeout);
-
-    sockaddr_in6 addr{};
-    addr.sin6_family = AF_INET6;
-    addr.sin6_port = htons(port);
-    addr.sin6_addr = linkLocalAddress;
-    addr.sin6_scope_id = interfaceIndex; // required for link-local (fe80::/10)
-
-    if (connect(socket_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-        T2_LOG("connect", L"connect() to port %u ifIndex=%lu failed, WSAGetLastError=%d",
-               port, interfaceIndex, WSAGetLastError());
-        Close();
-        return ConnectResult::ConnectFailed;
-    }
-    T2_LOG("connect", L"TCP connected: ifIndex=%lu port=%u (waiting for peer HELO)",
-           interfaceIndex, static_cast<unsigned>(port));
 
     // T2 sends HELO first (VERIFIED FROM SOURCE, Milestone 1 section 7).
     RawFrame helo;

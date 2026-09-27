@@ -8,6 +8,7 @@
 // assumptions, no guessed padding.
 
 #include "NcmTx.h"
+#include "Tunnel.h"
 #include "Device.h"
 #include "NdisMiniport.h"
 
@@ -397,8 +398,14 @@ T2NcmTxSubmitNetBuffer(
 
     frameLength = NET_BUFFER_DATA_LENGTH(NetBuffer);
 
-    status = T2NcmTxComputeLayout(DeviceContext, frameLength,
+    // +20 headroom so IPv4→IPv6 tunnel rewrite can expand the datagram.
+    status = T2NcmTxComputeLayout(DeviceContext, frameLength + 20,
         &ndpOffset, &ndpLength, &datagramOffset, &blockLength);
+    if (!NT_SUCCESS(status))
+    {
+        status = T2NcmTxComputeLayout(DeviceContext, frameLength,
+            &ndpOffset, &ndpLength, &datagramOffset, &blockLength);
+    }
     if (!NT_SUCCESS(status))
     {
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
@@ -441,6 +448,22 @@ T2NcmTxSubmitNetBuffer(
     if (frameData != (PVOID)(buffer + datagramOffset))
     {
         RtlCopyMemory(buffer + datagramOffset, frameData, frameLength);
+    }
+
+    {
+        ULONG tunLen = frameLength;
+        ULONG capacity = blockLength - datagramOffset;
+        if (T2NcmTunnelRewriteTxIpv4ToIpv6(DeviceContext,
+                buffer + datagramOffset, &tunLen, capacity) &&
+            tunLen != frameLength && tunLen <= 0xFFFF)
+        {
+            frameLength = tunLen;
+            {
+                PT2NCM_WIRE_NDP16_ENTRY_TX entries =
+                    (PT2NCM_WIRE_NDP16_ENTRY_TX)(buffer + ndpOffset + T2NCM_TX_NDP16_HEADER_LEN);
+                entries[0].wDatagramLength = (USHORT)frameLength;
+            }
+        }
     }
 
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, T2NCM_TX_REQUEST_CONTEXT);
