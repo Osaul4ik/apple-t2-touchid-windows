@@ -37,7 +37,7 @@ rem ============================================================
 rem 1. Install certificate
 rem ============================================================
 
-echo [1/5] Installing certificates...
+echo [1/6] Installing certificates...
 echo.
 
 if not exist "%ROOT%Inst\InstallCert.bat" (
@@ -66,7 +66,7 @@ rem ============================================================
 rem 2. Install SEP T2TouchIdTransport
 rem ============================================================
 
-echo [2/5] Installing SEP T2TouchIdTransport...
+echo [2/6] Installing SEP T2TouchIdTransport...
 echo.
 
 if not exist "%ROOT%SEP\T2TouchIdTransport.inf" (
@@ -95,7 +95,7 @@ rem ============================================================
 rem 3. Install NCM composite and refresh device list
 rem ============================================================
 
-echo [3/5] Installing Apple T2 composite...
+echo [3/6] Installing Apple T2 composite...
 echo.
 
 if not exist "%ROOT%NCM\apple-t2-composite.inf" (
@@ -138,7 +138,7 @@ rem ============================================================
 rem 4. Install NCM drivers
 rem ============================================================
 
-echo [4/5] Installing Apple T2 NCM drivers...
+echo [4/6] Installing Apple T2 NCM drivers...
 echo.
 
 if not exist "%ROOT%NCM\apple-t2-ncm.inf" (
@@ -185,10 +185,36 @@ echo [OK] NCM drivers installed.
 echo.
 
 rem ============================================================
-rem 5. Install T2 Touch ID Bio driver
+rem 5. Assign the static IPv4 tunnel address to the T2Ncm adapter
+rem ============================================================
+rem Without this, the adapter has no IPv4 address at all right after a
+rem fresh install (Windows APIPA autoconfig is not instant, and this NCM
+rem link may not report media-connect promptly either) - the first
+rem Ipv4Tunnel connect attempt then has nothing to bind/route from and
+rem fails until 169.254.84.1 is added by hand in Network Settings. This
+rem step automates that one manual step; see Set-T2NcmStaticIp.ps1's own
+rem header comment for the full rationale. Best-effort: a failure here
+rem (e.g. Mac not plugged in yet, adapter not enumerated within 30s) does
+rem not abort the install - the script itself logs what to do instead.
+
+echo [5/6] Assigning static IPv4 to Apple T2 NCM adapter...
+echo.
+
+if not exist "%ROOT%Inst\Set-T2NcmStaticIp.ps1" (
+    echo [WARNING] Inst\Set-T2NcmStaticIp.ps1 not found next to this installer - skipping.
+    echo Add 169.254.84.1 to the T2Ncm adapter manually in Network Settings if IPv4 tunnel mode is needed.
+    echo.
+) else (
+    powershell.exe -NoProfile -ExecutionPolicy Bypass ^
+        -File "%ROOT%Inst\Set-T2NcmStaticIp.ps1"
+    echo.
+)
+
+rem ============================================================
+rem 6. Install T2 Touch ID Bio driver
 rem ============================================================
 
-echo [5/5] Installing T2 Touch ID biometric driver...
+echo [6/6] Installing T2 Touch ID biometric driver...
 echo.
 
 if not exist "%ROOT%Inst\Install-T2TouchIdBio.ps1" (
