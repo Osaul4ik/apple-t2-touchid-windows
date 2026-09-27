@@ -194,11 +194,24 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
     // comment in TransportMode.h for the full chain.
     t2::transport::PushTransportModeToDriver(configuredMode);
     bool fellBackFromIpv6 = false;
+    // Session cache: skip the redundant probe once NativeIpv6 has already
+    // failed this session and the backoff window hasn't elapsed yet. Only
+    // applies when TransportMode itself isn't already forcing the tunnel -
+    // that manual override always takes the tunnel path unconditionally,
+    // same as before this cache existed.
+    bool skippedNativeIpv6Probe = false;
+    if (!tunnel && t2::transport::ShouldSkipNativeIpv6Probe()) {
+        tunnel = true;
+        skippedNativeIpv6Probe = true;
+    }
     const auto attemptStart = std::chrono::steady_clock::now();
     T2_LOG("connect", L"connect begin: ifIndex=%lu port=%u timeout=%lldms mode=%s",
            interfaceIndex, static_cast<unsigned>(port),
            static_cast<long long>(connectTimeout.count()),
-           tunnel ? L"Ipv4Tunnel (forced)" : L"NativeIpv6 (default, may fall back)");
+           tunnel ? (skippedNativeIpv6Probe
+                        ? L"Ipv4Tunnel (NativeIpv6 probe skipped - still in backoff window from an earlier failure this session)"
+                        : L"Ipv4Tunnel (forced)")
+                  : L"NativeIpv6 (default, may fall back)");
     if (!t2::EnsureWinsock()) {
         T2_LOG("connect", L"WSAStartup failed");
         return ConnectResult::ConnectFailed;
@@ -227,6 +240,11 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
             SetSocketTimeout(socket_, SO_SNDTIMEO, connectTimeout);
             T2_LOG("connect", L"TCP connected: ifIndex=%lu port=%u (waiting for peer HELO)",
                    interfaceIndex, static_cast<unsigned>(port));
+            // Confirmed working THIS attempt - drop any backoff left over
+            // from an earlier outage in this session (VPN disconnected,
+            // screen unlocked, resumed from sleep, ...) so the very next
+            // call goes straight back to trying NativeIpv6 first too.
+            t2::transport::RecordNativeIpv6Success();
         } else {
             T2_LOG("connect", L"NativeIpv6 first connect did not complete within %lldms "
                    L"(WSAGetLastError=%d) - falling back to Ipv4Tunnel for this attempt",
@@ -235,6 +253,13 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
             socket_ = INVALID_SOCKET;
             tunnel = true;
             fellBackFromIpv6 = true;
+            // VPN just came up, screen just locked, machine just woke,
+            // Cisco/WFP profile dropping IPv6, ... whatever the cause,
+            // remember it for the rest of this boot session (see
+            // RecordNativeIpv6Failure's own comment for the backoff/
+            // recovery trade-off) so subsequent calls skip straight to
+            // the tunnel instead of re-paying this same 150ms timeout.
+            t2::transport::RecordNativeIpv6Failure();
         }
     }
 

@@ -42,6 +42,25 @@ inline constexpr wchar_t kTransportModeValue[] = L"TransportMode";
 inline constexpr wchar_t kPeerIpv6Value[] = L"PeerIpv6";
 inline constexpr wchar_t kPeerMacValue[] = L"PeerMac";
 
+// Separate from kNetworkRegPath on purpose: TransportMode/PeerIpv6/PeerMac
+// above are meant to persist (manual A/B override, last-known peer for the
+// driver's own PASSIVE-level refresh). This subkey is the opposite — an
+// auto-detected "NativeIpv6 is currently unreachable" cache that MUST NOT
+// survive a reboot (a VPN that was up last session may be gone, a Cisco
+// profile may have changed, and a stale "assume tunnel" left over from
+// weeks ago would silently defeat the native-first default forever).
+// Created with REG_OPTION_VOLATILE: the key and everything under it is
+// destroyed by the OS itself on shutdown/reboot, so there is no cross-boot
+// staleness to invalidate by hand — a fresh boot simply finds nothing here
+// and Connect() falls through to its normal NativeIpv6-first behavior.
+// This also means every t2touchid.exe invocation (a new process each time,
+// per the CLI's usage pattern) sees the same cache without needing a
+// long-running service — the registry is the shared, per-boot-lifetime
+// store across those separate processes.
+inline constexpr wchar_t kSessionRegPath[] = L"SOFTWARE\\T2TouchId\\Network\\Session";
+inline constexpr wchar_t kNextProbeTickValue[] = L"NextProbeTick64";   // QWORD, GetTickCount64() domain
+inline constexpr wchar_t kBackoffMsValue[] = L"BackoffMs";            // DWORD
+
 enum class TransportMode : DWORD {
     NativeIpv6 = 0,
     Ipv4Tunnel = 1,
@@ -68,6 +87,99 @@ inline TransportMode ReadTransportMode() {
 
 inline bool IsTunnelModeActive() {
     return ReadTransportMode() == TransportMode::Ipv4Tunnel;
+}
+
+// Session-lifetime "NativeIpv6 is currently unreachable" cache. This is
+// NOT the manual TransportMode override above — it is what lets
+// Connection::Connect() stop paying the 150ms NativeIpv6 probe on every
+// single call once that probe has already failed once in this boot
+// session (e.g. VPN up, laptop asleep, Cisco/WFP profile dropping IPv6),
+// while still recovering automatically and promptly once the condition
+// clears (VPN down, screen unlocked, resumed from sleep) — see the
+// backoff comment on RecordNativeIpv6Failure below for why a short,
+// growing window achieves that without any OS event hook (session
+// lock/unlock, power resume, network change) to listen for.
+//
+// kSessionRegPath's REG_OPTION_VOLATILE key means "reset after reboot"
+// requires no logic here at all: a fresh boot has no key, ReadValue
+// below fails closed to "don't skip, probe normally" exactly as if this
+// function didn't exist yet.
+inline bool ShouldSkipNativeIpv6Probe() {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kSessionRegPath, 0, KEY_READ, &key) != ERROR_SUCCESS) {
+        return false; // no cache yet (or a fresh boot) - probe as normal
+    }
+    ULONGLONG nextProbeTick = 0;
+    DWORD type = 0;
+    DWORD cb = sizeof(nextProbeTick);
+    const LONG err = RegQueryValueExW(key, kNextProbeTickValue, nullptr, &type,
+                                      reinterpret_cast<LPBYTE>(&nextProbeTick), &cb);
+    RegCloseKey(key);
+    if (err != ERROR_SUCCESS || type != REG_QWORD || cb != sizeof(nextProbeTick)) {
+        return false;
+    }
+    // GetTickCount64() is milliseconds since THIS boot - directly
+    // comparable to a value written earlier in the same boot session,
+    // which is the only kind of value this volatile key can ever hold.
+    return GetTickCount64() < nextProbeTick;
+}
+
+// Call when a NativeIpv6 probe (the 150ms first-connect attempt) times
+// out. Backs off exponentially (starting at kInitialBackoffMs, capped at
+// kMaxBackoffMs) so a VPN session that stays up for an hour costs one
+// 150ms probe plus a handful of doubling retries, not one every single
+// Connect() call - while kInitialBackoffMs is still short enough that
+// unlocking the screen or disconnecting the VPN a few seconds after the
+// most recent failure is picked back up on the very next call, not stuck
+// behind a long-since-irrelevant backoff from earlier in the session.
+inline void RecordNativeIpv6Failure() {
+    constexpr ULONGLONG kInitialBackoffMs = 5000;   // 5s
+    constexpr ULONGLONG kMaxBackoffMs = 60000;      // 60s ceiling
+
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, kSessionRegPath, 0, nullptr,
+                        REG_OPTION_VOLATILE, KEY_READ | KEY_WRITE, nullptr,
+                        &key, nullptr) != ERROR_SUCCESS) {
+        return; // best-effort cache; a failure here just means every call
+                 // keeps paying the 150ms probe, not a functional break
+    }
+
+    DWORD backoffMs = 0;
+    DWORD type = 0;
+    DWORD cb = sizeof(backoffMs);
+    if (RegQueryValueExW(key, kBackoffMsValue, nullptr, &type,
+                         reinterpret_cast<LPBYTE>(&backoffMs), &cb) != ERROR_SUCCESS ||
+        type != REG_DWORD || backoffMs == 0) {
+        backoffMs = static_cast<DWORD>(kInitialBackoffMs);
+    }
+
+    const ULONGLONG nextProbeTick = GetTickCount64() + backoffMs;
+    RegSetValueExW(key, kNextProbeTickValue, 0, REG_QWORD,
+                  reinterpret_cast<const BYTE*>(&nextProbeTick), sizeof(nextProbeTick));
+
+    const ULONGLONG doubled = static_cast<ULONGLONG>(backoffMs) * 2;
+    const DWORD nextBackoffMs = static_cast<DWORD>(
+        (doubled > kMaxBackoffMs) ? kMaxBackoffMs : doubled);
+    RegSetValueExW(key, kBackoffMsValue, 0, REG_DWORD,
+                  reinterpret_cast<const BYTE*>(&nextBackoffMs), sizeof(nextBackoffMs));
+    RegCloseKey(key);
+}
+
+// Call the moment a NativeIpv6 probe actually succeeds (including one
+// that only ran because ShouldSkipNativeIpv6Probe's backoff window had
+// elapsed). Clears the cache outright rather than just resetting the
+// backoff counter, so the very next Connect() call - and every one after
+// it - goes back to trying NativeIpv6 first at zero cost, instead of
+// carrying forward any stale backoff state from the outage that just
+// ended.
+inline void RecordNativeIpv6Success() {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kSessionRegPath, 0, KEY_SET_VALUE, &key) != ERROR_SUCCESS) {
+        return; // nothing cached - already the desired state
+    }
+    RegDeleteValueW(key, kNextProbeTickValue);
+    RegDeleteValueW(key, kBackoffMsValue);
+    RegCloseKey(key);
 }
 
 inline in_addr MapPeerToIpv4(const in6_addr& peer6) {
