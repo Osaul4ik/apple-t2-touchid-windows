@@ -132,7 +132,7 @@ VOID T2NcmTunnelRefreshMode(_In_ PT2NCM_DEVICE_CONTEXT DeviceContext)
     {
         HANDLE key2 = NULL;
         OBJECT_ATTRIBUTES oa2;
-        UNICODE_STRING path2 = RTL_CONSTANT_STRING(L"\Registry\Machine\SOFTWARE\T2TouchId\Network");
+        UNICODE_STRING path2 = path; /* same as TransportMode key */
         UNICODE_STRING peerName = RTL_CONSTANT_STRING(L"PeerIpv6");
         UCHAR pbuf[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + 16];
         ULONG plen = 0;
