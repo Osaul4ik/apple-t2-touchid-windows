@@ -163,13 +163,37 @@ VOID T2NcmTunnelNotePeerFromIpv6Frame(
     _In_reads_bytes_(FrameLength) const UCHAR* Frame,
     _In_ ULONG FrameLength)
 {
+    const UCHAR* newPeer;
+    BOOLEAN wasValid;
+
     if (FrameLength < 14 + 40)
         return;
     if (T2NcmReadBe16(Frame + 12) != T2NCM_ETH_TYPE_IPV6)
         return;
     if ((Frame[14] >> 4) != 6)
         return;
-    RtlCopyMemory(DeviceContext->TunnelPeerIpv6, Frame + 14 + 8, 16);
+
+    newPeer = Frame + 14 + 8;
+    wasValid = DeviceContext->TunnelPeerIpv6Valid;
+
+    // Log only on first learn or on an actual change (T2 re-addressed,
+    // e.g. after reboot) — this runs on every inbound IPv6 frame
+    // (including ND/ICMPv6 keepalives), so logging unconditionally here
+    // would be exactly the per-frame spam that was just removed from the
+    // TX/RX rewrite paths.
+    if (!wasValid || !RtlEqualMemory(DeviceContext->TunnelPeerIpv6, newPeer, 16)) {
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
+            "T2Ncm: tunnel peer %s: "
+            "%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x\n",
+            wasValid ? "changed to" : "learned",
+            newPeer[0], newPeer[1], newPeer[2], newPeer[3],
+            newPeer[4], newPeer[5], newPeer[6], newPeer[7],
+            newPeer[8], newPeer[9], newPeer[10], newPeer[11],
+            newPeer[12], newPeer[13], newPeer[14], newPeer[15]));
+        DeviceContext->TunnelTxPeerUnknownLogged = FALSE; // give the next outage its own log line
+    }
+
+    RtlCopyMemory(DeviceContext->TunnelPeerIpv6, newPeer, 16);
     DeviceContext->TunnelPeerIpv6Valid = TRUE;
 }
 
@@ -195,8 +219,20 @@ BOOLEAN T2NcmTunnelRewriteTxIpv4ToIpv6(
 
     if (!DeviceContext->TunnelModeEnabled)
         return TRUE;
-    if (!DeviceContext->TunnelPeerIpv6Valid)
+    if (!DeviceContext->TunnelPeerIpv6Valid) {
+        // Log once per outage, not once per frame — this is exactly the
+        // state a stuck port scan looks like from the driver's side (every
+        // SYN arrives here and gets silently dropped because RX hasn't
+        // learned a peer yet), so it's worth knowing about, but a full
+        // 16384-port scan would otherwise print this 16384 times.
+        if (!DeviceContext->TunnelTxPeerUnknownLogged) {
+            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
+                "T2Ncm: tunnel TX dropped - peer IPv6 not learned yet "
+                "(waiting on an inbound IPv6 frame, e.g. ND reply)\n"));
+            DeviceContext->TunnelTxPeerUnknownLogged = TRUE;
+        }
         return TRUE; // peer unknown yet — leave frame (will fail until RX learns)
+    }
 
     fl = *FrameLength;
     if (fl < 14 + 20)
@@ -256,9 +292,12 @@ BOOLEAN T2NcmTunnelRewriteTxIpv4ToIpv6(
         }
     }
 
+    // No per-packet T2NCM_LOG here: this runs on every TX'd TCP/UDP frame,
+    // so at DPFLTR_INFO_LEVEL it floods DebugView with one line per SYN
+    // during a port scan (16384 of them) and one per data segment in
+    // normal use. T2NcmTunnelRefreshMode already logs the mode transition
+    // once; that's the useful signal, not each rewritten frame.
     *FrameLength = newFl;
-    T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
-        "T2Ncm[POWER]: tunnel TX IPv4->IPv6 len %lu->%lu\n", fl, newFl));
     return TRUE;
 }
 
@@ -340,8 +379,7 @@ BOOLEAN T2NcmTunnelRewriteRxIpv6ToIpv4(
         T2NcmWriteBe16(tcp + 16, csum);
     }
 
+    // Same reasoning as the TX side above: no per-packet log.
     *FrameLength = newFl;
-    T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
-        "T2Ncm[POWER]: tunnel RX IPv6->IPv4 len %lu->%lu\n", fl, newFl));
     return TRUE;
 }

@@ -31,6 +31,7 @@
 #include <netioapi.h>
 #include <cstdint>
 #include <cstring>
+#include "Log.h"
 
 #pragma comment(lib, "Iphlpapi.lib")
 
@@ -161,9 +162,22 @@ inline void EnsureTunnelIpv4Neighbor(unsigned long ifIndex, const in_addr& peer4
     // to create (ALREADY_EXISTS included) must fall through to Set, which
     // overwrites the existing row's state and MAC unconditionally.
     const DWORD c = CreateIpNetEntry2(&row);
-    if (c != NO_ERROR) {
-        SetIpNetEntry2(&row);
+    const bool createdFresh = (c == NO_ERROR);
+    DWORD setResult = NO_ERROR;
+    if (!createdFresh) {
+        setResult = SetIpNetEntry2(&row);
     }
+    T2_LOG("tunnel", L"ARP neighbor %u.%u.%u.%u -> %02X-%02X-%02X-%02X-%02X-%02X "
+           L"ifIndex=%lu: %s (create=%lu%s)",
+           peer4.S_un.S_un_b.s_b1, peer4.S_un.S_un_b.s_b2,
+           peer4.S_un.S_un_b.s_b3, peer4.S_un.S_un_b.s_b4,
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+           ifIndex,
+           createdFresh ? L"created"
+                        : (setResult == NO_ERROR ? L"updated existing row"
+                                                  : L"UPDATE FAILED"),
+           c,
+           createdFresh ? L"" : (setResult == NO_ERROR ? L", set=OK" : L", set FAILED"));
 }
 
 
@@ -173,12 +187,17 @@ inline void PushTunnelPeerToDriver(const in6_addr& peer6) {
                            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) {
+        T2_LOG("tunnel", L"PushTunnelPeerToDriver: could not open \\\\.\\T2Ncm "
+               L"(GetLastError=%lu) - driver may not be loaded", GetLastError());
         return;
     }
     DWORD returned = 0;
     const DWORD code = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x902, METHOD_BUFFERED, FILE_WRITE_ACCESS);
-    DeviceIoControl(h, code, (LPVOID)&peer6, (DWORD)sizeof(peer6),
-                    nullptr, 0, &returned, nullptr);
+    BOOL ok = DeviceIoControl(h, code, (LPVOID)&peer6, (DWORD)sizeof(peer6),
+                              nullptr, 0, &returned, nullptr);
+    if (!ok) {
+        T2_LOG("tunnel", L"PushTunnelPeerToDriver: IOCTL failed, GetLastError=%lu", GetLastError());
+    }
     CloseHandle(h);
 }
 
@@ -186,6 +205,10 @@ inline void PushTunnelPeerToDriver(const in6_addr& peer6) {
 inline void PrepareTunnelPeer(unsigned long ifIndex, const in6_addr& peer6) {
     UCHAR mac[6]{};
     const bool haveMac = LookupPeerMac(ifIndex, peer6, mac);
+    T2_LOG("tunnel", L"PrepareTunnelPeer: ifIndex=%lu peer=%02x%02x:%02x%02x mac=%s",
+           ifIndex, peer6.s6_addr[12], peer6.s6_addr[13],
+           peer6.s6_addr[14], peer6.s6_addr[15],
+           haveMac ? L"found" : L"NOT FOUND (ARP neighbor will not be set - tunnel will not work)");
     PublishTunnelPeer(peer6, haveMac ? mac : nullptr);
     PushTunnelPeerToDriver(peer6);
     if (haveMac) {

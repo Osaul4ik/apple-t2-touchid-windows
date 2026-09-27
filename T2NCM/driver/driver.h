@@ -246,6 +246,12 @@ typedef struct _T2NCM_DEVICE_CONTEXT
     BOOLEAN              TunnelModeEnabled;
     BOOLEAN              TunnelPeerIpv6Valid;
     UCHAR                TunnelPeerIpv6[16];
+    // Set the first time a TX frame is dropped (not rewritten) because
+    // TunnelPeerIpv6Valid is still FALSE; cleared as soon as the peer is
+    // learned. Without this a scan that starts before RX has learned the
+    // peer would log the same "peer unknown" line once per probed port
+    // instead of once per outage.
+    BOOLEAN              TunnelTxPeerUnknownLogged;
 
     // ---- NDIS ----
     NDIS_HANDLE          MiniportAdapterHandle;   // from MiniportInitializeEx
