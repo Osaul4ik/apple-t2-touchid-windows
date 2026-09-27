@@ -21,6 +21,7 @@
 #include "../../protocol/Discovery/PortScan.h"
 #include "../../protocol/Discovery/RemoteXpc.h"
 #include "../../protocol/BridgeXpc/Log.h"
+#include "../../protocol/BridgeXpc/TransportMode.h"
 #include <iostream>
 #include <string>
 #include <fstream>
@@ -615,9 +616,16 @@ static int CmdNetwork(int argc, wchar_t* argv[]) {
         }
     }
 
+    // See BridgeDiscovery.cpp's ConnectToBiometricKitBridge / this file's
+    // DiscoverBiometricKitBridge for why tunnel mode needs a narrower,
+    // slower scan than native: every candidate connect is serialized
+    // through T2Ncm.sys's IPv4<->IPv6 rewrite and the single USB bulk
+    // pipe pair, so native's already-tight 25ms/64-wide tuning ("10ms was
+    // flaky under concurrent scan load") is even less realistic there.
+    const bool tunnelActive = t2::transport::IsTunnelModeActive();
     ScanOptions opt;
-    opt.concurrency = 64;
-    opt.connectTimeoutMs = 25;  // 10ms was flaky under concurrent scan load
+    opt.concurrency = tunnelActive ? 16 : 64;
+    opt.connectTimeoutMs = tunnelActive ? 150 : 25;  // 10ms was flaky under concurrent scan load
     opt.includeTcpOnly = true;
     // Ascending (ScanOptions::scanFromEnd default) — the real BiometricKit
     // candidate has been observed near portBegin (~49000), not the high end.
@@ -807,11 +815,22 @@ static bool DiscoverBiometricKitBridge(int argc, wchar_t* argv[], int firstArgIn
     uint16_t foundPort = 0;
     uint16_t foundRsdPort = 0;
     unsigned lastHttp2Count = 0;
-    const unsigned timeoutsMs[] = {20, 60};
-    constexpr unsigned kAttempts = sizeof(timeoutsMs) / sizeof(timeoutsMs[0]);
+    // See BridgeDiscovery.cpp's ConnectToBiometricKitBridge for why tunnel
+    // mode needs its own, much less aggressive numbers here: Native's
+    // 256-wide/20ms-60ms scan floods the single USB bulk-OUT pipe with
+    // more in-flight SYNs than a tunnel-mode round trip (userspace ->
+    // T2Ncm.sys TX rewrite -> USB -> T2 -> USB -> T2Ncm.sys RX rewrite ->
+    // userspace) can answer in time, so nothing is ever found.
+    const bool tunnelActive = t2::transport::IsTunnelModeActive();
+    const unsigned timeoutsMsNative[] = {20, 60};
+    const unsigned timeoutsMsTunnel[] = {150, 400};
+    const unsigned* timeoutsMs = tunnelActive ? timeoutsMsTunnel : timeoutsMsNative;
+    const unsigned kAttempts = tunnelActive
+        ? static_cast<unsigned>(sizeof(timeoutsMsTunnel) / sizeof(timeoutsMsTunnel[0]))
+        : static_cast<unsigned>(sizeof(timeoutsMsNative) / sizeof(timeoutsMsNative[0]));
     for (unsigned attempt = 0; attempt < kAttempts; ++attempt) {
         ScanOptions opt;
-        opt.concurrency = 256;
+        opt.concurrency = tunnelActive ? 16 : 256;
         opt.includeTcpOnly = true;
         opt.connectTimeoutMs = timeoutsMs[attempt];
         // Ascending (ScanOptions::scanFromEnd default) — the real

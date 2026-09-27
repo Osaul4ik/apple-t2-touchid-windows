@@ -13,6 +13,7 @@
 using System;
 using System.ComponentModel;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Media;
 using Microsoft.Win32;
@@ -77,9 +78,21 @@ namespace T2TouchId.SepVaultGui
                     throw new UnauthorizedAccessException();
                 int mode = Ipv4TunnelCheck.IsChecked == true ? 1 : 0;
                 key.SetValue("TransportMode", mode, Microsoft.Win32.RegistryValueKind.DWord);
-                TransportStatusText.Text = mode == 1
-                    ? "Збережено: IPv4 tunnel. Перезапустіть T2TouchIdBio (і за потреби T2Ncm), додайте 169.254.84.1 на адаптер T2Ncm."
-                    : "Збережено: Native IPv6.";
+
+                // Registry alone only takes effect on the next
+                // MiniportInitializeEx/MiniportRestart (T2NcmTunnelRefreshMode).
+                // Push it into the already-running adapter too, via
+                // IOCTL_T2NCM_SET_TRANSPORT_MODE, so toggling the checkbox
+                // works immediately without disabling/re-enabling T2Ncm or
+                // rebooting. 169.254.84.1 still needs to be on the T2Ncm
+                // adapter for tunnel mode either way.
+                bool pushedLive = PushTransportModeToDriver(mode);
+                string liveNote = pushedLive
+                    ? " Застосовано одразу."
+                    : " Буде застосовано при наступному підключенні T2Ncm (драйвер зараз недоступний).";
+                TransportStatusText.Text = (mode == 1
+                    ? "Збережено: IPv4 tunnel. Додайте 169.254.84.1 на адаптер T2Ncm, якщо ще не додано."
+                    : "Збережено: Native IPv6.") + liveNote;
                 TransportStatusText.Foreground = DotOk;
             }
             catch (UnauthorizedAccessException)
@@ -91,6 +104,62 @@ namespace T2TouchId.SepVaultGui
             {
                 TransportStatusText.Text = "Помилка запису: " + ex.Message;
                 TransportStatusText.Foreground = DotError;
+            }
+        }
+
+        // ---- Live push to the running T2Ncm.sys (\\.\T2Ncm) ----
+        // IOCTL_T2NCM_SET_TRANSPORT_MODE = CTL_CODE(FILE_DEVICE_UNKNOWN=0x22,
+        // 0x903, METHOD_BUFFERED, FILE_WRITE_ACCESS) — computed the same way
+        // public.h's CTL_CODE macro does, same one-literal approach
+        // SepStatusClient.cs already uses for IOCTL_T2_GET_BOOTSTRAP_STATUS.
+        // T2Ncm.sys is reached through a fixed symbolic link
+        // (T2NCM_USER_DEVICE_PATH in public.h), not a device interface GUID,
+        // so this needs no SetupDi enumeration — just CreateFileW it directly.
+        private const uint IOCTL_T2NCM_SET_TRANSPORT_MODE = 0x0022A40C;
+        private const string T2NcmDevicePath = @"\\.\T2Ncm";
+
+        private const uint GENERIC_WRITE = 0x40000000;
+        private const uint FILE_SHARE_READ = 0x1;
+        private const uint FILE_SHARE_WRITE = 0x2;
+        private const uint OPEN_EXISTING = 3;
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern IntPtr CreateFileW(
+            string lpFileName, uint dwDesiredAccess, uint dwShareMode, IntPtr lpSecurityAttributes,
+            uint dwCreationDisposition, uint dwFlagsAndAttributes, IntPtr hTemplateFile);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool DeviceIoControl(
+            IntPtr hDevice, uint dwIoControlCode,
+            ref uint lpInBuffer, uint nInBufferSize,
+            IntPtr lpOutBuffer, uint nOutBufferSize,
+            out uint lpBytesReturned, IntPtr lpOverlapped);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CloseHandle(IntPtr hObject);
+
+        // Returns false (never throws) whenever T2Ncm.sys isn't loaded/the
+        // adapter isn't present right now — the registry write above is
+        // what matters for correctness; this is best-effort immediacy on
+        // top of it, same "don't block the setting on the device being
+        // there" shape as PushTunnelPeerToDriver in TransportMode.h.
+        private static bool PushTransportModeToDriver(int mode)
+        {
+            IntPtr handle = CreateFileW(T2NcmDevicePath, GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE, IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero);
+            if (handle == new IntPtr(-1))
+                return false;
+            try
+            {
+                uint value = (uint)mode;
+                return DeviceIoControl(handle, IOCTL_T2NCM_SET_TRANSPORT_MODE,
+                    ref value, sizeof(uint), IntPtr.Zero, 0, out _, IntPtr.Zero);
+            }
+            finally
+            {
+                CloseHandle(handle);
             }
         }
 

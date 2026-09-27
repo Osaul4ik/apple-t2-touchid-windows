@@ -7,6 +7,7 @@
 #include "PortScan.h"
 #include "RemoteXpc.h"
 #include "../BridgeXpc/Log.h"
+#include "../BridgeXpc/TransportMode.h"
 #include <atomic>
 #include <mutex>
 #include <thread>
@@ -38,9 +39,36 @@ constexpr std::chrono::milliseconds kRemoteXpcCheckTimeout{2000};
 // on a port that has already shown it is not answering.
 constexpr ULONGLONG kCacheTrustBudgetMs = 500;
 
+// 27.09.2026: the 500ms figure above (and the port-scan concurrency/timeout
+// constants in ScanAndProbe below) was tuned against Native IPv6, where
+// t2::transport RTT to the T2 peer is ~1ms (see PortScan.h). IPv4 tunnel
+// mode adds a real cost on every packet in both directions — userspace
+// AF_INET connect -> T2Ncm.sys TX rewrite (IPv4->IPv6) -> USB bulk-OUT ->
+// T2 -> USB bulk-IN -> T2Ncm.sys RX rewrite (IPv6->IPv4) -> userspace —
+// on top of which every one of these packets shares the single serialized
+// USB bulk pipe pair with every OTHER in-flight connection attempt.
+// Native's tuning (500ms cache budget; a 256-wide, 20ms-then-60ms full
+// scan) was never validated against that, and a DebugView capture from a
+// tunnel-mode session showed exactly the failure mode that combination
+// produces: none of the cached port's ~500ms budget is enough to get an
+// answer back, so every capture falls through to the full scan, and the
+// full scan's 256 near-simultaneous connect()s (still each individually
+// timing out in 20ms) flood the one bulk-OUT pipe with SYNs that were
+// never going to get a same-tick reply - "tunnel TX IPv4->IPv6" logged
+// hundreds of times inside the first ~20ms of the scan, no BiometricKit
+// port ever found, no fingerprint capture. Scale both knobs when tunnel
+// mode is active: fewer sockets in flight so the tunnel isn't asked to
+// rewrite/serialize more SYNs than the USB link can actually carry at
+// once, and enough per-attempt time for a rewritten round trip to
+// complete instead of only for a native one.
+ULONGLONG CacheTrustBudgetMs() {
+    return t2::transport::IsTunnelModeActive() ? 2000 : kCacheTrustBudgetMs;
+}
+
 bool TryCachedBridgePort(const NcmEndpoint& ep, t2::bridgexpc::Connection* conn,
                           uint16_t* outPort) {
     using namespace t2::bridgexpc;
+    const ULONGLONG cacheTrustBudgetMs = CacheTrustBudgetMs();
 
     uint16_t svcPort = 0, rsdPort = 0;
     if (!LoadCachedPort(ep, &svcPort, &rsdPort)) {
@@ -54,7 +82,7 @@ bool TryCachedBridgePort(const NcmEndpoint& ep, t2::bridgexpc::Connection* conn,
 
     const ULONGLONG budgetStart = GetTickCount64();
     ConnectResult crA = conn->Connect(ep.peerLinkLocal, ep.ifIndex, svcPort,
-                                       std::chrono::milliseconds(kCacheTrustBudgetMs));
+                                       std::chrono::milliseconds(cacheTrustBudgetMs));
     if (crA == ConnectResult::Ok) {
         T2_LOG("discovery", L"cached port %u answered with HELO - no scan needed",
                static_cast<unsigned>(svcPort));
@@ -65,9 +93,9 @@ bool TryCachedBridgePort(const NcmEndpoint& ep, t2::bridgexpc::Connection* conn,
            static_cast<unsigned>(svcPort), static_cast<unsigned>(rsdPort), static_cast<int>(crA));
 
     const ULONGLONG elapsedMs = GetTickCount64() - budgetStart;
-    if (elapsedMs >= kCacheTrustBudgetMs) {
+    if (elapsedMs >= cacheTrustBudgetMs) {
         T2_LOG("discovery", L"cache trust budget (%llu ms) used up on path A alone - full port scan follows",
-               static_cast<unsigned long long>(kCacheTrustBudgetMs));
+               static_cast<unsigned long long>(cacheTrustBudgetMs));
         return false;
     }
 
@@ -76,7 +104,7 @@ bool TryCachedBridgePort(const NcmEndpoint& ep, t2::bridgexpc::Connection* conn,
         // reconnect it may lead to, instead of giving each its own full
         // kRemoteXpcCheckTimeout (that pair used to be able to cost 4000ms
         // on top of path A). Not worth attempting on scraps of budget.
-        const auto halfRemaining = std::chrono::milliseconds((kCacheTrustBudgetMs - elapsedMs) / 2);
+        const auto halfRemaining = std::chrono::milliseconds((cacheTrustBudgetMs - elapsedMs) / 2);
         if (halfRemaining.count() >= 20) {
             uint16_t advertised = 0;
             if (ProbeServiceOnPort(ep, rsdPort, kBiometricKitService, halfRemaining,
@@ -173,11 +201,26 @@ bool ConnectToBiometricKitBridge(const NcmEndpoint& endpoint, t2::bridgexpc::Con
     uint16_t foundPort = 0;
     uint16_t foundRsdPort = 0;
     const ULONGLONG scanStartMs = GetTickCount64();
-    const unsigned timeoutsMs[] = {20, 60};
-    constexpr unsigned kAttempts = sizeof(timeoutsMs) / sizeof(timeoutsMs[0]);
+    const bool tunnelActive = t2::transport::IsTunnelModeActive();
+    // Native timings/concurrency (see the CacheTrustBudgetMs comment
+    // above for why tunnel mode needs its own numbers): 256 concurrent
+    // sockets is fine when each one is a native connect(), but under the
+    // tunnel every one of those SYNs is serialized onto the same USB
+    // bulk-OUT pipe and rewritten by T2Ncm.sys, so firing 256 at once
+    // just floods that single pipe faster than replies (rewritten back
+    // on RX) can come in — 20ms was never a real round-trip budget for
+    // that path. 16-wide keeps the scan from stacking more in-flight
+    // SYNs than one physical link can carry; 150ms/400ms give a
+    // rewritten round trip realistic room to land.
+    const unsigned timeoutsMsNative[] = {20, 60};
+    const unsigned timeoutsMsTunnel[] = {150, 400};
+    const unsigned* timeoutsMs = tunnelActive ? timeoutsMsTunnel : timeoutsMsNative;
+    const unsigned kAttempts = tunnelActive
+        ? static_cast<unsigned>(sizeof(timeoutsMsTunnel) / sizeof(timeoutsMsTunnel[0]))
+        : static_cast<unsigned>(sizeof(timeoutsMsNative) / sizeof(timeoutsMsNative[0]));
     for (unsigned attempt = 0; attempt < kAttempts; ++attempt) {
         ScanOptions opt;
-        opt.concurrency = 256;
+        opt.concurrency = tunnelActive ? 16 : 256;
         opt.includeTcpOnly = true;
         opt.connectTimeoutMs = timeoutsMs[attempt];
         // Ascending (ScanOptions::scanFromEnd default) — the real

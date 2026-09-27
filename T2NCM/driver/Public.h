@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // public.h
-// Public diagnostic interface exposed by T2Ncm.sys. Deliberately
-// read-only apart from the test-frame injector: this is a status query,
-// not a control surface — the control plane is brought up by
+// Public diagnostic interface exposed by T2Ncm.sys. Mostly a status
+// query, not a control surface — the control plane is brought up by
 // MiniportInitializeEx and OID_PNP_SET_POWER (Power.c), never by a
-// user-mode request.
+// user-mode request. The three exceptions (test-frame injection, seeding
+// the tunnel peer, and flipping TunnelModeEnabled live) are narrow,
+// specific writes into state the TX/RX path already reads on its own;
+// none of them replace or race with the PnP/power-driven lifecycle.
 //
 // HOW THIS IS REACHED (changed with the NDIS revision): T2Ncm.sys is an
 // NDIS miniport driver, so it has no WDF I/O queue and no
@@ -195,6 +197,18 @@ typedef struct _T2NCM_STATUS
 // Seed TunnelPeerIpv6 (16 bytes fe80) for IPv4 tunnel TX rewrite before first RX.
 #define IOCTL_T2NCM_SET_TUNNEL_PEER \
     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x902, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+
+// Flip TunnelModeEnabled live, without waiting for the next
+// MiniportInitializeEx/MiniportRestart (T2NcmTunnelRefreshMode otherwise
+// only re-reads HKLM\SOFTWARE\T2TouchId\Network\TransportMode at those two
+// points, so a GUI checkbox change used to require disabling/re-enabling
+// the T2Ncm adapter, or a reboot, before it took effect). Input buffer is
+// one ULONG: 0 = Native IPv6, 1 = IPv4 tunnel — same encoding as the
+// TransportMode registry value. The GUI is expected to write the registry
+// value first (so the mode survives the next real restart) and then send
+// this IOCTL to make the running adapter match it immediately.
+#define IOCTL_T2NCM_SET_TRANSPORT_MODE \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x903, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 
 // NT symbolic link the diagnostic device is reachable through. Created
 // by NdisMRegisterDeviceEx in NdisMiniport.c; open it with

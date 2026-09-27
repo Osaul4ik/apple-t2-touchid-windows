@@ -49,6 +49,10 @@ inline TransportMode ReadTransportMode() {
                : TransportMode::NativeIpv6;
 }
 
+inline bool IsTunnelModeActive() {
+    return ReadTransportMode() == TransportMode::Ipv4Tunnel;
+}
+
 inline in_addr MapPeerToIpv4(const in6_addr& peer6) {
     unsigned a = peer6.s6_addr[14];
     unsigned b = peer6.s6_addr[15];

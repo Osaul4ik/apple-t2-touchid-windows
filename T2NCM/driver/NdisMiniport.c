@@ -244,6 +244,33 @@ T2NcmDispatchDeviceControl(
         break;
     }
 
+    case IOCTL_T2NCM_SET_TRANSPORT_MODE:
+    {
+        ULONG inLen = stack->Parameters.DeviceIoControl.InputBufferLength;
+        ULONG mode;
+
+        if (inLen < sizeof(ULONG) || Irp->AssociatedIrp.SystemBuffer == NULL)
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        RtlCopyMemory(&mode, Irp->AssociatedIrp.SystemBuffer, sizeof(ULONG));
+
+        // Same field T2NcmTunnelRefreshMode sets from the registry at
+        // Initialize/Restart — writing it directly here is what makes a
+        // GUI checkbox change take effect on the already-running adapter
+        // instead of only on the next restart. Plain assignment, no
+        // Interlocked*: RefreshMode already writes this field the same
+        // way, and the TX/RX rewrite paths only ever read it.
+        context->TunnelModeEnabled = (mode == 1ul);
+
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
+            "T2Ncm: TunnelModeEnabled set live via IOCTL -> %u\n",
+            context->TunnelModeEnabled ? 1u : 0u));
+        status = STATUS_SUCCESS;
+        break;
+    }
+
     case IOCTL_T2NCM_SEND_TEST_FRAME:
     {
         ULONG inLen = stack->Parameters.DeviceIoControl.InputBufferLength;
