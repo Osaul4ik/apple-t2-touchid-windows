@@ -253,12 +253,14 @@ using t2::biometrickit::IdentityRecordV1;
 // macOS user id was actually enrolled, until a real settings UI exists.
 constexpr uint32_t kDefaultMacosUserId = 501;
 
-// Linux parity (t2-fprintd.py --match-seconds default=20.0): each BiometricKit
-// verify is one bounded transaction (StartMatch → events → Cancel), not an
-// unbounded wait. After Match / NoMatch / Timeout the CAPTURE_DATA completes
-// and Windows Hello may open a fresh CAPTURE (re-open verify). CancelIoEx
-// still ends the wait early. Suspend still aborts the live match (cmd 0x0c)
-// without requiring an infinite hold on SEP.
+// Hybrid (Linux + WBF lock screen): each BiometricKit StartMatch session is
+// bounded to matchWindow (t2-fprintd --match-seconds default=20s) so the SEP
+// never sits in capture mode forever. On Timeout / NoMatch the same pending
+// CAPTURE_DATA restarts a full Linux-order transaction (connect optional /
+// StartMatch again) — Hello on the lock screen often Deactivate's after a
+// completed CAPTURE and does not re-issue, so the IOCTL must stay pending.
+// CAPTURE ends only on Match, CancelIoEx, fatal transport, or shutdown.
+// Suspend still aborts the live match (cmd 0x0c) then parks/restarts.
 constexpr std::chrono::seconds kCaptureMatchWindow{20};
 
 // Only one CAPTURE_DATA may be in flight at a time (design doc 6, mirroring
@@ -1400,16 +1402,21 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
                 break;
             }
             if (outcome == VerifyOutcome::NoMatch) {
-                // Linux fprintd ends the verify transaction on no-match; the
-                // client may start a new one. Complete this CAPTURE so WBF can
-                // re-issue CAPTURE_DATA (re-open verify) instead of holding one
-                // IOCTL open across unbounded retries.
-                T2BioLog("CAPTURE_DATA(verify): no match — completing CAPTURE "
-                         "(WBF may open a new verify, Linux-style)");
-                break;
+                // Hybrid: end the SEP transaction (Cancel already sent) but keep
+                // this WBF CAPTURE pending and open a new StartMatch session.
+                T2BioLog("CAPTURE_DATA(verify): no match — restarting bounded "
+                         "verify under the same pending CAPTURE (hybrid)");
+                continue;
             }
-            // Timeout / Match / Rejected / Unstable / Malformed: end this CAPTURE.
-            // Timeout is the normal "finger not presented within matchWindow" path.
+            if (outcome == VerifyOutcome::Timeout) {
+                // matchWindow elapsed with no finger / no verdict. Restart so the
+                // lock screen keeps accepting touches (Hello may not re-CAPTURE).
+                T2BioLog("CAPTURE_DATA(verify): timeout (%llds) — restarting bounded "
+                         "verify under the same pending CAPTURE (hybrid)",
+                         static_cast<long long>(kCaptureMatchWindow.count()));
+                continue;
+            }
+            // Match / Rejected / Unstable / Malformed / remaining: end CAPTURE.
             break;
         }
     }
