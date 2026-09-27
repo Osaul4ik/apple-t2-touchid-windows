@@ -39,8 +39,13 @@ Connection::~Connection() { Close(); }
 
 void Connection::Close() {
     if (socket_ != INVALID_SOCKET) {
+        T2_LOG("connect", L"disconnect: closesocket (socket was open, pendingEvents=%zu)",
+               pendingEvents_.size());
         closesocket(socket_);
         socket_ = INVALID_SOCKET;
+    } else {
+        T2_LOG("connect", L"disconnect: already closed (pendingEvents=%zu)",
+               pendingEvents_.size());
     }
     // Defensive only: this class is one-connection-per-verification-attempt
     // (see the class comment) and is expected to be discarded after Close(),
@@ -114,6 +119,9 @@ static std::vector<uint8_t> BuildClientHeloBody(int64_t bridgeXpcVersion) {
 ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned long interfaceIndex,
                                    uint16_t port, std::chrono::milliseconds connectTimeout) {
     connectionLost_ = false;
+    T2_LOG("connect", L"connect begin: ifIndex=%lu port=%u timeout=%lldms",
+           interfaceIndex, static_cast<unsigned>(port),
+           static_cast<long long>(connectTimeout.count()));
     if (!t2::EnsureWinsock()) {
         T2_LOG("connect", L"WSAStartup failed");
         return ConnectResult::ConnectFailed;
@@ -134,11 +142,13 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
     addr.sin6_scope_id = interfaceIndex; // required for link-local (fe80::/10)
 
     if (connect(socket_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-        T2_LOG("connect", L"connect() to port %u failed, WSAGetLastError=%d",
-               port, WSAGetLastError());
+        T2_LOG("connect", L"connect() to port %u ifIndex=%lu failed, WSAGetLastError=%d",
+               port, interfaceIndex, WSAGetLastError());
         Close();
         return ConnectResult::ConnectFailed;
     }
+    T2_LOG("connect", L"TCP connected: ifIndex=%lu port=%u (waiting for peer HELO)",
+           interfaceIndex, static_cast<unsigned>(port));
 
     // T2 sends HELO first (VERIFIED FROM SOURCE, Milestone 1 section 7).
     RawFrame helo;

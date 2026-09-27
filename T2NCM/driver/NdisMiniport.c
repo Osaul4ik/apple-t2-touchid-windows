@@ -752,7 +752,11 @@ T2NcmMiniportPause(
     UNREFERENCED_PARAMETER(PauseParameters);
 
     T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
-        "T2Ncm: MiniportPause\n"));
+        "T2Ncm[POWER]: MiniportPause ENTER DataPathRunning=%ld rxNbls=%ld txReqs=%ld "
+        "(NDIS pause before sleep/Dx — stop data path)\n",
+        context->DataPathRunning,
+        context->OutstandingRxNbls,
+        context->OutstandingTxRequests));
 
     // Order matters. Close the gate first so no new indication or send
     // can start, then stop the reader, then wait for what was already in
@@ -768,6 +772,12 @@ T2NcmMiniportPause(
     // Back to NdisRegistered: the adapter still exists and the hardware
     // is still armed, it is just not moving frames.
     (VOID)T2NcmTrySetState(context, T2NcmStateStopping, T2NcmStateNdisRegistered);
+
+    T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
+        "T2Ncm[POWER]: MiniportPause EXIT — data path stopped, adapter PAUSED "
+        "(rxNbls=%ld txReqs=%ld)\n",
+        context->OutstandingRxNbls,
+        context->OutstandingTxRequests));
 
     // Synchronous completion. Returning NDIS_STATUS_PENDING would mean
     // calling NdisMPauseComplete later, and there is nothing here that
@@ -790,7 +800,10 @@ T2NcmMiniportRestart(
     UNREFERENCED_PARAMETER(RestartParameters);
 
     T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
-        "T2Ncm: MiniportRestart\n"));
+        "T2Ncm[POWER]: MiniportRestart ENTER PowerState=%u DataPathRunning=%ld "
+        "(resume / return to D0 — restart data path)\n",
+        (ULONG)context->PowerState,
+        context->DataPathRunning));
 
     if (context->PowerState != NdisDeviceStateD0)
     {
@@ -1468,7 +1481,8 @@ T2NcmMiniportShutdownEx(
     InterlockedExchange(&context->DataPathRunning, 0);
 
     T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
-        "T2Ncm: MiniportShutdownEx (action=%u) - data path closed\n",
+        "T2Ncm[POWER]: MiniportShutdownEx (action=%u) - data path closed "
+        "(system power-off / bugcheck path)\n",
         (ULONG)ShutdownAction));
 }
 

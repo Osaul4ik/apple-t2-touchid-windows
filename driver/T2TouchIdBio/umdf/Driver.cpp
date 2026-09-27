@@ -10,6 +10,53 @@
 // adapter (wbiosrvc) uses the "T2TouchIdEngine:" prefix, this driver
 // "T2TouchIdBio:". One OutputDebugString call per line so lines from parallel
 // IOCTL threads do not interleave.
+//
+// Gated by HKLM\SOFTWARE\T2TouchId\Logging (SepVault GUI):
+//   Bio=1   — general CAPTURE / WBF lines
+//   Power=1 — sleep / resume / shutdown / display / PBT lines (also shown if Bio=1)
+// Missing values default to enabled.
+static bool T2BioRegistryFlag(const wchar_t* name, bool defaultValue = true)
+{
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\T2TouchId\\Logging", 0,
+                      KEY_READ, &key) != ERROR_SUCCESS) {
+        return defaultValue;
+    }
+    DWORD data = defaultValue ? 1u : 0u;
+    DWORD type = 0;
+    DWORD cb = sizeof(data);
+    const LONG err = RegQueryValueExW(key, name, nullptr, &type,
+                                      reinterpret_cast<LPBYTE>(&data), &cb);
+    RegCloseKey(key);
+    if (err != ERROR_SUCCESS || (type != REG_DWORD && type != REG_BINARY)) {
+        return defaultValue;
+    }
+    return data != 0;
+}
+
+static bool T2BioMessageIsPowerRelated(_In_z_ const char* msg)
+{
+    static const char* kKeys[] = {
+        "suspend", "Suspend", "SUSPEND",
+        "resume", "Resume", "RESUME",
+        "shutdown", "Shutdown", "SHUTDOWN",
+        "PBT_", "WM_QUERY", "WM_END",
+        "sleep", "Sleep",
+        "power-button", "power button", "Power",
+        "D0", "EvtIoStop", "EvtIoResume",
+        "DISPLAY", "display",
+        "g_sleep", "BeginCaptureSuspend", "BeginCaptureShutdown",
+        "OnSuspendResume", "InvalidateActiveCapture",
+        "system shutting down", "shutting down"
+    };
+    for (const char* k : kKeys) {
+        if (strstr(msg, k) != nullptr) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void T2BioLog(_In_z_ const char* fmt, ...)
 {
     char buf[256];
@@ -20,8 +67,20 @@ void T2BioLog(_In_z_ const char* fmt, ...)
     if (FAILED(fmtHr)) {
         return;
     }
-    char line[400];
-    if (SUCCEEDED(StringCchPrintfA(line, ARRAYSIZE(line), "T2TouchIdBio: [%lu:%lu] %s\n",
+
+    const bool isPower = T2BioMessageIsPowerRelated(buf);
+    if (isPower) {
+        if (!T2BioRegistryFlag(L"Power") && !T2BioRegistryFlag(L"Bio")) {
+            return;
+        }
+    } else if (!T2BioRegistryFlag(L"Bio")) {
+        return;
+    }
+
+    char line[420];
+    const char* prefix = isPower ? "T2TouchIdBio[POWER]" : "T2TouchIdBio";
+    if (SUCCEEDED(StringCchPrintfA(line, ARRAYSIZE(line), "%s: [%lu:%lu] %s\n",
+                                   prefix,
                                    static_cast<unsigned long>(GetCurrentProcessId()),
                                    static_cast<unsigned long>(GetCurrentThreadId()), buf))) {
         OutputDebugStringA(line);

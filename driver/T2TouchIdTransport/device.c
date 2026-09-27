@@ -507,7 +507,7 @@ T2EvtDeviceD0Entry(
     // instead of only seeing the liveness-check line lower down (which is
     // skipped by both early returns).
     T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-        "T2TouchIdTransport: D0Entry ENTER PreviousState=%d (WdfPowerDevice: "
+        "T2TouchIdTransport[POWER]: D0Entry ENTER PreviousState=%d (WdfPowerDevice: "
         "D0=1 D1=2 D2=3 D3=4 D3Final=5)\n", PreviousState));
 
     // Milestone 2 section 26 / Milestone 2B §3: never assume old
@@ -522,7 +522,7 @@ T2EvtDeviceD0Entry(
         // nothing transport-specific to revalidate; leave State as-is
         // (NotInitialized) and let PrepareHardware set it when it runs.
         T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-            "T2TouchIdTransport: D0Entry EXIT - Bar4 not mapped yet, "
+            "T2TouchIdTransport[POWER]: D0Entry EXIT - Bar4 not mapped yet, "
             "deferring to PrepareHardware, State unchanged (%d)\n",
             ctx->State));
         WdfWaitLockRelease(ctx->ExchangeLock);
@@ -534,7 +534,7 @@ T2EvtDeviceD0Entry(
         // instance stays Invalid across power transitions too, for the
         // same reason it stays Invalid across a fresh PrepareHardware.
         T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-            "T2TouchIdTransport: D0Entry EXIT - State=Invalid (SEP-owned OOL "
+            "T2TouchIdTransport[POWER]: D0Entry EXIT - State=Invalid (SEP-owned OOL "
             "memory retained until reboot), staying Invalid across this "
             "power transition\n"));
         WdfWaitLockRelease(ctx->ExchangeLock);
@@ -551,7 +551,7 @@ T2EvtDeviceD0Entry(
     ULONG inbox = READ_REGISTER_ULONG((PULONG)(ctx->Bar4VirtualAddress + T2_SEP_INBOX_STATUS));
     BOOLEAN livenessOk = (inbox != T2_SEP_MAILBOX_DEAD_READ);
     T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-        "T2TouchIdTransport: D0Entry mailbox liveness check inbox=0x%x empty=%d ... %s\n",
+        "T2TouchIdTransport[POWER]: D0Entry mailbox liveness check inbox=0x%x empty=%d ... %s\n",
         inbox, (inbox & T2_SEP_INBOX_EMPTY_BIT) != 0,
         livenessOk ? "success" : "failed"));
 
@@ -575,7 +575,7 @@ T2EvtDeviceD0Entry(
     NTSTATUS busMasterStatus = T2EnablePciBusMaster(Device);
     BOOLEAN busMasterOk = NT_SUCCESS(busMasterStatus);
     T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-        "T2TouchIdTransport: D0Entry PCI bus-master re-arm status=0x%x (%s)\n",
+        "T2TouchIdTransport[POWER]: D0Entry PCI bus-master re-arm status=0x%x (%s)\n",
         busMasterStatus, busMasterOk ? "ok" : "failed"));
 
     // State-model fix (D0 resume OOL state inconsistency): an ordinary
@@ -603,14 +603,14 @@ T2EvtDeviceD0Entry(
 
     if (livenessOk && busMasterOk && oolFullyRegistered) {
         T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-            "T2TouchIdTransport: D0Entry resume (PreviousState=%d, "
+            "T2TouchIdTransport[POWER]: D0Entry resume (PreviousState=%d, "
             "OolInRegistered=1, OolOutRegistered=1, PriorState=%d) -> Ready; "
             "not re-running IOCTL_T2_REGISTER_OOL\n",
             PreviousState, ctx->State));
         T2SetTransportState(ctx, T2TransportReady);
     } else {
         T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-            "T2TouchIdTransport: D0Entry (PreviousState=%d, livenessOk=%d, "
+            "T2TouchIdTransport[POWER]: D0Entry (PreviousState=%d, livenessOk=%d, "
             "busMasterOk=%d, OolInRegistered=%d, OolOutRegistered=%d, "
             "PriorState=%d) -> HardwareReady; next AKS exchange fails "
             "closed until IOCTL_T2_REGISTER_OOL re-confirms with SEP\n",
@@ -620,7 +620,7 @@ T2EvtDeviceD0Entry(
     }
 
     T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-        "T2TouchIdTransport: D0Entry EXIT - State=%d\n", ctx->State));
+        "T2TouchIdTransport[POWER]: D0Entry EXIT - State=%d\n", ctx->State));
 
     WdfWaitLockRelease(ctx->ExchangeLock);
     return STATUS_SUCCESS;
@@ -641,7 +641,7 @@ T2EvtDeviceD0Exit(
     // (bounded by an in-flight exchange, see the comment below) is still
     // visible in the log as "D0Exit was entered but hasn't exited yet".
     T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-        "T2TouchIdTransport: D0Exit ENTER TargetState=%d, current State=%d\n",
+        "T2TouchIdTransport[POWER]: D0Exit ENTER TargetState=%d, current State=%d\n",
         TargetState, ctx->State));
 
     // Milestone 2B §3/§9: block new AKS exchanges/registration before the
@@ -660,14 +660,14 @@ T2EvtDeviceD0Exit(
         // registration), but fold it in defensively rather than leaving a
         // stale in-progress-looking state across the transition.
         T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-            "T2TouchIdTransport: D0Exit demoting State %d -> HardwareReady "
+            "T2TouchIdTransport[POWER]: D0Exit demoting State %d -> HardwareReady "
             "before power-down\n", ctx->State));
         T2SetTransportState(ctx, T2TransportHardwareReady);
     }
     WdfWaitLockRelease(ctx->ExchangeLock);
 
     T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-        "T2TouchIdTransport: D0Exit EXIT TargetState=%d, State=%d\n",
+        "T2TouchIdTransport[POWER]: D0Exit EXIT TargetState=%d, State=%d\n",
         TargetState, ctx->State));
 
     return STATUS_SUCCESS;

@@ -1,20 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0-only
-// Log.h — lightweight diagnostic logging for the BridgeXPC transport.
+// Log.h — lightweight diagnostic logging for BridgeXPC + shared registry gates.
 //
-// Every OutputDebugStringW call below is free to leave in permanently
-// (DebugView-only visibility, near-zero cost when nobody's attached) and
-// is meant to answer exactly the class of question "<command> failed" on
-// its own gives no way to answer: which of the several internal steps
-// inside Connect()/SendBiometricCommand()/etc. actually returned false,
-// and with what OS-level detail (WSAGetLastError, frame type/length,
-// request-id mismatch, reply shape).
+// Registry (HKLM\SOFTWARE\T2TouchId\Logging), DWORD 0/1 — toggled from the
+// SepVault GUI. Missing key/value = enabled (keep DebugView behaviour until
+// the user opts out).
+//   Bio        — T2TouchIdBio UMDF (CAPTURE, WBF)
+//   Transport  — T2TouchIdTransport.sys (kernel DbgPrint; see driver)
+//   Ncm        — T2Ncm.sys (kernel DbgPrint; see driver)
+//   BridgeXpc  — this file / Connection.cpp (connect, HELO, frames)
+//   Power      — sleep / resume / shutdown / D0 traces (Bio + user-mode)
 //
-// Console echo (T2_LOG) is OFF by default — `identities`/`verify` stay
-// quiet on the happy path — and is turned on for the process by main.cpp
-// when it sees `--verbose`/`-v` or the T2TOUCHID_VERBOSE=1 environment
-// variable. DebugView output is unconditional: attach DebugView (running
-// as Administrator, "Capture Global Win32") before running the command
-// and every line below shows up there regardless of the console flag.
+// Console echo is OFF by default; --verbose / T2TOUCHID_VERBOSE=1 enables it.
 #pragma once
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -27,15 +23,17 @@
 #include <cstdarg>
 #include <iostream>
 #include <chrono>
+#include <cstring>
 
 namespace t2::log {
+
+inline constexpr wchar_t kLogRegPath[] = L"SOFTWARE\\T2TouchId\\Logging";
 
 inline bool& ConsoleEnabled() {
     static bool enabled = false;
     return enabled;
 }
 
-// Call once from wmain() before dispatching a command.
 inline void InitFromEnvironment(bool cliVerboseFlag) {
     if (cliVerboseFlag) {
         ConsoleEnabled() = true;
@@ -48,10 +46,31 @@ inline void InitFromEnvironment(bool cliVerboseFlag) {
     }
 }
 
-// Millisecond-resolution timestamp since process start — enough to see
-// gaps between steps (e.g. "was the 5000ms LoadCalibration timeout
-// actually hit, or did it fail fast?") without pulling in wall-clock
-// formatting.
+// Default true when the value is absent so existing installs keep logging
+// until the GUI writes an explicit 0.
+inline bool RegistryFlag(const wchar_t* valueName, bool defaultValue = true) {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kLogRegPath, 0, KEY_READ, &key) != ERROR_SUCCESS) {
+        return defaultValue;
+    }
+    DWORD data = defaultValue ? 1u : 0u;
+    DWORD type = 0;
+    DWORD cb = sizeof(data);
+    const LONG err = RegQueryValueExW(key, valueName, nullptr, &type,
+                                      reinterpret_cast<LPBYTE>(&data), &cb);
+    RegCloseKey(key);
+    if (err != ERROR_SUCCESS || (type != REG_DWORD && type != REG_BINARY)) {
+        return defaultValue;
+    }
+    return data != 0;
+}
+
+inline bool BridgeXpcEnabled() { return RegistryFlag(L"BridgeXpc"); }
+inline bool BioEnabled() { return RegistryFlag(L"Bio"); }
+inline bool PowerEnabled() { return RegistryFlag(L"Power"); }
+inline bool TransportEnabled() { return RegistryFlag(L"Transport"); }
+inline bool NcmEnabled() { return RegistryFlag(L"Ncm"); }
+
 inline int64_t ElapsedMs() {
     static const auto start = std::chrono::steady_clock::now();
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -59,7 +78,17 @@ inline int64_t ElapsedMs() {
         .count();
 }
 
+inline void EmitLine(const wchar_t* line) {
+    OutputDebugStringW(line);
+    if (ConsoleEnabled()) {
+        std::wcerr << line;
+    }
+}
+
 inline void Logf(const wchar_t* tag, const wchar_t* fmt, ...) {
+    if (!BridgeXpcEnabled()) {
+        return;
+    }
     wchar_t msg[1024];
     va_list args;
     va_start(args, fmt);
@@ -69,27 +98,16 @@ inline void Logf(const wchar_t* tag, const wchar_t* fmt, ...) {
     wchar_t line[1100];
     _snwprintf_s(line, _TRUNCATE, L"[t2touchid +%lldms][%s] %s\n",
                  static_cast<long long>(ElapsedMs()), tag, msg);
-
-    // Always goes to DebugView - cheap, and it's the whole point of this
-    // file (a way to see what happened without --verbose cluttering a
-    // normal run, and without needing to repro under a debugger).
-    OutputDebugStringW(line);
-    if (ConsoleEnabled()) {
-        std::wcerr << line;
-    }
+    EmitLine(line);
 }
 
-// Hex-dumps up to maxBytes of a buffer, with a trailing "..." marker if
-// truncated. Never dumps more than maxBytes regardless of caller intent -
-// this is a diagnostic aid, not a way to leak an entire multi-KB
-// calibration blob into DebugView.
 inline std::wstring HexDump(const std::vector<uint8_t>& data, size_t maxBytes = 32) {
     std::wstring out;
     size_t n = data.size() < maxBytes ? data.size() : maxBytes;
     out.reserve(n * 2 + 3);
     wchar_t b[4];
     for (size_t i = 0; i < n; ++i) {
-        swprintf_s(b, L"%02x", data[i]);   // swprintf is banned (C28719)
+        swprintf_s(b, L"%02x", data[i]);
         out += b;
     }
     if (data.size() > n) out += L"...";

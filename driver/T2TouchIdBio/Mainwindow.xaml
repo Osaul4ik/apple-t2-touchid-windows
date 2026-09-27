@@ -2,8 +2,8 @@
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="T2 SEP — стан і налаштування"
-        Height="560" Width="480"
-        MinHeight="560" MinWidth="480"
+        Height="720" Width="520"
+        MinHeight="640" MinWidth="480"
         ResizeMode="CanResize"
         WindowStartupLocation="CenterScreen"
         FontFamily="Segoe UI"
@@ -93,6 +93,22 @@
                         </StackPanel>
                     </Border>
                 </Grid>
+            </Border>
+
+
+            <!-- ===================== Diagnostics / logging card ===================== -->
+            <Border Style="{StaticResource Card}">
+                <StackPanel>
+                    <TextBlock Style="{StaticResource SectionHeader}" Text="Діагностика — логи (DebugView)"/>
+                    <TextBlock TextWrapping="Wrap" Foreground="#666666" FontSize="12" Margin="0,0,0,10"
+                               Text="Прапорці пишуться в HKLM\SOFTWARE\T2TouchId\Logging. DebugView: Capture Global Win32 + Capture Kernel. Потрібні права адміністратора для запису."/>
+                    <CheckBox x:Name="LogPowerCheck" Content="Power / сон / resume / shutdown (рекомендовано)" Margin="0,0,0,6" Checked="OnLogFlagChanged" Unchecked="OnLogFlagChanged"/>
+                    <CheckBox x:Name="LogBioCheck" Content="T2TouchIdBio (UMDF, CAPTURE / Windows Hello)" Margin="0,0,0,6" Checked="OnLogFlagChanged" Unchecked="OnLogFlagChanged"/>
+                    <CheckBox x:Name="LogBridgeCheck" Content="BridgeXPC — з'єднання / disconnect" Margin="0,0,0,6" Checked="OnLogFlagChanged" Unchecked="OnLogFlagChanged"/>
+                    <CheckBox x:Name="LogTransportCheck" Content="T2TouchIdTransport (kernel, D0Entry/D0Exit)" Margin="0,0,0,6" Checked="OnLogFlagChanged" Unchecked="OnLogFlagChanged"/>
+                    <CheckBox x:Name="LogNcmCheck" Content="T2NCM (kernel, MiniportPause/Restart)" Margin="0,0,0,6" Checked="OnLogFlagChanged" Unchecked="OnLogFlagChanged"/>
+                    <TextBlock x:Name="LogStatusText" TextWrapping="Wrap" Foreground="#666666" FontSize="11" Margin="0,8,0,0"/>
+                </StackPanel>
             </Border>
 
             <!-- ===================== Vault import card ===================== -->

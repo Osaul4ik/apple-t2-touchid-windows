@@ -33,9 +33,96 @@ namespace T2TouchId.SepVaultGui
         {
             InitializeComponent();
             LoadSepStatus();
+            LoadLogFlags();
         }
 
         private void OnRefreshStatus(object sender, RoutedEventArgs e) => LoadSepStatus();
+
+        // ---- Per-driver DebugView logging (HKLM\SOFTWARE\T2TouchId\Logging) ----
+        private const string LogRegPath = @"SOFTWARE\T2TouchId\Logging";
+        private bool _logFlagsLoading;
+
+        private static bool ReadLogFlag(string name, bool defaultValue = true)
+        {
+            try
+            {
+                using var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(LogRegPath, writable: false);
+                if (key == null) return defaultValue;
+                object? v = key.GetValue(name);
+                if (v is int i) return i != 0;
+                if (v is long l) return l != 0;
+                return defaultValue;
+            }
+            catch
+            {
+                return defaultValue;
+            }
+        }
+
+        private static bool WriteLogFlag(string name, bool enabled)
+        {
+            try
+            {
+                using var key = Microsoft.Win32.Registry.LocalMachine.CreateSubKey(LogRegPath, true);
+                if (key == null) return false;
+                key.SetValue(name, enabled ? 1 : 0, Microsoft.Win32.RegistryValueKind.DWord);
+                return true;
+            }
+            catch (UnauthorizedAccessException)
+            {
+                return false;
+            }
+            catch (System.Security.SecurityException)
+            {
+                return false;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private void LoadLogFlags()
+        {
+            _logFlagsLoading = true;
+            try
+            {
+                LogPowerCheck.IsChecked = ReadLogFlag("Power");
+                LogBioCheck.IsChecked = ReadLogFlag("Bio");
+                LogBridgeCheck.IsChecked = ReadLogFlag("BridgeXpc");
+                LogTransportCheck.IsChecked = ReadLogFlag("Transport");
+                LogNcmCheck.IsChecked = ReadLogFlag("Ncm");
+                LogStatusText.Text = "Фільтр DebugView: T2TouchId* | T2Ncm* | t2touchid. Kernel: Capture Kernel для Transport/NCM.";
+                LogStatusText.Foreground = new SolidColorBrush(Color.FromRgb(0x66, 0x66, 0x66));
+            }
+            finally
+            {
+                _logFlagsLoading = false;
+            }
+        }
+
+        private void OnLogFlagChanged(object sender, RoutedEventArgs e)
+        {
+            if (_logFlagsLoading) return;
+
+            bool ok =
+                WriteLogFlag("Power", LogPowerCheck.IsChecked == true) &
+                WriteLogFlag("Bio", LogBioCheck.IsChecked == true) &
+                WriteLogFlag("BridgeXpc", LogBridgeCheck.IsChecked == true) &
+                WriteLogFlag("Transport", LogTransportCheck.IsChecked == true) &
+                WriteLogFlag("Ncm", LogNcmCheck.IsChecked == true);
+
+            if (!ok)
+            {
+                LogStatusText.Text = "Не вдалось записати HKLM (запустіть GUI від імені адміністратора).";
+                LogStatusText.Foreground = DotError;
+            }
+            else
+            {
+                LogStatusText.Text = "Збережено. UMDF/BridgeXpc підхоплять одразу; kernel — після наступного sleep або перезавантаження драйвера.";
+                LogStatusText.Foreground = DotOk;
+            }
+        }
 
         // Reads the driver's in-memory bootstrap status and updates the
         // banner. Never throws into the caller - every failure mode
