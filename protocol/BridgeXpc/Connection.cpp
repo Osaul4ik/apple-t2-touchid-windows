@@ -184,6 +184,15 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
     // per-attempt if the handshake doesn't complete in time. Ipv4Tunnel in
     // the registry still skips straight to the tunnel, unchanged.
     bool tunnel = (configuredMode == t2::transport::TransportMode::Ipv4Tunnel);
+    // Mirror the registry into the running driver on every connect attempt.
+    // T2NcmTunnelRefreshMode only re-reads the registry at
+    // MiniportInitializeEx/MiniportRestart, so without this push a registry
+    // write (or even an adapter disable/enable cycle that doesn't reach a
+    // full miniport reinit) can leave DeviceContext->TunnelModeEnabled
+    // stale - silently turning every tunnel-mode frame into a no-op passthrough
+    // that the IPv6-only T2 side drops. See PushTransportModeToDriver's own
+    // comment in TransportMode.h for the full chain.
+    t2::transport::PushTransportModeToDriver(configuredMode);
     bool fellBackFromIpv6 = false;
     const auto attemptStart = std::chrono::steady_clock::now();
     T2_LOG("connect", L"connect begin: ifIndex=%lu port=%u timeout=%lldms mode=%s",

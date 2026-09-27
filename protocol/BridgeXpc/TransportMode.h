@@ -201,6 +201,58 @@ inline void PushTunnelPeerToDriver(const in6_addr& peer6) {
     CloseHandle(h);
 }
 
+// Push the TransportMode registry value into the driver LIVE, via
+// IOCTL_T2NCM_SET_TRANSPORT_MODE (T2NCM/driver/Public.h, code 0x903).
+//
+// T2NcmTunnelRefreshMode (Tunnel.c) only re-reads
+// HKLM\SOFTWARE\T2TouchId\Network\TransportMode at MiniportInitializeEx /
+// MiniportRestart. A bare registry write from this process — or even a
+// Disable-NetAdapter/Enable-NetAdapter cycle, which does not reliably
+// reach a full miniport reinitialize for this NDIS device — leaves the
+// running driver's DeviceContext->TunnelModeEnabled stale. When that
+// happens T2NcmTunnelRewriteTxIpv4ToIpv6 keeps bailing out at its first
+// check (`if (!DeviceContext->TunnelModeEnabled) return TRUE;`), so every
+// outbound tunnel frame is sent as bare IPv4 — which the T2 side, an
+// IPv6-only NCM link, silently drops — and every AF_INET connect() times
+// out at 1500ms with WSA=0, no matter how correct the peer/ARP setup is.
+//
+// SepVaultGui already does this same push from a GUI checkbox
+// (MainWindow.xaml.cs, IOCTL_T2NCM_SET_TRANSPORT_MODE = 0x0022A40C) so a
+// live toggle takes effect without a restart. The CLI previously had no
+// equivalent and depended entirely on an adapter restart lining up with a
+// registry write that predated it - unreliable, and the cause of tunnel
+// mode failing even after PushTunnelPeerToDriver/EnsureTunnelIpv4Neighbor
+// both succeed. Calling this once per Connect(), for BOTH modes (not just
+// Ipv4Tunnel), keeps the running driver a live mirror of the registry
+// instead of a snapshot from whenever it last (re)initialized.
+inline void PushTransportModeToDriver(TransportMode mode) {
+    HANDLE h = CreateFileW(L"\\\\.\\T2Ncm", GENERIC_WRITE,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        T2_LOG("tunnel", L"PushTransportModeToDriver: could not open \\\\.\\T2Ncm "
+               L"(GetLastError=%lu) - driver may not be loaded", GetLastError());
+        return;
+    }
+    DWORD returned = 0;
+    DWORD modeValue = static_cast<DWORD>(mode);
+    // Same CTL_CODE as T2NCM/driver/Public.h's IOCTL_T2NCM_SET_TRANSPORT_MODE
+    // (0x903) - hand-rolled rather than including Public.h, matching how
+    // PushTunnelPeerToDriver above already hand-rolls IOCTL_T2NCM_SET_TUNNEL_PEER
+    // (0x902) in this file to avoid the winioctl.h double-inclusion hazard
+    // documented at the top of this file.
+    const DWORD code = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x903, METHOD_BUFFERED, FILE_WRITE_ACCESS);
+    BOOL ok = DeviceIoControl(h, code, &modeValue, (DWORD)sizeof(modeValue),
+                              nullptr, 0, &returned, nullptr);
+    if (!ok) {
+        T2_LOG("tunnel", L"PushTransportModeToDriver: IOCTL failed, GetLastError=%lu", GetLastError());
+    } else {
+        T2_LOG("tunnel", L"PushTransportModeToDriver: live TunnelModeEnabled -> %d",
+               mode == TransportMode::Ipv4Tunnel ? 1 : 0);
+    }
+    CloseHandle(h);
+}
+
 // Call before AF_INET connect in tunnel mode.
 inline void PrepareTunnelPeer(unsigned long ifIndex, const in6_addr& peer6) {
     UCHAR mac[6]{};
