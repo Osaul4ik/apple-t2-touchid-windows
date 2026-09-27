@@ -149,9 +149,19 @@ inline void EnsureTunnelIpv4Neighbor(unsigned long ifIndex, const in_addr& peer4
     std::memcpy(row.PhysicalAddress, mac, 6);
     row.PhysicalAddressLength = 6;
     row.State = NlnsPermanent;
-    // Create or set — ignore already-exists.
+    // CreateIpNetEntry2 only succeeds for a row that doesn't exist yet. In
+    // tunnel mode the row for 169.254.a.b almost always already exists by
+    // the time this runs — either a leftover Permanent entry from an
+    // earlier session with a now-stale MAC (T2 rebooted, link-layer
+    // address changed), or an Incomplete/Unreachable row Windows' own ARP
+    // left behind before PrepareTunnelPeer ever ran. Create then returns
+    // ERROR_OBJECT_ALREADY_EXISTS and — this was the bug — the old code
+    // treated that as "nothing to do" and left the stale/incomplete row in
+    // place, so every SYN to that address kept going nowhere. Any failure
+    // to create (ALREADY_EXISTS included) must fall through to Set, which
+    // overwrites the existing row's state and MAC unconditionally.
     const DWORD c = CreateIpNetEntry2(&row);
-    if (c != NO_ERROR && c != ERROR_OBJECT_ALREADY_EXISTS) {
+    if (c != NO_ERROR) {
         SetIpNetEntry2(&row);
     }
 }
