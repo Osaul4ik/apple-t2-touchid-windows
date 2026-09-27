@@ -58,8 +58,21 @@ inline constexpr wchar_t kPeerMacValue[] = L"PeerMac";
 // long-running service — the registry is the shared, per-boot-lifetime
 // store across those separate processes.
 inline constexpr wchar_t kSessionRegPath[] = L"SOFTWARE\\T2TouchId\\Network\\Session";
-inline constexpr wchar_t kNextProbeTickValue[] = L"NextProbeTick64";   // QWORD, GetTickCount64() domain
-inline constexpr wchar_t kBackoffMsValue[] = L"BackoffMs";            // DWORD
+// Event-driven, not time-driven: one bit, "skip the NativeIpv6 probe until
+// the next unlock". Replaces an earlier exponential-backoff timer
+// (NextProbeTick64/BackoffMs) that kept re-probing IPv6 on a clock while
+// the screen was still locked with the VPN still up — wasted 150ms/wasted
+// wall-clock on every re-probe that could only ever fail again, since
+// nothing about the VPN/WFP state was going to change mid-lock. The
+// desired cycle (per the user's own spec): IPv6 is always tried first at
+// boot; once it fails while locked, EVERY subsequent unlock attempt goes
+// straight to Ipv4Tunnel (no re-probing while still locked); on a real
+// WTS_SESSION_UNLOCK, this flag is cleared so the very next Connect() gets
+// exactly one fresh NativeIpv6 probe — if the VPN is still up it fails and
+// the flag is set again for the next lock cycle, if the VPN is now down it
+// succeeds and stays on NativeIpv6. T2TouchIdBio's SessionLockWndProc
+// (Queue.cpp) is the one place that clears this on WTS_SESSION_UNLOCK.
+inline constexpr wchar_t kSkipNativeIpv6ProbeValue[] = L"SkipNativeIpv6Probe"; // DWORD 0/1
 
 enum class TransportMode : DWORD {
     NativeIpv6 = 0,
@@ -92,94 +105,131 @@ inline bool IsTunnelModeActive() {
 // Session-lifetime "NativeIpv6 is currently unreachable" cache. This is
 // NOT the manual TransportMode override above — it is what lets
 // Connection::Connect() stop paying the 150ms NativeIpv6 probe on every
-// single call once that probe has already failed once in this boot
-// session (e.g. VPN up, laptop asleep, Cisco/WFP profile dropping IPv6),
-// while still recovering automatically and promptly once the condition
-// clears (VPN down, screen unlocked, resumed from sleep) — see the
-// backoff comment on RecordNativeIpv6Failure below for why a short,
-// growing window achieves that without any OS event hook (session
-// lock/unlock, power resume, network change) to listen for.
+// single call once that probe has already failed once since the last
+// unlock (e.g. VPN up while locked), while still recovering automatically
+// on the very next unlock — see AllowNextNativeIpv6ProbeOnUnlock() below
+// for the other half of that cycle.
 //
 // kSessionRegPath's REG_OPTION_VOLATILE key means "reset after reboot"
 // requires no logic here at all: a fresh boot has no key, ReadValue
 // below fails closed to "don't skip, probe normally" exactly as if this
-// function didn't exist yet.
+// function didn't exist yet — matching "on start, IPv6 is always tried
+// first".
 inline bool ShouldSkipNativeIpv6Probe() {
     HKEY key = nullptr;
     if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kSessionRegPath, 0, KEY_READ, &key) != ERROR_SUCCESS) {
         return false; // no cache yet (or a fresh boot) - probe as normal
     }
-    ULONGLONG nextProbeTick = 0;
+    DWORD skip = 0;
     DWORD type = 0;
-    DWORD cb = sizeof(nextProbeTick);
-    const LONG err = RegQueryValueExW(key, kNextProbeTickValue, nullptr, &type,
-                                      reinterpret_cast<LPBYTE>(&nextProbeTick), &cb);
+    DWORD cb = sizeof(skip);
+    const LONG err = RegQueryValueExW(key, kSkipNativeIpv6ProbeValue, nullptr, &type,
+                                      reinterpret_cast<LPBYTE>(&skip), &cb);
     RegCloseKey(key);
-    if (err != ERROR_SUCCESS || type != REG_QWORD || cb != sizeof(nextProbeTick)) {
+    if (err != ERROR_SUCCESS || type != REG_DWORD || cb != sizeof(skip)) {
         return false;
     }
-    // GetTickCount64() is milliseconds since THIS boot - directly
-    // comparable to a value written earlier in the same boot session,
-    // which is the only kind of value this volatile key can ever hold.
-    return GetTickCount64() < nextProbeTick;
+    return skip != 0;
 }
 
 // Call when a NativeIpv6 probe (the 150ms first-connect attempt) times
-// out. Backs off exponentially (starting at kInitialBackoffMs, capped at
-// kMaxBackoffMs) so a VPN session that stays up for an hour costs one
-// 150ms probe plus a handful of doubling retries, not one every single
-// Connect() call - while kInitialBackoffMs is still short enough that
-// unlocking the screen or disconnecting the VPN a few seconds after the
-// most recent failure is picked back up on the very next call, not stuck
-// behind a long-since-irrelevant backoff from earlier in the session.
+// out. Sets the skip flag so every further Connect() this lock cycle goes
+// straight to Ipv4Tunnel without re-paying the 150ms probe - there is
+// nothing to gain from re-probing on a clock while the screen is still
+// locked and the VPN/WFP state hasn't changed. The flag is cleared only
+// by an actual NativeIpv6 success (RecordNativeIpv6Success) or by a real
+// WTS_SESSION_UNLOCK (AllowNextNativeIpv6ProbeOnUnlock), never by time.
 inline void RecordNativeIpv6Failure() {
-    constexpr ULONGLONG kInitialBackoffMs = 5000;   // 5s
-    constexpr ULONGLONG kMaxBackoffMs = 60000;      // 60s ceiling
-
     HKEY key = nullptr;
     if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, kSessionRegPath, 0, nullptr,
-                        REG_OPTION_VOLATILE, KEY_READ | KEY_WRITE, nullptr,
+                        REG_OPTION_VOLATILE, KEY_SET_VALUE, nullptr,
                         &key, nullptr) != ERROR_SUCCESS) {
         return; // best-effort cache; a failure here just means every call
                  // keeps paying the 150ms probe, not a functional break
     }
-
-    DWORD backoffMs = 0;
-    DWORD type = 0;
-    DWORD cb = sizeof(backoffMs);
-    if (RegQueryValueExW(key, kBackoffMsValue, nullptr, &type,
-                         reinterpret_cast<LPBYTE>(&backoffMs), &cb) != ERROR_SUCCESS ||
-        type != REG_DWORD || backoffMs == 0) {
-        backoffMs = static_cast<DWORD>(kInitialBackoffMs);
-    }
-
-    const ULONGLONG nextProbeTick = GetTickCount64() + backoffMs;
-    RegSetValueExW(key, kNextProbeTickValue, 0, REG_QWORD,
-                  reinterpret_cast<const BYTE*>(&nextProbeTick), sizeof(nextProbeTick));
-
-    const ULONGLONG doubled = static_cast<ULONGLONG>(backoffMs) * 2;
-    const DWORD nextBackoffMs = static_cast<DWORD>(
-        (doubled > kMaxBackoffMs) ? kMaxBackoffMs : doubled);
-    RegSetValueExW(key, kBackoffMsValue, 0, REG_DWORD,
-                  reinterpret_cast<const BYTE*>(&nextBackoffMs), sizeof(nextBackoffMs));
+    DWORD one = 1;
+    RegSetValueExW(key, kSkipNativeIpv6ProbeValue, 0, REG_DWORD,
+                  reinterpret_cast<const BYTE*>(&one), sizeof(one));
     RegCloseKey(key);
 }
 
-// Call the moment a NativeIpv6 probe actually succeeds (including one
-// that only ran because ShouldSkipNativeIpv6Probe's backoff window had
-// elapsed). Clears the cache outright rather than just resetting the
-// backoff counter, so the very next Connect() call - and every one after
-// it - goes back to trying NativeIpv6 first at zero cost, instead of
-// carrying forward any stale backoff state from the outage that just
-// ended.
+// Call the moment a NativeIpv6 probe actually succeeds. Clears the skip
+// flag outright so the very next Connect() call - and every one after it
+// this lock cycle - goes back to trying NativeIpv6 first, instead of
+// carrying forward a stale "skip" state from an outage that just ended.
 inline void RecordNativeIpv6Success() {
     HKEY key = nullptr;
     if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kSessionRegPath, 0, KEY_SET_VALUE, &key) != ERROR_SUCCESS) {
         return; // nothing cached - already the desired state
     }
-    RegDeleteValueW(key, kNextProbeTickValue);
-    RegDeleteValueW(key, kBackoffMsValue);
+    RegDeleteValueW(key, kSkipNativeIpv6ProbeValue);
     RegCloseKey(key);
+}
+
+// How long a post-unlock reachability probe is allowed to take. Tighter
+// than kIpv6FirstConnectTimeout (150ms, Connection.cpp) on purpose: this
+// probe runs off to the side of any real verify attempt (see
+// ProbeNativeIpv6Reachable's own comment below) - there is no live user
+// action waiting on it, so there is no reason to give it the same budget
+// as an actual in-flight connect. 100ms is still generous for a real
+// link-local peer (single-digit ms in practice) while failing fast when
+// the VPN/WFP is still dropping IPv6.
+constexpr std::chrono::milliseconds kUnlockProbeTimeout{100};
+
+// Standalone reachability probe: a throwaway TCP SYN at the T2 peer's
+// real IPv6 link-local address, bounded by `timeout`. This is NEVER part
+// of the live Connect() path used by an actual verify attempt - it exists
+// solely so a real WTS_SESSION_UNLOCK (T2TouchIdBio's SessionLockWndProc,
+// Queue.cpp) can find out whether NativeIpv6 has become viable again
+// WITHOUT risking the switch happening mid-attempt on a real unlock.
+// Per the user's own spec: after unlock, while cached on Ipv4Tunnel, we
+// only TEST NativeIpv6 - we do not switch a live connect over to it - and
+// a failure within the 100ms budget means staying on Ipv4Tunnel, full
+// stop, until the next real unlock tries again.
+//
+// A completed handshake (err==0) or an immediate WSAECONNREFUSED both
+// prove the SYN actually reached the peer over IPv6 (a real RST requires
+// that) - either counts as "reachable" even though no real BridgeXPC
+// service is expected to be listening on this throwaway port. Anything
+// else (timeout, unreachable, VPN/WFP silently dropping the SYN) is not.
+inline bool ProbeNativeIpv6Reachable(const in6_addr& peer6, unsigned long ifIndex,
+                                     std::chrono::milliseconds timeout) {
+    if (!t2::EnsureWinsock()) return false;
+    SOCKET s = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) return false;
+
+    sockaddr_in6 addr{};
+    addr.sin6_family = AF_INET6;
+    addr.sin6_port = htons(1); // port need not be open - see comment above
+    addr.sin6_addr = peer6;
+    addr.sin6_scope_id = ifIndex;
+
+    u_long nonBlocking = 1;
+    ioctlsocket(s, FIONBIO, &nonBlocking);
+    bool reachable = false;
+    const int rc = connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    if (rc == 0) {
+        reachable = true;
+    } else if (WSAGetLastError() == WSAEWOULDBLOCK) {
+        fd_set writeSet, errSet;
+        FD_ZERO(&writeSet);
+        FD_ZERO(&errSet);
+        FD_SET(s, &writeSet);
+        FD_SET(s, &errSet);
+        timeval tv{};
+        tv.tv_sec = static_cast<long>(timeout.count() / 1000);
+        tv.tv_usec = static_cast<long>((timeout.count() % 1000) * 1000);
+        const int sel = select(0, nullptr, &writeSet, &errSet, &tv);
+        if (sel > 0 && (FD_ISSET(s, &writeSet) || FD_ISSET(s, &errSet))) {
+            int err = 0;
+            int errLen = sizeof(err);
+            getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &errLen);
+            reachable = (err == 0 || err == WSAECONNREFUSED);
+        }
+        // sel <= 0: nothing came back within `timeout` - not reachable.
+    }
+    closesocket(s);
+    return reachable;
 }
 
 inline in_addr MapPeerToIpv4(const in6_addr& peer6) {

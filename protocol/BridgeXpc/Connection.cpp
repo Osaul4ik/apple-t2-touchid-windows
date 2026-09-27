@@ -195,21 +195,34 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
     t2::transport::PushTransportModeToDriver(configuredMode);
     bool fellBackFromIpv6 = false;
     // Session cache: skip the redundant probe once NativeIpv6 has already
-    // failed this session and the backoff window hasn't elapsed yet. Only
-    // applies when TransportMode itself isn't already forcing the tunnel -
-    // that manual override always takes the tunnel path unconditionally,
-    // same as before this cache existed.
+    // failed since the last unlock (event-driven, not time-driven - see
+    // TransportMode.h's kSkipNativeIpv6ProbeValue comment; cleared again
+    // on the next real WTS_SESSION_UNLOCK). Only applies when TransportMode
+    // itself isn't already forcing the tunnel - that manual override always
+    // takes the tunnel path unconditionally, same as before this cache
+    // existed.
     bool skippedNativeIpv6Probe = false;
     if (!tunnel && t2::transport::ShouldSkipNativeIpv6Probe()) {
         tunnel = true;
         skippedNativeIpv6Probe = true;
+        // BUG FIX: the push at the top of this function sent `configuredMode`,
+        // which at that point was still NativeIpv6 (registry is only a manual
+        // override; this is a runtime-only fallback). Without this second
+        // push, T2Ncm.sys's DeviceContext->TunnelModeEnabled stays false even
+        // though we're about to speak AF_INET to it - every outbound tunnel
+        // frame then goes out as bare IPv4, which the IPv6-only T2 NCM link
+        // silently drops, and every AF_INET connect() below times out. Same
+        // failure mode PushTransportModeToDriver's own header comment already
+        // describes for the "bare registry write" case - this is the runtime
+        // equivalent of that same staleness.
+        t2::transport::PushTransportModeToDriver(t2::transport::TransportMode::Ipv4Tunnel);
     }
     const auto attemptStart = std::chrono::steady_clock::now();
     T2_LOG("connect", L"connect begin: ifIndex=%lu port=%u timeout=%lldms mode=%s",
            interfaceIndex, static_cast<unsigned>(port),
            static_cast<long long>(connectTimeout.count()),
            tunnel ? (skippedNativeIpv6Probe
-                        ? L"Ipv4Tunnel (NativeIpv6 probe skipped - still in backoff window from an earlier failure this session)"
+                        ? L"Ipv4Tunnel (NativeIpv6 probe skipped - failed earlier this lock cycle, waiting for next unlock)"
                         : L"Ipv4Tunnel (forced)")
                   : L"NativeIpv6 (default, may fall back)");
     if (!t2::EnsureWinsock()) {
@@ -240,10 +253,11 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
             SetSocketTimeout(socket_, SO_SNDTIMEO, connectTimeout);
             T2_LOG("connect", L"TCP connected: ifIndex=%lu port=%u (waiting for peer HELO)",
                    interfaceIndex, static_cast<unsigned>(port));
-            // Confirmed working THIS attempt - drop any backoff left over
-            // from an earlier outage in this session (VPN disconnected,
-            // screen unlocked, resumed from sleep, ...) so the very next
-            // call goes straight back to trying NativeIpv6 first too.
+            // Confirmed working THIS attempt - clear the skip flag left
+            // over from an earlier failure this lock cycle (VPN
+            // disconnected, screen unlocked, resumed from sleep, ...) so
+            // the very next call goes straight back to trying NativeIpv6
+            // first too.
             t2::transport::RecordNativeIpv6Success();
         } else {
             T2_LOG("connect", L"NativeIpv6 first connect did not complete within %lldms "
@@ -255,11 +269,26 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
             fellBackFromIpv6 = true;
             // VPN just came up, screen just locked, machine just woke,
             // Cisco/WFP profile dropping IPv6, ... whatever the cause,
-            // remember it for the rest of this boot session (see
-            // RecordNativeIpv6Failure's own comment for the backoff/
-            // recovery trade-off) so subsequent calls skip straight to
-            // the tunnel instead of re-paying this same 150ms timeout.
+            // remember it for the rest of THIS lock cycle (see
+            // TransportMode.h's kSkipNativeIpv6ProbeValue comment) so
+            // subsequent calls skip straight to the tunnel instead of
+            // re-paying this same 150ms timeout - until the next real
+            // unlock (AllowNextNativeIpv6ProbeOnUnlock) grants one more
+            // free probe.
             t2::transport::RecordNativeIpv6Failure();
+            // BUG FIX (same root cause as the skip-probe branch above): this
+            // is a same-call, runtime-only fallback - the early push at the
+            // top of Connect() already sent NativeIpv6 (the registry's
+            // configuredMode) before we knew the IPv6 handshake would time
+            // out. Without re-pushing here, PrepareTunnelPeer/ARP/AF_INET
+            // connect below all proceed correctly, but T2Ncm.sys's
+            // TunnelModeEnabled is still false, so the TX rewrite bails out
+            // and every frame goes out as bare IPv4 that the T2 silently
+            // drops - this is exactly the "fallback seems to happen but
+            // doesn't work" symptom, fixed by keeping the driver a live
+            // mirror of the mode we are ACTUALLY about to use, not just the
+            // registry value read at function entry.
+            t2::transport::PushTransportModeToDriver(t2::transport::TransportMode::Ipv4Tunnel);
         }
     }
 

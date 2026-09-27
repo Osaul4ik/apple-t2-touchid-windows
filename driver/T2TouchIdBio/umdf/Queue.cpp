@@ -2,6 +2,13 @@
 // Queue.cpp - WBDI IOCTL dispatch.
 #include "Internal.h"
 #include "../WbdiBir.h"
+// ProbeNativeIpv6Reachable()/RecordNativeIpv6Success()/RecordNativeIpv6Failure() -
+// the post-unlock background reachability probe, see the WTS_SESSION_UNLOCK
+// call site below and TransportMode.h's own header comment for the full
+// lock/unlock cycle.
+#include "BridgeXpc/TransportMode.h"
+// FindT2NcmEndpoints() - peer IPv6 link-local + interface index for the probe.
+#include "Discovery/Adapter.h"
 #include <atomic>
 #include <mutex>
 #include <optional>
@@ -1979,10 +1986,39 @@ LRESULT CALLBACK SessionLockWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         if (wParam == WTS_SESSION_LOCK) {
             std::lock_guard<std::mutex> commitLock(g_captureRequestCommitMu);
             BeginCaptureSessionLock("SessionLockNotify(WTS_SESSION_LOCK)");
+        } else if (wParam == WTS_SESSION_UNLOCK) {
+            // Not a capture-invalidation boundary (nothing to cancel here,
+            // unchanged from before). Per the transport-mode design
+            // (TransportMode.h): a real unlock only TESTS whether
+            // NativeIpv6 has become viable again - it must never make an
+            // actual verify's own Connect() risk switching transport
+            // mid-attempt. So this fires a throwaway, bounded (100ms)
+            // reachability probe on its own detached thread; the cached
+            // skip-flag decision is updated from THAT result, and no real
+            // Connect() call is ever used to find it out. Detached (not
+            // joined) so a slow/failing probe can never block this
+            // message loop from handling the next WM_WTSSESSION_CHANGE.
+            std::thread([]() {
+                const auto endpoints = t2::discovery::FindT2NcmEndpoints();
+                for (const auto& ep : endpoints) {
+                    if (ep.peerSource == t2::discovery::PeerSource::None) {
+                        continue; // no confirmed T2 peer yet - nothing to probe
+                    }
+                    const bool reachable = t2::transport::ProbeNativeIpv6Reachable(
+                        ep.peerLinkLocal, ep.ifIndex, t2::transport::kUnlockProbeTimeout);
+                    if (reachable) {
+                        t2::transport::RecordNativeIpv6Success();
+                        T2BioLog("UnlockProbe: NativeIpv6 reachable - next Connect() tries it first");
+                    } else {
+                        t2::transport::RecordNativeIpv6Failure();
+                        T2BioLog("UnlockProbe: NativeIpv6 unreachable within 100ms - staying on Ipv4Tunnel");
+                    }
+                    return;
+                }
+                T2BioLog("UnlockProbe: no T2 NCM endpoint with a known peer yet - skipped");
+            }).detach();
         }
-        // WTS_SESSION_UNLOCK and every other change type are intentionally
-        // ignored - only a lock is a new invalidation boundary; an unlock
-        // has nothing left to invalidate.
+        // Every other WM_WTSSESSION_CHANGE type is intentionally ignored.
         return 0;
     }
     if (msg == WM_DESTROY) {
