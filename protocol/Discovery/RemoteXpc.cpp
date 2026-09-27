@@ -524,8 +524,7 @@ bool RemoteXpcConnection::ReadDataFrame(uint32_t wantStreamId, std::vector<uint8
 RemoteXpcResult RemoteXpcConnection::Connect(const NcmEndpoint& endpoint, uint16_t port,
                                               std::chrono::milliseconds connectTimeout) {
     if (!t2::EnsureWinsock()) return RemoteXpcResult::ConnectFailed;
-    const bool tunnel =
-        t2::transport::ReadTransportMode() == t2::transport::TransportMode::Ipv4Tunnel;
+    const bool tunnel = t2::transport::IsTunnelModeActive();
     socket_ = socket(tunnel ? AF_INET : AF_INET6, SOCK_STREAM, IPPROTO_TCP);
     if (socket_ == INVALID_SOCKET) return RemoteXpcResult::ConnectFailed;
 

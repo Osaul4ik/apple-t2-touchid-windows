@@ -42,8 +42,7 @@ bool WaitReadable(SOCKET s, unsigned timeoutMs) {
 ProbeResult ProbePort(const NcmEndpoint& ep, uint16_t port,
                       unsigned connectTimeoutMs, unsigned recvTimeoutMs) {
     ProbeResult r;
-    const bool tunnel =
-        t2::transport::ReadTransportMode() == t2::transport::TransportMode::Ipv4Tunnel;
+    const bool tunnel = t2::transport::IsTunnelModeActive();
     SOCKET s = socket(tunnel ? AF_INET : AF_INET6, SOCK_STREAM, IPPROTO_TCP);
     if (s == INVALID_SOCKET) return r;
 
@@ -166,7 +165,7 @@ std::vector<PortCandidate> ScanHttp2Preface(const NcmEndpoint& endpoint,
     // over native IPv6. Connection.cpp's real BridgeXPC connect already did
     // this before its own AF_INET connect; the scanner needs the same seed
     // before it starts probing, not after.
-    if (t2::transport::ReadTransportMode() == t2::transport::TransportMode::Ipv4Tunnel) {
+    if (t2::transport::IsTunnelModeActive()) {
         t2::transport::PrepareTunnelPeer(endpoint.ifIndex, endpoint.peerLinkLocal);
     }
 

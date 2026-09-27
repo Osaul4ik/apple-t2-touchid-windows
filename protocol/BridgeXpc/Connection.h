@@ -29,9 +29,10 @@ public:
     ~Connection();
 
     // interfaceIndex selects the T2 CDC-NCM adapter (IPv6 scope id / IPv4
-    // IP_UNICAST_IF). TransportMode (registry) chooses NativeIpv6 vs Ipv4Tunnel:
-    // tunnel maps peer fe80→169.254.x.y and uses AF_INET so WFP IPv6 drops
-    // never see the flow; T2Ncm rewrites to IPv6 on the USB wire.
+    // IP_UNICAST_IF). t2::transport::ShouldSkipNativeIpv6Probe() (TransportMode.h)
+    // chooses NativeIpv6 vs Ipv4Tunnel: tunnel maps peer fe80→169.254.x.y and
+    // uses AF_INET so WFP IPv6 drops never see the flow; T2Ncm rewrites to
+    // IPv6 on the USB wire.
     ConnectResult Connect(const in6_addr& linkLocalAddress, unsigned long interfaceIndex,
                           uint16_t port, std::chrono::milliseconds connectTimeout);
 

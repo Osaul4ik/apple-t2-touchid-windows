@@ -39,17 +39,27 @@
 namespace t2::transport {
 
 inline constexpr wchar_t kNetworkRegPath[] = L"SOFTWARE\\T2TouchId\\Network";
-inline constexpr wchar_t kTransportModeValue[] = L"TransportMode";
 inline constexpr wchar_t kPeerIpv6Value[] = L"PeerIpv6";
 inline constexpr wchar_t kPeerMacValue[] = L"PeerMac";
 
-// Separate from kNetworkRegPath on purpose: TransportMode/PeerIpv6/PeerMac
-// above are meant to persist (manual A/B override, last-known peer for the
-// driver's own PASSIVE-level refresh). This subkey is the opposite — an
-// auto-detected "NativeIpv6 is currently unreachable" cache that MUST NOT
-// survive a reboot (a VPN that was up last session may be gone, a Cisco
-// profile may have changed, and a stale "assume tunnel" left over from
-// weeks ago would silently defeat the native-first default forever).
+// There used to be a second, PERSISTENT flag here (kTransportModeValue /
+// ReadTransportMode(), a manual A/B override the GUI checkbox wrote
+// straight to HKLM\...\Network\TransportMode). It was removed: it lived
+// right next to the auto-detected session cache below, did the same job
+// ("which transport to use right now"), and — because it survived a
+// reboot while the session cache deliberately does not — a forgotten
+// checked box silently pinned every future boot to Ipv4Tunnel and fought
+// the auto probe/fallback cycle below. There is now exactly one flag that
+// decides the live transport (kSkipNativeIpv6ProbeValue, in the volatile
+// subkey right below); the GUI checkbox now toggles that same flag
+// directly instead of a separate one — see MainWindow.xaml.cs.
+//
+// kPeerIpv6Value/kPeerMacValue above are meant to persist (last-known peer
+// for the driver's own PASSIVE-level refresh). This subkey is the opposite
+// — an auto-detected "NativeIpv6 is currently unreachable" cache that MUST
+// NOT survive a reboot (a VPN that was up last session may be gone, a
+// Cisco profile may have changed, and a stale "assume tunnel" left over
+// from weeks ago would silently defeat the native-first default forever).
 // Created with REG_OPTION_VOLATILE: the key and everything under it is
 // destroyed by the OS itself on shutdown/reboot, so there is no cross-boot
 // staleness to invalidate by hand — a fresh boot simply finds nothing here
@@ -79,33 +89,11 @@ enum class TransportMode : DWORD {
     NativeIpv6 = 0,
     Ipv4Tunnel = 1,
 };
-
-inline TransportMode ReadTransportMode() {
-    HKEY key = nullptr;
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kNetworkRegPath, 0, KEY_READ, &key) != ERROR_SUCCESS) {
-        return TransportMode::NativeIpv6;
-    }
-    DWORD data = 0;
-    DWORD type = 0;
-    DWORD cb = sizeof(data);
-    const LONG err = RegQueryValueExW(key, kTransportModeValue, nullptr, &type,
-                                      reinterpret_cast<LPBYTE>(&data), &cb);
-    RegCloseKey(key);
-    if (err != ERROR_SUCCESS || (type != REG_DWORD && type != REG_BINARY)) {
-        return TransportMode::NativeIpv6;
-    }
-    return (data == static_cast<DWORD>(TransportMode::Ipv4Tunnel))
-               ? TransportMode::Ipv4Tunnel
-               : TransportMode::NativeIpv6;
-}
-
-inline bool IsTunnelModeActive() {
-    return ReadTransportMode() == TransportMode::Ipv4Tunnel;
-}
+// IsTunnelModeActive() is defined further down, right after
+// ShouldSkipNativeIpv6Probe() (the one flag it now reads).
 
 // Session-lifetime "NativeIpv6 is currently unreachable" cache. This is
-// NOT the manual TransportMode override above — it is what lets
-// Connection::Connect() stop paying the 150ms NativeIpv6 probe on every
+// what lets Connection::Connect() stop paying the 150ms NativeIpv6 probe on every
 // single call once that probe has already failed once since the last
 // unlock (e.g. VPN up while locked), while still recovering automatically
 // on the very next unlock — see AllowNextNativeIpv6ProbeOnUnlock() below
@@ -131,6 +119,18 @@ inline bool ShouldSkipNativeIpv6Probe() {
         return false;
     }
     return skip != 0;
+}
+
+// The one and only "which transport is active right now" query. Callers
+// that just need a yes/no (RemoteXpc.cpp, PortScan.cpp, BridgeDiscovery.cpp,
+// main.cpp) read this instead of duplicating the flag lookup; Connection.cpp
+// itself still calls ShouldSkipNativeIpv6Probe() directly because it also
+// needs to react to a same-call fallback that happens after this point is
+// evaluated. No persisted override sits behind this anymore (see the removed
+// kTransportModeValue note above) — MainWindow.xaml.cs's checkbox sets/clears
+// exactly this same session flag now, so there is nothing else to check.
+inline bool IsTunnelModeActive() {
+    return ShouldSkipNativeIpv6Probe();
 }
 
 // Call when a NativeIpv6 probe (the 150ms first-connect attempt) times

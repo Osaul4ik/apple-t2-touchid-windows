@@ -176,54 +176,32 @@ constexpr std::chrono::milliseconds kIpv6FirstConnectTimeout{150};
 ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned long interfaceIndex,
                                    uint16_t port, std::chrono::milliseconds connectTimeout) {
     connectionLost_ = false;
-    const auto configuredMode = t2::transport::ReadTransportMode();
-    // The registry TransportMode is a manual OVERRIDE (kept for the existing
-    // A/B testing use), not a persistent record of "last connect used v4" -
-    // per the user's own default, an unset/NativeIpv6 registry always starts
-    // this call by trying native IPv6 first, falling back to the tunnel
-    // per-attempt if the handshake doesn't complete in time. Ipv4Tunnel in
-    // the registry still skips straight to the tunnel, unchanged.
-    bool tunnel = (configuredMode == t2::transport::TransportMode::Ipv4Tunnel);
-    // Mirror the registry into the running driver on every connect attempt.
-    // T2NcmTunnelRefreshMode only re-reads the registry at
-    // MiniportInitializeEx/MiniportRestart, so without this push a registry
-    // write (or even an adapter disable/enable cycle that doesn't reach a
-    // full miniport reinit) can leave DeviceContext->TunnelModeEnabled
-    // stale - silently turning every tunnel-mode frame into a no-op passthrough
-    // that the IPv6-only T2 side drops. See PushTransportModeToDriver's own
-    // comment in TransportMode.h for the full chain.
-    t2::transport::PushTransportModeToDriver(configuredMode);
-    bool fellBackFromIpv6 = false;
-    // Session cache: skip the redundant probe once NativeIpv6 has already
+    // The only input to "which transport does this call start on" is the
+    // session cache: skip the redundant NativeIpv6 probe once it has already
     // failed since the last unlock (event-driven, not time-driven - see
-    // TransportMode.h's kSkipNativeIpv6ProbeValue comment; cleared again
-    // on the next real WTS_SESSION_UNLOCK). Only applies when TransportMode
-    // itself isn't already forcing the tunnel - that manual override always
-    // takes the tunnel path unconditionally, same as before this cache
-    // existed.
-    bool skippedNativeIpv6Probe = false;
-    if (!tunnel && t2::transport::ShouldSkipNativeIpv6Probe()) {
-        tunnel = true;
-        skippedNativeIpv6Probe = true;
-        // BUG FIX: the push at the top of this function sent `configuredMode`,
-        // which at that point was still NativeIpv6 (registry is only a manual
-        // override; this is a runtime-only fallback). Without this second
-        // push, T2Ncm.sys's DeviceContext->TunnelModeEnabled stays false even
-        // though we're about to speak AF_INET to it - every outbound tunnel
-        // frame then goes out as bare IPv4, which the IPv6-only T2 NCM link
-        // silently drops, and every AF_INET connect() below times out. Same
-        // failure mode PushTransportModeToDriver's own header comment already
-        // describes for the "bare registry write" case - this is the runtime
-        // equivalent of that same staleness.
-        t2::transport::PushTransportModeToDriver(t2::transport::TransportMode::Ipv4Tunnel);
-    }
+    // TransportMode.h's kSkipNativeIpv6ProbeValue comment; cleared again on
+    // the next real WTS_SESSION_UNLOCK, or by MainWindow.xaml.cs's checkbox).
+    // There used to also be a persisted manual-override registry value read
+    // here (TransportMode) that could force the tunnel independently of this
+    // flag; it was removed (see TransportMode.h) precisely because it and
+    // this flag could disagree, so the GUI now sets this exact flag instead.
+    bool tunnel = t2::transport::ShouldSkipNativeIpv6Probe();
+    // Mirror the flag into the running driver on every connect attempt.
+    // T2NcmTunnelRefreshMode only re-reads the registry at
+    // MiniportInitializeEx/MiniportRestart, so without this push a plain
+    // registry write can leave DeviceContext->TunnelModeEnabled stale -
+    // silently turning every tunnel-mode frame into a no-op passthrough that
+    // the IPv6-only T2 side drops. See PushTransportModeToDriver's own
+    // comment in TransportMode.h for the full chain.
+    t2::transport::PushTransportModeToDriver(
+        tunnel ? t2::transport::TransportMode::Ipv4Tunnel : t2::transport::TransportMode::NativeIpv6);
+    bool fellBackFromIpv6 = false;
     const auto attemptStart = std::chrono::steady_clock::now();
     T2_LOG("connect", L"connect begin: ifIndex=%lu port=%u timeout=%lldms mode=%s",
            interfaceIndex, static_cast<unsigned>(port),
            static_cast<long long>(connectTimeout.count()),
-           tunnel ? (skippedNativeIpv6Probe
-                        ? L"Ipv4Tunnel (NativeIpv6 probe skipped - failed earlier this lock cycle, waiting for next unlock)"
-                        : L"Ipv4Tunnel (forced)")
+           tunnel ? L"Ipv4Tunnel (NativeIpv6 probe skipped - failed earlier this lock cycle "
+                    L"or forced via GUI, waiting for next unlock/uncheck)"
                   : L"NativeIpv6 (default, may fall back)");
     if (!t2::EnsureWinsock()) {
         T2_LOG("connect", L"WSAStartup failed");
@@ -278,9 +256,9 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
             t2::transport::RecordNativeIpv6Failure();
             // BUG FIX (same root cause as the skip-probe branch above): this
             // is a same-call, runtime-only fallback - the early push at the
-            // top of Connect() already sent NativeIpv6 (the registry's
-            // configuredMode) before we knew the IPv6 handshake would time
-            // out. Without re-pushing here, PrepareTunnelPeer/ARP/AF_INET
+            // top of Connect() already sent NativeIpv6 (we hadn't fallen
+            // back yet at that point) before we knew the IPv6 handshake
+            // would time out. Without re-pushing here, PrepareTunnelPeer/ARP/AF_INET
             // connect below all proceed correctly, but T2Ncm.sys's
             // TunnelModeEnabled is still false, so the TX rewrite bails out
             // and every frame goes out as bare IPv4 that the T2 silently

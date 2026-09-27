@@ -39,8 +39,24 @@ namespace T2TouchId.SepVaultGui
         }
 
 
-        // ---- Network transport mode (HKLM\SOFTWARE\T2TouchId\Network) ----
-        private const string NetworkRegPath = @"SOFTWARE\T2TouchId\Network";
+        // ---- Network transport mode ----
+        // There used to be a SEPARATE, persistent override here
+        // (HKLM\SOFTWARE\T2TouchId\Network\TransportMode, non-volatile) that
+        // the checkbox wrote on its own, independently of the auto
+        // probe/fallback cache Connection.cpp uses at runtime
+        // (SessionRegPath\SkipNativeIpv6Probe, volatile). That let the two
+        // disagree — e.g. a checked box surviving a reboot would silently
+        // pin every future boot to the tunnel, fighting the "always try v6
+        // first at cold boot" default. That override is gone: the checkbox
+        // now reads/writes the exact same session flag Connection.cpp reads
+        // (t2::transport::kSkipNativeIpv6ProbeValue in TransportMode.h) —
+        // checking it has the same effect as a real NativeIpv6 probe failure
+        // (skip straight to Ipv4Tunnel until the next unlock), and
+        // unchecking it has the same effect as a probe success (try
+        // NativeIpv6 again on the very next connect). Because the key is
+        // volatile it never survives a reboot, matching that same default.
+        private const string SessionRegPath = @"SOFTWARE\T2TouchId\Network\Session";
+        private const string SkipNativeIpv6ProbeValue = "SkipNativeIpv6Probe";
         private bool _transportLoading;
 
         private void LoadTransportMode()
@@ -51,15 +67,15 @@ namespace T2TouchId.SepVaultGui
                 bool tunnel = false;
                 try
                 {
-                    using var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(NetworkRegPath, false);
-                    if (key?.GetValue("TransportMode") is int i)
-                        tunnel = i == 1;
+                    using var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(SessionRegPath, false);
+                    if (key?.GetValue(SkipNativeIpv6ProbeValue) is int i)
+                        tunnel = i != 0;
                 }
-                catch { /* default native */ }
+                catch { /* default native - matches cold-boot default */ }
                 Ipv4TunnelCheck.IsChecked = tunnel;
                 TransportStatusText.Text = tunnel
-                    ? "Режим: IPv4 tunnel (TransportMode=1)."
-                    : "Режим: Native IPv6 (TransportMode=0).";
+                    ? "Режим цього сеансу: IPv4 tunnel (SkipNativeIpv6Probe=1)."
+                    : "Режим цього сеансу: Native IPv6 (SkipNativeIpv6Probe не встановлено).";
                 TransportStatusText.Foreground = new SolidColorBrush(Color.FromRgb(0x66, 0x66, 0x66));
             }
             finally
@@ -73,26 +89,36 @@ namespace T2TouchId.SepVaultGui
             if (_transportLoading) return;
             try
             {
-                using var key = Microsoft.Win32.Registry.LocalMachine.CreateSubKey(NetworkRegPath, true);
+                bool tunnel = Ipv4TunnelCheck.IsChecked == true;
+                // RegistryOptions.Volatile matters only for the FIRST-EVER
+                // creation of this key - if Connection.cpp already created it
+                // (RecordNativeIpv6Failure, TransportMode.h) this just opens
+                // the existing volatile key as-is. Without it, a GUI-first
+                // creation would leave a plain (non-volatile) key behind that
+                // DOES survive a reboot - exactly the bug this change removes.
+                using var key = Microsoft.Win32.Registry.LocalMachine.CreateSubKey(
+                    SessionRegPath, RegistryKeyPermissionCheck.ReadWriteSubTree,
+                    Microsoft.Win32.RegistryOptions.Volatile);
                 if (key == null)
                     throw new UnauthorizedAccessException();
-                int mode = Ipv4TunnelCheck.IsChecked == true ? 1 : 0;
-                key.SetValue("TransportMode", mode, Microsoft.Win32.RegistryValueKind.DWord);
+                if (tunnel)
+                    key.SetValue(SkipNativeIpv6ProbeValue, 1, Microsoft.Win32.RegistryValueKind.DWord);
+                else
+                    key.DeleteValue(SkipNativeIpv6ProbeValue, throwOnMissingValue: false);
 
-                // Registry alone only takes effect on the next
-                // MiniportInitializeEx/MiniportRestart (T2NcmTunnelRefreshMode).
                 // Push it into the already-running adapter too, via
                 // IOCTL_T2NCM_SET_TRANSPORT_MODE, so toggling the checkbox
-                // works immediately without disabling/re-enabling T2Ncm or
-                // rebooting. 169.254.84.1 still needs to be on the T2Ncm
-                // adapter for tunnel mode either way.
-                bool pushedLive = PushTransportModeToDriver(mode);
+                // works immediately on the next connect attempt without
+                // waiting for T2Ncm to reinitialize. 169.254.84.1 still needs
+                // to be on the T2Ncm adapter for tunnel mode either way.
+                bool pushedLive = PushTransportModeToDriver(tunnel ? 1 : 0);
                 string liveNote = pushedLive
                     ? " Застосовано одразу."
                     : " Буде застосовано при наступному підключенні T2Ncm (драйвер зараз недоступний).";
-                TransportStatusText.Text = (mode == 1
-                    ? "Збережено: IPv4 tunnel. Додайте 169.254.84.1 на адаптер T2Ncm, якщо ще не додано."
-                    : "Збережено: Native IPv6.") + liveNote;
+                TransportStatusText.Text = (tunnel
+                    ? "Цей сеанс: IPv4 tunnel. Додайте 169.254.84.1 на адаптер T2Ncm, якщо ще не додано."
+                    : "Цей сеанс: Native IPv6 (спробується знову на наступному підключенні).") + liveNote
+                    + " Скидається при перезавантаженні.";
                 TransportStatusText.Foreground = DotOk;
             }
             catch (UnauthorizedAccessException)
