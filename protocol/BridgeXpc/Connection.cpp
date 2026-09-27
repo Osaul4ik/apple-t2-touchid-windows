@@ -6,6 +6,7 @@
 #include "Winsock.h"
 #include <ws2tcpip.h>
 #include <rpc.h>
+#include <algorithm>
 #include <cctype>
 #pragma comment(lib, "Ws2_32.lib")
 #pragma comment(lib, "Rpcrt4.lib")
@@ -58,6 +59,51 @@ void Connection::Close() {
 static bool SetSocketTimeout(SOCKET s, int optname, std::chrono::milliseconds timeout) {
     DWORD ms = static_cast<DWORD>(timeout.count());
     return setsockopt(s, SOL_SOCKET, optname, reinterpret_cast<const char*>(&ms), sizeof(ms)) == 0;
+}
+
+// BUG FIX (v6/v4 fallback work): SO_RCVTIMEO/SO_SNDTIMEO, set right after
+// socket() below, do NOT bound connect() itself on Windows - they only
+// govern send()/recv() on an already-established socket. A plain blocking
+// connect() is instead bounded by the OS's own TCP connect timeout (several
+// seconds), so a link that accepts the SYN but never completes the
+// handshake (or a WFP/firewall rule that silently drops it) used to hang
+// past `connectTimeout` entirely before HELO's own timeout even started.
+// This puts the socket in non-blocking mode for the handshake only, then
+// restores blocking mode before returning - callers get an ordinary
+// blocking socket either way, just with a real, enforced connect deadline.
+static bool ConnectWithTimeout(SOCKET s, const sockaddr* addr, int addrlen,
+                                std::chrono::milliseconds timeout) {
+    u_long nonBlocking = 1;
+    if (ioctlsocket(s, FIONBIO, &nonBlocking) != 0) {
+        return false;
+    }
+    bool ok = false;
+    const int rc = connect(s, addr, addrlen);
+    if (rc == 0) {
+        ok = true;
+    } else if (WSAGetLastError() == WSAEWOULDBLOCK) {
+        fd_set writeSet, errSet;
+        FD_ZERO(&writeSet);
+        FD_ZERO(&errSet);
+        FD_SET(s, &writeSet);
+        FD_SET(s, &errSet);
+        timeval tv{};
+        tv.tv_sec = static_cast<long>(timeout.count() / 1000);
+        tv.tv_usec = static_cast<long>((timeout.count() % 1000) * 1000);
+        const int sel = select(0, nullptr, &writeSet, &errSet, &tv);
+        if (sel > 0 && FD_ISSET(s, &writeSet) && !FD_ISSET(s, &errSet)) {
+            int err = 0;
+            int errLen = sizeof(err);
+            ok = (getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &errLen) == 0
+                  && err == 0);
+        }
+        // sel <= 0 (timeout/error) or an errSet hit both leave ok=false, which
+        // is exactly "no first connect within the deadline" from the caller's
+        // point of view - the case the 150ms IPv6 fallback below depends on.
+    }
+    u_long blocking = 0;
+    ioctlsocket(s, FIONBIO, &blocking);
+    return ok;
 }
 
 // Narrow, bounded extraction of one integer field from the peer's HELO
@@ -117,18 +163,65 @@ static std::vector<uint8_t> BuildClientHeloBody(int64_t bridgeXpcVersion) {
     return std::vector<uint8_t>(json.begin(), json.end());
 }
 
+// How long the DEFAULT NativeIpv6 attempt is allowed to take to complete its
+// initial TCP handshake before this falls back to the IPv4 tunnel for the
+// SAME Connect() call. This is intentionally much shorter than
+// connectTimeout as a whole: a real T2 link-local peer that is actually
+// reachable over IPv6 answers a local-segment SYN in low single-digit
+// milliseconds, so 150ms already generously covers that case while still
+// failing fast on a Cisco/WFP setup that drops the SYN (or its SYN-ACK)
+// silently rather than rejecting it (a rejection would return WSAECONNREFUSED
+// immediately anyway, well under 150ms).
+constexpr std::chrono::milliseconds kIpv6FirstConnectTimeout{150};
+
 ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned long interfaceIndex,
                                    uint16_t port, std::chrono::milliseconds connectTimeout) {
     connectionLost_ = false;
-    const auto mode = t2::transport::ReadTransportMode();
-    const bool tunnel = (mode == t2::transport::TransportMode::Ipv4Tunnel);
+    const auto configuredMode = t2::transport::ReadTransportMode();
+    // The registry TransportMode is a manual OVERRIDE (kept for the existing
+    // A/B testing use), not a persistent record of "last connect used v4" -
+    // per the user's own default, an unset/NativeIpv6 registry always starts
+    // this call by trying native IPv6 first, falling back to the tunnel
+    // per-attempt if the handshake doesn't complete in time. Ipv4Tunnel in
+    // the registry still skips straight to the tunnel, unchanged.
+    bool tunnel = (configuredMode == t2::transport::TransportMode::Ipv4Tunnel);
+    bool fellBackFromIpv6 = false;
+    const auto attemptStart = std::chrono::steady_clock::now();
     T2_LOG("connect", L"connect begin: ifIndex=%lu port=%u timeout=%lldms mode=%s",
            interfaceIndex, static_cast<unsigned>(port),
            static_cast<long long>(connectTimeout.count()),
-           tunnel ? L"Ipv4Tunnel" : L"NativeIpv6");
+           tunnel ? L"Ipv4Tunnel (forced)" : L"NativeIpv6 (default, may fall back)");
     if (!t2::EnsureWinsock()) {
         T2_LOG("connect", L"WSAStartup failed");
         return ConnectResult::ConnectFailed;
+    }
+
+    if (!tunnel) {
+        socket_ = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+        if (socket_ == INVALID_SOCKET) {
+            T2_LOG("connect", L"socket(AF_INET6) failed, WSAGetLastError=%d", WSAGetLastError());
+            return ConnectResult::ConnectFailed;
+        }
+        sockaddr_in6 addr{};
+        addr.sin6_family = AF_INET6;
+        addr.sin6_port = htons(port);
+        addr.sin6_addr = linkLocalAddress;
+        addr.sin6_scope_id = interfaceIndex;
+        const auto v6Timeout = std::min(connectTimeout, kIpv6FirstConnectTimeout);
+        if (ConnectWithTimeout(socket_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr), v6Timeout)) {
+            SetSocketTimeout(socket_, SO_RCVTIMEO, connectTimeout);
+            SetSocketTimeout(socket_, SO_SNDTIMEO, connectTimeout);
+            T2_LOG("connect", L"TCP connected: ifIndex=%lu port=%u (waiting for peer HELO)",
+                   interfaceIndex, static_cast<unsigned>(port));
+        } else {
+            T2_LOG("connect", L"NativeIpv6 first connect did not complete within %lldms "
+                   L"(WSAGetLastError=%d) - falling back to Ipv4Tunnel for this attempt",
+                   static_cast<long long>(v6Timeout.count()), WSAGetLastError());
+            closesocket(socket_);
+            socket_ = INVALID_SOCKET;
+            tunnel = true;
+            fellBackFromIpv6 = true;
+        }
     }
 
     if (tunnel) {
@@ -140,8 +233,6 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
             T2_LOG("connect", L"socket(AF_INET) failed, WSAGetLastError=%d", WSAGetLastError());
             return ConnectResult::ConnectFailed;
         }
-        SetSocketTimeout(socket_, SO_RCVTIMEO, connectTimeout);
-        SetSocketTimeout(socket_, SO_SNDTIMEO, connectTimeout);
         // Force the T2 NCM interface (Cisco/VPN often has a default route that
         // would otherwise steal 169.254/16).
         DWORD ifIndexNet = htonl(static_cast<DWORD>(interfaceIndex));
@@ -159,35 +250,32 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
                peer4.S_un.S_un_b.s_b1, peer4.S_un.S_un_b.s_b2,
                peer4.S_un.S_un_b.s_b3, peer4.S_un.S_un_b.s_b4,
                static_cast<unsigned>(port), interfaceIndex);
-        if (connect(socket_, reinterpret_cast<sockaddr*>(&addr4), sizeof(addr4)) != 0) {
+        // If this is a same-call fallback from a timed-out IPv6 attempt,
+        // don't hand the tunnel a fresh full connectTimeout on top of the
+        // 150ms already spent - subtract the elapsed time (floored, so a
+        // near-exhausted caller-supplied budget still gets a small, useful
+        // window rather than 0/negative) so the whole Connect() call stays
+        // bounded close to the caller's original connectTimeout.
+        auto tunnelTimeout = connectTimeout;
+        if (fellBackFromIpv6) {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - attemptStart);
+            const auto remaining = connectTimeout - elapsed;
+            constexpr std::chrono::milliseconds kMinTunnelBudget{300};
+            tunnelTimeout = std::max(remaining, kMinTunnelBudget);
+        }
+        if (!ConnectWithTimeout(socket_, reinterpret_cast<sockaddr*>(&addr4), sizeof(addr4),
+                                 tunnelTimeout)) {
             T2_LOG("connect", L"connect(AF_INET) failed WSA=%d — need T2Ncm tunnel rewrite + "
                    L"IPv4 neighbor for mapped 169.254 address",
                    WSAGetLastError());
             Close();
             return ConnectResult::ConnectFailed;
         }
-        T2_LOG("connect", L"TCP connected (IPv4 tunnel): ifIndex=%lu port=%u (waiting for peer HELO)",
-               interfaceIndex, static_cast<unsigned>(port));
-    } else {
-        socket_ = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
-        if (socket_ == INVALID_SOCKET) {
-            T2_LOG("connect", L"socket(AF_INET6) failed, WSAGetLastError=%d", WSAGetLastError());
-            return ConnectResult::ConnectFailed;
-        }
         SetSocketTimeout(socket_, SO_RCVTIMEO, connectTimeout);
         SetSocketTimeout(socket_, SO_SNDTIMEO, connectTimeout);
-        sockaddr_in6 addr{};
-        addr.sin6_family = AF_INET6;
-        addr.sin6_port = htons(port);
-        addr.sin6_addr = linkLocalAddress;
-        addr.sin6_scope_id = interfaceIndex;
-        if (connect(socket_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-            T2_LOG("connect", L"connect() to port %u ifIndex=%lu failed, WSAGetLastError=%d",
-                   port, interfaceIndex, WSAGetLastError());
-            Close();
-            return ConnectResult::ConnectFailed;
-        }
-        T2_LOG("connect", L"TCP connected: ifIndex=%lu port=%u (waiting for peer HELO)",
+        T2_LOG("connect", L"TCP connected (IPv4 tunnel%s): ifIndex=%lu port=%u (waiting for peer HELO)",
+               fellBackFromIpv6 ? L", fallback from timed-out IPv6" : L"",
                interfaceIndex, static_cast<unsigned>(port));
     }
 
