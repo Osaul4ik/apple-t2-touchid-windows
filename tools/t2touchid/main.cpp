@@ -529,12 +529,25 @@ static int CmdNcmStatus() {
         std::wcout << L"IOCTL_T2NCM_GET_STATUS failed, GetLastError=" << GetLastError() << L"\n";
         return 1;
     }
+    auto printMac = [](const wchar_t* label, const UINT8 mac[6]) {
+        wchar_t buf[32];
+        swprintf_s(buf, L"%02X-%02X-%02X-%02X-%02X-%02X",
+                   mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        std::wcout << label << buf << L"\n";
+    };
+
     std::wcout << L"LifecycleState        " << status.LifecycleState << L"\n";
     std::wcout << L"NdisAdapterReady      " << (status.NdisAdapterReady ? L"yes" : L"no") << L"\n";
     std::wcout << L"DataPathRunning       " << (status.DataPathRunning ? L"yes" : L"no") << L"\n";
     std::wcout << L"PowerState            " << status.PowerState << L" (0=Unspecified,1=D0,2..5=D1..D3)\n";
     std::wcout << L"CdcPacketFilter       0x" << std::hex << status.CdcPacketFilter << std::dec
                << (status.CdcPacketFilterApplied ? L" (applied)" : L" (NOT applied)") << L"\n";
+    std::wcout << L"MacAddressIsPermanent " << (status.MacAddressIsPermanent ? L"yes" : L"no (generated)") << L"\n";
+    if (status.MacAddressValid) {
+        printMac(L"MacAddress (ours)     ", status.MacAddress);
+    } else {
+        std::wcout << L"MacAddress (ours)     (not valid)\n";
+    }
     std::wcout << L"OutstandingRxNbls     " << status.OutstandingRxNbls << L"\n";
     std::wcout << L"OutstandingTxRequests " << status.OutstandingTxRequests << L"\n";
     std::wcout << L"RxNtbsReceived        " << status.RxNtbsReceived << L"\n";
@@ -544,6 +557,8 @@ static int CmdNcmStatus() {
     std::wcout << L"RxFramesRejected      " << status.RxFramesRejected << L"\n";
     std::wcout << L"RxLastFrameEtherType  0x" << std::hex << status.RxLastFrameEtherType << std::dec << L"\n";
     std::wcout << L"RxLastFrameLength     " << status.RxLastFrameLength << L"\n";
+    printMac(L"RxLastFrameDest       ", status.RxLastFrameDest);
+    printMac(L"RxLastFrameSrc        ", status.RxLastFrameSrc);
     std::wcout << L"DrainTimeoutCount     " << status.DrainTimeoutCount << L"\n";
     return 0;
 }
