@@ -227,6 +227,23 @@ T2NcmDispatchDeviceControl(
         break;
     }
 
+
+    case IOCTL_T2NCM_SET_TUNNEL_PEER:
+    {
+        ULONG inLen = stack->Parameters.DeviceIoControl.InputBufferLength;
+        if (inLen < 16 || Irp->AssociatedIrp.SystemBuffer == NULL)
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        RtlCopyMemory(context->TunnelPeerIpv6, Irp->AssociatedIrp.SystemBuffer, 16);
+        context->TunnelPeerIpv6Valid = TRUE;
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
+            "T2Ncm: TunnelPeerIpv6 set via IOCTL (tunnel rewrite armed)\n"));
+        status = STATUS_SUCCESS;
+        break;
+    }
+
     case IOCTL_T2NCM_SEND_TEST_FRAME:
     {
         ULONG inLen = stack->Parameters.DeviceIoControl.InputBufferLength;

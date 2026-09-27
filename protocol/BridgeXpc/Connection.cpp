@@ -132,6 +132,8 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
     }
 
     if (tunnel) {
+        // Seed T2Ncm peer IPv6 + static IPv4 neighbor (ARP) before SYN.
+        t2::transport::PrepareTunnelPeer(interfaceIndex, linkLocalAddress);
         const in_addr peer4 = t2::transport::MapPeerToIpv4(linkLocalAddress);
         socket_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (socket_ == INVALID_SOCKET) {

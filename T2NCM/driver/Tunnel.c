@@ -127,10 +127,34 @@ VOID T2NcmTunnelRefreshMode(_In_ PT2NCM_DEVICE_CONTEXT DeviceContext)
         }
     }
 
-    DeviceContext->TunnelModeEnabled = enabled;
+        DeviceContext->TunnelModeEnabled = enabled;
+
+    {
+        HANDLE key2 = NULL;
+        OBJECT_ATTRIBUTES oa2;
+        UNICODE_STRING path2 = RTL_CONSTANT_STRING(L"\Registry\Machine\SOFTWARE\T2TouchId\Network");
+        UNICODE_STRING peerName = RTL_CONSTANT_STRING(L"PeerIpv6");
+        UCHAR pbuf[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + 16];
+        ULONG plen = 0;
+        PKEY_VALUE_PARTIAL_INFORMATION pinfo = (PKEY_VALUE_PARTIAL_INFORMATION)pbuf;
+
+        InitializeObjectAttributes(&oa2, &path2, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+        if (NT_SUCCESS(ZwOpenKey(&key2, KEY_READ, &oa2))) {
+            if (NT_SUCCESS(ZwQueryValueKey(key2, &peerName, KeyValuePartialInformation,
+                                           pbuf, sizeof(pbuf), &plen)) &&
+                pinfo->Type == REG_BINARY && pinfo->DataLength >= 16) {
+                RtlCopyMemory(DeviceContext->TunnelPeerIpv6, pinfo->Data, 16);
+                DeviceContext->TunnelPeerIpv6Valid = TRUE;
+            }
+            ZwClose(key2);
+        }
+    }
+
     T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
-        "T2Ncm: TunnelModeEnabled=%u (cached from registry, PASSIVE)\n",
-        enabled ? 1u : 0u));
+        "T2Ncm: TunnelModeEnabled=%u PeerIpv6Valid=%u (cached PASSIVE)\n",
+        enabled ? 1u : 0u,
+        DeviceContext->TunnelPeerIpv6Valid ? 1u : 0u));
+
 }
 
 

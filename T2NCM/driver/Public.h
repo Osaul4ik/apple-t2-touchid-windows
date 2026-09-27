@@ -192,6 +192,10 @@ typedef struct _T2NCM_STATUS
 #define IOCTL_T2NCM_SEND_TEST_FRAME \
     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x901, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 
+// Seed TunnelPeerIpv6 (16 bytes fe80) for IPv4 tunnel TX rewrite before first RX.
+#define IOCTL_T2NCM_SET_TUNNEL_PEER \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x902, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+
 // NT symbolic link the diagnostic device is reachable through. Created
 // by NdisMRegisterDeviceEx in NdisMiniport.c; open it with
 // CreateFile("\\\\.\\T2Ncm", ...).
