@@ -278,19 +278,30 @@ BOOLEAN T2NcmTunnelRewriteTxIpv4ToIpv6(
     UCHAR* tcp;
     USHORT oldCheck;
 
-    if (!DeviceContext->TunnelModeEnabled)
-        return TRUE;
-
     // Any frame that is already IPv6 here is native traffic Windows built
     // itself (this function only ever produces IPv6 as output, never takes
     // it as input) — its source is Windows' real address on this adapter.
     // Learn it before the ethType==IPv4 check below returns early for it.
+    //
+    // Done BEFORE the TunnelModeEnabled check on purpose: while the adapter
+    // is still in Native IPv6 mode Windows' own ND/MLD frames are the only
+    // chance to learn its link-local address. With the check first, a
+    // switch to tunnel mode made AFTER a VPN/WFP filter was already
+    // dropping IPv6 never saw a single native frame and started with an
+    // unknown local address (-> the T2's Neighbor Solicitation for the
+    // synthesized address was never answered and the tunnel stayed dead),
+    // whereas tunnel-then-VPN worked only because frames had flowed in the
+    // meantime. IOCTL_T2NCM_SET_TUNNEL_LOCAL covers the case where no such
+    // frame is ever emitted.
     {
         ULONG probeLen = *FrameLength;
         USHORT probeEth = (probeLen >= 14) ? T2NcmReadBe16(Frame + 12) : 0;
         if (probeEth == T2NCM_ETH_TYPE_IPV6)
             T2NcmTunnelNoteLocalFromIpv6Frame(DeviceContext, Frame, probeLen);
     }
+
+    if (!DeviceContext->TunnelModeEnabled)
+        return TRUE;
 
     if (!DeviceContext->TunnelPeerIpv6Valid) {
         // Log once per outage, not once per frame — this is exactly the

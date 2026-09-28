@@ -427,6 +427,32 @@ inline LastPushedPeerState& LastPushedPeer() {
     static LastPushedPeerState s;
     return s;
 }
+// Dedupe for the local (Windows-side) link-local push, same idea as
+// LastPushedPeer above.
+struct LastPushedLocalState {
+    std::mutex mu;
+    in6_addr local{};
+    bool valid = false;
+};
+inline LastPushedLocalState& LastPushedLocal() {
+    static LastPushedLocalState s;
+    return s;
+}
+inline void ClearLastPushedLocal() {
+    std::lock_guard<std::mutex> lock(LastPushedLocal().mu);
+    LastPushedLocal().valid = false;
+}
+inline bool IsSameAsLastPushedLocal(const in6_addr& a) {
+    std::lock_guard<std::mutex> lock(LastPushedLocal().mu);
+    return LastPushedLocal().valid &&
+           std::memcmp(&LastPushedLocal().local, &a, sizeof(in6_addr)) == 0;
+}
+inline void RememberLastPushedLocal(const in6_addr& a) {
+    std::lock_guard<std::mutex> lock(LastPushedLocal().mu);
+    LastPushedLocal().local = a;
+    LastPushedLocal().valid = true;
+}
+
 // Cache of "have we already ensured the static ARP neighbor for this
 // tunnel peer" - separate from LastPushedPeer (that one only dedupes the
 // IOCTL to the driver, not the neighbor-table syscalls below it).
@@ -484,6 +510,7 @@ inline void InvalidateTunnelPrepCache() {
         ArpPrepCache().valid = false;
     }
     ClearLastPushedPeer();
+    ClearLastPushedLocal();
     LastPushedModeFlag().store(-1, std::memory_order_relaxed);
 }
 
@@ -527,6 +554,80 @@ inline bool PushTunnelPeerToDriver(const in6_addr& peer6) {
         T2_LOG("tunnel", L"PushTunnelPeerToDriver: IOCTL failed, GetLastError=%lu", GetLastError());
     } else {
         RememberLastPushedPeer(peer6);
+    }
+    CloseHandle(h);
+    return ok != FALSE;
+}
+
+// Windows' REAL link-local IPv6 address on the T2 adapter, read straight from
+// the IP stack's own configuration (works while a VPN/WFP filter drops all
+// IPv6 traffic - it never touches the wire). Prefers a Preferred address,
+// otherwise takes any link-local one (Tentative right after boot).
+inline bool LookupLocalLinkLocal(unsigned long ifIndex, in6_addr* out) {
+    PMIB_UNICASTIPADDRESS_TABLE table = nullptr;
+    if (GetUnicastIpAddressTable(AF_INET6, &table) != NO_ERROR || !table) {
+        return false;
+    }
+    bool found = false;
+    bool foundPreferred = false;
+    for (ULONG i = 0; i < table->NumEntries; ++i) {
+        const auto& row = table->Table[i];
+        if (row.InterfaceIndex != ifIndex) continue;
+        if (row.Address.si_family != AF_INET6) continue;
+        const in6_addr& a = row.Address.Ipv6.sin6_addr;
+        if (a.s6_addr[0] != 0xFE || (a.s6_addr[1] & 0xC0) != 0x80) continue;
+        const bool preferred = (row.DadState == IpDadStatePreferred);
+        if (foundPreferred || (found && !preferred)) continue;
+        *out = a;
+        found = true;
+        foundPreferred = preferred;
+    }
+    FreeMibTable(table);
+    return found;
+}
+
+// Hand Windows' real link-local address to T2Ncm.sys
+// (IOCTL_T2NCM_SET_TUNNEL_LOCAL, code 0x904). Without it the driver only
+// learns that address from a native outbound IPv6 frame; when tunnel mode is
+// switched on while a VPN is already blocking IPv6 no such frame ever leaves,
+// the tunnel TX source falls back to a MAC-derived address Windows does not
+// own, the T2's Neighbor Solicitation for it is never answered and every
+// AF_INET connect() times out. Best-effort: on any failure the old passive
+// learning still applies.
+inline bool PushTunnelLocalToDriver(unsigned long ifIndex) {
+    if (IsTransportIoSuspended()) {
+        T2_LOG("tunnel", L"PushTunnelLocalToDriver: skipped (system suspending / Dx)");
+        return false;
+    }
+    in6_addr local{};
+    if (!LookupLocalLinkLocal(ifIndex, &local)) {
+        T2_LOG("tunnel", L"PushTunnelLocalToDriver: no link-local IPv6 on ifIndex=%lu "
+               L"- driver will have to learn it from native traffic", ifIndex);
+        return false;
+    }
+    if (IsSameAsLastPushedLocal(local)) {
+        return true; // already armed
+    }
+    HANDLE h = CreateFileW(L"\\\\.\\T2Ncm", FILE_WRITE_DATA, // see PushTunnelPeerToDriver
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        T2_LOG("tunnel", L"PushTunnelLocalToDriver: could not open \\\\.\\T2Ncm "
+               L"(GetLastError=%lu) - driver not loaded, or (5) access denied", GetLastError());
+        return false;
+    }
+    DWORD returned = 0;
+    const DWORD code = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x904, METHOD_BUFFERED, FILE_WRITE_ACCESS);
+    BOOL ok = DeviceIoControl(h, code, (LPVOID)&local, (DWORD)sizeof(local),
+                              nullptr, 0, &returned, nullptr);
+    if (!ok) {
+        // An older T2Ncm.sys without this IOCTL fails here (ERROR_INVALID_FUNCTION):
+        // harmless, the driver keeps learning passively as before.
+        T2_LOG("tunnel", L"PushTunnelLocalToDriver: IOCTL failed, GetLastError=%lu", GetLastError());
+    } else {
+        RememberLastPushedLocal(local);
+        T2_LOG("tunnel", L"PushTunnelLocalToDriver: local fe80 ...%02x%02x:%02x%02x armed in driver",
+               local.s6_addr[12], local.s6_addr[13], local.s6_addr[14], local.s6_addr[15]);
     }
     CloseHandle(h);
     return ok != FALSE;
@@ -588,6 +689,7 @@ inline bool PushTransportModeToDriver(TransportMode mode) {
         T2_LOG("tunnel", L"PushTransportModeToDriver: IOCTL failed, GetLastError=%lu", GetLastError());
     } else {
         LastPushedModeFlag().store(want, std::memory_order_relaxed);
+        ClearLastPushedLocal(); // mode flipped: re-arm the local address on the next PrepareTunnelPeer
         T2_LOG("tunnel", L"PushTransportModeToDriver: live TunnelModeEnabled -> %d", want);
     }
     CloseHandle(h);
@@ -609,6 +711,7 @@ inline void PrepareTunnelPeer(unsigned long ifIndex, const in6_addr& peer6) {
     if (IsArpAlreadyPrepared(peer6)) {
         PublishTunnelPeer(peer6, nullptr);
         PushTunnelPeerToDriver(peer6);
+        PushTunnelLocalToDriver(ifIndex);
         return;
     }
     UCHAR mac[6]{};
@@ -633,6 +736,7 @@ inline void PrepareTunnelPeer(unsigned long ifIndex, const in6_addr& peer6) {
            haveMac ? L"found" : L"NOT FOUND (ARP neighbor will not be set - tunnel will not work)");
     PublishTunnelPeer(peer6, haveMac ? mac : nullptr);
     PushTunnelPeerToDriver(peer6);
+    PushTunnelLocalToDriver(ifIndex);
     if (haveMac) {
         EnsureTunnelIpv4Neighbor(ifIndex, MapPeerToIpv4(peer6), mac);
         RememberArpPrepared(peer6);

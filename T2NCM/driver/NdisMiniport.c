@@ -244,6 +244,32 @@ T2NcmDispatchDeviceControl(
         break;
     }
 
+    case IOCTL_T2NCM_SET_TUNNEL_LOCAL:
+    {
+        ULONG inLen = stack->Parameters.DeviceIoControl.InputBufferLength;
+        const UCHAR* localAddr;
+
+        if (inLen < 16 || Irp->AssociatedIrp.SystemBuffer == NULL)
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        localAddr = (const UCHAR*)Irp->AssociatedIrp.SystemBuffer;
+        // Only a link-local (fe80::/10) address is ever a valid tunnel source.
+        if (localAddr[0] != 0xFE || (localAddr[1] & 0xC0) != 0x80)
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        RtlCopyMemory(context->TunnelLocalIpv6, localAddr, 16);
+        context->TunnelLocalIpv6Valid = TRUE;
+        context->TunnelLocalIpv6UnknownLogged = FALSE;
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
+            "T2Ncm: TunnelLocalIpv6 set via IOCTL (real Windows link-local, no native frame needed)\n"));
+        status = STATUS_SUCCESS;
+        break;
+    }
+
     case IOCTL_T2NCM_SET_TRANSPORT_MODE:
     {
         ULONG inLen = stack->Parameters.DeviceIoControl.InputBufferLength;

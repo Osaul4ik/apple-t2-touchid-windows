@@ -215,6 +215,20 @@ typedef struct _T2NCM_STATUS
 #define IOCTL_T2NCM_SET_TRANSPORT_MODE \
     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x903, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 
+// Seed TunnelLocalIpv6 (16 bytes fe80): Windows' REAL link-local address on
+// this adapter, as reported by the IP stack (GetUnicastIpAddressTable /
+// GetAdaptersAddresses), NOT derived from the MAC. In IPv4-tunnel mode every
+// rewritten TX frame is sent with this as its IPv6 source; if the driver has
+// not learned it yet it falls back to a MAC-derived address Windows never
+// owns, the T2's Neighbor Solicitation for it goes unanswered and no reply
+// is ever routed back. Passive learning from native outbound IPv6 frames
+// (T2NcmTunnelNoteLocalFromIpv6Frame) needs Windows to actually emit such a
+// frame, which it does not when a VPN/WFP filter is already up at the
+// moment tunnel mode is switched on - so userspace pushes the address
+// explicitly instead. Input: 16 bytes, must be inside fe80::/10.
+#define IOCTL_T2NCM_SET_TUNNEL_LOCAL \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x904, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+
 // NT symbolic link the diagnostic device is reachable through. Created
 // by NdisMRegisterDeviceEx in NdisMiniport.c; open it with
 // CreateFile("\\\\.\\T2Ncm", ...).

@@ -174,6 +174,9 @@ namespace T2TouchId.SepVaultGui
                 if (tunnel)
                 {
                     peerOk = PushPersistedPeerToDriver();
+                    // Windows' real fe80 must reach the driver explicitly: with a VPN
+                    // already up no native IPv6 frame leaves for it to learn from.
+                    PushLocalLinkLocalToDriver();
                     // Best-effort datapath warm so T2Ncm learns local addresses.
                     WarmTunnelDatapathFromPersistedPeer();
                 }
@@ -229,6 +232,7 @@ namespace T2TouchId.SepVaultGui
 
         private const uint IOCTL_T2NCM_SET_TRANSPORT_MODE = 0x0022A40C;
         private const uint IOCTL_T2NCM_SET_TUNNEL_PEER = 0x0022A408;
+        private const uint IOCTL_T2NCM_SET_TUNNEL_LOCAL = 0x0022A410;
         private const string T2NcmDevicePath = @"\\.\T2Ncm";
 
         private const uint GENERIC_WRITE = 0x40000000;
@@ -304,6 +308,56 @@ namespace T2TouchId.SepVaultGui
             {
                 return false;
             }
+        }
+
+        private static bool IsT2NcmAdapter(System.Net.NetworkInformation.NetworkInterface nic)
+        {
+            string d = nic.Description ?? "";
+            string n = nic.Name ?? "";
+            if (d.Contains("T2") && d.Contains("NCM")) return true;
+            if (n.Contains("T2") && n.Contains("NCM")) return true;
+            return d.Contains("UsbNcm") || n.Contains("UsbNcm") ||
+                   d.Contains("Apple T2 USB NCM") || n.Contains("Apple T2 USB NCM");
+        }
+
+        // Read Windows' real link-local IPv6 on the T2 NCM adapter from the IP stack
+        // (no network traffic, so it works while a VPN drops IPv6) and hand it to
+        // T2Ncm.sys, which needs it as the source of every rewritten tunnel frame.
+        private static bool PushLocalLinkLocalToDriver()
+        {
+            try
+            {
+                foreach (var nic in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (!IsT2NcmAdapter(nic)) continue;
+                    foreach (var ua in nic.GetIPProperties().UnicastAddresses)
+                    {
+                        var a = ua.Address;
+                        if (a.AddressFamily != System.Net.Sockets.AddressFamily.InterNetworkV6 || !a.IsIPv6LinkLocal)
+                            continue;
+                        byte[] bytes = a.GetAddressBytes();
+                        if (bytes.Length != 16) continue;
+                        IntPtr handle = CreateFileW(T2NcmDevicePath, GENERIC_WRITE,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE, IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero);
+                        if (handle == new IntPtr(-1))
+                            return false;
+                        try
+                        {
+                            return DeviceIoControl(handle, IOCTL_T2NCM_SET_TUNNEL_LOCAL,
+                                bytes, (uint)bytes.Length, IntPtr.Zero, 0, out _, IntPtr.Zero);
+                        }
+                        finally
+                        {
+                            CloseHandle(handle);
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                /* best-effort */
+            }
+            return false;
         }
 
         // Map last 4 bytes of fe80 to 169.254.x.y (same as MapPeerToIpv4 in TransportMode.h)
