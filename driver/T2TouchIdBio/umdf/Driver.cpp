@@ -4,6 +4,7 @@
 // which scopes INITGUID tightly around just <winbio_ioctl.h> (see the
 // comment there for why it must NOT be left on across <windows.h>/<wdf.h>).
 #include "Internal.h"
+#include "../../../protocol/BridgeXpc/Log.h"   // shared, TTL-cached Bio/Power gates
 
 // DebugView: run as Administrator, Capture -> Capture Global Win32 (WUDFHost.exe
 // is a LocalService process in session 0). Filter: T2TouchId*  - the engine
@@ -15,25 +16,6 @@
 //   Bio=1   — general CAPTURE / WBF lines
 //   Power=1 — sleep / resume / shutdown / display / PBT lines (also shown if Bio=1)
 // Missing values default to enabled.
-static bool T2BioRegistryFlag(const wchar_t* name, bool defaultValue = true)
-{
-    HKEY key = nullptr;
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\T2TouchId\\Logging", 0,
-                      KEY_READ, &key) != ERROR_SUCCESS) {
-        return defaultValue;
-    }
-    DWORD data = defaultValue ? 1u : 0u;
-    DWORD type = 0;
-    DWORD cb = sizeof(data);
-    const LONG err = RegQueryValueExW(key, name, nullptr, &type,
-                                      reinterpret_cast<LPBYTE>(&data), &cb);
-    RegCloseKey(key);
-    if (err != ERROR_SUCCESS || (type != REG_DWORD && type != REG_BINARY)) {
-        return defaultValue;
-    }
-    return data != 0;
-}
-
 static bool T2BioMessageIsPowerRelated(_In_z_ const char* msg)
 {
     static const char* kKeys[] = {
@@ -59,6 +41,16 @@ static bool T2BioMessageIsPowerRelated(_In_z_ const char* msg)
 
 void T2BioLog(_In_z_ const char* fmt, ...)
 {
+    // Cheap gate first (cached, see t2::log::CachedRegistryFlag): with both
+    // flags off nothing below can be emitted, so skip the formatting and the
+    // 30-keyword strstr classification entirely. Power-related lines go out
+    // if Power OR Bio is on, everything else only if Bio is on - unchanged.
+    const bool bio = t2::log::BioEnabled();
+    const bool power = t2::log::PowerEnabled();
+    if (!bio && !power) {
+        return;
+    }
+
     char buf[256];
     va_list ap;
     va_start(ap, fmt);
@@ -69,11 +61,7 @@ void T2BioLog(_In_z_ const char* fmt, ...)
     }
 
     const bool isPower = T2BioMessageIsPowerRelated(buf);
-    if (isPower) {
-        if (!T2BioRegistryFlag(L"Power") && !T2BioRegistryFlag(L"Bio")) {
-            return;
-        }
-    } else if (!T2BioRegistryFlag(L"Bio")) {
+    if (isPower ? !(power || bio) : !bio) {
         return;
     }
 

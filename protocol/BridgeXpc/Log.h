@@ -16,6 +16,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <atomic>
 #include <string>
 #include <vector>
 #include <cstdint>
@@ -65,11 +66,37 @@ inline bool RegistryFlag(const wchar_t* valueName, bool defaultValue = true) {
     return data != 0;
 }
 
-inline bool BridgeXpcEnabled() { return RegistryFlag(L"BridgeXpc"); }
-inline bool BioEnabled() { return RegistryFlag(L"Bio"); }
-inline bool PowerEnabled() { return RegistryFlag(L"Power"); }
-inline bool TransportEnabled() { return RegistryFlag(L"Transport"); }
-inline bool NcmEnabled() { return RegistryFlag(L"Ncm"); }
+// RegistryFlag() costs RegOpenKeyEx + RegQueryValueEx + RegCloseKey, and the
+// gates below run on EVERY log line - including the per-frame lines inside
+// the recv loop (Connection::WaitForEvent / ReadFrame) while a verify is
+// armed. Cache each value for kFlagTtlMs: the SepVault GUI toggle still
+// takes effect, just up to that long after the write, and the hot path
+// becomes one GetTickCount64() + an atomic load. A racing refresh from two
+// threads is benign (both store the same registry value).
+inline constexpr ULONGLONG kFlagTtlMs = 2000;
+
+struct CachedFlag {
+    std::atomic<ULONGLONG> stampMs{0};   // 0 = never read
+    std::atomic<bool> value{true};       // same default as RegistryFlag()
+};
+
+inline bool CachedRegistryFlag(CachedFlag& cache, const wchar_t* valueName) {
+    const ULONGLONG now = GetTickCount64();
+    const ULONGLONG last = cache.stampMs.load(std::memory_order_relaxed);
+    if (last != 0 && now - last < kFlagTtlMs) {
+        return cache.value.load(std::memory_order_relaxed);
+    }
+    const bool v = RegistryFlag(valueName);
+    cache.value.store(v, std::memory_order_relaxed);
+    cache.stampMs.store(now != 0 ? now : 1, std::memory_order_relaxed);
+    return v;
+}
+
+inline bool BridgeXpcEnabled() { static CachedFlag c; return CachedRegistryFlag(c, L"BridgeXpc"); }
+inline bool BioEnabled() { static CachedFlag c; return CachedRegistryFlag(c, L"Bio"); }
+inline bool PowerEnabled() { static CachedFlag c; return CachedRegistryFlag(c, L"Power"); }
+inline bool TransportEnabled() { static CachedFlag c; return CachedRegistryFlag(c, L"Transport"); }
+inline bool NcmEnabled() { static CachedFlag c; return CachedRegistryFlag(c, L"Ncm"); }
 
 inline int64_t ElapsedMs() {
     static const auto start = std::chrono::steady_clock::now();
@@ -120,4 +147,11 @@ inline std::wstring Widen(const std::string& s) {
 
 } // namespace t2::log
 
-#define T2_LOG(tag, ...) ::t2::log::Logf(L##tag, __VA_ARGS__)
+// The gate sits in the macro (not only inside Logf) so that a disabled log
+// line does not evaluate its arguments either: several call sites build a
+// HexDump()/Widen() std::wstring inline (e.g. the 512-byte event dump in
+// Connection::WaitForEvent = 512 swprintf_s calls per event), and with
+// arguments evaluated eagerly that cost was paid even with logging off.
+// Logf() keeps its own check for the direct ::t2::log::Logf() callers.
+#define T2_LOG(tag, ...) \
+    do { if (::t2::log::BridgeXpcEnabled()) ::t2::log::Logf(L##tag, __VA_ARGS__); } while (0)
