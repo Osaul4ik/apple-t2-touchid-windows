@@ -578,10 +578,19 @@ ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_
     if (Type == PBT_APMSUSPEND) {
         g_sleepBarrier.store(true, std::memory_order_release);
         g_powerButtonGraceUntil.store(0, std::memory_order_release); // suspend owns the barrier
+        // Freeze T2Ncm control IOCTLs for the whole Dx window — background
+        // Connect/LockRefresh/warmup must not arm tunnel while miniport is paused.
+        t2::transport::SetTransportIoSuspended(true);
         std::lock_guard<std::mutex> commitLock(g_captureRequestCommitMu);
         BeginCaptureSuspend("OnSuspendResume(PBT_APMSUSPEND)");
     } else if (Type == PBT_APMRESUMESUSPEND || Type == PBT_APMRESUMEAUTOMATIC) {
         g_sleepBarrier.store(false, std::memory_order_release);
+        // Allow tunnel IOCTLs again only after resume. Sticky already cleared
+        // below; Connect will rediscover once NCM is Running.
+        t2::transport::SetTransportIoSuspended(false);
+        // Force next PushTransportMode to actually hit the driver (post-Dx
+        // cache in miniport may not match our LastPushedMode).
+        t2::transport::LastPushedModeFlag().store(-1, std::memory_order_relaxed);
         // Resume hygiene (no service restarts — WBF owns Activate/CAPTURE):
         // 1) Drop sticky NCM / match-replay (adapter and connection may change).
         // 2) Wake the still-pending capture worker. It clears the suspend
@@ -1062,6 +1071,21 @@ void CompleteCaptureData(_In_ WDFREQUEST Request, HRESULT winBioHresult,
 bool ConnectForCapture(t2::bridgexpc::Connection* outConn)
 {
     const ULONGLONG t0 = GetTickCount64();
+
+    // After Sx resume the miniport may still be in NcmReady→Running transition.
+    // One short settle per suspend generation avoids CAPTURE racing DataPathRunning=0.
+    {
+        static std::atomic<ULONGLONG> s_settledGen{0};
+        const ULONGLONG gen = g_suspendGeneration.load(std::memory_order_acquire);
+        ULONGLONG settled = s_settledGen.load(std::memory_order_relaxed);
+        if (gen != 0 && settled != gen) {
+            if (s_settledGen.compare_exchange_strong(settled, gen)) {
+                T2BioLog("CAPTURE_DATA: post-resume NCM settle 500ms (gen=%llu)",
+                         static_cast<unsigned long long>(gen));
+                Sleep(500);
+            }
+        }
+    }
 
     // If the session transport flipped (NativeIpv6 ↔ Ipv4Tunnel) since the
     // sticky endpoint was cached, the old TCP path is almost certainly dead
