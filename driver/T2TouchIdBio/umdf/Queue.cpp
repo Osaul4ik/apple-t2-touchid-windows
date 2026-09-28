@@ -2,10 +2,9 @@
 // Queue.cpp - WBDI IOCTL dispatch.
 #include "Internal.h"
 #include "../WbdiBir.h"
-// ProbeNativeIpv6Reachable()/RecordNativeIpv6Success()/RecordNativeIpv6Failure() -
-// the post-unlock background reachability probe, see the WTS_SESSION_UNLOCK
-// call site below and TransportMode.h's own header comment for the full
-// lock/unlock cycle.
+// Transport policy (Native IPv6 <-> IPv4 tunnel auto-switch): see the header
+// comment in TransportMode.h. This file only feeds it events
+// (RequestNativeReprobe on unlock / resume).
 #include "BridgeXpc/TransportMode.h"
 // FindT2NcmEndpoints() - peer IPv6 link-local + interface index for the probe.
 #include "Discovery/Adapter.h"
@@ -700,6 +699,7 @@ ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_
         // Connect/LockRefresh/warmup must not arm tunnel while miniport is paused.
         t2::transport::SetTransportIoSuspended(true);
         t2::transport::BumpRealSuspendGeneration();
+        t2::transport::RequestNativeReprobe(); // link/VPN state may differ after Sx
         std::lock_guard<std::mutex> commitLock(g_captureRequestCommitMu);
         BeginCaptureSuspend("OnSuspendResume(PBT_APMSUSPEND)");
     } else if (Type == PBT_APMRESUMESUSPEND || Type == PBT_APMRESUMEAUTOMATIC) {
@@ -1296,16 +1296,16 @@ ConnectWait ConnectForCaptureWithRetry(HANDLE cancelEvent, t2::bridgexpc::Connec
             if (attempt > 1) {
                 T2BioLog("CAPTURE_DATA: BridgeXPC reachable after %u attempts (%llu ms) mode=%s",
                          attempt, static_cast<unsigned long long>(GetTickCount64() - start),
-                         t2::transport::ShouldSkipNativeIpv6Probe() ? "Ipv4Tunnel" : "NativeIpv6");
+                         t2::transport::IsTunnelModeActive() ? "Ipv4Tunnel" : "NativeIpv6");
             }
             return ConnectWait::Connected;
         }
         if (t2::bridgexpc::Connection::IsEventSignaled(cancelEvent)) {
             return ConnectWait::Cancelled;
         }
-        // Native just failed and Connect() armed tunnel (SkipNative now set).
-        // Drop sticky and retry immediately — caller will then send a NEW
-        // verify on a clean Ipv4Tunnel Connection (not a half-dead v6 session).
+        // Connect() already tried BOTH transports inside this attempt (a
+        // native TCP failure is retried on the tunnel immediately), so a
+        // failure here means the T2 itself is not ready: back off and retry.
         const ULONGLONG waited = GetTickCount64() - start;
         if (waited >= kConnectRetryWindowMs) {
             T2BioLog("CAPTURE_DATA: BridgeXPC still unreachable after %llu ms - giving up",
@@ -2237,7 +2237,9 @@ LRESULT CALLBACK SessionLockWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             std::lock_guard<std::mutex> commitLock(g_captureRequestCommitMu);
             BeginCaptureSessionLock("SessionLockNotify(WTS_SESSION_LOCK)");
         } else if (wParam == WTS_SESSION_UNLOCK) {
-            // Manual transport mode only — no unlock probe / AutoSwitch.
+            // A VPN may have come or gone while locked: let the next Connect()
+            // re-probe Native IPv6 once if it is currently on the auto tunnel.
+            t2::transport::RequestNativeReprobe();
         }
         // Every other WM_WTSSESSION_CHANGE type is intentionally ignored.
         return 0;

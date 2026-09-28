@@ -207,30 +207,24 @@ static std::vector<uint8_t> BuildClientHeloBody(int64_t bridgeXpcVersion) {
     return std::vector<uint8_t>(json.begin(), json.end());
 }
 
-// How long the DEFAULT NativeIpv6 attempt is allowed to take to complete its
-// initial TCP handshake before this falls back to the IPv4 tunnel for the
-// SAME Connect() call. This is intentionally much shorter than
-// connectTimeout as a whole: a real T2 link-local peer that is actually
-// reachable over IPv6 answers a local-segment SYN in low single-digit
-
-ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned long interfaceIndex,
-                                   uint16_t port, std::chrono::milliseconds connectTimeout) {
-    connectionLost_.store(false);
-    // The only input to "which transport does this call start on" is the
-    // session cache: skip the redundant NativeIpv6 probe once it has already
-    // failed since the last unlock (event-driven, not time-driven - see
-    // TransportMode.h's kSkipNativeIpv6ProbeValue comment; cleared again on
-    // the next real WTS_SESSION_UNLOCK, or by MainWindow.xaml.cs's checkbox).
-    // There used to also be a persisted manual-override registry value read
-    // here (TransportMode) that could force the tunnel independently of this
-    // flag; it was removed (see TransportMode.h) precisely because it and
-    // this flag could disagree, so the GUI now sets this exact flag instead.
-    bool tunnel = t2::transport::ShouldSkipNativeIpv6Probe();
-    // Manual mode only: GUI/cmd sets SkipNativeIpv6Probe. No timed v6→tunnel fallback.
+// One transport attempt (no fallback logic). `tcpTimeout` bounds only the TCP
+// handshake; `heloTimeout` bounds the HELO exchange and the established
+// socket's later send/recv defaults. *outTcpFailed is set when the handshake
+// itself did not complete (the only failure that says "this path is dead" -
+// a HELO problem means the path works), *outTcpMs is the handshake time.
+ConnectResult Connection::ConnectOnce(bool tunnel, const in6_addr& linkLocalAddress,
+                                      unsigned long interfaceIndex, uint16_t port,
+                                      std::chrono::milliseconds tcpTimeout,
+                                      std::chrono::milliseconds heloTimeout,
+                                      bool* outTcpFailed, ULONGLONG* outTcpMs) {
+    *outTcpFailed = false;
+    *outTcpMs = 0;
     t2::transport::PushTransportModeToDriver(
         tunnel ? t2::transport::TransportMode::Ipv4Tunnel
                : t2::transport::TransportMode::NativeIpv6);
 
+    const ULONGLONG tcpStart = GetTickCount64();
+    int wsa = 0;
     if (tunnel) {
         t2::transport::PrepareTunnelPeer(interfaceIndex, linkLocalAddress);
         const in_addr peer4 = t2::transport::MapPeerToIpv4(linkLocalAddress);
@@ -241,8 +235,7 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
         }
         DWORD ifIndexNet = htonl(static_cast<DWORD>(interfaceIndex));
         if (setsockopt(socket_, IPPROTO_IP, IP_UNICAST_IF,
-                       reinterpret_cast<const char*>(&ifIndexNet),
-                       sizeof(ifIndexNet)) != 0) {
+                       reinterpret_cast<const char*>(&ifIndexNet), sizeof(ifIndexNet)) != 0) {
             T2_LOG("connect", L"IP_UNICAST_IF ifIndex=%lu failed WSA=%d (continuing)",
                    interfaceIndex, WSAGetLastError());
         }
@@ -255,17 +248,14 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
                peer4.S_un.S_un_b.s_b3, peer4.S_un.S_un_b.s_b4,
                static_cast<unsigned>(port), interfaceIndex);
         if (!ConnectWithTimeout(socket_, reinterpret_cast<sockaddr*>(&addr4), sizeof(addr4),
-                                 connectTimeout)) {
-            T2_LOG("connect", L"connect(AF_INET) failed WSA=%d", WSAGetLastError());
+                                tcpTimeout, &wsa)) {
+            T2_LOG("connect", L"connect(AF_INET) failed WSA=%d (%llu ms)", wsa,
+                   static_cast<unsigned long long>(GetTickCount64() - tcpStart));
             t2::transport::InvalidateTunnelPrepCache(); // re-prepare neighbor/peer next time
             Close();
+            *outTcpFailed = true;
             return ConnectResult::ConnectFailed;
         }
-        TuneEstablishedSocket(socket_);
-        SetSocketTimeout(socket_, SO_RCVTIMEO, connectTimeout);
-        SetSocketTimeout(socket_, SO_SNDTIMEO, connectTimeout);
-        T2_LOG("connect", L"TCP connected (IPv4 tunnel): ifIndex=%lu port=%u (waiting for peer HELO)",
-               interfaceIndex, static_cast<unsigned>(port));
     } else {
         socket_ = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
         if (socket_ == INVALID_SOCKET) {
@@ -277,26 +267,30 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
         addr.sin6_port = htons(port);
         addr.sin6_addr = linkLocalAddress;
         addr.sin6_scope_id = interfaceIndex;
-        T2_LOG("connect", L"NativeIpv6 ifIndex=%lu port=%u",
-               interfaceIndex, static_cast<unsigned>(port));
+        T2_LOG("connect", L"NativeIpv6 ifIndex=%lu port=%u (tcp budget %lld ms)",
+               interfaceIndex, static_cast<unsigned>(port),
+               static_cast<long long>(tcpTimeout.count()));
         if (!ConnectWithTimeout(socket_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr),
-                                 connectTimeout)) {
-            T2_LOG("connect", L"connect(AF_INET6) failed WSA=%d", WSAGetLastError());
+                                tcpTimeout, &wsa)) {
+            T2_LOG("connect", L"connect(AF_INET6) failed WSA=%d (%llu ms)", wsa,
+                   static_cast<unsigned long long>(GetTickCount64() - tcpStart));
             Close();
+            *outTcpFailed = true;
             return ConnectResult::ConnectFailed;
         }
-        TuneEstablishedSocket(socket_);
-        SetSocketTimeout(socket_, SO_RCVTIMEO, connectTimeout);
-        SetSocketTimeout(socket_, SO_SNDTIMEO, connectTimeout);
-        T2_LOG("connect", L"TCP connected (Native IPv6): ifIndex=%lu port=%u (waiting for peer HELO)",
-               interfaceIndex, static_cast<unsigned>(port));
     }
+    *outTcpMs = GetTickCount64() - tcpStart;
+    TuneEstablishedSocket(socket_);
+    SetSocketTimeout(socket_, SO_RCVTIMEO, heloTimeout);
+    SetSocketTimeout(socket_, SO_SNDTIMEO, heloTimeout);
+    T2_LOG("connect", L"TCP connected (%s): ifIndex=%lu port=%u, %llu ms (waiting for peer HELO)",
+           tunnel ? L"IPv4 tunnel" : L"Native IPv6", interfaceIndex,
+           static_cast<unsigned>(port), static_cast<unsigned long long>(*outTcpMs));
 
     RawFrame helo;
-    if (!ReadFrame(&helo, connectTimeout) || helo.type != FrameType::Helo) {
+    if (!ReadFrame(&helo, heloTimeout) || helo.type != FrameType::Helo) {
         T2_LOG("connect", L"HELO read failed or wrong frame type "
-               "(connected=true, timeout=%lldms)",
-               static_cast<long long>(connectTimeout.count()));
+               "(connected=true, timeout=%lldms)", static_cast<long long>(heloTimeout.count()));
         if (tunnel) t2::transport::InvalidateTunnelPrepCache();
         Close();
         return ConnectResult::HeloTimeout;
@@ -304,20 +298,8 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
     T2_LOG("connect", L"peer HELO received, %zu bytes: %s",
            helo.body.size(), HexDump(helo.body, 96).c_str());
 
-    // BUG FIX: this used to echo the peer's own HELO body straight back
-    // (WriteFrame(FrameType::Helo, helo.body)). That is NOT what the
-    // verified reference does. docs/linux-reference-analysis.md line 187
-    // (itself sourced from bridge-xpc-probe.py's send_helo()) says the
-    // client replies with its OWN HELO JSON - only reusing the peer's
-    // BridgeXPCVersion number - not a copy of the T2's self-description
-    // (its own OSBuild/ProcessName). Sending the device's own HELO back to
-    // it, unchanged, doesn't identify us as a real client, which is a
-    // plausible reason bridgeOS accepts the handshake (framing is valid,
-    // so HELO/getBridgeVersion/setClientVersion/reset/cancel all still
-    // "work") but then withholds the FDR calibration blob on a policy it
-    // gates by client identity - GetFdrCalibration comes back with [None]
-    // ("bridgeOS returned no usable FDR calibration data") instead of an
-    // error, so nothing before it ever caught this.
+    // The client replies with its OWN HELO (only the peer's BridgeXPCVersion
+    // is reused), not an echo of the peer's - see BuildClientHeloBody.
     std::string peerHeloJson(helo.body.begin(), helo.body.end());
     int64_t bridgeXpcVersion = 0;
     if (!ExtractJsonIntField(peerHeloJson, "BridgeXPCVersion", &bridgeXpcVersion)) {
@@ -332,9 +314,74 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
         Close();
         return ConnectResult::HeloMalformed;
     }
-
     T2_LOG("connect", L"handshake OK, BridgeXPCVersion=%lld", static_cast<long long>(bridgeXpcVersion));
     return ConnectResult::Ok;
+}
+
+// Entry point. Transport policy lives in TransportMode.h (read its header
+// comment first). In short:
+//  * forced tunnel (GUI/--tunnel)  -> tunnel only, no probing;
+//  * auto-switch OFF               -> native only (unless forced), old behaviour;
+//  * auto-switch ON (default)      -> start on the last-known-good transport;
+//    a native attempt gets a short adaptive TCP budget (NativeConnectBudget),
+//    and a TCP-level failure on either transport immediately retries the
+//    other one within this same call. Only a SUCCESSFUL fallback is remembered.
+ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned long interfaceIndex,
+                                  uint16_t port, std::chrono::milliseconds connectTimeout) {
+    namespace tp = t2::transport;
+    connectionLost_.store(false);
+    tp::EnsureNetworkChangeWatch();
+
+    const bool autoSwitch = !tp::IsTunnelForced() && tp::IsAutoSwitchEnabled();
+    bool tunnel = tp::IsTunnelModeActive();
+    if (autoSwitch && tunnel && tp::ConsumeNativeReprobeDue()) {
+        T2_LOG("connect", L"auto-switch: network/session changed - re-probing Native IPv6");
+        tunnel = false;
+    }
+
+    const std::chrono::milliseconds firstTcp =
+        (autoSwitch && !tunnel) ? tp::NativeConnectBudget(connectTimeout) : connectTimeout;
+    bool tcpFailed = false;
+    ULONGLONG tcpMs = 0;
+    const ULONGLONG t0 = GetTickCount64();
+    ConnectResult r = ConnectOnce(tunnel, linkLocalAddress, interfaceIndex, port,
+                                  firstTcp, connectTimeout, &tcpFailed, &tcpMs);
+    if (!tcpFailed) {
+        if (!tunnel) tp::RecordNativeSuccess(tcpMs); // path works -> clears auto-tunnel
+        return r;                                     // Ok, or a HELO-level problem (no switch)
+    }
+    if (!autoSwitch) return r;
+
+    // TCP handshake did not complete: this transport is dead right now. Try
+    // the other one immediately. Tunnel handshakes get a floor because the
+    // ARP/peer prep is part of them; native ones use the adaptive budget.
+    const bool other = !tunnel;
+    long long fbMs = connectTimeout.count();
+    if (other) {
+        if (fbMs > 800) fbMs = 800;
+        if (fbMs < 300) fbMs = 300;
+    }
+    const std::chrono::milliseconds fallbackTcp =
+        other ? std::chrono::milliseconds(fbMs) : tp::NativeConnectBudget(connectTimeout);
+    bool tcpFailed2 = false;
+    ULONGLONG tcpMs2 = 0;
+    ConnectResult r2 = ConnectOnce(other, linkLocalAddress, interfaceIndex, port,
+                                   fallbackTcp, connectTimeout, &tcpFailed2, &tcpMs2);
+    if (!tcpFailed2) {
+        if (other) tp::CommitAutoTunnel(true);
+        else       tp::RecordNativeSuccess(tcpMs2);
+        T2_LOG("connect", L"auto-switch: %s -> %s after %llu ms (%s)",
+               tunnel ? L"IPv4 tunnel" : L"Native IPv6", other ? L"IPv4 tunnel" : L"Native IPv6",
+               static_cast<unsigned long long>(GetTickCount64() - t0),
+               r2 == ConnectResult::Ok ? L"connected" : L"TCP ok, HELO failed");
+        return r2;
+    }
+    // Both transports failed at TCP level: the T2 is probably not ready.
+    // State is left untouched (nothing was committed) so the caller's retry
+    // loop simply starts over with the same bounded attempts.
+    T2_LOG("connect", L"auto-switch: both transports failed at TCP level (%llu ms)",
+           static_cast<unsigned long long>(GetTickCount64() - t0));
+    return r;
 }
 
 

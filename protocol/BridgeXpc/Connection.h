@@ -31,10 +31,12 @@ public:
     ~Connection();
 
     // interfaceIndex selects the T2 CDC-NCM adapter (IPv6 scope id / IPv4
-    // IP_UNICAST_IF). t2::transport::ShouldSkipNativeIpv6Probe() (TransportMode.h)
-    // chooses NativeIpv6 vs Ipv4Tunnel: tunnel maps peer fe80→169.254.x.y and
-    // uses AF_INET so WFP IPv6 drops never see the flow; T2Ncm rewrites to
-    // IPv6 on the USB wire.
+    // IP_UNICAST_IF). Transport policy (TransportMode.h): NativeIpv6 vs
+    // Ipv4Tunnel (peer fe80→169.254.x.y over AF_INET, so WFP IPv6 drops never
+    // see the flow; T2Ncm rewrites to IPv6 on the USB wire). With auto-switch
+    // on (default) a TCP-level failure on one transport is retried on the
+    // other inside this call; connectTimeout still bounds HELO and the
+    // fallback handshake.
     ConnectResult Connect(const in6_addr& linkLocalAddress, unsigned long interfaceIndex,
                           uint16_t port, std::chrono::milliseconds connectTimeout);
 
@@ -148,6 +150,11 @@ public:
     bool ConnectionLost() const { return connectionLost_.load(std::memory_order_relaxed); }
 
 private:
+    ConnectResult ConnectOnce(bool tunnel, const in6_addr& linkLocalAddress,
+                              unsigned long interfaceIndex, uint16_t port,
+                              std::chrono::milliseconds tcpTimeout,
+                              std::chrono::milliseconds heloTimeout,
+                              bool* outTcpFailed, ULONGLONG* outTcpMs);
     SOCKET socket_ = INVALID_SOCKET;
     std::atomic<bool> connectionLost_{false};
 

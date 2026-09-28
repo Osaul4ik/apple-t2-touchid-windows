@@ -46,169 +46,177 @@ inline constexpr wchar_t kNetworkRegPath[] = L"SOFTWARE\\T2TouchId\\Network";
 inline constexpr wchar_t kPeerIpv6Value[] = L"PeerIpv6";
 inline constexpr wchar_t kPeerMacValue[] = L"PeerMac";
 
-// There used to be a second, PERSISTENT flag here (kTransportModeValue /
-// ReadTransportMode(), a manual A/B override the GUI checkbox wrote
-// straight to HKLM\...\Network\TransportMode). It was removed: it lived
-// right next to the auto-detected session cache below, did the same job
-// ("which transport to use right now"), and — because it survived a
-// reboot while the session cache deliberately does not — a forgotten
-// checked box silently pinned every future boot to Ipv4Tunnel and fought
-// the auto probe/fallback cycle below. There is now exactly one flag that
-// decides the live transport (kSkipNativeIpv6ProbeValue, in the volatile
-// subkey right below); the GUI checkbox now toggles that same flag
-// directly instead of a separate one — see MainWindow.xaml.cs.
+// ---- Transport selection: Native IPv6 vs IPv4 tunnel -------------------
 //
-// kPeerIpv6Value/kPeerMacValue above are meant to persist (last-known peer
-// for the driver's own PASSIVE-level refresh). This subkey is the opposite
-// — an auto-detected "NativeIpv6 is currently unreachable" cache that MUST
-// NOT survive a reboot (a VPN that was up last session may be gone, a
-// Cisco profile may have changed, and a stale "assume tunnel" left over
-// from weeks ago would silently defeat the native-first default forever).
-// Created with REG_OPTION_VOLATILE: the key and everything under it is
-// destroyed by the OS itself on shutdown/reboot, so there is no cross-boot
-// staleness to invalidate by hand — a fresh boot simply finds nothing here
-// and Connect() falls through to its normal NativeIpv6-first behavior.
-// This also means every t2touchid.exe invocation (a new process each time,
-// per the CLI's usage pattern) sees the same cache without needing a
-// long-running service — the registry is the shared, per-boot-lifetime
-// store across those separate processes.
+// Three independent inputs decide which transport a Connect() starts on:
+//
+//  1. MANUAL FORCE (session, volatile): HKLM\...\Network\Session\
+//     SkipNativeIpv6Probe = 1. Written by the GUI checkbox / SepVaultGui
+//     --tunnel. Means "always tunnel, never probe IPv6". Disappears on reboot
+//     (REG_OPTION_VOLATILE) so a forgotten box cannot pin future boots.
+//
+//  2. AUTO-SWITCH (persistent setting, default ON): HKLM\...\Network\
+//     AutoSwitch (DWORD, missing == 1). Toggled from the GUI. When on, a
+//     Native IPv6 connect that fails at the TCP level (VPN/WFP dropping IPv6)
+//     is immediately retried over the IPv4 tunnel inside the same Connect()
+//     call, and the tunnel is remembered (see 3). When off, behaviour is the
+//     old manual-only one: whatever is forced, or Native IPv6.
+//
+//  3. AUTO-TUNNEL STATE (in-process only): set when a fallback to the tunnel
+//     SUCCEEDED, never on a mere native failure (a T2 that is still booting
+//     must not leave us pinned to a tunnel that does not work either). It is
+//     deliberately not mirrored into the registry: the UMDF host runs as
+//     LocalService and cannot write HKLM, and a stale cross-process copy that
+//     one side can set but the other cannot clear was the source of the old
+//     "stuck on tunnel" behaviour. Every process re-learns it with one
+//     bounded native attempt.
+//
+// Native and tunnel are mutually exclusive at the driver level: while
+// T2Ncm.sys has TunnelModeEnabled set it rewrites EVERY inbound IPv6 TCP/UDP
+// frame to IPv4 (Tunnel.c, T2NcmTunnelRewriteRxIpv6ToIpv4), so a native SYN-ACK
+// would never reach the IPv6 stack. That is why the two paths are tried one
+// after the other, never raced in parallel.
+//
+// Getting back from tunnel to native is event-driven, not polled:
+//  * a real add/delete of an IP interface (a VPN coming up or going down),
+//  * WTS_SESSION_UNLOCK / real resume (Queue.cpp calls RequestNativeReprobe),
+//  * the GUI bumping Session\ReprobeNonce,
+//  * a slow safety net (kReprobeSafetyNetMs) for silent WFP policy changes.
+// A re-probe costs one bounded native SYN (NativeConnectBudget) and only while
+// auto-tunnel is active; on failure the known-good tunnel is used at once.
 inline constexpr wchar_t kSessionRegPath[] = L"SOFTWARE\\T2TouchId\\Network\\Session";
-// Event-driven, not time-driven: one bit, "skip the NativeIpv6 probe until
-// the next unlock". Replaces an earlier exponential-backoff timer
-// (NextProbeTick64/BackoffMs) that kept re-probing IPv6 on a clock while
-// the screen was still locked with the VPN still up — wasted 400ms/wasted
-// wall-clock on every re-probe that could only ever fail again, since
-// nothing about the VPN/WFP state was going to change mid-lock. The
-// desired cycle (per the user's own spec): IPv6 is always tried first at
-// boot; once it fails while locked, EVERY subsequent unlock attempt goes
-// straight to Ipv4Tunnel (no re-probing while still locked); on a real
-// WTS_SESSION_UNLOCK, this flag is cleared so the very next Connect() gets
-// exactly one fresh NativeIpv6 probe — if the VPN is still up it fails and
-// the flag is set again for the next lock cycle, if the VPN is now down it
-// succeeds and stays on NativeIpv6. T2TouchIdBio's SessionLockWndProc
-// (Queue.cpp) is the one place that clears this on WTS_SESSION_UNLOCK.
-inline constexpr wchar_t kSkipNativeIpv6ProbeValue[] = L"SkipNativeIpv6Probe"; // DWORD 0/1
+inline constexpr wchar_t kSkipNativeIpv6ProbeValue[] = L"SkipNativeIpv6Probe"; // manual force (name kept for GUI compat)
+inline constexpr wchar_t kReprobeNonceValue[] = L"ReprobeNonce";                // GUI bumps it on any transport change
+inline constexpr wchar_t kAutoSwitchValue[] = L"AutoSwitch";                    // under kNetworkRegPath, persistent
 
 enum class TransportMode : DWORD {
     NativeIpv6 = 0,
     Ipv4Tunnel = 1,
 };
-// IsTunnelModeActive() is defined further down, right after
-// ShouldSkipNativeIpv6Probe() (the one flag it now reads).
 
-// Session-lifetime "NativeIpv6 is currently unreachable" cache. This is
-// what lets Connection::Connect() stop paying the 400ms NativeIpv6 probe on every
-// single call once that probe has already failed once since the last
-// unlock (e.g. VPN up while locked), while still recovering automatically
-// on the very next unlock — see AllowNextNativeIpv6ProbeOnUnlock() below
-// for the other half of that cycle.
-//
-// kSessionRegPath's REG_OPTION_VOLATILE key means "reset after reboot"
-// requires no logic here at all: a fresh boot has no key, ReadValue
-// below fails closed to "don't skip, probe normally" exactly as if this
-// function didn't exist yet — matching "on start, IPv6 is always tried
-// first".
-// In-process copy of the flag. The UMDF host (LocalService) usually cannot
-// WRITE HKLM\\SOFTWARE\\T2TouchId (the key is created by an admin installer), so
-// RecordNativeIpv6Failure()'s registry write silently failed there and every
-// retry started on NativeIpv6 again ("mode=NativeIpv6" on all 7 attempts in
-// the field log). WUDFHost.exe outlives every capture, so a process-lifetime
-// atomic is a reliable store for the service; the registry value remains the
-// cross-process channel (CLI/GUI). Effective flag = process flag OR registry.
-inline std::atomic<bool> g_procSkipNativeIpv6Probe{false};
-
-inline bool ShouldSkipNativeIpv6Probe() {
-    if (g_procSkipNativeIpv6Probe.load(std::memory_order_relaxed)) return true;
-    HKEY key = nullptr;
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kSessionRegPath, 0, KEY_READ, &key) != ERROR_SUCCESS) {
-        return false; // no cache yet (or a fresh boot) - probe as normal
+// Registry reads are cached for a short TTL: IsTunnelModeActive() sits on hot
+// paths (PortScan::ProbePort calls it once per probed port - up to 16384 times
+// per scan - and used to open/query/close the key every time).
+struct CachedDword {
+    std::atomic<ULONGLONG> at{0};
+    std::atomic<DWORD> val{0};
+};
+inline DWORD ReadDwordCached(CachedDword& c, const wchar_t* subKey, const wchar_t* name,
+                             DWORD def, ULONGLONG ttlMs) {
+    const ULONGLONG now = GetTickCount64();
+    const ULONGLONG last = c.at.load(std::memory_order_relaxed);
+    if (last != 0 && now - last < ttlMs) return c.val.load(std::memory_order_relaxed);
+    DWORD v = def;
+    DWORD cb = sizeof(v);
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, subKey, name, RRF_RT_REG_DWORD,
+                     nullptr, &v, &cb) != ERROR_SUCCESS) {
+        v = def; // missing key/value or no read access: fail to the default
     }
-    DWORD skip = 0;
-    DWORD type = 0;
-    DWORD cb = sizeof(skip);
-    const LONG err = RegQueryValueExW(key, kSkipNativeIpv6ProbeValue, nullptr, &type,
-                                      reinterpret_cast<LPBYTE>(&skip), &cb);
-    RegCloseKey(key);
-    if (err != ERROR_SUCCESS || type != REG_DWORD || cb != sizeof(skip)) {
-        return false;
-    }
-    return skip != 0;
+    c.val.store(v, std::memory_order_relaxed);
+    c.at.store(now, std::memory_order_relaxed);
+    return v;
 }
 
-// The one and only "which transport is active right now" query. Callers
-// that just need a yes/no (RemoteXpc.cpp, PortScan.cpp, BridgeDiscovery.cpp,
-// main.cpp) read this instead of duplicating the flag lookup; Connection.cpp
-// itself still calls ShouldSkipNativeIpv6Probe() directly because it also
-// needs to react to a same-call fallback that happens after this point is
-// evaluated. No persisted override sits behind this anymore (see the removed
-// kTransportModeValue note above) — MainWindow.xaml.cs's checkbox sets/clears
-// exactly this same session flag now, so there is nothing else to check.
+inline bool IsTunnelForced() {
+    static CachedDword c;
+    return ReadDwordCached(c, kSessionRegPath, kSkipNativeIpv6ProbeValue, 0, 200) != 0;
+}
+inline bool IsAutoSwitchEnabled() {
+    static CachedDword c;
+    return ReadDwordCached(c, kNetworkRegPath, kAutoSwitchValue, 1, 1000) != 0;
+}
+
+inline std::atomic<bool> g_autoTunnel{false};
+
+// THE query for "which transport is active right now" (discovery budgets,
+// port scan, RemoteXPC and Connection all read this).
 inline bool IsTunnelModeActive() {
-    return ShouldSkipNativeIpv6Probe();
+    return g_autoTunnel.load(std::memory_order_relaxed) || IsTunnelForced();
 }
 
-// Call when a NativeIpv6 probe (the 400ms first-connect attempt) times
-// out. Sets the skip flag so every further Connect() this lock cycle goes
-// straight to Ipv4Tunnel without re-paying the 400ms probe - there is
-// nothing to gain from re-probing on a clock while the screen is still
-// locked and the VPN/WFP state hasn't changed. The flag is cleared only
-// by an actual NativeIpv6 success (RecordNativeIpv6Success) or by a real
-// WTS_SESSION_UNLOCK (AllowNextNativeIpv6ProbeOnUnlock), never by time.
-inline void RecordNativeIpv6Failure() {
-    g_procSkipNativeIpv6Probe.store(true, std::memory_order_relaxed);
-    HKEY key = nullptr;
-    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, kSessionRegPath, 0, nullptr,
-                        REG_OPTION_VOLATILE, KEY_SET_VALUE, nullptr,
-                        &key, nullptr) != ERROR_SUCCESS) {
-        return; // best-effort cache; a failure here just means every call
-                 // keeps paying the 400ms probe, not a functional break
+// ---- native re-probe triggers -----------------------------------------
+inline constexpr ULONGLONG kReprobeMinGapMs = 3000;       // flap guard
+inline constexpr ULONGLONG kReprobeSafetyNetMs = 120000;  // silent WFP changes
+inline std::atomic<bool> g_reprobeDue{false};
+inline std::atomic<ULONGLONG> g_lastNativeTryTick{0};
+inline std::atomic<DWORD> g_seenReprobeNonce{0};
+
+inline void RequestNativeReprobe() { g_reprobeDue.store(true, std::memory_order_relaxed); }
+
+// True at most once per trigger, and only while auto-tunnel is active.
+inline bool ConsumeNativeReprobeDue() {
+    if (!g_autoTunnel.load(std::memory_order_relaxed)) return false;
+    const ULONGLONG now = GetTickCount64();
+    const ULONGLONG last = g_lastNativeTryTick.load(std::memory_order_relaxed);
+    if (last != 0 && now - last < kReprobeMinGapMs) return false; // trigger stays pending
+    bool due = g_reprobeDue.exchange(false, std::memory_order_relaxed);
+    if (!due) {
+        static CachedDword nonce;
+        const DWORD n = ReadDwordCached(nonce, kSessionRegPath, kReprobeNonceValue, 0, 200);
+        if (n != g_seenReprobeNonce.exchange(n, std::memory_order_relaxed)) due = true;
     }
-    DWORD one = 1;
-    RegSetValueExW(key, kSkipNativeIpv6ProbeValue, 0, REG_DWORD,
-                  reinterpret_cast<const BYTE*>(&one), sizeof(one));
-    RegCloseKey(key);
+    if (!due && last != 0 && now - last >= kReprobeSafetyNetMs) due = true;
+    if (due) g_lastNativeTryTick.store(now, std::memory_order_relaxed);
+    return due;
 }
 
-// Call the moment a NativeIpv6 probe actually succeeds. Clears the skip
-// flag outright so the very next Connect() call - and every one after it
-// this lock cycle - goes back to trying NativeIpv6 first, instead of
-// carrying forward a stale "skip" state from an outage that just ended.
-inline void RecordNativeIpv6Success() {
-    g_procSkipNativeIpv6Probe.store(false, std::memory_order_relaxed);
-    HKEY key = nullptr;
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kSessionRegPath, 0, KEY_SET_VALUE, &key) != ERROR_SUCCESS) {
-        return; // nothing cached - already the desired state
-    }
-    RegDeleteValueW(key, kSkipNativeIpv6ProbeValue);
-    RegCloseKey(key);
+inline VOID NETIOAPI_API_ OnIpInterfaceChange(PVOID, PMIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE type) {
+    // Only real arrival/removal of an interface (VPN up/down). Parameter
+    // changes (DAD, metrics, lifetimes) fire constantly and mean nothing here.
+    if (type == MibAddInstance || type == MibDeleteInstance) RequestNativeReprobe();
+}
+inline void EnsureNetworkChangeWatch() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        HANDLE h = nullptr;
+        NotifyIpInterfaceChange(AF_UNSPEC, OnIpInterfaceChange, nullptr, FALSE, &h);
+        // Handle intentionally kept for the process lifetime.
+    });
 }
 
-// How long a post-unlock reachability probe is allowed to take. Tighter
-// than kIpv6FirstConnectTimeout (400ms, Connection.cpp) on purpose: this
-// probe runs off to the side of any real verify attempt (see
-// ProbeNativeIpv6Reachable's own comment below) - there is no live user
-// action waiting on it, so there is no reason to give it the same budget
-// as an actual in-flight connect. 100ms is still generous for a real
-// link-local peer (single-digit ms in practice) while failing fast when
-// the VPN/WFP is still dropping IPv6.
-constexpr std::chrono::milliseconds kUnlockProbeTimeout{100};
+// ---- adaptive native connect budget -------------------------------------
+// A healthy T2 link-local peer answers a SYN in single-digit ms (field logs:
+// whole socket+connect+HELO = 13-16 ms). A blocked path never answers, so the
+// only cost of "is IPv6 dead?" is how long we wait before deciding. The wait
+// is 4x the smoothed successful connect time, clamped to [60, 250] ms; 150 ms
+// before anything has been measured. It only bounds the TCP handshake; HELO
+// keeps the caller's full timeout.
+inline std::atomic<DWORD> g_nativeEmaMs{0};
+inline std::chrono::milliseconds NativeConnectBudget(std::chrono::milliseconds cap) {
+    const DWORD ema = g_nativeEmaMs.load(std::memory_order_relaxed);
+    long long ms = (ema == 0) ? 150 : static_cast<long long>(ema) * 4 + 30;
+    if (ms < 60) ms = 60;
+    if (ms > 250) ms = 250;
+    if (cap.count() < ms) ms = cap.count();
+    return std::chrono::milliseconds(ms);
+}
+// Native TCP handshake completed: the IPv6 path works. Clears auto-tunnel.
+inline void RecordNativeSuccess(ULONGLONG tcpMs) {
+    const DWORD old = g_nativeEmaMs.load(std::memory_order_relaxed);
+    DWORD next = (old == 0) ? static_cast<DWORD>(tcpMs) : static_cast<DWORD>((old * 3 + tcpMs) / 4);
+    if (next == 0) next = 1;
+    g_nativeEmaMs.store(next, std::memory_order_relaxed);
+    g_autoTunnel.store(false, std::memory_order_relaxed);
+}
+// Tunnel handshake completed after native failed: remember it.
+inline void CommitAutoTunnel(bool on) {
+    g_autoTunnel.store(on, std::memory_order_relaxed);
+    if (on) g_lastNativeTryTick.store(GetTickCount64(), std::memory_order_relaxed);
+}
 
-// Standalone reachability probe: a throwaway TCP SYN at the T2 peer's
-// real IPv6 link-local address, bounded by `timeout`. This is NEVER part
-// of the live Connect() path used by an actual verify attempt - it exists
-// solely so a real WTS_SESSION_UNLOCK (T2TouchIdBio's SessionLockWndProc,
-// Queue.cpp) can find out whether NativeIpv6 has become viable again
-// WITHOUT risking the switch happening mid-attempt on a real unlock.
-// Per the user's own spec: after unlock, while cached on Ipv4Tunnel, we
-// only TEST NativeIpv6 - we do not switch a live connect over to it - and
-// a failure within the 100ms budget means staying on Ipv4Tunnel, full
-// stop, until the next real unlock tries again.
-//
-// A completed handshake (err==0) or an immediate WSAECONNREFUSED both
-// prove the SYN actually reached the peer over IPv6 (a real RST requires
-// that) - either counts as "reachable" even though no real BridgeXPC
-// service is expected to be listening on this throwaway port. Anything
-// else (timeout, unreachable, VPN/WFP silently dropping the SYN) is not.
+// ---- persisted-peer trust -----------------------------------------------
+// Adapter.cpp uses the last-known T2 peer straight away when the neighbor
+// table is empty (skipping the ~550 ms ping + poll). If a connect to that
+// guessed peer then fails, this flag makes the NEXT discovery do the full
+// ping-based lookup once instead of trusting it again.
+inline std::atomic<bool> g_persistedPeerDistrusted{false};
+inline void DistrustPersistedPeer() { g_persistedPeerDistrusted.store(true, std::memory_order_relaxed); }
+inline bool ConsumePersistedPeerDistrust() { return g_persistedPeerDistrusted.exchange(false, std::memory_order_relaxed); }
+
+// Standalone reachability probe: a throwaway TCP SYN at the T2 peer's IPv6
+// link-local address, bounded by `timeout`. A completed handshake or an RST
+// (WSAECONNREFUSED) both prove the SYN reached the peer over IPv6. Only
+// meaningful while T2Ncm is in native mode (tunnel mode rewrites the reply).
 inline bool ProbeNativeIpv6Reachable(const in6_addr& peer6, unsigned long ifIndex,
                                      std::chrono::milliseconds timeout) {
     if (!t2::EnsureWinsock()) return false;
@@ -631,5 +639,20 @@ inline void PrepareTunnelPeer(unsigned long ifIndex, const in6_addr& peer6) {
     }
 }
 
+// Cold-discovery pre-flight (BridgeDiscovery.cpp): with no cached BridgeXPC
+// port the next step is a full port scan, which over a blocked IPv6 path
+// burns seconds probing nothing. One bounded native SYN at the peer decides
+// first. Returns true when native IPv6 works (or the answer is unknowable),
+// false when it does not - the caller then arms the tunnel provisionally.
+inline bool PreflightNativeIpv6(const in6_addr& peer6, unsigned long ifIndex) {
+    PushTransportModeToDriver(TransportMode::NativeIpv6); // probe needs a native RX path
+    const ULONGLONG t0 = GetTickCount64();
+    const bool ok = ProbeNativeIpv6Reachable(peer6, ifIndex,
+                        NativeConnectBudget(std::chrono::milliseconds(250)));
+    if (ok) RecordNativeSuccess(GetTickCount64() - t0);
+    T2_LOG("tunnel", L"PreflightNativeIpv6: %s (%llu ms)", ok ? L"reachable" : L"UNREACHABLE",
+           static_cast<unsigned long long>(GetTickCount64() - t0));
+    return ok;
+}
 
 } // namespace t2::transport

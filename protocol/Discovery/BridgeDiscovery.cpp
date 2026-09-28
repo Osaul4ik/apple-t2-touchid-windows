@@ -198,6 +198,25 @@ bool ConnectToBiometricKitBridge(const NcmEndpoint& endpoint, t2::bridgexpc::Con
         }
     }
 
+    // Cold path (no cached port, or the cached one did not answer): a full
+    // port scan is next. Over a blocked IPv6 path that scan probes 16k ports
+    // into a void for seconds, so decide the transport first with one bounded
+    // native SYN. The tunnel is armed only provisionally here and is rolled
+    // back below if the scan finds nothing (T2 simply not ready yet).
+    bool provisionalTunnel = false;
+    if (!t2::transport::IsTunnelModeActive() && t2::transport::IsAutoSwitchEnabled()) {
+        if (!t2::transport::PreflightNativeIpv6(endpoint.peerLinkLocal, endpoint.ifIndex)) {
+            t2::transport::CommitAutoTunnel(true);
+            provisionalTunnel = true;
+            T2_LOG("discovery", L"native IPv6 unreachable - scanning over the IPv4 tunnel");
+        }
+    }
+    auto rollbackProvisionalTunnel = [&]() {
+        if (!provisionalTunnel) return;
+        t2::transport::CommitAutoTunnel(false);
+        t2::transport::PushTransportModeToDriver(t2::transport::TransportMode::NativeIpv6);
+    };
+
     uint16_t foundPort = 0;
     uint16_t foundRsdPort = 0;
     const ULONGLONG scanStartMs = GetTickCount64();
@@ -237,12 +256,17 @@ bool ConnectToBiometricKitBridge(const NcmEndpoint& endpoint, t2::bridgexpc::Con
            static_cast<unsigned long long>(GetTickCount64() - scanStartMs),
            static_cast<unsigned>(foundPort));
     if (foundPort == 0) {
+        rollbackProvisionalTunnel();
+        if (endpoint.peerSource == PeerSource::LastKnown) {
+            t2::transport::DistrustPersistedPeer(); // next discovery does the full lookup
+        }
         return false;
     }
 
     ConnectResult cr = outConn->Connect(endpoint.peerLinkLocal, endpoint.ifIndex, foundPort,
                                          std::chrono::milliseconds(2000));
     if (cr != ConnectResult::Ok) {
+        rollbackProvisionalTunnel();
         return false;
     }
     SaveCachedPort(endpoint, foundPort, foundRsdPort);

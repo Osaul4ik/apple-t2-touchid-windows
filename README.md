@@ -320,36 +320,41 @@ userspace talks AF_INET to a synthetic `169.254.x.y` address, and
 on the wire — the T2 itself only ever sees IPv6, nothing changes on its
 side.
 
-This is fully automatic and needs no configuration in the normal case:
+Switching is automatic (**auto-switch, on by default**) and needs no
+configuration in the normal case:
 
-- Every cold boot always tries native IPv6 first.
-- After the first (and every) real unlock, the stack **prepares the IPv4
-  tunnel path in the background** (ARP neighbor + peer push into
-  `T2Ncm.sys` — same work the `network` / static-IP path needs) while
-  staying on native IPv6. That way a later VPN that blocks IPv6 can fall
-  back without a cold ARP miss.
-- If a connect attempt (e.g. finger unlock while VPN is up) doesn't get an
-  IPv6 handshake within **~400 ms**, that one call falls back to the IPv4
-  tunnel and the verify continues over the tunnel; every subsequent call
-  **for the rest of that lock cycle** skips straight to the tunnel too —
-  no repeated 400 ms timeouts while the screen stays locked.
-- Every real unlock runs a throwaway native-IPv6 reachability probe
-  (~100 ms). If the VPN dropped it succeeds and the next Connect uses
-  IPv6 again; if not, the tunnel stays selected until a later unlock
-  succeeds.
-- Once every **4 unlocks** the background path also forces a full tunnel
-  re-arm before the probe, then switches back to native IPv6 only if the
-  probe succeeds.
-- This state resets on every reboot (it's a volatile registry cache) —
-  Windows always starts a fresh boot by trying IPv6.
+- Every process starts on native IPv6. A native connect gets a short,
+  adaptive TCP-handshake budget (4x the smoothed successful connect time,
+  clamped to 60–250 ms; 150 ms before anything is measured). A healthy
+  link answers in a few ms, so the budget only matters when IPv6 is dead.
+- If the native handshake fails (dropped SYN or an immediate WFP error), the
+  **same `Connect()` call** retries over the IPv4 tunnel — no extra retry
+  cycle. Only a *successful* tunnel connect is remembered, so a T2 that is
+  merely still booting never pins the stack to a tunnel that doesn't work
+  either. While the tunnel is remembered, every connect and discovery step
+  goes straight to it (no repeated timeouts, no ping-based peer lookup).
+- Going back to IPv6 is event-driven, not polled: a real IP-interface
+  add/remove (VPN up/down), `WTS_SESSION_UNLOCK`, resume from sleep, or any
+  change made in the GUI triggers **one** bounded native attempt on the next
+  connect (at most once per 3 s). If it fails, the tunnel is used at once; a
+  120 s safety net covers silent WFP policy changes.
+- With no cached BridgeXPC port (first run, cold boot) one bounded native
+  SYN runs *before* the full port scan, so a blocked IPv6 path doesn't burn
+  seconds scanning 16k ports into a void.
+- Native and tunnel can't be raced in parallel: with tunnel mode on,
+  `T2Ncm.sys` rewrites every inbound IPv6 TCP/UDP frame to IPv4, so a native
+  SYN-ACK would never reach the IPv6 stack.
 
-There's also a manual override in the T2TouchIdBio GUI ("IPv4 tunnel цього
-сеансу" checkbox): checking it forces the tunnel immediately, exactly as
-if a real probe had just failed; unchecking it clears that and the next
-connect tries native IPv6 again. It's session-scoped on purpose (same
-volatile flag as the automatic fallback, not a separate persistent
-setting) so a forgotten checked box can't silently pin every future boot
-to the tunnel.
+Controls (T2TouchIdBio GUI, needs admin):
+
+- **"Авто-перемикання IPv6 → IPv4"** checkbox — the persistent switch
+  (`HKLM\SOFTWARE\T2TouchId\Network\AutoSwitch`, DWORD; missing = on).
+  Off means native IPv6 only (or the forced tunnel below). Also available as
+  `SepVaultGui.exe --auto` / `--no-auto`.
+- **"Примусово IPv4 tunnel"** checkbox — forces the tunnel and disables
+  auto-switch while checked. Session-scoped on purpose (volatile key, gone
+  after reboot) so a forgotten checked box can't pin every future boot.
+  `SepVaultGui.exe --tunnel` / `--native`.
 
 If you ever do need tunnel mode, make sure `169.254.84.1/16` is assigned
 to the "Apple T2 USB NCM Network Adapter" — `Set-T2NcmStaticIp.ps1`

@@ -53,7 +53,58 @@ namespace T2TouchId.SepVaultGui
         private const string NetworkRegPath = @"SOFTWARE\T2TouchId\Network";
         private const string SkipNativeIpv6ProbeValue = "SkipNativeIpv6Probe";
         private const string PeerIpv6Value = "PeerIpv6";
+        // Persistent setting (HKLM\SOFTWARE\T2TouchId\Network\AutoSwitch, DWORD).
+        // Missing == ON. Read by the native side (TransportMode.h IsAutoSwitchEnabled).
+        private const string AutoSwitchValue = "AutoSwitch";
+        // Bumped on every transport change so a running Bio service re-probes
+        // Native IPv6 immediately instead of waiting for a network event.
+        private const string ReprobeNonceValue = "ReprobeNonce";
         private bool _transportLoading;
+
+        private static bool ReadAutoSwitch()
+        {
+            try
+            {
+                using var key = Registry.LocalMachine.OpenSubKey(NetworkRegPath, false);
+                return !(key?.GetValue(AutoSwitchValue) is int i && i == 0);
+            }
+            catch { return true; }
+        }
+
+        private static bool WriteAutoSwitch(bool enabled)
+        {
+            try
+            {
+                using var key = Registry.LocalMachine.CreateSubKey(NetworkRegPath, true);
+                if (key == null) return false;
+                key.SetValue(AutoSwitchValue, enabled ? 1 : 0, RegistryValueKind.DWord);
+                BumpReprobeNonce();
+                return true;
+            }
+            catch { return false; }
+        }
+
+        // The Session key must be VOLATILE (gone after reboot) - a forced-tunnel
+        // box that survives a reboot silently pins every future boot. Plain
+        // CreateSubKey(path) would create it non-volatile.
+        private static RegistryKey? CreateSessionKey() =>
+            Registry.LocalMachine.CreateSubKey(SessionRegPath,
+                RegistryKeyPermissionCheck.ReadWriteSubTree, RegistryOptions.Volatile);
+
+        private static void BumpReprobeNonce()
+        {
+            try
+            {
+                using var key = CreateSessionKey();
+                if (key == null) return;
+                int n = key.GetValue(ReprobeNonceValue) is int v ? v : 0;
+                key.SetValue(ReprobeNonceValue, unchecked(n + 1), RegistryValueKind.DWord);
+            }
+            catch { /* best effort - network/session events still trigger a re-probe */ }
+        }
+
+        /// <summary>Set the persistent auto-switch flag from the command line.</summary>
+        public static bool ApplyAutoSwitchFromCommandLine(bool enabled) => WriteAutoSwitch(enabled);
 
         private void LoadTransportMode()
         {
@@ -68,15 +119,21 @@ namespace T2TouchId.SepVaultGui
                         tunnel = i != 0;
                 }
                 catch { /* default native */ }
+                bool auto = ReadAutoSwitch();
                 Ipv4TunnelCheck.IsChecked = tunnel;
+                AutoSwitchCheck.IsChecked = auto;
                 TransportStatusText.Text = tunnel
-                    ? "Режим: IPv4 tunnel (ручний)."
-                    : "Режим: Native IPv6 (ручний).";
+                    ? "Режим: IPv4 tunnel примусово (авто-перемикання не діє, доки вибрано)."
+                    : auto
+                        ? "Режим: авто — Native IPv6; якщо недоступний (VPN) — одразу IPv4 tunnel."
+                        : "Режим: Native IPv6 (авто-перемикання вимкнено).";
                 TransportStatusText.Foreground = new SolidColorBrush(Color.FromRgb(0x66, 0x66, 0x66));
                 if (WarmupStatusText != null)
                 {
-                    WarmupStatusText.Text = "Авто-перемикання вимкнено. Використовуйте чекбокс або cmd: --tunnel / --native";
-                    WarmupDetailText.Text = "Приклад: SepVaultGui.exe --tunnel --quit";
+                    WarmupStatusText.Text = auto
+                        ? "Увімкнено (за замовчуванням)."
+                        : "Вимкнено: використовується Native IPv6 (або примусовий tunnel).";
+                    WarmupDetailText.Text = "Повернення на IPv6 — за подіями: VPN підключився/відключився, unlock, вихід зі сну. cmd: SepVaultGui.exe --auto | --no-auto";
                 }
             }
             finally
@@ -98,7 +155,7 @@ namespace T2TouchId.SepVaultGui
         {
             try
             {
-                using (var key = Registry.LocalMachine.CreateSubKey(SessionRegPath, true))
+                using (var key = CreateSessionKey())
                 {
                     if (key == null)
                     {
@@ -111,6 +168,7 @@ namespace T2TouchId.SepVaultGui
                         key.DeleteValue(SkipNativeIpv6ProbeValue, throwOnMissingValue: false);
                 }
 
+                BumpReprobeNonce();
                 bool pushed = PushTransportModeToDriver(tunnel ? 1 : 0);
                 bool peerOk = true;
                 if (tunnel)
@@ -139,6 +197,25 @@ namespace T2TouchId.SepVaultGui
                 status = "Помилка: " + ex.Message;
                 return false;
             }
+        }
+
+        private void OnAutoSwitchChanged(object sender, RoutedEventArgs e)
+        {
+            if (_transportLoading) return;
+            bool enabled = AutoSwitchCheck.IsChecked == true;
+            bool ok = WriteAutoSwitch(enabled);
+            if (!ok)
+            {
+                TransportStatusText.Text = "Не вдалось записати HKLM (запустіть GUI від імені адміністратора).";
+                TransportStatusText.Foreground = DotError;
+                LoadTransportMode(); // revert the checkbox to what is really stored
+                return;
+            }
+            LoadTransportMode();
+            TransportStatusText.Text = enabled
+                ? "Авто-перемикання увімкнено — діє з наступного підключення."
+                : "Авто-перемикання вимкнено — діє з наступного підключення.";
+            TransportStatusText.Foreground = DotOk;
         }
 
         private void OnTransportModeChanged(object sender, RoutedEventArgs e)

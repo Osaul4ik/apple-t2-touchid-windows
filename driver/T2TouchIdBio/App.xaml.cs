@@ -11,6 +11,7 @@ namespace T2TouchId.SepVaultGui
         //   SepVaultGui.exe --tunnel
         //   SepVaultGui.exe --native
         //   SepVaultGui.exe --tunnel --quit
+        //   SepVaultGui.exe --auto  | --no-auto   (persistent IPv6->IPv4 auto-switch, default on)
         //   SepVaultGui.exe /tunnel /quit
         protected override void OnStartup(StartupEventArgs e)
         {
@@ -20,6 +21,18 @@ namespace T2TouchId.SepVaultGui
             bool tunnel = args.Any(a => a is "--tunnel" or "/tunnel" or "--ipv4" or "/ipv4");
             bool native = args.Any(a => a is "--native" or "/native" or "--ipv6" or "/ipv6");
             bool quit = args.Any(a => a is "--quit" or "/quit" or "-q");
+            bool autoOn = args.Any(a => a is "--auto" or "/auto");
+            bool autoOff = args.Any(a => a is "--no-auto" or "/no-auto");
+
+            if (autoOn != autoOff)
+            {
+                bool okAuto = T2TouchId.SepVaultGui.MainWindow.ApplyAutoSwitchFromCommandLine(autoOn);
+                if (quit && !(tunnel || native))
+                {
+                    Environment.Exit(okAuto ? 0 : 1);
+                    return;
+                }
+            }
 
             if (tunnel || native)
             {
@@ -35,7 +48,7 @@ namespace T2TouchId.SepVaultGui
             }
 
             var window = new T2TouchId.SepVaultGui.MainWindow();
-            if (tunnel || native)
+            if (tunnel || native || autoOn != autoOff)
             {
                 window.RefreshTransportUi();
             }

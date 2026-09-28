@@ -166,69 +166,47 @@ bool FillFromAdapter(IP_ADAPTER_ADDRESSES* a, NcmEndpoint* out) {
             out->peerLinkLocal = peer;
             out->peerSource = PeerSource::NeighborTable;
             PersistPeerWithMac(out->ifIndex, peer, neighborMac, haveNeighborMac);
-        } else if (t2::transport::ShouldSkipNativeIpv6Probe()) {
-            // OPTIMIZATION (tunnel-mode fast path): the session cache
-            // already knows NativeIpv6 failed once since the last unlock
-            // (see TransportMode.h's kSkipNativeIpv6ProbeValue) - i.e. ND
-            // is known-broken this lock cycle (VPN/WFP dropping it), which
-            // is exactly the condition that makes FindNeighborPeer fail
-            // here. Every previous run still paid for
-            // PromptPeerViaMulticastPing (spawns ping.exe, ~300-1300ms
-            // WaitForSingleObject) plus the 250ms neighbor-table poll below
-            // on EVERY single verify attempt while locked, even though
-            // both were already known to be futile. Going straight to the
-            // persisted last-known peer skips ~550ms+ of dead time per
-            // attempt for the entire rest of this lock cycle; the very
-            // next real unlock still gets one full fresh probe (see
-            // Connect()'s tunnel branch / SessionLockWndProc), so a T2
-            // that actually re-addresses is still picked up promptly.
+        } else {
+            // Neighbor table has no T2 entry (cold boot, resume, or a VPN/WFP
+            // dropping ND). Resolution order:
+            //  1. last-known peer persisted from a good session - free, and
+            //     right unless the machine was paired with another T2. Used
+            //     always in tunnel mode, and in native mode unless a connect
+            //     to it just failed (DistrustPersistedPeer);
+            //  2. multicast ping + neighbor-table poll (~550 ms worst case,
+            //     spawns ping.exe) - only when 1 gave nothing.
+            const bool tunnelActive = t2::transport::IsTunnelModeActive();
+            const bool trustPersisted = !t2::transport::ConsumePersistedPeerDistrust();
             in6_addr saved{};
-            if (t2::transport::ReadPersistedPeer(&saved, nullptr, nullptr)) {
+            if ((tunnelActive || trustPersisted) &&
+                t2::transport::ReadPersistedPeer(&saved, nullptr, nullptr)) {
                 out->peerLinkLocal = saved;
                 out->peerSource = PeerSource::LastKnown;
-            }
-        } else {
-            // OPTIMIZATION: this used to be PromptPeerViaMulticastPing()
-            // followed by an unconditional Sleep(250) and a single
-            // check — ~550ms of dead time even in the common case where
-            // the neighbor table populates in 10-20ms. That fixed wait
-            // was also the part most exposed to VPN interference: a
-            // VPN's LWF/WFP filter driver sitting in the network stack
-            // adds jitter to ICMPv6 round-trip time, and a blind sleep
-            // has no way to notice the answer arrived early — it just
-            // burns the full budget regardless.
-            //
-            // Polling every 10ms instead means we pick up the neighbor
-            // entry on the tick right after it lands, whatever that
-            // takes, instead of always paying for the worst case. The
-            // ping still gets its full timeout to elicit a reply; only
-            // the "wait for the table to update" half became
-            // responsive. Total budget is kept close to the original
-            // (300ms ping + up to ~250ms poll) so a genuinely slow
-            // reply is no worse off than before.
-            PromptPeerViaMulticastPing(out->ifIndex, 300);
+            } else if (!tunnelActive) {
+                // The ping still gets its full timeout; only the wait for the
+                // neighbor table is responsive (10 ms polling instead of a
+                // blind sleep, so a VPN filter's ICMPv6 jitter is not paid
+                // in full).
+                PromptPeerViaMulticastPing(out->ifIndex, 300);
 
-            const int kPeerPollIntervalMs = 10;
-            const int kPeerPollBudgetMs = 250;
-            for (int waited = 0; waited < kPeerPollBudgetMs;
-                 waited += kPeerPollIntervalMs) {
-                unsigned char pollMac[6]{};
-                bool havePollMac = false;
-                if (FindNeighborPeer(out->ifIndex, &peer, pollMac, &havePollMac)) {
-                    out->peerLinkLocal = peer;
-                    out->peerSource = PeerSource::NeighborTable;
-                    PersistPeerWithMac(out->ifIndex, peer, pollMac, havePollMac);
-                    break;
+                const int kPeerPollIntervalMs = 10;
+                const int kPeerPollBudgetMs = 250;
+                for (int waited = 0; waited < kPeerPollBudgetMs;
+                     waited += kPeerPollIntervalMs) {
+                    unsigned char pollMac[6]{};
+                    bool havePollMac = false;
+                    if (FindNeighborPeer(out->ifIndex, &peer, pollMac, &havePollMac)) {
+                        out->peerLinkLocal = peer;
+                        out->peerSource = PeerSource::NeighborTable;
+                        PersistPeerWithMac(out->ifIndex, peer, pollMac, havePollMac);
+                        break;
+                    }
+                    Sleep(kPeerPollIntervalMs);
                 }
-                Sleep(kPeerPollIntervalMs);
-            }
-            if (out->peerSource == PeerSource::None) {
-                // Neighbor table still empty: ND/ICMPv6 is being dropped
-                // (VPN/WFP) - exactly when the IPv4 tunnel is needed. Use the
-                // peer persisted from the last good IPv6 session so
-                // Connect() can still fall back to v4.
-                in6_addr saved{};
-                if (t2::transport::ReadPersistedPeer(&saved, nullptr, nullptr)) {
+                if (out->peerSource == PeerSource::None &&
+                    t2::transport::ReadPersistedPeer(&saved, nullptr, nullptr)) {
+                    // ND/ICMPv6 dropped: last-known peer still lets Connect()
+                    // fall back to the IPv4 tunnel.
                     out->peerLinkLocal = saved;
                     out->peerSource = PeerSource::LastKnown;
                 }
