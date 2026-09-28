@@ -168,6 +168,11 @@
 #define T2NCM_ETHERNET_HEADER_SIZE  14u
 #define T2NCM_MTU                   1500u
 #define T2NCM_MAX_FRAME_SIZE        (T2NCM_ETHERNET_HEADER_SIZE + T2NCM_MTU)  // 1514
+
+// Upper bound on concurrently outstanding bulk-IN read requests. The RX
+// engine (NcmRx.c) uses T2NCM_RX_PENDING_READS of them; the device context
+// reserves this many slots.
+#define T2NCM_RX_MAX_READ_SLOTS     8u
 #define T2NCM_MAX_MULTICAST_LIST    32u
 
 // The T2's NCM function sits on USB 2.0 high speed (480 Mbit/s) — this
@@ -382,19 +387,35 @@ typedef struct _T2NCM_DEVICE_CONTEXT
     USHORT               RxLastFrameEtherType;
     USHORT               RxLastFrameLength;
 
-    // WDFUSBPIPE's own continuous-reader machinery owns the actual read
-    // requests; nothing else to store here. Start/stop is idempotent —
-    // see NcmRx.c.
+    // Bulk-IN read engine (NcmRx.c). This is a hand-rolled request loop,
+    // not WdfUsbTargetPipeConfigContinuousReader: the framework's
+    // failed-read recovery (CancelRepeaters) double-cancelled reads that
+    // AppleUSBVHCI had already completed and bugchecked the machine
+    // (0x13A, pool tag 'Mdl_'). Start/stop is idempotent - see NcmRx.c.
     BOOLEAN              RxStarted;
 
-    // Whether WdfUsbTargetPipeConfigContinuousReader has already been
-    // called for the WDFUSBPIPE currently cached in BulkInPipe. WDF
-    // allows that call exactly once per pipe object — a plain NDIS
-    // Pause/Restart cycle reuses the SAME pipe object (no alt-setting
-    // reselect happens), so Restart must only WdfIoTargetStart it again,
-    // never reconfigure it. Cleared to FALSE only when BulkInPipe itself
-    // is replaced with a new pipe object (T2NcmUsbActivateDataInterface),
-    // which is the one event that actually invalidates this. See NcmRx.c.
+    // The WDFUSBPIPE the current read loop was built for. Captured at
+    // T2NcmRxStart so the completion routines never depend on BulkInPipe,
+    // which T2NcmUsbDeactivateDataInterface clears; NULL while stopped.
+    WDFUSBPIPE           RxPipe;
+    ULONG                RxReadBufferSize;
+
+    // One WDFREQUEST (with a request-parented WDFMEMORY) per pending read.
+    // Created in T2NcmRxStart against RxPipe's I/O target, deleted in
+    // T2NcmRxStop once RxReadsOutstanding has drained to zero.
+    WDFREQUEST           RxReadRequests[T2NCM_RX_MAX_READ_SLOTS];
+
+    // 1 while a completed read may be re-sent; T2NcmRxStop clears it
+    // before stopping the target.
+    volatile LONG        RxReadsRunning;
+
+    // Requests currently owned by the USB stack or by a completion
+    // routine. T2NcmRxStop waits for 0 before deleting anything.
+    volatile LONG        RxReadsOutstanding;
+
+    // LEGACY: only meaningful for the old continuous reader. Nothing reads
+    // it any more; it stays so Power.c and UsbTransport.c, which still
+    // reset it, need no change.
     BOOLEAN              RxReaderConfigured;
 
     // OUT-direction NDP geometry from GET_NTB_PARAMETERS.

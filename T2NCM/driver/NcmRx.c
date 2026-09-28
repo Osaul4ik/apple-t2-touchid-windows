@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-// NcmRx.c — NTB16 RX parser + bulk-IN continuous reader + NDIS receive
+// NcmRx.c — NTB16 RX parser + bulk-IN read loop + NDIS receive
 // indication.
 //
 // The parser half is unchanged from the pre-NDIS milestone and keeps its
@@ -8,8 +8,8 @@
 // the tail of the loop — each accepted datagram is now copied into an
 // NBL and indicated to NDIS instead of only bumping a counter.
 //
-// Copy, not zero-copy, on purpose: the continuous reader owns its buffer
-// and re-arms the read as soon as the completion returns, so the NTB is
+// Copy, not zero-copy, on purpose: the read loop owns its buffer and
+// re-arms the read as soon as the completion returns, so the NTB is
 // gone the moment this function exits. Handing NDIS an MDL over the
 // reader's own buffer would mean the receive path could not be re-armed
 // until the protocol stack was done with the frame, which is a far worse
@@ -61,7 +61,8 @@ typedef struct _T2NCM_WIRE_NDP16
 #define T2NCM_NDP16_HEADER_LENGTH   8u
 #define T2NCM_ETHERNET_HEADER_LEN   14u  // dest(6) + src(6) + ethertype(2)
 
-// Number of concurrently outstanding bulk-IN reads. Enough depth that
+// Number of concurrently outstanding bulk-IN reads (must not exceed
+// T2NCM_RX_MAX_READ_SLOTS in driver.h). Enough depth that
 // the pipe is never starved between one completion and the next read
 // being requeued, small enough that a paused adapter is not holding a
 // large amount of pinned pool.
@@ -690,25 +691,117 @@ T2NcmRxParseNtb(
     // rare by construction.
 }
 
-EVT_WDF_USB_READER_COMPLETION_ROUTINE T2NcmEvtRxReadComplete;
+// ---------------------------------------------------------------------
+// Bulk-IN read engine.
+//
+// This is a hand-rolled request loop, NOT WdfUsbTargetPipeConfigContinuous-
+// Reader. The framework's continuous reader recovers from a failed read by
+// queueing a work item that calls FxUsbPipeContinuousReader::CancelRepeaters
+// and cancels every sibling read - including reads that WdfIoTargetStop
+// (CancelSentIo) had just cancelled itself. On this hardware AppleUSBVHCI
+// completes a cancelled read with STATUS_UNSUCCESSFUL (0xC0000001) instead
+// of STATUS_CANCELLED, so every stop looked like a failed read to WDF, the
+// recovery work item ran, and its second IoCancelIrp reached VHCI's
+// EvtIoCanceledOnQueue for an IRP VHCI had already completed: IoFreeMdl
+// ran twice and the kernel heap bugchecked (0x13A, arg1 0x11, pool tag
+// 'Mdl_', AppleUSBVHCI+0x1d5de in the dump).
+//
+// The loop below never cancels anything on its own. A read that completes
+// with an error is simply not re-sent, and the only cancel a request ever
+// sees is the single one WdfIoTargetStop issues from T2NcmRxStop.
+//
+// Ownership rules:
+//   * RxReadRequests[] holds T2NCM_RX_PENDING_READS WDFREQUESTs, created
+//     against the CURRENT bulk-IN pipe's I/O target in T2NcmRxStart and
+//     deleted in T2NcmRxStop. A request never outlives the pipe object it
+//     was created for (alt-setting re-selection replaces the pipe).
+//   * RxReadsRunning is the gate: a completion re-sends its request only
+//     while it is 1. T2NcmRxStop clears it before stopping the target.
+//   * RxReadsOutstanding counts requests owned by the USB stack or by a
+//     completion routine. A resend takes its own count BEFORE the
+//     completing routine drops the old one, so the count never touches 0
+//     while the loop is alive; T2NcmRxStop waits for 0 before deleting.
+// ---------------------------------------------------------------------
 
-VOID
-T2NcmEvtRxReadComplete(
-    _In_ WDFUSBPIPE  Pipe,
-    _In_ WDFMEMORY   Buffer,
-    _In_ size_t      NumBytesTransferred,
-    _In_ WDFCONTEXT  Context
+#define T2NCM_RX_STOP_DRAIN_POLL_MS     10u
+#define T2NCM_RX_STOP_DRAIN_TIMEOUT_MS  5000u
+
+C_ASSERT(T2NCM_RX_PENDING_READS <= T2NCM_RX_MAX_READ_SLOTS);
+
+typedef struct _T2NCM_RX_READ_CONTEXT
+{
+    PT2NCM_DEVICE_CONTEXT DeviceContext;
+    WDFMEMORY             Memory;   // parented to the request
+} T2NCM_RX_READ_CONTEXT, *PT2NCM_RX_READ_CONTEXT;
+
+WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(T2NCM_RX_READ_CONTEXT, T2NcmGetRxReadContext)
+
+EVT_WDF_REQUEST_COMPLETION_ROUTINE T2NcmEvtRxReadComplete;
+
+// Formats and sends one read. On FALSE the request is NOT in flight and
+// no outstanding count is held for it.
+static
+BOOLEAN
+T2NcmRxSubmitRead(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext,
+    _In_ WDFREQUEST            Request
     )
 {
-    PT2NCM_DEVICE_CONTEXT deviceContext = (PT2NCM_DEVICE_CONTEXT)Context;
-    const UCHAR* buffer;
+    PT2NCM_RX_READ_CONTEXT readContext = T2NcmGetRxReadContext(Request);
+    NTSTATUS status;
 
-    UNREFERENCED_PARAMETER(Pipe);
+    status = WdfUsbTargetPipeFormatRequestForRead(
+        DeviceContext->RxPipe, Request, readContext->Memory, NULL);
+    if (!NT_SUCCESS(status))
+    {
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+            "T2Ncm: RX FormatRequestForRead failed (0x%08X)\n", status));
+        return FALSE;
+    }
+
+    WdfRequestSetCompletionRoutine(Request, T2NcmEvtRxReadComplete, readContext);
+
+    // Count BEFORE sending: the completion can run before WdfRequestSend
+    // returns, and T2NcmRxStop must never see 0 while a read is in flight.
+    InterlockedIncrement(&DeviceContext->RxReadsOutstanding);
+
+    if (!WdfRequestSend(Request,
+            WdfUsbTargetPipeGetIoTarget(DeviceContext->RxPipe),
+            WDF_NO_SEND_OPTIONS))
+    {
+        status = WdfRequestGetStatus(Request);
+        InterlockedDecrement(&DeviceContext->RxReadsOutstanding);
+
+        // A resend racing T2NcmRxStop lands on a stopped target and fails
+        // here; that is the expected, quiet way for the loop to end.
+        if (DeviceContext->RxReadsRunning != 0)
+        {
+            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+                "T2Ncm: RX WdfRequestSend failed (0x%08X) - read not re-armed\n",
+                status));
+        }
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+// One completed bulk-IN transfer that succeeded: gate checks, then hand
+// the NTB to the parser. Same rules as the old continuous-reader callback.
+static
+VOID
+T2NcmRxHandleRead(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext,
+    _In_ PT2NCM_RX_READ_CONTEXT ReadContext,
+    _In_ size_t NumBytesTransferred
+    )
+{
+    const UCHAR* buffer;
 
     if (NumBytesTransferred == 0)
     {
         // A legitimate zero-length packet (NCM/USB ZLP framing), not an
-        // error — nothing to parse.
+        // error - nothing to parse.
         return;
     }
 
@@ -718,49 +811,156 @@ T2NcmEvtRxReadComplete(
     // hand NDIS a frame on a paused adapter, which is exactly what
     // pause means it must not receive. Cheap volatile read, checked on
     // every completion rather than assumed from the stop ordering.
-    if (deviceContext->DataPathRunning == 0)
+    if (DeviceContext->DataPathRunning == 0)
     {
-        InterlockedIncrement64(&deviceContext->RxNtbsReceived);
-        InterlockedIncrement64(&deviceContext->InDiscards);
+        InterlockedIncrement64(&DeviceContext->RxNtbsReceived);
+        InterlockedIncrement64(&DeviceContext->InDiscards);
         return;
     }
 
-    buffer = (const UCHAR*)WdfMemoryGetBuffer(Buffer, NULL);
+    buffer = (const UCHAR*)WdfMemoryGetBuffer(ReadContext->Memory, NULL);
     if (buffer == NULL)
     {
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
             "T2Ncm: RX read completion had a NULL buffer - dropping\n"));
-        InterlockedIncrement64(&deviceContext->RxFramesRejected);
+        InterlockedIncrement64(&DeviceContext->RxFramesRejected);
         return;
     }
 
-    T2NcmRxParseNtb(deviceContext, buffer, NumBytesTransferred,
+    T2NcmRxParseNtb(DeviceContext, buffer, NumBytesTransferred,
         (BOOLEAN)(KeGetCurrentIrql() == DISPATCH_LEVEL));
 }
 
-EVT_WDF_USB_READERS_FAILED T2NcmEvtRxReadersFailed;
-
-BOOLEAN
-T2NcmEvtRxReadersFailed(
-    _In_    WDFUSBPIPE Pipe,
-    _In_    NTSTATUS   Status,
-    _In_    USBD_STATUS UsbdStatus
+VOID
+T2NcmEvtRxReadComplete(
+    _In_ WDFREQUEST                     Request,
+    _In_ WDFIOTARGET                    Target,
+    _In_ PWDF_REQUEST_COMPLETION_PARAMS Params,
+    _In_ WDFCONTEXT                     Context
     )
 {
-    UNREFERENCED_PARAMETER(Pipe);
+    PT2NCM_RX_READ_CONTEXT readContext = (PT2NCM_RX_READ_CONTEXT)Context;
+    PT2NCM_DEVICE_CONTEXT deviceContext = readContext->DeviceContext;
+    NTSTATUS status = Params->IoStatus.Status;
 
-    // Returning FALSE: don't let the framework reset the pipe and
-    // restart the reader on its own. An unbounded auto-restart loop on a
-    // device that is actually gone (unplugged) is worse than stopping,
-    // and under the inverted model the recovery path is NDIS's to drive
-    // — a reset request or a halt/reinitialize — not a retry loop
-    // hidden inside the read engine.
-    T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-        "T2Ncm: RX continuous reader stopped itself (status=0x%08X, "
-        "usbdStatus=0x%08X) - bulk-IN reads will not resume until the "
-        "adapter is restarted\n", Status, UsbdStatus));
+    UNREFERENCED_PARAMETER(Target);
 
-    return FALSE;
+    if (NT_SUCCESS(status))
+    {
+        T2NcmRxHandleRead(deviceContext, readContext,
+            Params->Parameters.Usb.Completion->Parameters.PipeRead.Length);
+
+        if (deviceContext->RxReadsRunning != 0)
+        {
+            WDF_REQUEST_REUSE_PARAMS reuse;
+
+            WDF_REQUEST_REUSE_PARAMS_INIT(&reuse,
+                WDF_REQUEST_REUSE_NO_FLAGS, STATUS_SUCCESS);
+
+            status = WdfRequestReuse(Request, &reuse);
+            if (NT_SUCCESS(status))
+            {
+                // Takes its own outstanding count before ours is dropped
+                // below. Failure is logged inside and simply retires
+                // this slot.
+                (VOID)T2NcmRxSubmitRead(deviceContext, Request);
+            }
+            else
+            {
+                T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+                    "T2Ncm: RX WdfRequestReuse failed (0x%08X) - read not re-armed\n",
+                    status));
+            }
+        }
+    }
+    else if (deviceContext->RxReadsRunning != 0)
+    {
+        // A genuine failure while the loop is supposed to be running. The
+        // slot is retired (no resend); the other slots keep running, and
+        // if the device is really gone they all end up here. Recovery is
+        // NDIS's to drive (reset, or halt/reinitialize), same policy the
+        // old EvtReadersFailed=FALSE expressed.
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+            "T2Ncm: RX bulk-IN read failed (status=0x%08X) - slot retired, "
+            "not re-armed until the adapter is restarted\n", status));
+        InterlockedIncrement64(&deviceContext->InErrors);
+    }
+    // else: a stop is in progress and this is the cancelled read coming
+    // back. AppleUSBVHCI reports that as 0xC0000001, which is expected
+    // here and deliberately neither logged nor counted.
+
+    InterlockedDecrement(&deviceContext->RxReadsOutstanding);
+}
+
+static
+VOID
+T2NcmRxDeleteReadRequests(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
+    )
+{
+    ULONG i;
+
+    for (i = 0; i < T2NCM_RX_MAX_READ_SLOTS; i++)
+    {
+        if (DeviceContext->RxReadRequests[i] != NULL)
+        {
+            // Also releases the parented WDFMEMORY.
+            WdfObjectDelete(DeviceContext->RxReadRequests[i]);
+            DeviceContext->RxReadRequests[i] = NULL;
+        }
+    }
+}
+
+// Shared by T2NcmRxStop and the failure path of T2NcmRxStart. PASSIVE_LEVEL
+// only (WdfIoTargetStop with CancelSentIo, and a sleeping drain wait).
+static
+VOID
+T2NcmRxTeardownReads(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
+    )
+{
+    ULONG waitedMs = 0;
+
+    NT_ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
+
+    // Close the gate first so a completion racing the stop does not queue
+    // a fresh read; one that slips through anyway fails on the stopped
+    // target inside T2NcmRxSubmitRead.
+    InterlockedExchange(&DeviceContext->RxReadsRunning, 0);
+
+    if (DeviceContext->RxPipe != NULL)
+    {
+        // The ONLY cancel this engine ever issues.
+        WdfIoTargetStop(
+            WdfUsbTargetPipeGetIoTarget(DeviceContext->RxPipe),
+            WdfIoTargetCancelSentIo);
+    }
+
+    // Wait until no request is owned by the USB stack or a completion
+    // routine. Deleting a request that is still in flight is a bugcheck,
+    // so on timeout the requests are leaked instead (T2NcmRxStart refuses
+    // to run over a non-zero count).
+    while (InterlockedCompareExchange(
+               (LONG volatile *)&DeviceContext->RxReadsOutstanding, 0, 0) != 0)
+    {
+        LARGE_INTEGER delay;
+
+        if (waitedMs >= T2NCM_RX_STOP_DRAIN_TIMEOUT_MS)
+        {
+            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+                "T2Ncm: RX stop timed out with %ld read(s) still outstanding - "
+                "leaking the read requests rather than deleting them in flight\n",
+                DeviceContext->RxReadsOutstanding));
+            return;
+        }
+
+        delay.QuadPart = -((LONGLONG)T2NCM_RX_STOP_DRAIN_POLL_MS * 10000);
+        KeDelayExecutionThread(KernelMode, FALSE, &delay);
+        waitedMs += T2NCM_RX_STOP_DRAIN_POLL_MS;
+    }
+
+    T2NcmRxDeleteReadRequests(DeviceContext);
+    DeviceContext->RxPipe = NULL;
 }
 
 NTSTATUS
@@ -768,11 +968,10 @@ T2NcmRxStart(
     _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
     )
 {
-    WDF_USB_CONTINUOUS_READER_CONFIG readerConfig;
     WDF_USB_PIPE_INFORMATION pipeInfo;
     ULONG maxPacketSize;
-    ULONG readerBufferSize;
-    BOOLEAN reused;
+    ULONG readBufferSize;
+    ULONG i;
     NTSTATUS status;
 
     if (DeviceContext->RxStarted)
@@ -796,17 +995,31 @@ T2NcmRxStart(
         return STATUS_INVALID_DEVICE_STATE;
     }
 
-    // WdfUsbTargetPipeConfigContinuousReader requires TransferLength to
-    // be a multiple of the pipe's MaximumPacketSize (STATUS_INVALID_
-    // BUFFER_SIZE otherwise — confirmed on real hardware: negotiated
-    // NtbInMaxSize=32764 is NOT a multiple of the bulk endpoint's
-    // 512-byte MaximumPacketSize). The device's own NtbInMaxSize is a
-    // content-size limit, not a USB transfer-chunking one, so rounding
-    // the READ buffer up to the next multiple is correct — it only
-    // changes how much slack the last packet of a transfer can have,
-    // never what T2NcmRxParseNtb is allowed to trust (that still
-    // validates against the actual NumBytesTransferred, not this
-    // buffer size).
+    // A previous stop that timed out left requests in flight; starting a
+    // second set on top of them would orphan them.
+    if (InterlockedCompareExchange(
+            (LONG volatile *)&DeviceContext->RxReadsOutstanding, 0, 0) != 0)
+    {
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+            "T2Ncm: T2NcmRxStart refused - %ld read(s) from a previous "
+            "run are still outstanding\n", DeviceContext->RxReadsOutstanding));
+        return STATUS_DEVICE_BUSY;
+    }
+
+    // Idle leftovers (a stop that finished draining always deletes them,
+    // but be explicit that nothing stale is ever reused).
+    T2NcmRxDeleteReadRequests(DeviceContext);
+
+    // The read buffer must be a multiple of the pipe's MaximumPacketSize
+    // (WdfUsbTargetPipeFormatRequestForRead rejects it otherwise -
+    // confirmed on real hardware: negotiated NtbInMaxSize=32764 is NOT a
+    // multiple of the bulk endpoint's 512-byte MaximumPacketSize). The
+    // device's own NtbInMaxSize is a content-size limit, not a USB
+    // transfer-chunking one, so rounding the READ buffer up to the next
+    // multiple is correct - it only changes how much slack the last packet
+    // of a transfer can have, never what T2NcmRxParseNtb is allowed to
+    // trust (that still validates against the actual bytes transferred,
+    // not this buffer size).
     WDF_USB_PIPE_INFORMATION_INIT(&pipeInfo);
     WdfUsbTargetPipeGetInformation(DeviceContext->BulkInPipe, &pipeInfo);
 
@@ -815,83 +1028,95 @@ T2NcmRxStart(
     {
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
             "T2Ncm: BulkInPipe reports MaximumPacketSize=0 - cannot size "
-            "the continuous reader buffer\n"));
+            "the read buffers\n"));
         return STATUS_INVALID_DEVICE_STATE;
     }
 
-    // Computed unconditionally (cheap arithmetic, no WDF call) so the
-    // trailing log line below always has a real value, whether or not
-    // this call actually reconfigures the reader.
-    readerBufferSize =
+    readBufferSize =
         ((DeviceContext->NtbInMaxSize + maxPacketSize - 1) / maxPacketSize) * maxPacketSize;
 
-    // WdfUsbTargetPipeConfigContinuousReader may be called only ONCE for
-    // a given pipe object — calling it again on a pipe that already has
-    // a continuous reader configured fails with STATUS_INVALID_DEVICE_
-    // STATE (0xC0000184), confirmed on hardware. A plain NDIS Pause ->
-    // Restart cycle (T2NcmMiniportPause/T2NcmMiniportRestart) does not
-    // touch the USB alt setting and so keeps the exact same BulkInPipe
-    // object across the cycle; only WdfIoTargetStop/Start should run
-    // then. Only actually reconfigure when BulkInPipe is a pipe object
-    // this function has not configured yet (fresh bring-up, or after
-    // T2NcmUsbActivateDataInterface handed back a brand-new pipe on
-    // re-arm — see driver.h and Power.c).
-    if (!DeviceContext->RxReaderConfigured)
-    {
-        reused = FALSE;
+    DeviceContext->RxPipe = DeviceContext->BulkInPipe;
+    DeviceContext->RxReadBufferSize = readBufferSize;
 
-        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
-            "T2Ncm: T2NcmRxStart configuring continuous reader on a new "
-            "pipe object (ntbMax=%lu, bufferSize=%lu, maxPacketSize=%lu)\n",
-            DeviceContext->NtbInMaxSize, readerBufferSize, maxPacketSize));
-
-        WDF_USB_CONTINUOUS_READER_CONFIG_INIT(
-            &readerConfig,
-            T2NcmEvtRxReadComplete,
-            DeviceContext,
-            readerBufferSize);
-
-        readerConfig.EvtUsbTargetPipeReadersFailed = T2NcmEvtRxReadersFailed;
-        readerConfig.NumPendingReads = T2NCM_RX_PENDING_READS;
-
-        status = WdfUsbTargetPipeConfigContinuousReader(
-            DeviceContext->BulkInPipe, &readerConfig);
-        if (!NT_SUCCESS(status))
-        {
-            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-                "T2Ncm: WdfUsbTargetPipeConfigContinuousReader failed (0x%08X)\n",
-                status));
-            return status;
-        }
-
-        DeviceContext->RxReaderConfigured = TRUE;
-    }
-    else
-    {
-        reused = TRUE;
-
-        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
-            "T2Ncm: T2NcmRxStart reusing existing reader config on the same "
-            "pipe object (Pause/Restart cycle) - WdfIoTargetStart only\n"));
-    }
-
-    status = WdfIoTargetStart(WdfUsbTargetPipeGetIoTarget(DeviceContext->BulkInPipe));
+    // Pipe I/O targets are stopped after a stop and must be started
+    // again; a fresh pipe object after an alt-setting switch needs it too.
+    status = WdfIoTargetStart(WdfUsbTargetPipeGetIoTarget(DeviceContext->RxPipe));
     if (!NT_SUCCESS(status))
     {
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
             "T2Ncm: WdfIoTargetStart(BulkInPipe) failed (0x%08X)\n", status));
+        DeviceContext->RxPipe = NULL;
         return status;
+    }
+
+    for (i = 0; i < T2NCM_RX_PENDING_READS; i++)
+    {
+        WDF_OBJECT_ATTRIBUTES attributes;
+        WDFREQUEST request = NULL;
+        WDFMEMORY memory = NULL;
+        PT2NCM_RX_READ_CONTEXT readContext;
+
+        WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, T2NCM_RX_READ_CONTEXT);
+        attributes.ParentObject = DeviceContext->WdfDevice;
+
+        status = WdfRequestCreate(&attributes,
+            WdfUsbTargetPipeGetIoTarget(DeviceContext->RxPipe), &request);
+        if (!NT_SUCCESS(status))
+        {
+            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+                "T2Ncm: WdfRequestCreate (bulk-IN read %lu) failed (0x%08X)\n",
+                i, status));
+            goto Fail;
+        }
+
+        // Stored before anything else can fail, so Fail: deletes it.
+        DeviceContext->RxReadRequests[i] = request;
+
+        WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
+        attributes.ParentObject = request;
+
+        status = WdfMemoryCreate(&attributes, NonPagedPoolNx, T2NCM_RX_POOL_TAG,
+            readBufferSize, &memory, NULL);
+        if (!NT_SUCCESS(status))
+        {
+            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+                "T2Ncm: WdfMemoryCreate (bulk-IN read %lu, %lu bytes) failed (0x%08X)\n",
+                i, readBufferSize, status));
+            goto Fail;
+        }
+
+        readContext = T2NcmGetRxReadContext(request);
+        readContext->DeviceContext = DeviceContext;
+        readContext->Memory        = memory;
+    }
+
+    // Open the gate before the first send: a completion can arrive before
+    // the loop below has submitted every slot.
+    InterlockedExchange(&DeviceContext->RxReadsRunning, 1);
+
+    for (i = 0; i < T2NCM_RX_PENDING_READS; i++)
+    {
+        if (!T2NcmRxSubmitRead(DeviceContext, DeviceContext->RxReadRequests[i]))
+        {
+            status = STATUS_UNSUCCESSFUL;
+            goto Fail;
+        }
     }
 
     DeviceContext->RxStarted = TRUE;
 
     T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
-        "T2Ncm: RX continuous reader started (ntbMax=%lu, bufferSize=%lu, "
-        "maxPacketSize=%lu, pendingReads=%u, reused=%u)\n",
-        DeviceContext->NtbInMaxSize, readerBufferSize, maxPacketSize,
-        T2NCM_RX_PENDING_READS, (ULONG)reused));
+        "T2Ncm: RX read loop started (ntbMax=%lu, bufferSize=%lu, "
+        "maxPacketSize=%lu, pendingReads=%u)\n",
+        DeviceContext->NtbInMaxSize, readBufferSize, maxPacketSize,
+        T2NCM_RX_PENDING_READS));
 
     return STATUS_SUCCESS;
+
+Fail:
+    // Cancels whatever did get sent, waits for it, deletes every slot.
+    T2NcmRxTeardownReads(DeviceContext);
+    return status;
 }
 
 VOID
@@ -904,16 +1129,14 @@ T2NcmRxStop(
         return; // idempotent, see NcmRx.h
     }
 
-    // WdfIoTargetStop's default action (WdfIoTargetCancelSentIo) cancels
-    // outstanding reads and waits for their completions to run before
-    // returning, so nothing races the pipe teardown that follows on a
-    // halt path.
-    WdfIoTargetStop(
-        WdfUsbTargetPipeGetIoTarget(DeviceContext->BulkInPipe),
-        WdfIoTargetCancelSentIo);
+    // Cancels outstanding reads (once - nothing else cancels them), waits
+    // for every completion routine to finish, and only then deletes the
+    // requests, so nothing races the pipe teardown that follows on a halt
+    // path.
+    T2NcmRxTeardownReads(DeviceContext);
 
     DeviceContext->RxStarted = FALSE;
 
     T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
-        "T2Ncm: RX continuous reader stopped\n"));
+        "T2Ncm: RX read loop stopped\n"));
 }

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-// NcmRx.h — NTB16 RX parser + bulk-IN continuous reader + NDIS receive
+// NcmRx.h — NTB16 RX parser + bulk-IN read loop + NDIS receive
 // indication.
 //
 // Ownership under the inverted power model (Driver.h):
@@ -27,21 +27,27 @@ T2NcmRxFreeResources(
     _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
     );
 
-// Configures a continuous reader on DeviceContext->BulkInPipe (buffer
+// Creates the bulk-IN read requests on DeviceContext->BulkInPipe (buffer
 // size = the already-negotiated NtbInMaxSize, rounded up to the pipe's
-// MaximumPacketSize) and starts it. Call only after
+// MaximumPacketSize) and starts the read loop. Call only after
 // T2NcmUsbActivateDataInterface has switched the data interface to alt 1
 // and populated BulkInPipe.
 //
+// This is NOT WdfUsbTargetPipeConfigContinuousReader - see NcmRx.c for
+// why. A read that fails is not re-sent and nothing is cancelled except
+// by T2NcmRxStop.
+//
 // Idempotent: a second call while already started is a no-op success.
+// PASSIVE_LEVEL.
 NTSTATUS
 T2NcmRxStart(
     _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
     );
 
-// Stops the continuous reader and waits for in-flight reads to
-// complete. Idempotent — safe to call when RX was never started, or
-// twice in a row (surprise removal followed by an explicit pause).
+// Stops the read loop: cancels outstanding reads exactly once, waits for
+// every completion routine to finish, then deletes the requests.
+// Idempotent - safe to call when RX was never started, or twice in a row
+// (surprise removal followed by an explicit pause). PASSIVE_LEVEL only.
 //
 // Note what this does NOT do: it does not wait for already-indicated
 // NBLs to come back. That drain belongs to MiniportPause, which is the
