@@ -106,13 +106,21 @@ VOID T2NcmTunnelRefreshMode(_In_ PT2NCM_DEVICE_CONTEXT DeviceContext)
     UCHAR buf[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(ULONG)];
     ULONG resultLen = 0;
     PKEY_VALUE_PARTIAL_INFORMATION info = (PKEY_VALUE_PARTIAL_INFORMATION)buf;
-    UNICODE_STRING valueName = RTL_CONSTANT_STRING(L"TransportMode");
+    /* COLD-BOOT FIX: read the VOLATILE session flag userspace maintains
+     * (Network\Session\SkipNativeIpv6Probe), NOT the old persistent
+     * Network\TransportMode value. A stale TransportMode=1 left by an older
+     * build/GUI survived reboots and made the driver come up in IPv4-tunnel
+     * mode at every cold boot, contradicting "IPv6 is always tried first".
+     * The volatile key does not exist after a reboot -> enabled=FALSE. */
+    UNICODE_STRING sessionPath =
+        RTL_CONSTANT_STRING(L"\\Registry\\Machine\\SOFTWARE\\T2TouchId\\Network\\Session");
+    UNICODE_STRING valueName = RTL_CONSTANT_STRING(L"SkipNativeIpv6Probe");
     BOOLEAN enabled = FALSE;
 
     // PASSIVE_LEVEL only — never call from SendNetBufferLists / RX DPC.
     NT_ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
 
-    InitializeObjectAttributes(&oa, &path, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+    InitializeObjectAttributes(&oa, &sessionPath, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
     status = ZwOpenKey(&key, KEY_READ, &oa);
     if (NT_SUCCESS(status))
     {

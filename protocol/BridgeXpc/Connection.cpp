@@ -71,16 +71,27 @@ static bool SetSocketTimeout(SOCKET s, int optname, std::chrono::milliseconds ti
 // restores blocking mode before returning - callers get an ordinary
 // blocking socket either way, just with a real, enforced connect deadline.
 static bool ConnectWithTimeout(SOCKET s, const sockaddr* addr, int addrlen,
-                                std::chrono::milliseconds timeout) {
+                                std::chrono::milliseconds timeout,
+                                int* outWsaError = nullptr) {
+    // outWsaError (optional): 0 on success, WSAETIMEDOUT when nothing came
+    // back within `timeout`, otherwise the real socket error (SO_ERROR or
+    // the immediate connect() failure). Callers that must tell "the SYN got
+    // an RST back" (WSAECONNREFUSED - the path WORKS, only the port is dead)
+    // apart from "the SYN vanished" (timeout - path broken) need this; a
+    // bare bool collapses both into false.
+    if (outWsaError) *outWsaError = 0;
     u_long nonBlocking = 1;
     if (ioctlsocket(s, FIONBIO, &nonBlocking) != 0) {
+        if (outWsaError) *outWsaError = WSAGetLastError();
         return false;
     }
     bool ok = false;
     const int rc = connect(s, addr, addrlen);
     if (rc == 0) {
         ok = true;
-    } else if (WSAGetLastError() == WSAEWOULDBLOCK) {
+    } else if (WSAGetLastError() != WSAEWOULDBLOCK) {
+        if (outWsaError) *outWsaError = WSAGetLastError(); // immediate failure
+    } else {
         fd_set writeSet, errSet;
         FD_ZERO(&writeSet);
         FD_ZERO(&errSet);
@@ -90,11 +101,15 @@ static bool ConnectWithTimeout(SOCKET s, const sockaddr* addr, int addrlen,
         tv.tv_sec = static_cast<long>(timeout.count() / 1000);
         tv.tv_usec = static_cast<long>((timeout.count() % 1000) * 1000);
         const int sel = select(0, nullptr, &writeSet, &errSet, &tv);
-        if (sel > 0 && FD_ISSET(s, &writeSet) && !FD_ISSET(s, &errSet)) {
+        if (sel > 0) {
             int err = 0;
             int errLen = sizeof(err);
-            ok = (getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &errLen) == 0
-                  && err == 0);
+            const bool haveErr =
+                getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &errLen) == 0;
+            ok = haveErr && err == 0 && FD_ISSET(s, &writeSet) && !FD_ISSET(s, &errSet);
+            if (!ok && outWsaError) *outWsaError = haveErr && err != 0 ? err : WSAECONNABORTED;
+        } else if (outWsaError) {
+            *outWsaError = WSAETIMEDOUT;
         }
         // sel <= 0 (timeout/error) or an errSet hit both leave ok=false, which
         // is exactly "no first connect within the deadline" from the caller's
@@ -226,7 +241,9 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
         const auto v6Timeout = (connectTimeout < kIpv6FirstConnectTimeout)
                                     ? connectTimeout
                                     : kIpv6FirstConnectTimeout;
-        if (ConnectWithTimeout(socket_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr), v6Timeout)) {
+        int v6Err = 0;
+        if (ConnectWithTimeout(socket_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr), v6Timeout,
+                               &v6Err)) {
             SetSocketTimeout(socket_, SO_RCVTIMEO, connectTimeout);
             SetSocketTimeout(socket_, SO_SNDTIMEO, connectTimeout);
             T2_LOG("connect", L"TCP connected: ifIndex=%lu port=%u (waiting for peer HELO)",
@@ -237,10 +254,31 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
             // the very next call goes straight back to trying NativeIpv6
             // first too.
             t2::transport::RecordNativeIpv6Success();
+        } else if (v6Err == WSAECONNREFUSED) {
+            // COLD-BOOT FIX. A TCP RST means the SYN crossed IPv6 to the T2
+            // and the T2 answered - the IPv6 path WORKS; only this port is
+            // not listening. That is exactly what a stale cached BridgeXPC
+            // port looks like after a cold boot (the T2 rebooted too and
+            // bridgeOS picked a new port; portcache.ini survives the
+            // reboot). This used to fall into the branch below and call
+            // RecordNativeIpv6Failure(), pinning the whole first lock cycle
+            // (= the logon screen after a cold boot) to the slow IPv4
+            // tunnel + tunnel-tuned port scan although IPv6 was fine.
+            // ProbeNativeIpv6Reachable (TransportMode.h) already counts
+            // REFUSED as reachable; this makes Connect() consistent with it.
+            // Report a plain ConnectFailed so discovery moves on to its
+            // next candidate / full scan, still over IPv6.
+            T2_LOG("connect", L"NativeIpv6: RST from peer (WSAECONNREFUSED) - IPv6 path is "
+                   L"alive, port %u is just not listening (stale cached port?); NOT falling "
+                   L"back to Ipv4Tunnel", static_cast<unsigned>(port));
+            closesocket(socket_);
+            socket_ = INVALID_SOCKET;
+            t2::transport::RecordNativeIpv6Success();
+            return ConnectResult::ConnectFailed;
         } else {
             T2_LOG("connect", L"NativeIpv6 first connect did not complete within %lldms "
-                   L"(WSAGetLastError=%d) - falling back to Ipv4Tunnel for this attempt",
-                   static_cast<long long>(v6Timeout.count()), WSAGetLastError());
+                   L"(WSA error=%d) - falling back to Ipv4Tunnel for this attempt",
+                   static_cast<long long>(v6Timeout.count()), v6Err);
             closesocket(socket_);
             socket_ = INVALID_SOCKET;
             tunnel = true;

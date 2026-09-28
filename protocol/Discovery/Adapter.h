@@ -24,6 +24,10 @@ enum class PeerSource {
     None,
     NeighborTable,
     ManualOverride,
+    // Persisted from the last time the neighbor table had it. Only used when
+    // the table is empty (IPv6 ND blocked by VPN/WFP) so the IPv4-tunnel
+    // fallback still has a target after a cold boot.
+    LastKnown,
 };
 
 struct NcmEndpoint {

@@ -644,6 +644,8 @@ static int CmdNetwork(int argc, wchar_t* argv[]) {
             std::wcout << std::wstring(peer.begin(), peer.end());
             if (ep.peerSource == PeerSource::NeighborTable)
                 std::wcout << L"  (IPv6 neighbor table - scan target)\n";
+            else if (ep.peerSource == PeerSource::LastKnown)
+                std::wcout << L"  (last known peer - IPv6 ND blocked, IPv4 tunnel target)\n";
             else
                 std::wcout << L"  (--host override - scan target)\n";
         }

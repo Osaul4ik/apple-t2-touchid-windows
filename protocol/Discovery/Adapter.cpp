@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include "Adapter.h"
+#include "../BridgeXpc/TransportMode.h"
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
 #include <netioapi.h>
@@ -88,6 +89,15 @@ bool IsAcceptableNeighborState(NL_NEIGHBOR_STATE state) {
     return NeighborStatePriority(state) > 0;
 }
 
+// Best-effort: remember the confirmed peer (fe80 + MAC) so a later cold boot
+// with IPv6 ND blocked still has a tunnel target. May fail silently when the
+// caller lacks HKLM write access (UMDF host) - then the CLI/GUI run persists it.
+void PersistPeer(unsigned long ifIndex, const in6_addr& peer) {
+    UCHAR mac[6]{};
+    const bool haveMac = t2::transport::LookupPeerMac(ifIndex, peer, mac);
+    t2::transport::PublishTunnelPeer(peer, haveMac ? mac : nullptr);
+}
+
 bool FillFromAdapter(IP_ADAPTER_ADDRESSES* a, NcmEndpoint* out) {
     out->ifIndex = a->Ipv6IfIndex ? a->Ipv6IfIndex : a->IfIndex;
     out->friendlyName = a->FriendlyName ? a->FriendlyName : L"";
@@ -98,16 +108,34 @@ bool FillFromAdapter(IP_ADAPTER_ADDRESSES* a, NcmEndpoint* out) {
         out->hasMac = true;
     }
 
+    // COLD-BOOT FIX: this used to REQUIRE a Preferred link-local address and
+    // dropped the whole endpoint otherwise. Right after boot the address is
+    // still Tentative (DAD ~1s), and with IPv6 disabled/filtered it may not
+    // exist at all - in both cases discovery returned nothing and the IPv4
+    // tunnel fallback never got a chance. localLinkLocal is informational
+    // only, so: prefer a Preferred one, else any link-local, else derive it
+    // from the adapter MAC. The endpoint is valid as long as the MAC exists.
     bool gotLocal = false;
+    bool gotPreferred = false;
     for (auto* u = a->FirstUnicastAddress; u; u = u->Next) {
         if (!u->Address.lpSockaddr || u->Address.lpSockaddr->sa_family != AF_INET6)
             continue;
         auto* sa = reinterpret_cast<sockaddr_in6*>(u->Address.lpSockaddr);
         if (!IsLinkLocal(sa->sin6_addr)) continue;
-        if (u->DadState != IpDadStatePreferred) continue;
+        const bool preferred = (u->DadState == IpDadStatePreferred);
+        if (gotPreferred || (gotLocal && !preferred)) continue;
         out->localLinkLocal = sa->sin6_addr;
         gotLocal = true;
-        break;
+        gotPreferred = preferred;
+    }
+    if (!gotLocal && out->hasMac) {
+        in6_addr d{};
+        d.u.Byte[0] = 0xFE; d.u.Byte[1] = 0x80;
+        d.u.Byte[8] = out->mac[0] ^ 0x02; d.u.Byte[9] = out->mac[1]; d.u.Byte[10] = out->mac[2];
+        d.u.Byte[11] = 0xFF; d.u.Byte[12] = 0xFE;
+        d.u.Byte[13] = out->mac[3]; d.u.Byte[14] = out->mac[4]; d.u.Byte[15] = out->mac[5];
+        out->localLinkLocal = d;
+        gotLocal = true;
     }
 
     // Real discovery, not derivation: look up whatever the Windows IPv6
@@ -122,6 +150,7 @@ bool FillFromAdapter(IP_ADAPTER_ADDRESSES* a, NcmEndpoint* out) {
         if (FindNeighborPeer(out->ifIndex, &peer)) {
             out->peerLinkLocal = peer;
             out->peerSource = PeerSource::NeighborTable;
+            PersistPeer(out->ifIndex, peer);
         } else {
             // OPTIMIZATION: this used to be PromptPeerViaMulticastPing()
             // followed by an unconditional Sleep(250) and a single
@@ -150,9 +179,21 @@ bool FillFromAdapter(IP_ADAPTER_ADDRESSES* a, NcmEndpoint* out) {
                 if (FindNeighborPeer(out->ifIndex, &peer)) {
                     out->peerLinkLocal = peer;
                     out->peerSource = PeerSource::NeighborTable;
+                    PersistPeer(out->ifIndex, peer);
                     break;
                 }
                 Sleep(kPeerPollIntervalMs);
+            }
+            if (out->peerSource == PeerSource::None) {
+                // Neighbor table still empty: ND/ICMPv6 is being dropped
+                // (VPN/WFP) - exactly when the IPv4 tunnel is needed. Use the
+                // peer persisted from the last good IPv6 session so
+                // Connect() can still fall back to v4.
+                in6_addr saved{};
+                if (t2::transport::ReadPersistedPeer(&saved, nullptr, nullptr)) {
+                    out->peerLinkLocal = saved;
+                    out->peerSource = PeerSource::LastKnown;
+                }
             }
         }
     }

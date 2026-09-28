@@ -29,6 +29,7 @@
 #endif
 #include <iphlpapi.h>
 #include <netioapi.h>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include "Log.h"
@@ -269,6 +270,30 @@ inline void PublishTunnelPeer(const in6_addr& peer6, const UCHAR mac[6] /*nullab
     RegCloseKey(key);
 }
 
+// Last-known peer (fe80 + MAC) persisted by PublishTunnelPeer. Lets discovery
+// and the tunnel keep working after a cold boot when the IPv6 neighbor table
+// is still empty because a VPN/WFP drops the ff02::1 ping and Neighbor
+// Discovery (the exact case the IPv4 tunnel exists for).
+inline bool ReadPersistedPeer(in6_addr* peer6, UCHAR mac[6], bool* haveMac) {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kNetworkRegPath, 0, KEY_READ, &key) != ERROR_SUCCESS) {
+        return false;
+    }
+    DWORD type = 0, cb = sizeof(in6_addr);
+    bool ok = RegQueryValueExW(key, kPeerIpv6Value, nullptr, &type,
+                               reinterpret_cast<LPBYTE>(peer6), &cb) == ERROR_SUCCESS &&
+              type == REG_BINARY && cb == sizeof(in6_addr);
+    if (ok && haveMac && mac) {
+        cb = 6;
+        type = 0;
+        *haveMac = RegQueryValueExW(key, kPeerMacValue, nullptr, &type,
+                                    mac, &cb) == ERROR_SUCCESS &&
+                   type == REG_BINARY && cb == 6;
+    }
+    RegCloseKey(key);
+    return ok;
+}
+
 // Look up peer MAC from the IPv6 neighbor table (same entry as discovery).
 inline bool LookupPeerMac(unsigned long ifIndex, const in6_addr& peer6, UCHAR outMac[6]) {
     PMIB_IPNET_TABLE2 table = nullptr;
@@ -419,7 +444,21 @@ inline void PushTransportModeToDriver(TransportMode mode) {
 // Call before AF_INET connect in tunnel mode.
 inline void PrepareTunnelPeer(unsigned long ifIndex, const in6_addr& peer6) {
     UCHAR mac[6]{};
-    const bool haveMac = LookupPeerMac(ifIndex, peer6, mac);
+    bool haveMac = LookupPeerMac(ifIndex, peer6, mac);
+    if (!haveMac) {
+        // Neighbor table empty (VPN/WFP dropped ND) - fall back to the MAC
+        // persisted from the last time IPv6 worked, but only if it belongs
+        // to this same peer.
+        in6_addr savedPeer{};
+        UCHAR savedMac[6]{};
+        bool savedHaveMac = false;
+        if (ReadPersistedPeer(&savedPeer, savedMac, &savedHaveMac) && savedHaveMac &&
+            std::memcmp(&savedPeer, &peer6, sizeof(in6_addr)) == 0) {
+            std::memcpy(mac, savedMac, 6);
+            haveMac = true;
+            T2_LOG("tunnel", L"PrepareTunnelPeer: neighbor table empty - using persisted peer MAC");
+        }
+    }
     T2_LOG("tunnel", L"PrepareTunnelPeer: ifIndex=%lu peer=%02x%02x:%02x%02x mac=%s",
            ifIndex, peer6.s6_addr[12], peer6.s6_addr[13],
            peer6.s6_addr[14], peer6.s6_addr[15],
