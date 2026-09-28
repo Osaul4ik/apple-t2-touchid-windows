@@ -102,7 +102,7 @@ namespace T2TouchId.SepVaultGui
                 using var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(SessionRegPath, false);
                 if (key == null)
                 {
-                    WarmupStatusText.Text = "idle — ще не було unlock після cold boot";
+                    WarmupStatusText.Text = "idle — ще не було unlock після першого Match";
                     WarmupDetailText.Text = "";
                     return;
                 }
@@ -113,7 +113,7 @@ namespace T2TouchId.SepVaultGui
                 {
                     WarmupStatusText.Text = done is int i && i != 0
                         ? "done (статус не записано)"
-                        : "idle — ще не було unlock після cold boot";
+                        : "idle — ще не було unlock після першого Match";
                     WarmupDetailText.Text = "";
                     return;
                 }

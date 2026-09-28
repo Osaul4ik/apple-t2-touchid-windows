@@ -1208,6 +1208,89 @@ ConnectWait ConnectForCaptureWithRetry(HANDLE cancelEvent, t2::bridgexpc::Connec
     }
 }
 
+// Cold-boot IPv4 tunnel pre-warm: once per boot, after the FIRST successful
+// fingerprint Match (not WTS_SESSION_UNLOCK — that can fire with no peer yet
+// or before the bio service has a sticky endpoint, leaving GUI on "idle").
+// Orient on Match: peer is known, sticky NCM is valid, user just proved the
+// native path works. Arm tunnel infra in the background, then restore v6.
+void ScheduleColdBootWarmupIfNeeded()
+{
+    if (t2::transport::IsColdBootWarmupDone()) {
+        return;
+    }
+    // Claim done optimistically in the worker after success/fail; here only
+    // launch once per process even if two Matches race.
+    static std::atomic<bool> s_started{false};
+    bool expected = false;
+    if (!s_started.compare_exchange_strong(expected, true)) {
+        return;
+    }
+    std::thread([]() {
+        t2::transport::WriteWarmupStatus(L"waiting-peer",
+            L"First Match OK — waiting for T2 NCM peer");
+        T2BioLog("ColdBootWarmup: scheduled after first successful Match");
+
+        // Prefer sticky endpoint from the Match that just completed.
+        t2::discovery::NcmEndpoint sticky{};
+        bool haveSticky = false;
+        {
+            std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
+            if (g_stickyNcm.valid) {
+                sticky = g_stickyNcm.ep;
+                haveSticky = true;
+            }
+        }
+
+        bool warmed = false;
+        for (int attempt = 0; attempt < 16 && !warmed; ++attempt) {
+            if (attempt > 0) {
+                Sleep(500);
+            }
+            unsigned long ifIndex = 0;
+            in6_addr peer6{};
+            bool got = false;
+            if (haveSticky && sticky.peerSource != t2::discovery::PeerSource::None) {
+                ifIndex = sticky.ifIndex;
+                peer6 = sticky.peerLinkLocal;
+                got = true;
+                haveSticky = false; // only use sticky once; then rediscover
+            } else {
+                const auto endpoints = t2::discovery::FindT2NcmEndpoints();
+                for (const auto& ep : endpoints) {
+                    if (ep.peerSource == t2::discovery::PeerSource::None) {
+                        continue;
+                    }
+                    ifIndex = ep.ifIndex;
+                    peer6 = ep.peerLinkLocal;
+                    got = true;
+                    break;
+                }
+            }
+            if (!got) {
+                if (attempt == 0) {
+                    T2BioLog("ColdBootWarmup: no peer yet - retrying");
+                }
+                continue;
+            }
+            wchar_t detail[128];
+            swprintf_s(detail, L"ifIndex=%lu attempt=%d (after Match)",
+                       static_cast<unsigned long>(ifIndex), attempt + 1);
+            t2::transport::WriteWarmupStatus(L"warming", detail);
+            warmed = t2::transport::RunColdBootTunnelWarmup(ifIndex, peer6);
+            T2BioLog("ColdBootWarmup: %s (ifIndex=%lu attempt=%d)",
+                     warmed ? "OK" : "FAILED",
+                     static_cast<unsigned long>(ifIndex), attempt + 1);
+        }
+        if (!warmed) {
+            t2::transport::WriteWarmupStatus(L"failed",
+                L"No T2 NCM peer within 8s after first Match");
+            T2BioLog("ColdBootWarmup: gave up - no peer after Match");
+            t2::transport::MarkColdBootWarmupDone();
+        }
+    }).detach();
+}
+
+
 // A/B switch for the BIR layout (see WbdiBir.h BirOptions). Read on every capture so a
 // registry edit takes effect without a rebuild. Missing value = shipped default (3).
 //   HKLM\SOFTWARE\T2TouchIdBio\BirVariant  (REG_DWORD)
@@ -1578,6 +1661,9 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
         T2BioLog("CAPTURE_DATA(verify): BIR built, %llu bytes (vendor payload %llu)",
                  static_cast<unsigned long long>(bir.size()), static_cast<unsigned long long>(payload.size()));
         ArmMatchReplay(matchedUuid); // next CAPTURE = 2nd of the WBF pair
+        // First successful Match this boot → cold-boot IPv4 tunnel pre-warm.
+        // Peer/sticky are valid here; WTS_SESSION_UNLOCK is too early/unreliable.
+        ScheduleColdBootWarmupIfNeeded();
     } else {
         ClearMatchReplay();
     }
@@ -2096,62 +2182,15 @@ LRESULT CALLBACK SessionLockWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                 }).detach();
             }
         } else if (wParam == WTS_SESSION_UNLOCK) {
-            // Transport unlock path (no spam):
-            //  A) Once per cold boot (first unlock while ColdBootWarmupDone
-            //     unset): full IPv4 tunnel pre-warm, then restore NativeIpv6.
-            //     Status -> Session\WarmupStatus for GUI.
-            //  B) Every 4th unlock only: lightweight NativeIpv6 reachability
-            //     probe (~100ms) for VPN recovery. Other unlocks do nothing.
+            // Cold-boot warmup is NOT here — it runs after the first successful
+            // Match (ScheduleColdBootWarmupIfNeeded). Unlock only does the
+            // every-4th lightweight v6 probe for VPN recovery.
             static std::atomic<unsigned> s_unlockCount{0};
             const unsigned unlockN = s_unlockCount.fetch_add(1, std::memory_order_relaxed) + 1;
-            const bool everyFourth = (unlockN % 4u) == 0u;
-            const bool needColdWarmup = !t2::transport::IsColdBootWarmupDone();
-            if (!needColdWarmup && !everyFourth) {
-                return 0; // nothing to do this unlock
+            if ((unlockN % 4u) != 0u) {
+                return 0;
             }
-            std::thread([everyFourth, unlockN, needColdWarmup]() {
-                // ---- Cold-boot IPv4 pre-warm (once per boot) ----
-                if (needColdWarmup) {
-                    t2::transport::WriteWarmupStatus(L"waiting-peer",
-                        L"Waiting for T2 NCM peer after first unlock");
-                    T2BioLog("ColdBootWarmup: start (unlock#%u)", unlockN);
-                    bool warmed = false;
-                    for (int attempt = 0; attempt < 16 && !warmed; ++attempt) {
-                        if (attempt > 0) {
-                            Sleep(500);
-                        }
-                        const auto endpoints = t2::discovery::FindT2NcmEndpoints();
-                        for (const auto& ep : endpoints) {
-                            if (ep.peerSource == t2::discovery::PeerSource::None) {
-                                continue;
-                            }
-                            wchar_t detail[128];
-                            swprintf_s(detail, L"ifIndex=%lu attempt=%d",
-                                       static_cast<unsigned long>(ep.ifIndex), attempt + 1);
-                            t2::transport::WriteWarmupStatus(L"warming", detail);
-                            warmed = t2::transport::RunColdBootTunnelWarmup(
-                                ep.ifIndex, ep.peerLinkLocal);
-                            T2BioLog("ColdBootWarmup: %s (ifIndex=%lu attempt=%d)",
-                                     warmed ? "OK" : "FAILED",
-                                     static_cast<unsigned long>(ep.ifIndex), attempt + 1);
-                            break;
-                        }
-                        if (!warmed && attempt == 0) {
-                            T2BioLog("ColdBootWarmup: no peer yet - retrying");
-                        }
-                    }
-                    if (!warmed) {
-                        t2::transport::WriteWarmupStatus(L"failed",
-                            L"No T2 NCM peer within 8s after first unlock");
-                        T2BioLog("ColdBootWarmup: gave up - no peer");
-                        t2::transport::MarkColdBootWarmupDone();
-                    }
-                }
-
-                // ---- VPN recovery probe (every 4th unlock only) ----
-                if (!everyFourth) {
-                    return;
-                }
+            std::thread([unlockN]() {
                 const auto endpoints = t2::discovery::FindT2NcmEndpoints();
                 for (const auto& ep : endpoints) {
                     if (ep.peerSource == t2::discovery::PeerSource::None) {
