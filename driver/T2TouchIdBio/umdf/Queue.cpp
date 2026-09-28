@@ -623,6 +623,7 @@ ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_
         // Force next PushTransportMode to actually hit the driver (post-Dx
         // cache in miniport may not match our LastPushedMode).
         t2::transport::LastPushedModeFlag().store(-1, std::memory_order_relaxed);
+        t2::transport::ClearLastPushedPeer();
         // Resume hygiene: drop sticky/replay; pending CAPTURE restarts via resume event.
         ClearMatchReplay();
         ClearStickyNcm();

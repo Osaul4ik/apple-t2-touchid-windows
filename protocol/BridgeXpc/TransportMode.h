@@ -30,6 +30,7 @@
 #include <iphlpapi.h>
 #include <netioapi.h>
 #include <atomic>
+#include <mutex>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -460,6 +461,31 @@ inline std::atomic<int>& LastPushedModeFlag() {
     return s;
 }
 
+// Dedupe TunnelPeer IOCTL: port scan pushed same peer 15–20x per CAPTURE.
+struct LastPushedPeerState {
+    std::mutex mu;
+    in6_addr peer{};
+    bool valid = false;
+};
+inline LastPushedPeerState& LastPushedPeer() {
+    static LastPushedPeerState s;
+    return s;
+}
+inline void ClearLastPushedPeer() {
+    std::lock_guard<std::mutex> lock(LastPushedPeer().mu);
+    LastPushedPeer().valid = false;
+}
+inline bool IsSameAsLastPushedPeer(const in6_addr& peer6) {
+    std::lock_guard<std::mutex> lock(LastPushedPeer().mu);
+    return LastPushedPeer().valid &&
+           std::memcmp(&LastPushedPeer().peer, &peer6, sizeof(in6_addr)) == 0;
+}
+inline void RememberLastPushedPeer(const in6_addr& peer6) {
+    std::lock_guard<std::mutex> lock(LastPushedPeer().mu);
+    LastPushedPeer().peer = peer6;
+    LastPushedPeer().valid = true;
+}
+
 // Cold-boot warmup in progress: Connect must not race Push Tunnel↔Native.
 inline std::atomic<bool>& WarmupInProgressFlag() {
     static std::atomic<bool> s{false};
@@ -511,6 +537,9 @@ inline bool PushTunnelPeerToDriver(const in6_addr& peer6) {
         T2_LOG("tunnel", L"PushTunnelPeerToDriver: skipped (system suspending / Dx)");
         return false;
     }
+    if (IsSameAsLastPushedPeer(peer6)) {
+        return true; // already armed — kill port-scan IOCTL storm
+    }
     // FILE_WRITE_DATA only (not GENERIC_WRITE): the control device grants
     // LocalService exactly that (see NdisMiniport.c SDDL); GENERIC_WRITE also
     // asks for WRITE_ATTRIBUTES/EA/APPEND and would be denied for the service.
@@ -528,6 +557,8 @@ inline bool PushTunnelPeerToDriver(const in6_addr& peer6) {
                               nullptr, 0, &returned, nullptr);
     if (!ok) {
         T2_LOG("tunnel", L"PushTunnelPeerToDriver: IOCTL failed, GetLastError=%lu", GetLastError());
+    } else {
+        RememberLastPushedPeer(peer6);
     }
     CloseHandle(h);
     return ok != FALSE;
