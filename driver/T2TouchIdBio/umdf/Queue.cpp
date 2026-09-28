@@ -1063,6 +1063,11 @@ bool ConnectForCapture(t2::bridgexpc::Connection* outConn)
 {
     const ULONGLONG t0 = GetTickCount64();
 
+    // VPN may have come up while unlocked with no lock-notification race.
+    // Arm tunnel before sticky/native so this CAPTURE can verify, not just
+    // burn 400ms and fail.
+    t2::transport::ArmTunnelIfVpnActive();
+
     // If the session transport flipped (NativeIpv6 ↔ Ipv4Tunnel) since the
     // sticky endpoint was cached, the old TCP path is almost certainly dead
     // (VPN just came up, or just went down). Trying sticky first would only
@@ -1156,16 +1161,38 @@ ConnectWait ConnectForCaptureWithRetry(HANDLE cancelEvent, t2::bridgexpc::Connec
 {
     const ULONGLONG start = GetTickCount64();
     DWORD backoffMs = kConnectRetryFirstMs;
+    bool wasNative = !t2::transport::ShouldSkipNativeIpv6Probe();
     for (unsigned attempt = 1;; ++attempt) {
         if (ConnectForCapture(outConn)) {
             if (attempt > 1) {
-                T2BioLog("CAPTURE_DATA: BridgeXPC reachable after %u attempts (%llu ms)",
-                         attempt, static_cast<unsigned long long>(GetTickCount64() - start));
+                T2BioLog("CAPTURE_DATA: BridgeXPC reachable after %u attempts (%llu ms) mode=%s",
+                         attempt, static_cast<unsigned long long>(GetTickCount64() - start),
+                         t2::transport::ShouldSkipNativeIpv6Probe() ? "Ipv4Tunnel" : "NativeIpv6");
             }
             return ConnectWait::Connected;
         }
         if (t2::bridgexpc::Connection::IsEventSignaled(cancelEvent)) {
             return ConnectWait::Cancelled;
+        }
+        // Native just failed and Connect() armed tunnel (SkipNative now set).
+        // Drop sticky and retry immediately — caller will then send a NEW
+        // verify on a clean Ipv4Tunnel Connection (not a half-dead v6 session).
+        const bool nowTunnel = t2::transport::ShouldSkipNativeIpv6Probe();
+        if (wasNative && nowTunnel) {
+            wasNative = false;
+            {
+                std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
+                g_stickyNcm.valid = false;
+            }
+            T2BioLog("CAPTURE_DATA: v6 dead -> Ipv4Tunnel armed; immediate reconnect for NEW verify");
+            // Prepare peer before the next connect so ARP/driver are ready.
+            const auto endpoints = t2::discovery::FindT2NcmEndpoints();
+            for (const auto& ep : endpoints) {
+                if (ep.peerSource == t2::discovery::PeerSource::None) continue;
+                t2::transport::PrepareTunnelPeer(ep.ifIndex, ep.peerLinkLocal);
+                break;
+            }
+            continue; // no backoff
         }
         const ULONGLONG waited = GetTickCount64() - start;
         if (waited >= kConnectRetryWindowMs) {
@@ -2055,6 +2082,29 @@ LRESULT CALLBACK SessionLockWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         if (wParam == WTS_SESSION_LOCK) {
             std::lock_guard<std::mutex> commitLock(g_captureRequestCommitMu);
             BeginCaptureSessionLock("SessionLockNotify(WTS_SESSION_LOCK)");
+            // Pre-arm BEFORE lock-screen CAPTURE when a VPN is up — without a
+            // T2 v6 probe (those would fire on every lock). Detects VPN via
+            // host adapters; if none, no-op. If VPN (or already SkipNative),
+            // push tunnel + PrepareTunnelPeer so the first finger can Connect
+            // and send verify over Ipv4Tunnel immediately.
+            std::thread([]() {
+                t2::transport::ArmTunnelIfVpnActive();
+                if (!t2::transport::ShouldSkipNativeIpv6Probe()) {
+                    return; // still native, nothing to refresh
+                }
+                (void)t2::transport::PushTransportModeToDriver(
+                    t2::transport::TransportMode::Ipv4Tunnel);
+                const auto endpoints = t2::discovery::FindT2NcmEndpoints();
+                for (const auto& ep : endpoints) {
+                    if (ep.peerSource == t2::discovery::PeerSource::None) {
+                        continue;
+                    }
+                    t2::transport::PrepareTunnelPeer(ep.ifIndex, ep.peerLinkLocal);
+                    T2BioLog("LockArm: Ipv4Tunnel ready for lock-screen CAPTURE");
+                    return;
+                }
+                T2BioLog("LockArm: tunnel mode but no peer yet");
+            }).detach();
         } else if (wParam == WTS_SESSION_UNLOCK) {
             // Transport unlock path (no spam):
             //  A) Once per cold boot (first unlock while ColdBootWarmupDone

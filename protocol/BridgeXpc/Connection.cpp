@@ -276,39 +276,24 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
             t2::transport::RecordNativeIpv6Success();
             return ConnectResult::ConnectFailed;
         } else {
+            // v6 is dead this lock cycle. Do NOT continue this Connect() on
+            // tunnel: a half-open native attempt + mid-call AF_INET switch
+            // left verify unable to deliver a clean StartMatch. Instead arm
+            // tunnel for the session and fail THIS connect so the caller
+            // (ConnectForCaptureWithRetry / HandleCaptureVerify) opens a
+            // brand-new Connection on Ipv4Tunnel and sends a NEW verify.
             T2_LOG("connect", L"NativeIpv6 first connect did not complete within %lldms "
-                   L"(WSA error=%d) - falling back to Ipv4Tunnel for this attempt",
+                   L"(WSA error=%d) - arming Ipv4Tunnel and failing this connect "
+                   L"so caller retries verify on tunnel",
                    static_cast<long long>(v6Timeout.count()), v6Err);
             closesocket(socket_);
             socket_ = INVALID_SOCKET;
-            tunnel = true;
-            fellBackFromIpv6 = true;
-            // VPN just came up, screen just locked, machine just woke,
-            // Cisco/WFP profile dropping IPv6, ... whatever the cause,
-            // remember it for the rest of THIS lock cycle (see
-            // TransportMode.h's kSkipNativeIpv6ProbeValue comment) so
-            // subsequent calls skip straight to the tunnel instead of
-            // re-paying this same 400ms timeout - until the next real
-            // unlock (AllowNextNativeIpv6ProbeOnUnlock) grants one more
-            // free probe.
             t2::transport::RecordNativeIpv6Failure();
-            // BUG FIX (same root cause as the skip-probe branch above): this
-            // is a same-call, runtime-only fallback - the early push at the
-            // top of Connect() already sent NativeIpv6 (we hadn't fallen
-            // back yet at that point) before we knew the IPv6 handshake
-            // would time out. Without re-pushing here, PrepareTunnelPeer/ARP/AF_INET
-            // connect below all proceed correctly, but T2Ncm.sys's
-            // TunnelModeEnabled is still false, so the TX rewrite bails out
-            // and every frame goes out as bare IPv4 that the T2 silently
-            // drops - this is exactly the "fallback seems to happen but
-            // doesn't work" symptom, fixed by keeping the driver a live
-            // mirror of the mode we are ACTUALLY about to use, not just the
-            // registry value read at function entry.
             if (!t2::transport::PushTransportModeToDriver(t2::transport::TransportMode::Ipv4Tunnel)) {
                 T2_LOG("connect", L"WARNING: T2Ncm.sys could not be switched to tunnel mode "
-                       L"(control device not reachable from this process) - the IPv4 connect "
-                       L"below will time out; reinstall T2Ncm.sys with the LocalService SDDL");
+                       L"(control device not reachable from this process)");
             }
+            return ConnectResult::ConnectFailed;
         }
     }
 
