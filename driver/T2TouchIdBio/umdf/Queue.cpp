@@ -1216,12 +1216,25 @@ ConnectWait ConnectForCaptureWithRetry(HANDLE cancelEvent, t2::bridgexpc::Connec
                 g_stickyNcm.valid = false;
             }
             T2BioLog("CAPTURE_DATA: v6 dead -> Ipv4Tunnel armed; immediate reconnect for NEW verify");
-            // Prepare peer before the next connect so ARP/driver are ready.
-            const auto endpoints = t2::discovery::FindT2NcmEndpoints();
-            for (const auto& ep : endpoints) {
-                if (ep.peerSource == t2::discovery::PeerSource::None) continue;
-                t2::transport::PrepareTunnelPeer(ep.ifIndex, ep.peerLinkLocal);
-                break;
+            // Sticky-first peer refresh before tunnel reconnect.
+            {
+                bool prepared = false;
+                {
+                    std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
+                    if (g_stickyNcm.valid &&
+                        g_stickyNcm.ep.peerSource != t2::discovery::PeerSource::None) {
+                        t2::transport::PrepareTunnelPeer(
+                            g_stickyNcm.ep.ifIndex, g_stickyNcm.ep.peerLinkLocal);
+                        prepared = true;
+                    }
+                }
+                if (!prepared) {
+                    for (const auto& ep : t2::discovery::FindT2NcmEndpoints()) {
+                        if (ep.peerSource == t2::discovery::PeerSource::None) continue;
+                        t2::transport::PrepareTunnelPeer(ep.ifIndex, ep.peerLinkLocal);
+                        break;
+                    }
+                }
             }
             continue; // no backoff
         }
@@ -2216,21 +2229,34 @@ LRESULT CALLBACK SessionLockWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         if (wParam == WTS_SESSION_LOCK) {
             std::lock_guard<std::mutex> commitLock(g_captureRequestCommitMu);
             BeginCaptureSessionLock("SessionLockNotify(WTS_SESSION_LOCK)");
-            // Only refresh tunnel peer when v6 is already known dead for this
-            // session (SkipNative set by a prior Connect v6 failure). No VPN
-            // heuristics and no T2 probe on every lock.
+            // v6 already dead: refresh ARP/peer only. Mode is owned by Connect
+            // (no Push here — avoids IOCTL storm; LastPushed/driver stay put).
             if (t2::transport::ShouldSkipNativeIpv6Probe()) {
                 std::thread([]() {
-                    (void)t2::transport::PushTransportModeToDriver(
-                        t2::transport::TransportMode::Ipv4Tunnel);
-                    const auto endpoints = t2::discovery::FindT2NcmEndpoints();
-                    for (const auto& ep : endpoints) {
-                        if (ep.peerSource == t2::discovery::PeerSource::None) {
-                            continue;
+                    unsigned long ifIndex = 0;
+                    in6_addr peer6{};
+                    bool got = false;
+                    {
+                        std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
+                        if (g_stickyNcm.valid &&
+                            g_stickyNcm.ep.peerSource != t2::discovery::PeerSource::None) {
+                            ifIndex = g_stickyNcm.ep.ifIndex;
+                            peer6 = g_stickyNcm.ep.peerLinkLocal;
+                            got = true;
                         }
-                        t2::transport::PrepareTunnelPeer(ep.ifIndex, ep.peerLinkLocal);
-                        T2BioLog("LockRefresh: Ipv4Tunnel peer refreshed");
-                        return;
+                    }
+                    if (!got) {
+                        for (const auto& ep : t2::discovery::FindT2NcmEndpoints()) {
+                            if (ep.peerSource == t2::discovery::PeerSource::None) continue;
+                            ifIndex = ep.ifIndex;
+                            peer6 = ep.peerLinkLocal;
+                            got = true;
+                            break;
+                        }
+                    }
+                    if (got) {
+                        t2::transport::PrepareTunnelPeer(ifIndex, peer6);
+                        T2BioLog("LockRefresh: Ipv4Tunnel peer refreshed (sticky-first)");
                     }
                 }).detach();
             }
@@ -2244,29 +2270,43 @@ LRESULT CALLBACK SessionLockWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                 return 0;
             }
             std::thread([unlockN]() {
-                const auto endpoints = t2::discovery::FindT2NcmEndpoints();
-                for (const auto& ep : endpoints) {
-                    if (ep.peerSource == t2::discovery::PeerSource::None) {
-                        continue;
+                // Sticky-first; only update session flags — Connect applies driver mode.
+                unsigned long ifIndex = 0;
+                in6_addr peer6{};
+                bool got = false;
+                {
+                    std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
+                    if (g_stickyNcm.valid &&
+                        g_stickyNcm.ep.peerSource != t2::discovery::PeerSource::None) {
+                        ifIndex = g_stickyNcm.ep.ifIndex;
+                        peer6 = g_stickyNcm.ep.peerLinkLocal;
+                        got = true;
                     }
-                    const bool reachable = t2::transport::ProbeNativeIpv6Reachable(
-                        ep.peerLinkLocal, ep.ifIndex, t2::transport::kUnlockProbeTimeout);
-                    if (reachable) {
-                        t2::transport::RecordNativeIpv6Success();
-                        (void)t2::transport::PushTransportModeToDriver(
-                            t2::transport::TransportMode::NativeIpv6);
-                        T2BioLog("UnlockProbe: NativeIpv6 reachable (unlock#%u, every-4th)",
-                                 unlockN);
-                    } else {
-                        t2::transport::RecordNativeIpv6Failure();
-                        (void)t2::transport::PushTransportModeToDriver(
-                            t2::transport::TransportMode::Ipv4Tunnel);
-                        T2BioLog("UnlockProbe: NativeIpv6 unreachable - Ipv4Tunnel "
-                                 "(unlock#%u, every-4th)", unlockN);
+                }
+                if (!got) {
+                    for (const auto& ep : t2::discovery::FindT2NcmEndpoints()) {
+                        if (ep.peerSource == t2::discovery::PeerSource::None) continue;
+                        ifIndex = ep.ifIndex;
+                        peer6 = ep.peerLinkLocal;
+                        got = true;
+                        break;
                     }
+                }
+                if (!got) {
+                    T2BioLog("UnlockProbe: no peer yet (unlock#%u, every-4th)", unlockN);
                     return;
                 }
-                T2BioLog("UnlockProbe: no peer yet (unlock#%u, every-4th)", unlockN);
+                const bool reachable = t2::transport::ProbeNativeIpv6Reachable(
+                    peer6, ifIndex, t2::transport::kUnlockProbeTimeout);
+                if (reachable) {
+                    t2::transport::RecordNativeIpv6Success();
+                    T2BioLog("UnlockProbe: NativeIpv6 reachable (unlock#%u, every-4th) "
+                             "- session flag only", unlockN);
+                } else {
+                    t2::transport::RecordNativeIpv6Failure();
+                    T2BioLog("UnlockProbe: NativeIpv6 unreachable (unlock#%u, every-4th) "
+                             "- session flag only", unlockN);
+                }
             }).detach();
         }
         // Every other WM_WTSSESSION_CHANGE type is intentionally ignored.

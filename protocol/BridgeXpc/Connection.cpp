@@ -200,11 +200,7 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
     // here (TransportMode) that could force the tunnel independently of this
     // flag; it was removed (see TransportMode.h) precisely because it and
     // this flag could disagree, so the GUI now sets this exact flag instead.
-        // Cold-boot warmup must not race: it briefly forces driver TunnelMode
-    // while session still claims native. Wait it out before choosing path.
-    t2::transport::WaitWarmupIdle(3000);
-
-bool tunnel = t2::transport::ShouldSkipNativeIpv6Probe();
+    bool tunnel = t2::transport::ShouldSkipNativeIpv6Probe();
     // Mirror the flag into the running driver on every connect attempt.
     // T2NcmTunnelRefreshMode only re-reads the registry at
     // MiniportInitializeEx/MiniportRestart, so without this push a plain
