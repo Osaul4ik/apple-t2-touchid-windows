@@ -59,7 +59,15 @@ bool ParseIpv6(const char* text, in6_addr* out);
 // Returns false, leaving *out untouched, if no such neighbor exists yet
 // — this can legitimately happen before any multicast traffic (e.g. an
 // ff02::1 ping) has had a chance to populate the table.
-bool FindNeighborPeer(unsigned long ifIndex, in6_addr* out);
+// outMac (optional): if the winning neighbor-table row already carries a
+// full 6-byte link-layer address, it's copied here and *outHaveMac is set
+// true - lets a caller that's about to look the MAC up again (e.g.
+// PersistPeer's LookupPeerMac) skip a second full GetIpNetTable2 walk for
+// the row this call already read. *outHaveMac is always written when
+// outMac is non-null (false on any path that didn't get a MAC, including
+// FindNeighborPeer returning false at all).
+bool FindNeighborPeer(unsigned long ifIndex, in6_addr* out,
+                       unsigned char outMac[6] = nullptr, bool* outHaveMac = nullptr);
 
 std::string FormatLinkLocal(const in6_addr& addr, unsigned long scopeId);
 

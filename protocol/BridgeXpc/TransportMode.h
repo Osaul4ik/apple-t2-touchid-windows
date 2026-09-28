@@ -88,58 +88,6 @@ inline constexpr wchar_t kSessionRegPath[] = L"SOFTWARE\\T2TouchId\\Network\\Ses
 // succeeds and stays on NativeIpv6. T2TouchIdBio's SessionLockWndProc
 // (Queue.cpp) is the one place that clears this on WTS_SESSION_UNLOCK.
 inline constexpr wchar_t kSkipNativeIpv6ProbeValue[] = L"SkipNativeIpv6Probe"; // DWORD 0/1
-// Cold-boot IPv4 tunnel pre-warm (once per boot, after the first real unlock).
-// Volatile session key — disappears on reboot so the next cold boot warms again.
-inline constexpr wchar_t kColdBootWarmupDoneValue[] = L"ColdBootWarmupDone"; // DWORD 1 when done
-inline constexpr wchar_t kWarmupStatusValue[] = L"WarmupStatus";           // REG_SZ human status
-inline constexpr wchar_t kWarmupDetailValue[] = L"WarmupDetail";           // REG_SZ optional detail
-
-inline void WriteWarmupStatus(const wchar_t* status, const wchar_t* detail = L"") {
-    HKEY key = nullptr;
-    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, kSessionRegPath, 0, nullptr,
-                        REG_OPTION_VOLATILE, KEY_SET_VALUE, nullptr,
-                        &key, nullptr) != ERROR_SUCCESS) {
-        return;
-    }
-    if (status) {
-        RegSetValueExW(key, kWarmupStatusValue, 0, REG_SZ,
-                       reinterpret_cast<const BYTE*>(status),
-                       static_cast<DWORD>((wcslen(status) + 1) * sizeof(wchar_t)));
-    }
-    if (detail) {
-        RegSetValueExW(key, kWarmupDetailValue, 0, REG_SZ,
-                       reinterpret_cast<const BYTE*>(detail),
-                       static_cast<DWORD>((wcslen(detail) + 1) * sizeof(wchar_t)));
-    }
-    RegCloseKey(key);
-}
-
-inline bool IsColdBootWarmupDone() {
-    HKEY key = nullptr;
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kSessionRegPath, 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS) {
-        return false;
-    }
-    DWORD type = 0, val = 0, cb = sizeof(val);
-    const LONG err = RegQueryValueExW(key, kColdBootWarmupDoneValue, nullptr, &type,
-                                      reinterpret_cast<BYTE*>(&val), &cb);
-    RegCloseKey(key);
-    return err == ERROR_SUCCESS && type == REG_DWORD && val != 0;
-}
-
-inline void MarkColdBootWarmupDone() {
-    HKEY key = nullptr;
-    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, kSessionRegPath, 0, nullptr,
-                        REG_OPTION_VOLATILE, KEY_SET_VALUE, nullptr,
-                        &key, nullptr) != ERROR_SUCCESS) {
-        return;
-    }
-    DWORD one = 1;
-    RegSetValueExW(key, kColdBootWarmupDoneValue, 0, REG_DWORD,
-                   reinterpret_cast<const BYTE*>(&one), sizeof(one));
-    RegCloseKey(key);
-}
-
-
 
 enum class TransportMode : DWORD {
     NativeIpv6 = 0,
@@ -531,29 +479,6 @@ inline void InvalidateTunnelPrepCache() {
     LastPushedModeFlag().store(-1, std::memory_order_relaxed);
 }
 
-// Cold-boot warmup in progress: Connect must not race Push Tunnel↔Native.
-inline std::atomic<bool>& WarmupInProgressFlag() {
-    static std::atomic<bool> s{false};
-    return s;
-}
-inline void SetWarmupInProgress(bool v) {
-    WarmupInProgressFlag().store(v, std::memory_order_release);
-}
-inline bool IsWarmupInProgress() {
-    return WarmupInProgressFlag().load(std::memory_order_acquire);
-}
-// Wait up to timeoutMs for warmup to finish (CAPTURE path).
-inline void WaitWarmupIdle(DWORD timeoutMs = 3000) {
-    const ULONGLONG t0 = GetTickCount64();
-    while (IsWarmupInProgress()) {
-        if (GetTickCount64() - t0 >= timeoutMs) {
-            T2_LOG("warmup", L"WaitWarmupIdle: timed out after %lu ms", timeoutMs);
-            break;
-        }
-        Sleep(20);
-    }
-}
-
 // Real Sx suspend generation (NOT screen-lock). Bio bumps this only on
 // PBT_APMSUSPEND so Connect settle does not fire on every WTS_SESSION_LOCK.
 inline std::atomic<ULONGLONG>& RealSuspendGeneration() {
@@ -565,16 +490,6 @@ inline void BumpRealSuspendGeneration() {
 }
 inline ULONGLONG GetRealSuspendGeneration() {
     return RealSuspendGeneration().load(std::memory_order_acquire);
-}
-
-// Allow cold-boot warmup to be retried after a Dx-interrupted attempt.
-inline void ClearColdBootWarmupDoneForRetry() {
-    HKEY key = nullptr;
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kSessionRegPath, 0, KEY_SET_VALUE, &key) != ERROR_SUCCESS) {
-        return;
-    }
-    RegDeleteValueW(key, L"ColdBootWarmupDone");
-    RegCloseKey(key);
 }
 
 inline bool PushTunnelPeerToDriver(const in6_addr& peer6) {
@@ -716,79 +631,5 @@ inline void PrepareTunnelPeer(unsigned long ifIndex, const in6_addr& peer6) {
     }
 }
 
-
-// Once-per-boot: arm IPv4 tunnel infra (driver mode + ARP + peer push), then
-// restore NativeIpv6. Does NOT leave the session on tunnel. Safe to call only
-// after a real unlock when a peer is (or will become) known.
-
-// Send a throwaway TCP SYN through the tunnel so T2Ncm can learn local IPv4
-// and link-local from outbound frames. Without this, the first real CAPTURE
-// after VPN races "tunnel TX using synthesized local IPv6" and HELO fails;
-// the second CAPTURE works once learning completed. Port 1 is intentional —
-// we only need TX, not a successful handshake.
-inline void ForceTunnelDatapathWarm(unsigned long ifIndex, const in6_addr& peer6) {
-    if (IsTransportIoSuspended()) {
-        return;
-    }
-    const in_addr peer4 = MapPeerToIpv4(peer6);
-    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (s == INVALID_SOCKET) {
-        return;
-    }
-    DWORD ifIndexNet = htonl(static_cast<DWORD>(ifIndex));
-    (void)setsockopt(s, IPPROTO_IP, IP_UNICAST_IF,
-                     reinterpret_cast<const char*>(&ifIndexNet), sizeof(ifIndexNet));
-    u_long nonblock = 1;
-    (void)ioctlsocket(s, FIONBIO, &nonblock);
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(1);
-    addr.sin_addr = peer4;
-    (void)connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
-    fd_set wset;
-    FD_ZERO(&wset);
-    FD_SET(s, &wset);
-    timeval tv{};
-    tv.tv_sec = 0;
-    tv.tv_usec = 80000; // 80ms
-    (void)select(0, nullptr, &wset, nullptr, &tv);
-    closesocket(s);
-    Sleep(40); // let miniport finish local-address learning from the frame
-    T2_LOG("tunnel", L"ForceTunnelDatapathWarm: poke ifIndex=%lu done", ifIndex);
-}
-
-inline bool RunColdBootTunnelWarmup(unsigned long ifIndex, const in6_addr& peer6) {
-    if (IsTransportIoSuspended()) {
-        WriteWarmupStatus(L"deferred", L"Dx/suspend - retry after resume");
-        T2_LOG("warmup", L"ColdBootWarmup: deferred (system suspending)");
-        return false; // caller must NOT MarkColdBootDone
-    }
-    SetWarmupInProgress(true);
-    struct WarmupGuard {
-        ~WarmupGuard() { SetWarmupInProgress(false); }
-    } warmupGuard;
-
-    WriteWarmupStatus(L"arming-tunnel", L"PushTransportModeToDriver(Ipv4Tunnel)");
-    if (!PushTransportModeToDriver(TransportMode::Ipv4Tunnel)) {
-        WriteWarmupStatus(L"failed", L"PushTransportModeToDriver(Ipv4Tunnel) failed");
-        T2_LOG("warmup", L"ColdBootWarmup: Push Ipv4Tunnel FAILED");
-        return false;
-    }
-    WriteWarmupStatus(L"preparing-peer", L"PrepareTunnelPeer (ARP + driver peer)");
-    PrepareTunnelPeer(ifIndex, peer6);
-    WriteWarmupStatus(L"learning-local", L"ForceTunnelDatapathWarm (local IPv4/v6)");
-    ForceTunnelDatapathWarm(ifIndex, peer6);
-    WriteWarmupStatus(L"restoring-v6", L"PushTransportModeToDriver(NativeIpv6)");
-    RecordNativeIpv6Success(); // clear any skip flag; stay native after warm
-    if (!PushTransportModeToDriver(TransportMode::NativeIpv6)) {
-        WriteWarmupStatus(L"failed", L"Push NativeIpv6 after warm failed (peer prepared)");
-        T2_LOG("warmup", L"ColdBootWarmup: Push NativeIpv6 FAILED (peer still prepared)");
-        // Peer is prepared either way; mode push failure is non-fatal for later fallback.
-    }
-    MarkColdBootWarmupDone();
-    WriteWarmupStatus(L"ok", L"IPv4 tunnel pre-warmed; session stays on Native IPv6");
-    T2_LOG("warmup", L"ColdBootWarmup: OK ifIndex=%lu", ifIndex);
-    return true;
-}
 
 } // namespace t2::transport

@@ -98,6 +98,19 @@ void PersistPeer(unsigned long ifIndex, const in6_addr& peer) {
     t2::transport::PublishTunnelPeer(peer, haveMac ? mac : nullptr);
 }
 
+// Same as PersistPeer, but for a caller that already has the MAC in hand
+// (from the same neighbor-table row FindNeighborPeer just read) - skips
+// the redundant second GetIpNetTable2 walk LookupPeerMac would otherwise
+// do to re-find a row we were just looking at.
+void PersistPeerWithMac(unsigned long ifIndex, const in6_addr& peer,
+                         const unsigned char* mac, bool haveMac) {
+    if (haveMac) {
+        t2::transport::PublishTunnelPeer(peer, mac);
+    } else {
+        PersistPeer(ifIndex, peer); // fall back to the full lookup
+    }
+}
+
 bool FillFromAdapter(IP_ADAPTER_ADDRESSES* a, NcmEndpoint* out) {
     out->ifIndex = a->Ipv6IfIndex ? a->Ipv6IfIndex : a->IfIndex;
     out->friendlyName = a->FriendlyName ? a->FriendlyName : L"";
@@ -147,10 +160,33 @@ bool FillFromAdapter(IP_ADAPTER_ADDRESSES* a, NcmEndpoint* out) {
     // retry also comes up empty, so the caller can fall back to --host.
     if (gotLocal) {
         in6_addr peer{};
-        if (FindNeighborPeer(out->ifIndex, &peer)) {
+        unsigned char neighborMac[6]{};
+        bool haveNeighborMac = false;
+        if (FindNeighborPeer(out->ifIndex, &peer, neighborMac, &haveNeighborMac)) {
             out->peerLinkLocal = peer;
             out->peerSource = PeerSource::NeighborTable;
-            PersistPeer(out->ifIndex, peer);
+            PersistPeerWithMac(out->ifIndex, peer, neighborMac, haveNeighborMac);
+        } else if (t2::transport::ShouldSkipNativeIpv6Probe()) {
+            // OPTIMIZATION (tunnel-mode fast path): the session cache
+            // already knows NativeIpv6 failed once since the last unlock
+            // (see TransportMode.h's kSkipNativeIpv6ProbeValue) - i.e. ND
+            // is known-broken this lock cycle (VPN/WFP dropping it), which
+            // is exactly the condition that makes FindNeighborPeer fail
+            // here. Every previous run still paid for
+            // PromptPeerViaMulticastPing (spawns ping.exe, ~300-1300ms
+            // WaitForSingleObject) plus the 250ms neighbor-table poll below
+            // on EVERY single verify attempt while locked, even though
+            // both were already known to be futile. Going straight to the
+            // persisted last-known peer skips ~550ms+ of dead time per
+            // attempt for the entire rest of this lock cycle; the very
+            // next real unlock still gets one full fresh probe (see
+            // Connect()'s tunnel branch / SessionLockWndProc), so a T2
+            // that actually re-addresses is still picked up promptly.
+            in6_addr saved{};
+            if (t2::transport::ReadPersistedPeer(&saved, nullptr, nullptr)) {
+                out->peerLinkLocal = saved;
+                out->peerSource = PeerSource::LastKnown;
+            }
         } else {
             // OPTIMIZATION: this used to be PromptPeerViaMulticastPing()
             // followed by an unconditional Sleep(250) and a single
@@ -176,10 +212,12 @@ bool FillFromAdapter(IP_ADAPTER_ADDRESSES* a, NcmEndpoint* out) {
             const int kPeerPollBudgetMs = 250;
             for (int waited = 0; waited < kPeerPollBudgetMs;
                  waited += kPeerPollIntervalMs) {
-                if (FindNeighborPeer(out->ifIndex, &peer)) {
+                unsigned char pollMac[6]{};
+                bool havePollMac = false;
+                if (FindNeighborPeer(out->ifIndex, &peer, pollMac, &havePollMac)) {
                     out->peerLinkLocal = peer;
                     out->peerSource = PeerSource::NeighborTable;
-                    PersistPeer(out->ifIndex, peer);
+                    PersistPeerWithMac(out->ifIndex, peer, pollMac, havePollMac);
                     break;
                 }
                 Sleep(kPeerPollIntervalMs);
@@ -203,7 +241,9 @@ bool FillFromAdapter(IP_ADAPTER_ADDRESSES* a, NcmEndpoint* out) {
 
 } // namespace
 
-bool FindNeighborPeer(unsigned long ifIndex, in6_addr* out) {
+bool FindNeighborPeer(unsigned long ifIndex, in6_addr* out,
+                       unsigned char outMac[6], bool* outHaveMac) {
+    if (outHaveMac) *outHaveMac = false;
     if (!out || ifIndex == 0) return false;
 
     PMIB_IPNET_TABLE2 table = nullptr;
@@ -214,6 +254,8 @@ bool FindNeighborPeer(unsigned long ifIndex, in6_addr* out) {
     bool found = false;
     int bestPriority = 0;
     in6_addr best{};
+    unsigned char bestMac[6]{};
+    bool bestHaveMac = false;
 
     for (ULONG i = 0; i < table->NumEntries; ++i) {
         const MIB_IPNET_ROW2& row = table->Table[i];
@@ -231,6 +273,13 @@ bool FindNeighborPeer(unsigned long ifIndex, in6_addr* out) {
             found = true;
             bestPriority = priority;
             best = addr;
+            // Capture the MAC from this same row while we're here - saves
+            // a caller (PersistPeer) from walking the whole table again
+            // moments later just to look up the identical row.
+            bestHaveMac = row.PhysicalAddressLength >= 6;
+            if (bestHaveMac) {
+                std::memcpy(bestMac, row.PhysicalAddress, 6);
+            }
         }
     }
 
@@ -238,6 +287,10 @@ bool FindNeighborPeer(unsigned long ifIndex, in6_addr* out) {
 
     if (found) {
         *out = best;
+        if (outMac && outHaveMac && bestHaveMac) {
+            std::memcpy(outMac, bestMac, 6);
+            *outHaveMac = true;
+        }
     }
     return found;
 }
