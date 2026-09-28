@@ -276,24 +276,27 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
             t2::transport::RecordNativeIpv6Success();
             return ConnectResult::ConnectFailed;
         } else {
-            // v6 is dead this lock cycle. Do NOT continue this Connect() on
-            // tunnel: a half-open native attempt + mid-call AF_INET switch
-            // left verify unable to deliver a clean StartMatch. Instead arm
-            // tunnel for the session and fail THIS connect so the caller
-            // (ConnectForCaptureWithRetry / HandleCaptureVerify) opens a
-            // brand-new Connection on Ipv4Tunnel and sends a NEW verify.
+            // v6 dead: arm tunnel and CONTINUE this Connect() on AF_INET.
+            // Returning ConnectFailed here made discovery/CAPTURE give up on the
+            // first lock after VPN before a clean tunnel+verify could run —
+            // user saw "no reaction"; the next lock (already SkipNative) worked
+            // after ~1.5s. Same-call fallback + PrepareTunnelPeer + new HELO
+            // is the NEW session path; HandleCaptureVerify still sends a fresh
+            // StartMatch/verify on the connection we return.
             T2_LOG("connect", L"NativeIpv6 first connect did not complete within %lldms "
-                   L"(WSA error=%d) - arming Ipv4Tunnel and failing this connect "
-                   L"so caller retries verify on tunnel",
+                   L"(WSA error=%d) - falling back to Ipv4Tunnel for this attempt "
+                   L"(then fresh HELO + verify on tunnel)",
                    static_cast<long long>(v6Timeout.count()), v6Err);
             closesocket(socket_);
             socket_ = INVALID_SOCKET;
+            tunnel = true;
+            fellBackFromIpv6 = true;
             t2::transport::RecordNativeIpv6Failure();
             if (!t2::transport::PushTransportModeToDriver(t2::transport::TransportMode::Ipv4Tunnel)) {
                 T2_LOG("connect", L"WARNING: T2Ncm.sys could not be switched to tunnel mode "
-                       L"(control device not reachable from this process)");
+                       L"(control device not reachable from this process) - the IPv4 connect "
+                       L"below will time out; reinstall T2Ncm.sys with the LocalService SDDL");
             }
-            return ConnectResult::ConnectFailed;
         }
     }
 
