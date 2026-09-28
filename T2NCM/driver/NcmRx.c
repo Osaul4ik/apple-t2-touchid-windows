@@ -573,7 +573,16 @@ T2NcmRxParseNtb(
                 ULONG tunLen = entry.wDatagramLength;
                 const UCHAR* deliver = frame;
 
-                if (tunLen <= sizeof(tunFrame))
+                // T2NcmTunnelRewriteRxIpv6ToIpv4 is a no-op (returns TRUE
+                // unchanged) whenever tunnel mode is off, which is the
+                // common case (NativeIpv6 is the default and the whole
+                // point of the tunnel is that it's a fallback). The
+                // up-to-1514-byte RtlCopyMemory below used to run on EVERY
+                // received frame regardless - checking the flag here
+                // (already cached at PASSIVE, safe to read at DISPATCH)
+                // skips that copy entirely on the hot path when there is
+                // nothing for the rewrite to do.
+                if (DeviceContext->TunnelModeEnabled && tunLen <= sizeof(tunFrame))
                 {
                     RtlCopyMemory(tunFrame, frame, tunLen);
                     if (T2NcmTunnelRewriteRxIpv6ToIpv4(DeviceContext, tunFrame, &tunLen))

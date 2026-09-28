@@ -471,6 +471,35 @@ inline LastPushedPeerState& LastPushedPeer() {
     static LastPushedPeerState s;
     return s;
 }
+// Cache of "have we already ensured the static ARP neighbor for this
+// tunnel peer" - separate from LastPushedPeer (that one only dedupes the
+// IOCTL to the driver, not the neighbor-table syscalls below it).
+// PrepareTunnelPeer's LookupPeerMac(GetIpNetTable2) + EnsureTunnelIpv4Neighbor
+// (CreateIpNetEntry2/SetIpNetEntry2) are the two heaviest synchronous calls
+// in the whole tunnel Connect() path - a full neighbor-table walk plus a
+// kernel IP helper round-trip - and previously ran unconditionally on
+// EVERY Connect(), even the common case of the same peer as last time
+// (e.g. a lock-screen retry loop). Skipping them when nothing changed
+// removes that cost from the tunnel's steady-state per-attempt latency.
+struct ArpPrepCacheState {
+    std::mutex mu;
+    in6_addr peer{};
+    bool valid = false;
+};
+inline ArpPrepCacheState& ArpPrepCache() {
+    static ArpPrepCacheState s;
+    return s;
+}
+inline bool IsArpAlreadyPrepared(const in6_addr& peer6) {
+    std::lock_guard<std::mutex> lock(ArpPrepCache().mu);
+    return ArpPrepCache().valid &&
+           std::memcmp(&ArpPrepCache().peer, &peer6, sizeof(in6_addr)) == 0;
+}
+inline void RememberArpPrepared(const in6_addr& peer6) {
+    std::lock_guard<std::mutex> lock(ArpPrepCache().mu);
+    ArpPrepCache().peer = peer6;
+    ArpPrepCache().valid = true;
+}
 inline void ClearLastPushedPeer() {
     std::lock_guard<std::mutex> lock(LastPushedPeer().mu);
     LastPushedPeer().valid = false;
@@ -484,6 +513,22 @@ inline void RememberLastPushedPeer(const in6_addr& peer6) {
     std::lock_guard<std::mutex> lock(LastPushedPeer().mu);
     LastPushedPeer().peer = peer6;
     LastPushedPeer().valid = true;
+}
+
+// Call whenever a tunnel connect actually FAILS (TCP connect or HELO
+// timeout) - forces the next PrepareTunnelPeer to redo the full
+// lookup+ARP-set instead of trusting a neighbor entry that may itself be
+// the reason the connect just failed (T2 rebooted/re-addressed mid-lock,
+// stale MAC in the neighbor table). Also clears the IOCTL-dedupe caches
+// for the same reason - a failed connect means "don't trust what we
+// think is already armed in the driver either".
+inline void InvalidateTunnelPrepCache() {
+    {
+        std::lock_guard<std::mutex> lock(ArpPrepCache().mu);
+        ArpPrepCache().valid = false;
+    }
+    ClearLastPushedPeer();
+    LastPushedModeFlag().store(-1, std::memory_order_relaxed);
 }
 
 // Cold-boot warmup in progress: Connect must not race Push Tunnel↔Native.
@@ -632,6 +677,17 @@ inline void PrepareTunnelPeer(unsigned long ifIndex, const in6_addr& peer6) {
         T2_LOG("tunnel", L"PrepareTunnelPeer: skipped (system suspending / Dx)");
         return;
     }
+    // Fast path: same peer as last time we successfully prepared it, and
+    // nothing has invalidated that since (see InvalidateTunnelPrepCache).
+    // Skips the neighbor-table walk and the ARP create/set syscalls -
+    // still publishes the peer to the registry and (via the existing
+    // IsSameAsLastPushedPeer dedupe inside it) pushes it to the driver,
+    // both of which are already cheap early-outs.
+    if (IsArpAlreadyPrepared(peer6)) {
+        PublishTunnelPeer(peer6, nullptr);
+        PushTunnelPeerToDriver(peer6);
+        return;
+    }
     UCHAR mac[6]{};
     bool haveMac = LookupPeerMac(ifIndex, peer6, mac);
     if (!haveMac) {
@@ -656,6 +712,7 @@ inline void PrepareTunnelPeer(unsigned long ifIndex, const in6_addr& peer6) {
     PushTunnelPeerToDriver(peer6);
     if (haveMac) {
         EnsureTunnelIpv4Neighbor(ifIndex, MapPeerToIpv4(peer6), mac);
+        RememberArpPrepared(peer6);
     }
 }
 

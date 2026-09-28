@@ -121,6 +121,35 @@ static bool ConnectWithTimeout(SOCKET s, const sockaddr* addr, int addrlen,
     return ok;
 }
 
+// Latency tuning for the established BridgeXPC socket (both NativeIpv6 and
+// the Ipv4 tunnel). BridgeXPC is a request/response protocol made of many
+// small frames, which is the worst case for two Windows TCP defaults:
+//  * Nagle: WriteFrame used to send the 16-byte header and the body as two
+//    separate send() calls. The second (small) send is held back until the
+//    first is ACKed, and the T2 delays that ACK (~40 ms) -> +40 ms/command.
+//  * Delayed ACK: Windows waits up to 200 ms before ACKing a lone segment,
+//    which stalls a peer that itself writes header+body separately.
+// TCP_NODELAY + an ACK frequency of 1 remove both. Every step is
+// best-effort: a failure only means the old (slower) behaviour.
+#ifndef SIO_TCP_SET_ACK_FREQUENCY
+#define SIO_TCP_SET_ACK_FREQUENCY _WSAIOW(IOC_VENDOR, 23)
+#endif
+static void TuneEstablishedSocket(SOCKET s) {
+    BOOL nodelay = TRUE;
+    if (setsockopt(s, IPPROTO_TCP, TCP_NODELAY,
+                   reinterpret_cast<const char*>(&nodelay), sizeof(nodelay)) != 0) {
+        T2_LOG("connect", L"TCP_NODELAY failed WSA=%d (continuing)", WSAGetLastError());
+    }
+    DWORD ackFreq = 1;
+    DWORD bytes = 0;
+    if (WSAIoctl(s, SIO_TCP_SET_ACK_FREQUENCY, &ackFreq, sizeof(ackFreq),
+                 nullptr, 0, &bytes, nullptr, nullptr) != 0) {
+        // Needs Windows 10 1809+; older builds just keep delayed ACK.
+        T2_LOG("connect", L"SIO_TCP_SET_ACK_FREQUENCY failed WSA=%d (continuing)",
+               WSAGetLastError());
+    }
+}
+
 // Narrow, bounded extraction of one integer field from the peer's HELO
 // JSON - e.g. {"MaxSupportedProtocolVersion":1,"OSBuild":"...",
 // "BridgeXPCVersion":39,"ProcessName":"..."}. This is deliberately not a
@@ -228,9 +257,11 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
         if (!ConnectWithTimeout(socket_, reinterpret_cast<sockaddr*>(&addr4), sizeof(addr4),
                                  connectTimeout)) {
             T2_LOG("connect", L"connect(AF_INET) failed WSA=%d", WSAGetLastError());
+            t2::transport::InvalidateTunnelPrepCache(); // re-prepare neighbor/peer next time
             Close();
             return ConnectResult::ConnectFailed;
         }
+        TuneEstablishedSocket(socket_);
         SetSocketTimeout(socket_, SO_RCVTIMEO, connectTimeout);
         SetSocketTimeout(socket_, SO_SNDTIMEO, connectTimeout);
         T2_LOG("connect", L"TCP connected (IPv4 tunnel): ifIndex=%lu port=%u (waiting for peer HELO)",
@@ -254,6 +285,7 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
             Close();
             return ConnectResult::ConnectFailed;
         }
+        TuneEstablishedSocket(socket_);
         SetSocketTimeout(socket_, SO_RCVTIMEO, connectTimeout);
         SetSocketTimeout(socket_, SO_SNDTIMEO, connectTimeout);
         T2_LOG("connect", L"TCP connected (Native IPv6): ifIndex=%lu port=%u (waiting for peer HELO)",
@@ -265,6 +297,7 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
         T2_LOG("connect", L"HELO read failed or wrong frame type "
                "(connected=true, timeout=%lldms)",
                static_cast<long long>(connectTimeout.count()));
+        if (tunnel) t2::transport::InvalidateTunnelPrepCache();
         Close();
         return ConnectResult::HeloTimeout;
     }
@@ -921,24 +954,31 @@ static bool WriteAll(SOCKET s, const uint8_t* data, size_t len) {
 }
 
 bool Connection::WriteFrame(FrameType type, const std::vector<uint8_t>& body) {
-    uint8_t header[16];
+    // Header and body go out in ONE send(): two back-to-back small sends
+    // are the Nagle/delayed-ACK trap described at TuneEstablishedSocket.
+    // Small frames (the common case) use a stack buffer, no allocation.
     uint16_t magic = kFrameMagic;
     uint16_t version = kProtocolVersion;
     uint32_t frameType = static_cast<uint32_t>(type);
     uint64_t bodyLength = body.size();
 
-    std::memcpy(header + 0, &magic, 2);
-    std::memcpy(header + 2, &version, 2);
-    std::memcpy(header + 4, &frameType, 4);
-    std::memcpy(header + 8, &bodyLength, 8);
+    uint8_t stackBuf[16 + 512];
+    std::vector<uint8_t> heapBuf;
+    uint8_t* out = stackBuf;
+    const size_t total = 16 + body.size();
+    if (total > sizeof(stackBuf)) {
+        heapBuf.resize(total);
+        out = heapBuf.data();
+    }
 
-    if (!WriteAll(socket_, header, sizeof(header))) {
-        return false;
+    std::memcpy(out + 0, &magic, 2);
+    std::memcpy(out + 2, &version, 2);
+    std::memcpy(out + 4, &frameType, 4);
+    std::memcpy(out + 8, &bodyLength, 8);
+    if (!body.empty()) {
+        std::memcpy(out + 16, body.data(), body.size());
     }
-    if (!body.empty() && !WriteAll(socket_, body.data(), body.size())) {
-        return false;
-    }
-    return true;
+    return WriteAll(socket_, out, total);
 }
 
 } // namespace t2::bridgexpc

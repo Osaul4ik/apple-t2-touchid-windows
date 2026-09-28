@@ -274,7 +274,6 @@ BOOLEAN T2NcmTunnelRewriteTxIpv4ToIpv6(
     ULONG newFl;
     UCHAR src6[16];
     UCHAR dst6[16];
-    UCHAR tcpCopy[60];
     ULONG tcpHdrLen;
     UCHAR* tcp;
     USHORT oldCheck;
@@ -381,12 +380,14 @@ BOOLEAN T2NcmTunnelRewriteTxIpv4ToIpv6(
     if (proto == T2NCM_IPPROTO_TCP && payloadLen >= 20) {
         tcp = Frame + 14 + 40;
         tcpHdrLen = (ULONG)((tcp[12] >> 4) * 4);
-        if (tcpHdrLen >= 20 && tcpHdrLen <= payloadLen && tcpHdrLen <= sizeof(tcpCopy)) {
-            RtlCopyMemory(tcpCopy, tcp, tcpHdrLen);
-            tcpCopy[16] = 0;
-            tcpCopy[17] = 0;
-            oldCheck = T2NcmTcpChecksumV6(src6, dst6, tcpCopy, payloadLen);
-            // recompute with zeroed checksum field over full TCP segment
+        if (tcpHdrLen >= 20 && tcpHdrLen <= payloadLen && tcpHdrLen <= 60u) {
+            // NOTE: this used to compute the same TCP checksum twice -
+            // once over a scratch copy (tcpCopy) whose result was
+            // immediately discarded, then again over `tcp` itself, which
+            // is the only value ever used. tcpCopy was dead. Computing a
+            // pseudo-header+segment checksum over up to 60 bytes twice per
+            // TX'd TCP frame was pure wasted CPU on the tunnel's hot path;
+            // this now does it once.
             tcp[16] = 0;
             tcp[17] = 0;
             oldCheck = T2NcmTcpChecksumV6(src6, dst6, tcp, payloadLen);
