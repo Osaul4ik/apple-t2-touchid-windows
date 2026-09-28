@@ -323,15 +323,23 @@ side.
 This is fully automatic and needs no configuration in the normal case:
 
 - Every cold boot always tries native IPv6 first.
-- If a connect attempt doesn't get an IPv6 handshake within ~150 ms (VPN
-  just came up, screen just locked, etc.), that one call falls back to the
-  IPv4 tunnel, and every subsequent call **for the rest of that lock
-  cycle** skips straight to the tunnel too — no repeated 150 ms timeouts
-  while the screen stays locked.
-- The very next real unlock gets exactly one fresh native-IPv6 probe: if
-  the VPN dropped in the meantime it succeeds and stays on IPv6; if not,
-  it fails fast and the tunnel keeps being used until the unlock after
-  that.
+- After the first (and every) real unlock, the stack **prepares the IPv4
+  tunnel path in the background** (ARP neighbor + peer push into
+  `T2Ncm.sys` — same work the `network` / static-IP path needs) while
+  staying on native IPv6. That way a later VPN that blocks IPv6 can fall
+  back without a cold ARP miss.
+- If a connect attempt (e.g. finger unlock while VPN is up) doesn't get an
+  IPv6 handshake within **~400 ms**, that one call falls back to the IPv4
+  tunnel and the verify continues over the tunnel; every subsequent call
+  **for the rest of that lock cycle** skips straight to the tunnel too —
+  no repeated 400 ms timeouts while the screen stays locked.
+- Every real unlock runs a throwaway native-IPv6 reachability probe
+  (~100 ms). If the VPN dropped it succeeds and the next Connect uses
+  IPv6 again; if not, the tunnel stays selected until a later unlock
+  succeeds.
+- Once every **4 unlocks** the background path also forces a full tunnel
+  re-arm before the probe, then switches back to native IPv6 only if the
+  probe succeeds.
 - This state resets on every reboot (it's a volatile registry cache) —
   Windows always starts a fresh boot by trying IPv6.
 

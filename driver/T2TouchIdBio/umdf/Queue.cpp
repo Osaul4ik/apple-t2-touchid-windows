@@ -1987,35 +1987,68 @@ LRESULT CALLBACK SessionLockWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             std::lock_guard<std::mutex> commitLock(g_captureRequestCommitMu);
             BeginCaptureSessionLock("SessionLockNotify(WTS_SESSION_LOCK)");
         } else if (wParam == WTS_SESSION_UNLOCK) {
-            // Not a capture-invalidation boundary (nothing to cancel here,
-            // unchanged from before). Per the transport-mode design
-            // (TransportMode.h): a real unlock only TESTS whether
-            // NativeIpv6 has become viable again - it must never make an
-            // actual verify's own Connect() risk switching transport
-            // mid-attempt. So this fires a throwaway, bounded (100ms)
-            // reachability probe on its own detached thread; the cached
-            // skip-flag decision is updated from THAT result, and no real
-            // Connect() call is ever used to find it out. Detached (not
-            // joined) so a slow/failing probe can never block this
-            // message loop from handling the next WM_WTSSESSION_CHANGE.
-            std::thread([]() {
+            // Not a capture-invalidation boundary (nothing to cancel here).
+            // Transport-mode design (TransportMode.h + user AutoSwitch spec):
+            //
+            // 1) Cold boot / every unlock: in background prepare the IPv4
+            //    tunnel path (PrepareTunnelPeer = ARP neighbor + push peer
+            //    to T2Ncm.sys) — analogue of the `network` / static-IP setup —
+            //    so a later VPN that blocks IPv6 can fall back without a
+            //    cold ARP miss. We do NOT flip the live mode to tunnel here
+            //    until the probe says IPv6 is unreachable.
+            // 2) Always TEST NativeIpv6 with a throwaway probe (100ms). Result
+            //    updates the session skip-flag; no real Connect() is used.
+            // 3) Every 4th unlock: force a full re-check cycle — ensure tunnel
+            //    infra is live, probe v6, and if reachable switch back to
+            //    NativeIpv6 (RecordNativeIpv6Success); if not, stay on tunnel.
+            // Detached so a slow probe never blocks the message loop.
+            static std::atomic<unsigned> s_unlockCount{0};
+            const unsigned unlockN = s_unlockCount.fetch_add(1, std::memory_order_relaxed) + 1;
+            const bool everyFourth = (unlockN % 4u) == 0u;
+            std::thread([everyFourth, unlockN]() {
                 const auto endpoints = t2::discovery::FindT2NcmEndpoints();
+                bool hadPeer = false;
                 for (const auto& ep : endpoints) {
                     if (ep.peerSource == t2::discovery::PeerSource::None) {
-                        continue; // no confirmed T2 peer yet - nothing to probe
+                        continue;
                     }
+                    hadPeer = true;
+
+                    // Background IPv4 tunnel prep (cold-boot + ongoing).
+                    // Warms ARP / driver peer so a 400ms live fallback works.
+                    t2::transport::PrepareTunnelPeer(ep.ifIndex, ep.peerLinkLocal);
+                    T2BioLog("UnlockProbe: prepared IPv4 tunnel peer (ifIndex=%lu) unlock#%u%s",
+                             static_cast<unsigned long>(ep.ifIndex), unlockN,
+                             everyFourth ? " [every-4th full cycle]" : "");
+
+                    if (everyFourth) {
+                        // Periodic full cycle: ensure driver tunnel rewrite
+                        // is armed, then test whether v6 is back.
+                        (void)t2::transport::PushTransportModeToDriver(
+                            t2::transport::TransportMode::Ipv4Tunnel);
+                    }
+
                     const bool reachable = t2::transport::ProbeNativeIpv6Reachable(
                         ep.peerLinkLocal, ep.ifIndex, t2::transport::kUnlockProbeTimeout);
                     if (reachable) {
                         t2::transport::RecordNativeIpv6Success();
-                        T2BioLog("UnlockProbe: NativeIpv6 reachable - next Connect() tries it first");
+                        (void)t2::transport::PushTransportModeToDriver(
+                            t2::transport::TransportMode::NativeIpv6);
+                        T2BioLog("UnlockProbe: NativeIpv6 reachable - next Connect() tries it first"
+                                 " (unlock#%u)", unlockN);
                     } else {
                         t2::transport::RecordNativeIpv6Failure();
-                        T2BioLog("UnlockProbe: NativeIpv6 unreachable within 100ms - staying on Ipv4Tunnel");
+                        (void)t2::transport::PushTransportModeToDriver(
+                            t2::transport::TransportMode::Ipv4Tunnel);
+                        T2BioLog("UnlockProbe: NativeIpv6 unreachable within 100ms - staying on"
+                                 " Ipv4Tunnel (unlock#%u)", unlockN);
                     }
                     return;
                 }
-                T2BioLog("UnlockProbe: no T2 NCM endpoint with a known peer yet - skipped");
+                if (!hadPeer) {
+                    T2BioLog("UnlockProbe: no T2 NCM endpoint with a known peer yet - skipped"
+                             " (unlock#%u)", unlockN);
+                }
             }).detach();
         }
         // Every other WM_WTSSESSION_CHANGE type is intentionally ignored.

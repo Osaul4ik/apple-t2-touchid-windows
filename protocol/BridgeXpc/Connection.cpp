@@ -113,7 +113,7 @@ static bool ConnectWithTimeout(SOCKET s, const sockaddr* addr, int addrlen,
         }
         // sel <= 0 (timeout/error) or an errSet hit both leave ok=false, which
         // is exactly "no first connect within the deadline" from the caller's
-        // point of view - the case the 150ms IPv6 fallback below depends on.
+        // point of view - the case the 400ms IPv6 fallback below depends on.
     }
     u_long blocking = 0;
     ioctlsocket(s, FIONBIO, &blocking);
@@ -182,11 +182,11 @@ static std::vector<uint8_t> BuildClientHeloBody(int64_t bridgeXpcVersion) {
 // SAME Connect() call. This is intentionally much shorter than
 // connectTimeout as a whole: a real T2 link-local peer that is actually
 // reachable over IPv6 answers a local-segment SYN in low single-digit
-// milliseconds, so 150ms already generously covers that case while still
+// milliseconds, so 400ms already generously covers that case while still
 // failing fast on a Cisco/WFP setup that drops the SYN (or its SYN-ACK)
 // silently rather than rejecting it (a rejection would return WSAECONNREFUSED
-// immediately anyway, well under 150ms).
-constexpr std::chrono::milliseconds kIpv6FirstConnectTimeout{150};
+// immediately anyway, well under 400ms).
+constexpr std::chrono::milliseconds kIpv6FirstConnectTimeout{400};
 
 ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned long interfaceIndex,
                                    uint16_t port, std::chrono::milliseconds connectTimeout) {
@@ -288,7 +288,7 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
             // remember it for the rest of THIS lock cycle (see
             // TransportMode.h's kSkipNativeIpv6ProbeValue comment) so
             // subsequent calls skip straight to the tunnel instead of
-            // re-paying this same 150ms timeout - until the next real
+            // re-paying this same 400ms timeout - until the next real
             // unlock (AllowNextNativeIpv6ProbeOnUnlock) grants one more
             // free probe.
             t2::transport::RecordNativeIpv6Failure();
@@ -340,7 +340,7 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
                static_cast<unsigned>(port), interfaceIndex);
         // If this is a same-call fallback from a timed-out IPv6 attempt,
         // don't hand the tunnel a fresh full connectTimeout on top of the
-        // 150ms already spent - subtract the elapsed time (floored, so a
+        // 400ms already spent - subtract the elapsed time (floored, so a
         // near-exhausted caller-supplied budget still gets a small, useful
         // window rather than 0/negative) so the whole Connect() call stays
         // bounded close to the caller's original connectTimeout.

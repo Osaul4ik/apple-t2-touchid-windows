@@ -74,7 +74,7 @@ inline constexpr wchar_t kSessionRegPath[] = L"SOFTWARE\\T2TouchId\\Network\\Ses
 // Event-driven, not time-driven: one bit, "skip the NativeIpv6 probe until
 // the next unlock". Replaces an earlier exponential-backoff timer
 // (NextProbeTick64/BackoffMs) that kept re-probing IPv6 on a clock while
-// the screen was still locked with the VPN still up — wasted 150ms/wasted
+// the screen was still locked with the VPN still up — wasted 400ms/wasted
 // wall-clock on every re-probe that could only ever fail again, since
 // nothing about the VPN/WFP state was going to change mid-lock. The
 // desired cycle (per the user's own spec): IPv6 is always tried first at
@@ -95,7 +95,7 @@ enum class TransportMode : DWORD {
 // ShouldSkipNativeIpv6Probe() (the one flag it now reads).
 
 // Session-lifetime "NativeIpv6 is currently unreachable" cache. This is
-// what lets Connection::Connect() stop paying the 150ms NativeIpv6 probe on every
+// what lets Connection::Connect() stop paying the 400ms NativeIpv6 probe on every
 // single call once that probe has already failed once since the last
 // unlock (e.g. VPN up while locked), while still recovering automatically
 // on the very next unlock — see AllowNextNativeIpv6ProbeOnUnlock() below
@@ -145,9 +145,9 @@ inline bool IsTunnelModeActive() {
     return ShouldSkipNativeIpv6Probe();
 }
 
-// Call when a NativeIpv6 probe (the 150ms first-connect attempt) times
+// Call when a NativeIpv6 probe (the 400ms first-connect attempt) times
 // out. Sets the skip flag so every further Connect() this lock cycle goes
-// straight to Ipv4Tunnel without re-paying the 150ms probe - there is
+// straight to Ipv4Tunnel without re-paying the 400ms probe - there is
 // nothing to gain from re-probing on a clock while the screen is still
 // locked and the VPN/WFP state hasn't changed. The flag is cleared only
 // by an actual NativeIpv6 success (RecordNativeIpv6Success) or by a real
@@ -159,7 +159,7 @@ inline void RecordNativeIpv6Failure() {
                         REG_OPTION_VOLATILE, KEY_SET_VALUE, nullptr,
                         &key, nullptr) != ERROR_SUCCESS) {
         return; // best-effort cache; a failure here just means every call
-                 // keeps paying the 150ms probe, not a functional break
+                 // keeps paying the 400ms probe, not a functional break
     }
     DWORD one = 1;
     RegSetValueExW(key, kSkipNativeIpv6ProbeValue, 0, REG_DWORD,
@@ -182,7 +182,7 @@ inline void RecordNativeIpv6Success() {
 }
 
 // How long a post-unlock reachability probe is allowed to take. Tighter
-// than kIpv6FirstConnectTimeout (150ms, Connection.cpp) on purpose: this
+// than kIpv6FirstConnectTimeout (400ms, Connection.cpp) on purpose: this
 // probe runs off to the side of any real verify attempt (see
 // ProbeNativeIpv6Reachable's own comment below) - there is no live user
 // action waiting on it, so there is no reason to give it the same budget
