@@ -655,6 +655,28 @@ VOID EvtCaptureCancel(_In_ WDFREQUEST Request)
         SetEvent(cancelEvent); // wakes the blocked Verify()/WaitForEvent() loop
                                 // within kCancelPollSlice (Connection.cpp)
     }
+    // Watchdog: if the worker is stuck inside Connect()/port-scan (those
+    // paths do not poll cancelEvent), g_captureBusy stays true and every
+    // later CAPTURE_DATA dies with DATA_COLLECTION_IN_PROGRESS. After 5s
+    // force-drop the slot so Hello can arm again. Harmless if the worker
+    // already released the flag — compare_exchange only clears when still set.
+    std::thread([]() {
+        Sleep(5000);
+        bool expected = true;
+        if (g_captureBusy.compare_exchange_strong(expected, false,
+                                                  std::memory_order_relaxed)) {
+            T2BioLog("CAPTURE_DATA: cancel watchdog force-cleared g_captureBusy "
+                     "after 5s (worker did not unwind)");
+            {
+                std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
+                g_stickyNcm.valid = false;
+            }
+            HANDLE ce = GetCaptureCancelEvent();
+            if (ce) {
+                ResetEvent(ce);
+            }
+        }
+    }).detach();
     bool owns = false;
     {
         std::lock_guard<std::mutex> lock(g_cancelTrackMu);
@@ -893,9 +915,36 @@ SlotWait WaitForCancelledPredecessor(_In_ WDFREQUEST Request, CaptureBusyGuard& 
         T2BioLog("CAPTURE_DATA: cancelled while waiting for the previous capture to unwind");
         return SlotWait::RequestCancelled;
     }
-    T2BioLog("CAPTURE_DATA: predecessor wait finished after %llu ms (%s)",
+        T2BioLog("CAPTURE_DATA: predecessor wait finished after %llu ms (%s)",
              static_cast<unsigned long long>(GetTickCount64() - start),
              result == SlotWait::Acquired ? "slot acquired" : "still busy");
+    // Hung-worker recovery: the cancelled predecessor held g_captureBusy past
+    // the full 8s budget (typical after a mid-capture IPv6→tunnel fallback
+    // where Connect/port-scan does not poll the cancel event). Leaving the
+    // flag set would make every later CAPTURE_DATA fail with
+    // DATA_COLLECTION_IN_PROGRESS until the process restarts — Windows Hello
+    // then "does not see the finger". Force-drop the slot so the current
+    // request can proceed; risk of a late double-complete is lower than a
+    // permanent lockout (EvtCaptureCancel already completed the old request).
+    if (result == SlotWait::StillBusy) {
+        T2BioLog("CAPTURE_DATA: forcing g_captureBusy=false after hung predecessor "
+                 "(cancel was signaled, worker never released the slot)");
+        g_captureBusy.store(false, std::memory_order_relaxed);
+        HANDLE ce = GetCaptureCancelEvent();
+        if (ce) {
+            ResetEvent(ce); // clear stale cancel so the next wait path is clean
+        }
+        // Also drop sticky NCM: the hung worker almost always died inside
+        // Connect on a transport that just changed (VPN up → tunnel).
+        {
+            std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
+            g_stickyNcm.valid = false;
+        }
+        if (guard.TryAcquire()) {
+            result = SlotWait::Acquired;
+            T2BioLog("CAPTURE_DATA: slot re-acquired after force-clear");
+        }
+    }
     return result;
 }
 
@@ -1013,6 +1062,26 @@ void CompleteCaptureData(_In_ WDFREQUEST Request, HRESULT winBioHresult,
 bool ConnectForCapture(t2::bridgexpc::Connection* outConn)
 {
     const ULONGLONG t0 = GetTickCount64();
+
+    // If the session transport flipped (NativeIpv6 ↔ Ipv4Tunnel) since the
+    // sticky endpoint was cached, the old TCP path is almost certainly dead
+    // (VPN just came up, or just went down). Trying sticky first would only
+    // burn the full Connect timeout before rediscovery — and under cancel
+    // that hang is what left g_captureBusy stuck for 8s+. Drop sticky when
+    // the mode disagrees with what we last stored it under.
+    static std::atomic<int> s_stickyMode{-1}; // -1 unknown, 0 native, 1 tunnel
+    const int nowMode = t2::transport::IsTunnelModeActive() ? 1 : 0;
+    const int prevMode = s_stickyMode.load(std::memory_order_relaxed);
+    if (prevMode != -1 && prevMode != nowMode) {
+        std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
+        if (g_stickyNcm.valid) {
+            T2BioLog("CAPTURE_DATA: transport mode changed (%s -> %s) - dropping sticky NCM",
+                     prevMode ? "Ipv4Tunnel" : "NativeIpv6",
+                     nowMode ? "Ipv4Tunnel" : "NativeIpv6");
+            g_stickyNcm.valid = false;
+        }
+    }
+    s_stickyMode.store(nowMode, std::memory_order_relaxed);
 
     t2::discovery::NcmEndpoint stickyEp{};
     bool haveSticky = false;
