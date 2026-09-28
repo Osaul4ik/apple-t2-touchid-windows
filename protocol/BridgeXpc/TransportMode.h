@@ -663,6 +663,43 @@ inline void PrepareTunnelPeer(unsigned long ifIndex, const in6_addr& peer6) {
 // Once-per-boot: arm IPv4 tunnel infra (driver mode + ARP + peer push), then
 // restore NativeIpv6. Does NOT leave the session on tunnel. Safe to call only
 // after a real unlock when a peer is (or will become) known.
+
+// Send a throwaway TCP SYN through the tunnel so T2Ncm can learn local IPv4
+// and link-local from outbound frames. Without this, the first real CAPTURE
+// after VPN races "tunnel TX using synthesized local IPv6" and HELO fails;
+// the second CAPTURE works once learning completed. Port 1 is intentional —
+// we only need TX, not a successful handshake.
+inline void ForceTunnelDatapathWarm(unsigned long ifIndex, const in6_addr& peer6) {
+    if (IsTransportIoSuspended()) {
+        return;
+    }
+    const in_addr peer4 = MapPeerToIpv4(peer6);
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) {
+        return;
+    }
+    DWORD ifIndexNet = htonl(static_cast<DWORD>(ifIndex));
+    (void)setsockopt(s, IPPROTO_IP, IP_UNICAST_IF,
+                     reinterpret_cast<const char*>(&ifIndexNet), sizeof(ifIndexNet));
+    u_long nonblock = 1;
+    (void)ioctlsocket(s, FIONBIO, &nonblock);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(1);
+    addr.sin_addr = peer4;
+    (void)connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    fd_set wset;
+    FD_ZERO(&wset);
+    FD_SET(s, &wset);
+    timeval tv{};
+    tv.tv_sec = 0;
+    tv.tv_usec = 80000; // 80ms
+    (void)select(0, nullptr, &wset, nullptr, &tv);
+    closesocket(s);
+    Sleep(40); // let miniport finish local-address learning from the frame
+    T2_LOG("tunnel", L"ForceTunnelDatapathWarm: poke ifIndex=%lu done", ifIndex);
+}
+
 inline bool RunColdBootTunnelWarmup(unsigned long ifIndex, const in6_addr& peer6) {
     if (IsTransportIoSuspended()) {
         WriteWarmupStatus(L"deferred", L"Dx/suspend - retry after resume");
@@ -682,8 +719,8 @@ inline bool RunColdBootTunnelWarmup(unsigned long ifIndex, const in6_addr& peer6
     }
     WriteWarmupStatus(L"preparing-peer", L"PrepareTunnelPeer (ARP + driver peer)");
     PrepareTunnelPeer(ifIndex, peer6);
-    // Brief pause so ARP/neighbor settles before we flip mode back.
-    Sleep(50);
+    WriteWarmupStatus(L"learning-local", L"ForceTunnelDatapathWarm (local IPv4/v6)");
+    ForceTunnelDatapathWarm(ifIndex, peer6);
     WriteWarmupStatus(L"restoring-v6", L"PushTransportModeToDriver(NativeIpv6)");
     RecordNativeIpv6Success(); // clear any skip flag; stay native after warm
     if (!PushTransportModeToDriver(TransportMode::NativeIpv6)) {

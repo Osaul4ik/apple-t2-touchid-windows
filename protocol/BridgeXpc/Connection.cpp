@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Connection.cpp
 #include "Connection.h"
+#include <atomic>
 #include "Log.h"
 #include "TransportMode.h"
 #include "Winsock.h"
@@ -306,6 +307,15 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
     if (tunnel) {
         // Seed T2Ncm peer IPv6 + static IPv4 neighbor (ARP) before SYN.
         t2::transport::PrepareTunnelPeer(interfaceIndex, linkLocalAddress);
+        // After VPN flips us to tunnel, the first TX must not race synthesized
+        // local IPv6 (kernel log). One poke per process after mode arm is enough.
+        {
+            static std::atomic<bool> s_datapathWarmed{false};
+            if (fellBackFromIpv6 || !s_datapathWarmed.load(std::memory_order_relaxed)) {
+                t2::transport::ForceTunnelDatapathWarm(interfaceIndex, linkLocalAddress);
+                s_datapathWarmed.store(true, std::memory_order_relaxed);
+            }
+        }
         const in_addr peer4 = t2::transport::MapPeerToIpv4(linkLocalAddress);
         socket_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (socket_ == INVALID_SOCKET) {
