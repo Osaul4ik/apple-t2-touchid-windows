@@ -200,7 +200,11 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
     // here (TransportMode) that could force the tunnel independently of this
     // flag; it was removed (see TransportMode.h) precisely because it and
     // this flag could disagree, so the GUI now sets this exact flag instead.
-    bool tunnel = t2::transport::ShouldSkipNativeIpv6Probe();
+        // Cold-boot warmup must not race: it briefly forces driver TunnelMode
+    // while session still claims native. Wait it out before choosing path.
+    t2::transport::WaitWarmupIdle(3000);
+
+bool tunnel = t2::transport::ShouldSkipNativeIpv6Probe();
     // Mirror the flag into the running driver on every connect attempt.
     // T2NcmTunnelRefreshMode only re-reads the registry at
     // MiniportInitializeEx/MiniportRestart, so without this push a plain
@@ -289,14 +293,17 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
                    static_cast<long long>(v6Timeout.count()), v6Err);
             closesocket(socket_);
             socket_ = INVALID_SOCKET;
-            tunnel = true;
-            fellBackFromIpv6 = true;
             t2::transport::RecordNativeIpv6Failure();
             if (!t2::transport::PushTransportModeToDriver(t2::transport::TransportMode::Ipv4Tunnel)) {
-                T2_LOG("connect", L"WARNING: T2Ncm.sys could not be switched to tunnel mode "
-                       L"(control device not reachable from this process) - the IPv4 connect "
-                       L"below will time out; reinstall T2Ncm.sys with the LocalService SDDL");
+                // Do not AF_INET blindly with driver still on native rewrite —
+                // that is the "fallback seems to happen but doesn't work" path.
+                T2_LOG("connect", L"NativeIpv6 timed out and T2Ncm.sys could not switch to "
+                       L"tunnel mode - failing this connect for retry "
+                       L"(Dx gate, ACL, or driver not ready)");
+                return ConnectResult::ConnectFailed;
             }
+            tunnel = true;
+            fellBackFromIpv6 = true;
         }
     }
 

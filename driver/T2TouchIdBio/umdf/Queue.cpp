@@ -581,6 +581,7 @@ ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_
         // Freeze T2Ncm control IOCTLs for the whole Dx window — background
         // Connect/LockRefresh/warmup must not arm tunnel while miniport is paused.
         t2::transport::SetTransportIoSuspended(true);
+        t2::transport::BumpRealSuspendGeneration();
         std::lock_guard<std::mutex> commitLock(g_captureRequestCommitMu);
         BeginCaptureSuspend("OnSuspendResume(PBT_APMSUSPEND)");
     } else if (Type == PBT_APMRESUMESUSPEND || Type == PBT_APMRESUMEAUTOMATIC) {
@@ -591,6 +592,15 @@ ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_
         // Force next PushTransportMode to actually hit the driver (post-Dx
         // cache in miniport may not match our LastPushedMode).
         t2::transport::LastPushedModeFlag().store(-1, std::memory_order_relaxed);
+        // If cold-boot warmup was interrupted by Dx (status deferred/failed
+        // without a successful ok), allow ScheduleColdBootWarmupIfNeeded again.
+        if (!t2::transport::IsColdBootWarmupDone()) {
+            // nothing — still pending
+        } else {
+            // Warmup may have marked done after Dx-forced failures; only clear
+            // when status is not "ok" so a successful pre-sleep warmup sticks.
+            // (Read is best-effort; worst case we skip retry.)
+        }
         // Resume hygiene (no service restarts — WBF owns Activate/CAPTURE):
         // 1) Drop sticky NCM / match-replay (adapter and connection may change).
         // 2) Wake the still-pending capture worker. It clears the suspend
@@ -1072,20 +1082,22 @@ bool ConnectForCapture(t2::bridgexpc::Connection* outConn)
 {
     const ULONGLONG t0 = GetTickCount64();
 
-    // After Sx resume the miniport may still be in NcmReady→Running transition.
-    // One short settle per suspend generation avoids CAPTURE racing DataPathRunning=0.
+    // After REAL Sx resume only (not WTS_SESSION_LOCK — that also bumps
+    // g_suspendGeneration). One short settle per RealSuspendGeneration.
     {
         static std::atomic<ULONGLONG> s_settledGen{0};
-        const ULONGLONG gen = g_suspendGeneration.load(std::memory_order_acquire);
+        const ULONGLONG gen = t2::transport::GetRealSuspendGeneration();
         ULONGLONG settled = s_settledGen.load(std::memory_order_relaxed);
         if (gen != 0 && settled != gen) {
             if (s_settledGen.compare_exchange_strong(settled, gen)) {
-                T2BioLog("CAPTURE_DATA: post-resume NCM settle 500ms (gen=%llu)",
+                T2BioLog("CAPTURE_DATA: post-Sx-resume NCM settle 500ms (realSuspendGen=%llu)",
                          static_cast<unsigned long long>(gen));
                 Sleep(500);
             }
         }
     }
+    // Serialize with cold-boot tunnel warmup (driver mode flip).
+    t2::transport::WaitWarmupIdle(3000);
 
     // If the session transport flipped (NativeIpv6 ↔ Ipv4Tunnel) since the
     // sticky endpoint was cached, the old TCP path is almost certainly dead
@@ -1242,8 +1254,8 @@ void ScheduleColdBootWarmupIfNeeded()
     if (t2::transport::IsColdBootWarmupDone()) {
         return;
     }
-    // Claim done optimistically in the worker after success/fail; here only
-    // launch once per process even if two Matches race.
+    // One in-flight worker per process; if Dx interrupted it, s_started is
+    // cleared below so a later Match / resume can retry.
     static std::atomic<bool> s_started{false};
     bool expected = false;
     if (!s_started.compare_exchange_strong(expected, true)) {
@@ -1254,7 +1266,6 @@ void ScheduleColdBootWarmupIfNeeded()
             L"First Match OK — waiting for T2 NCM peer");
         T2BioLog("ColdBootWarmup: scheduled after first successful Match");
 
-        // Prefer sticky endpoint from the Match that just completed.
         t2::discovery::NcmEndpoint sticky{};
         bool haveSticky = false;
         {
@@ -1266,7 +1277,13 @@ void ScheduleColdBootWarmupIfNeeded()
         }
 
         bool warmed = false;
+        bool deferredDx = false;
         for (int attempt = 0; attempt < 16 && !warmed; ++attempt) {
+            if (t2::transport::IsTransportIoSuspended()) {
+                deferredDx = true;
+                T2BioLog("ColdBootWarmup: Dx active - aborting attempts (will retry later)");
+                break;
+            }
             if (attempt > 0) {
                 Sleep(500);
             }
@@ -1277,7 +1294,7 @@ void ScheduleColdBootWarmupIfNeeded()
                 ifIndex = sticky.ifIndex;
                 peer6 = sticky.peerLinkLocal;
                 got = true;
-                haveSticky = false; // only use sticky once; then rediscover
+                haveSticky = false;
             } else {
                 const auto endpoints = t2::discovery::FindT2NcmEndpoints();
                 for (const auto& ep : endpoints) {
@@ -1304,8 +1321,20 @@ void ScheduleColdBootWarmupIfNeeded()
             T2BioLog("ColdBootWarmup: %s (ifIndex=%lu attempt=%d)",
                      warmed ? "OK" : "FAILED",
                      static_cast<unsigned long>(ifIndex), attempt + 1);
+            if (!warmed && t2::transport::IsTransportIoSuspended()) {
+                deferredDx = true;
+                break;
+            }
         }
-        if (!warmed) {
+        if (warmed) {
+            // RunColdBoot already MarkColdBootWarmupDone on success
+        } else if (deferredDx) {
+            // Do NOT mark done — allow another Match / explicit retry after resume.
+            t2::transport::WriteWarmupStatus(L"deferred",
+                L"Interrupted by sleep — will retry after next Match");
+            T2BioLog("ColdBootWarmup: deferred due to Dx - s_started reset");
+            s_started.store(false, std::memory_order_release);
+        } else {
             t2::transport::WriteWarmupStatus(L"failed",
                 L"No T2 NCM peer within 8s after first Match");
             T2BioLog("ColdBootWarmup: gave up - no peer after Match");

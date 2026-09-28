@@ -460,6 +460,52 @@ inline std::atomic<int>& LastPushedModeFlag() {
     return s;
 }
 
+// Cold-boot warmup in progress: Connect must not race Push Tunnel↔Native.
+inline std::atomic<bool>& WarmupInProgressFlag() {
+    static std::atomic<bool> s{false};
+    return s;
+}
+inline void SetWarmupInProgress(bool v) {
+    WarmupInProgressFlag().store(v, std::memory_order_release);
+}
+inline bool IsWarmupInProgress() {
+    return WarmupInProgressFlag().load(std::memory_order_acquire);
+}
+// Wait up to timeoutMs for warmup to finish (CAPTURE path).
+inline void WaitWarmupIdle(DWORD timeoutMs = 3000) {
+    const ULONGLONG t0 = GetTickCount64();
+    while (IsWarmupInProgress()) {
+        if (GetTickCount64() - t0 >= timeoutMs) {
+            T2_LOG("warmup", L"WaitWarmupIdle: timed out after %lu ms", timeoutMs);
+            break;
+        }
+        Sleep(20);
+    }
+}
+
+// Real Sx suspend generation (NOT screen-lock). Bio bumps this only on
+// PBT_APMSUSPEND so Connect settle does not fire on every WTS_SESSION_LOCK.
+inline std::atomic<ULONGLONG>& RealSuspendGeneration() {
+    static std::atomic<ULONGLONG> s{0};
+    return s;
+}
+inline void BumpRealSuspendGeneration() {
+    RealSuspendGeneration().fetch_add(1, std::memory_order_acq_rel);
+}
+inline ULONGLONG GetRealSuspendGeneration() {
+    return RealSuspendGeneration().load(std::memory_order_acquire);
+}
+
+// Allow cold-boot warmup to be retried after a Dx-interrupted attempt.
+inline void ClearColdBootWarmupDoneForRetry() {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kSessionKeyPath, 0, KEY_SET_VALUE, &key) != ERROR_SUCCESS) {
+        return;
+    }
+    RegDeleteValueW(key, L"ColdBootWarmupDone");
+    RegCloseKey(key);
+}
+
 inline bool PushTunnelPeerToDriver(const in6_addr& peer6) {
     if (IsTransportIoSuspended()) {
         T2_LOG("tunnel", L"PushTunnelPeerToDriver: skipped (system suspending / Dx)");
@@ -587,6 +633,16 @@ inline void PrepareTunnelPeer(unsigned long ifIndex, const in6_addr& peer6) {
 // restore NativeIpv6. Does NOT leave the session on tunnel. Safe to call only
 // after a real unlock when a peer is (or will become) known.
 inline bool RunColdBootTunnelWarmup(unsigned long ifIndex, const in6_addr& peer6) {
+    if (IsTransportIoSuspended()) {
+        WriteWarmupStatus(L"deferred", L"Dx/suspend - retry after resume");
+        T2_LOG("warmup", L"ColdBootWarmup: deferred (system suspending)");
+        return false; // caller must NOT MarkColdBootDone
+    }
+    SetWarmupInProgress(true);
+    struct WarmupGuard {
+        ~WarmupGuard() { SetWarmupInProgress(false); }
+    } warmupGuard;
+
     WriteWarmupStatus(L"arming-tunnel", L"PushTransportModeToDriver(Ipv4Tunnel)");
     if (!PushTransportModeToDriver(TransportMode::Ipv4Tunnel)) {
         WriteWarmupStatus(L"failed", L"PushTransportModeToDriver(Ipv4Tunnel) failed");
@@ -607,89 +663,7 @@ inline bool RunColdBootTunnelWarmup(unsigned long ifIndex, const in6_addr& peer6
     MarkColdBootWarmupDone();
     WriteWarmupStatus(L"ok", L"IPv4 tunnel pre-warmed; session stays on Native IPv6");
     T2_LOG("warmup", L"ColdBootWarmup: OK ifIndex=%lu", ifIndex);
-  
-// Heuristic: is a corporate/consumer VPN adapter up that is known to
-// black-hole IPv6 (Cisco AnyConnect + WFP is the original case)? Used to
-// pre-arm Ipv4Tunnel BEFORE the lock-screen CAPTURE so the first finger
-// does not burn 400ms on a dead NativeIpv6 path and then fail to deliver
-// verify. This is NOT a T2 reachability probe — it only looks at host
-// adapters, so a normal lock with no VPN costs almost nothing (one
-// GetAdaptersAddresses walk).
-inline bool IsVpnLikelyBlockingIpv6() {
-    ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
-                  GAA_FLAG_SKIP_DNS_SERVER;
-    ULONG size = 0;
-    if (GetAdaptersAddresses(AF_UNSPEC, flags, nullptr, nullptr, &size) != ERROR_BUFFER_OVERFLOW) {
-        return false;
-    }
-    std::vector<BYTE> buf(size);
-    auto* addrs = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data());
-    if (GetAdaptersAddresses(AF_UNSPEC, flags, nullptr, addrs, &size) != NO_ERROR) {
-        return false;
-    }
-    // Substrings matched case-insensitively against Description / FriendlyName.
-    static const wchar_t* kHints[] = {
-        L"cisco", L"anyconnect", L"vpn", L"wireguard", L"wintun", L"tap-windows",
-        L"tap-win", L"openvpn", L"globalprotect", L"pangpa", L"pulse secure",
-        L"pulsevpn", L"forticlient", L"fortinet", L"check point", L"checkpoint",
-        L"sonicwall", L"zscaler", L"nordlynx", L"mullvad", L"expressvpn",
-        L"surfshark", L"protonvpn", L"ikev2", L"sstp", L"l2tp",
-    };
-    auto containsHint = [](const wchar_t* s) -> bool {
-        if (!s || !s[0]) return false;
-        // cheap ASCII-lower compare for Latin descriptions
-        for (const wchar_t* hint : kHints) {
-            // wcsstr is case-sensitive; walk manually lowercased
-            for (const wchar_t* p = s; *p; ++p) {
-                const wchar_t* a = p;
-                const wchar_t* b = hint;
-                while (*a && *b) {
-                    wchar_t ca = *a, cb = *b;
-                    if (ca >= L'A' && ca <= L'Z') ca = static_cast<wchar_t>(ca - L'A' + L'a');
-                    if (cb >= L'A' && cb <= L'Z') cb = static_cast<wchar_t>(cb - L'A' + L'a');
-                    if (ca != cb) break;
-                    ++a; ++b;
-                }
-                if (!*b) return true;
-            }
-        }
-        return false;
-    };
-    for (auto* a = addrs; a; a = a->Next) {
-        if (a->OperStatus != IfOperStatusUp) continue;
-        // PPP is almost always a VPN/dial-up tunnel.
-        const bool ppp = (a->IfType == IF_TYPE_PPP);
-        const bool named = containsHint(a->Description) || containsHint(a->FriendlyName);
-        // Skip the T2 NCM adapter itself if description ever matched "vpn".
-        if (containsHint(a->Description) && wcsstr(a->Description ? a->Description : L"", L"T2")) {
-            continue;
-        }
-        if (ppp || named) {
-            T2_LOG("tunnel", L"VPN heuristic matched: ifType=%u desc=%s",
-                   static_cast<unsigned>(a->IfType),
-                   a->Description ? a->Description : L"(null)");
-            return true;
-        }
-    }
-    return false;
-}
-
-// If a VPN is up and we are still on NativeIpv6, flip the session to
-// Ipv4Tunnel and refresh the peer so the next Connect skips the dead v6
-// path entirely. No-op when already on tunnel or when no VPN is present.
-inline void ArmTunnelIfVpnActive() {
-    if (ShouldSkipNativeIpv6Probe()) {
-        return; // already tunnel for this lock cycle
-    }
-    if (!IsVpnLikelyBlockingIpv6()) {
-        return;
-    }
-    RecordNativeIpv6Failure();
-    (void)PushTransportModeToDriver(TransportMode::Ipv4Tunnel);
-    T2_LOG("tunnel", L"ArmTunnelIfVpnActive: VPN up - session forced to Ipv4Tunnel");
-}
-
-  return true;
+    return true;
 }
 
 } // namespace t2::transport
