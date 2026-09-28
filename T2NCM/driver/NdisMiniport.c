@@ -346,11 +346,20 @@ T2NcmRegisterDiagnosticDevice(
     UNICODE_STRING symbolicName;
     NDIS_STATUS status;
 
-    // Administrators and SYSTEM only. This surface can inject a raw
-    // Ethernet frame onto the wire, so it is not something an
+    // Administrators and SYSTEM get full access. This surface can inject a
+    // raw Ethernet frame onto the wire, so it is not something an
     // unprivileged process should be able to open even on a developer
     // machine.
-    DECLARE_CONST_UNICODE_STRING(sddl, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
+    //
+    // PLUS a deliberately WRITE-ONLY grant to LocalService (LS), which is the
+    // account the T2TouchIdBio UMDF host runs as: mask 0x100082 =
+    // FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE. Without it every
+    // automatic IPv6->IPv4 fallback done by the service failed to arm this
+    // driver (CreateFile(\\.\\T2Ncm) -> ERROR_ACCESS_DENIED), so TX frames
+    // stayed bare IPv4 and the T2 dropped them; only the admin GUI could
+    // arm it. No READ right, and GET_STATUS / SEND_TEST_FRAME require READ
+    // (Public.h), so LS can only reach SET_TUNNEL_PEER / SET_TRANSPORT_MODE.
+    DECLARE_CONST_UNICODE_STRING(sddl, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x100082;;;LS)");
 
     RtlZeroMemory(dispatchTable, sizeof(dispatchTable));
     dispatchTable[IRP_MJ_CREATE]         = T2NcmDispatchCreateClose;

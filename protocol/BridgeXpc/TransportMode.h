@@ -29,6 +29,7 @@
 #endif
 #include <iphlpapi.h>
 #include <netioapi.h>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -105,7 +106,17 @@ enum class TransportMode : DWORD {
 // below fails closed to "don't skip, probe normally" exactly as if this
 // function didn't exist yet — matching "on start, IPv6 is always tried
 // first".
+// In-process copy of the flag. The UMDF host (LocalService) usually cannot
+// WRITE HKLM\\SOFTWARE\\T2TouchId (the key is created by an admin installer), so
+// RecordNativeIpv6Failure()'s registry write silently failed there and every
+// retry started on NativeIpv6 again ("mode=NativeIpv6" on all 7 attempts in
+// the field log). WUDFHost.exe outlives every capture, so a process-lifetime
+// atomic is a reliable store for the service; the registry value remains the
+// cross-process channel (CLI/GUI). Effective flag = process flag OR registry.
+inline std::atomic<bool> g_procSkipNativeIpv6Probe{false};
+
 inline bool ShouldSkipNativeIpv6Probe() {
+    if (g_procSkipNativeIpv6Probe.load(std::memory_order_relaxed)) return true;
     HKEY key = nullptr;
     if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kSessionRegPath, 0, KEY_READ, &key) != ERROR_SUCCESS) {
         return false; // no cache yet (or a fresh boot) - probe as normal
@@ -142,6 +153,7 @@ inline bool IsTunnelModeActive() {
 // by an actual NativeIpv6 success (RecordNativeIpv6Success) or by a real
 // WTS_SESSION_UNLOCK (AllowNextNativeIpv6ProbeOnUnlock), never by time.
 inline void RecordNativeIpv6Failure() {
+    g_procSkipNativeIpv6Probe.store(true, std::memory_order_relaxed);
     HKEY key = nullptr;
     if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, kSessionRegPath, 0, nullptr,
                         REG_OPTION_VOLATILE, KEY_SET_VALUE, nullptr,
@@ -160,6 +172,7 @@ inline void RecordNativeIpv6Failure() {
 // this lock cycle - goes back to trying NativeIpv6 first, instead of
 // carrying forward a stale "skip" state from an outage that just ended.
 inline void RecordNativeIpv6Success() {
+    g_procSkipNativeIpv6Probe.store(false, std::memory_order_relaxed);
     HKEY key = nullptr;
     if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kSessionRegPath, 0, KEY_SET_VALUE, &key) != ERROR_SUCCESS) {
         return; // nothing cached - already the desired state
@@ -370,14 +383,17 @@ inline void EnsureTunnelIpv4Neighbor(unsigned long ifIndex, const in_addr& peer4
 
 
 // Push peer fe80 into T2Ncm.sys so TX rewrite works immediately (no RX wait).
-inline void PushTunnelPeerToDriver(const in6_addr& peer6) {
-    HANDLE h = CreateFileW(L"\\\\.\\T2Ncm", GENERIC_WRITE,
+inline bool PushTunnelPeerToDriver(const in6_addr& peer6) {
+    // FILE_WRITE_DATA only (not GENERIC_WRITE): the control device grants
+    // LocalService exactly that (see NdisMiniport.c SDDL); GENERIC_WRITE also
+    // asks for WRITE_ATTRIBUTES/EA/APPEND and would be denied for the service.
+    HANDLE h = CreateFileW(L"\\\\.\\T2Ncm", FILE_WRITE_DATA,
                            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) {
         T2_LOG("tunnel", L"PushTunnelPeerToDriver: could not open \\\\.\\T2Ncm "
-               L"(GetLastError=%lu) - driver may not be loaded", GetLastError());
-        return;
+               L"(GetLastError=%lu) - driver not loaded, or (5) access denied", GetLastError());
+        return false;
     }
     DWORD returned = 0;
     const DWORD code = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x902, METHOD_BUFFERED, FILE_WRITE_ACCESS);
@@ -387,6 +403,7 @@ inline void PushTunnelPeerToDriver(const in6_addr& peer6) {
         T2_LOG("tunnel", L"PushTunnelPeerToDriver: IOCTL failed, GetLastError=%lu", GetLastError());
     }
     CloseHandle(h);
+    return ok != FALSE;
 }
 
 // Push the TransportMode registry value into the driver LIVE, via
@@ -413,14 +430,14 @@ inline void PushTunnelPeerToDriver(const in6_addr& peer6) {
 // both succeed. Calling this once per Connect(), for BOTH modes (not just
 // Ipv4Tunnel), keeps the running driver a live mirror of the registry
 // instead of a snapshot from whenever it last (re)initialized.
-inline void PushTransportModeToDriver(TransportMode mode) {
-    HANDLE h = CreateFileW(L"\\\\.\\T2Ncm", GENERIC_WRITE,
+inline bool PushTransportModeToDriver(TransportMode mode) {
+    HANDLE h = CreateFileW(L"\\\\.\\T2Ncm", FILE_WRITE_DATA, // see PushTunnelPeerToDriver
                            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) {
         T2_LOG("tunnel", L"PushTransportModeToDriver: could not open \\\\.\\T2Ncm "
-               L"(GetLastError=%lu) - driver may not be loaded", GetLastError());
-        return;
+               L"(GetLastError=%lu) - driver not loaded, or (5) access denied", GetLastError());
+        return false;
     }
     DWORD returned = 0;
     DWORD modeValue = static_cast<DWORD>(mode);
@@ -439,6 +456,7 @@ inline void PushTransportModeToDriver(TransportMode mode) {
                mode == TransportMode::Ipv4Tunnel ? 1 : 0);
     }
     CloseHandle(h);
+    return ok != FALSE;
 }
 
 // Call before AF_INET connect in tunnel mode.

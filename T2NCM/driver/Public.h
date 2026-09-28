@@ -191,8 +191,13 @@ typedef struct _T2NCM_STATUS
 // "it left the pipe" signal, which IOCTL_T2NCM_GET_STATUS's
 // RxFramesParsed/TxFramesSent counters already give without needing an
 // output struct here.
+// Access is READ|WRITE on purpose: the control device's SDDL (NdisMiniport.c)
+// hands the UMDF host (LocalService) a WRITE-ONLY handle so it can send
+// SET_TUNNEL_PEER / SET_TRANSPORT_MODE. The I/O manager rejects any IOCTL whose
+// required access the handle lacks, so requiring READ here (and in GET_STATUS)
+// keeps raw-frame injection admin/SYSTEM-only.
 #define IOCTL_T2NCM_SEND_TEST_FRAME \
-    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x901, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x901, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
 
 // Seed TunnelPeerIpv6 (16 bytes fe80) for IPv4 tunnel TX rewrite before first RX.
 #define IOCTL_T2NCM_SET_TUNNEL_PEER \

@@ -35,6 +35,24 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Best-effort: let the T2TouchIdBio UMDF host (LocalService) write the shared
+# transport flag / last-known peer under HKLM\SOFTWARE\T2TouchId\Network (and
+# the volatile Session subkey, which inherits this ACL). Without it those writes
+# fail silently in the service. Never fatal.
+try {
+    $regPath = 'HKLM:\SOFTWARE\T2TouchId\Network'
+    if (-not (Test-Path $regPath)) { New-Item -Path $regPath -Force | Out-Null }
+    $acl  = Get-Acl $regPath
+    $rule = New-Object System.Security.AccessControl.RegistryAccessRule(
+        'NT AUTHORITY\LOCAL SERVICE', 'SetValue,CreateSubKey,Delete,ReadKey',
+        'ContainerInherit', 'None', 'Allow')
+    $acl.AddAccessRule($rule)
+    Set-Acl -Path $regPath -AclObject $acl
+    Write-Host "Granted LocalService write access to $regPath"
+} catch {
+    Write-Warning "Could not set registry ACL on HKLM\SOFTWARE\T2TouchId\Network: $($_.Exception.Message)"
+}
+
 Write-Host "Waiting for '$InterfaceDescriptionMatch' to enumerate (up to ${WaitSeconds}s)..."
 $adapter = $null
 $deadline = (Get-Date).AddSeconds($WaitSeconds)

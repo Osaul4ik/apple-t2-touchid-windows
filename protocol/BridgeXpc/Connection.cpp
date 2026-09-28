@@ -304,7 +304,11 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
             // doesn't work" symptom, fixed by keeping the driver a live
             // mirror of the mode we are ACTUALLY about to use, not just the
             // registry value read at function entry.
-            t2::transport::PushTransportModeToDriver(t2::transport::TransportMode::Ipv4Tunnel);
+            if (!t2::transport::PushTransportModeToDriver(t2::transport::TransportMode::Ipv4Tunnel)) {
+                T2_LOG("connect", L"WARNING: T2Ncm.sys could not be switched to tunnel mode "
+                       L"(control device not reachable from this process) - the IPv4 connect "
+                       L"below will time out; reinstall T2Ncm.sys with the LocalService SDDL");
+            }
         }
     }
 
