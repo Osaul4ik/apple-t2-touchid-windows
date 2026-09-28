@@ -275,6 +275,35 @@ constexpr std::chrono::seconds kCaptureMatchWindow{20};
 // layer too, since the parallel dispatch queue can hand this IOCTL to more
 // than one worker thread at once).
 std::atomic<bool> g_captureBusy{false};
+
+// ---- capture-slot release notification (replaces Sleep polling) ----
+// Two manual-reset events, both signaled whenever g_captureBusy drops to
+// false through the normal release paths: one for the cancel watchdog, one
+// for a request waiting on a cancelled predecessor. Separate events so the
+// consumers' ResetEvent() calls cannot eat each other's wakeups. Never
+// closed (process-lifetime, like the cancel event).
+HANDLE SlotReleasedWatchEvent()
+{
+    static HANDLE h = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    return h;
+}
+HANDLE SlotReleasedWaitEvent()
+{
+    static HANDLE h = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    return h;
+}
+void NotifyCaptureSlotReleased()
+{
+    if (HANDLE h = SlotReleasedWatchEvent()) SetEvent(h);
+    if (HANDLE h = SlotReleasedWaitEvent()) SetEvent(h);
+}
+
+// Cancel watchdog state: ONE coalesced watchdog thread at most (was: a new
+// detached thread sleeping 5s on every cancel), and it exits as soon as the
+// worker releases the slot instead of always sleeping the full 5s.
+std::atomic<bool> g_watchdogActive{false};
+std::atomic<int> g_watchdogThreads{0};          // drained at driver unload
+std::atomic<ULONGLONG> g_watchdogDeadlineMs{0};
 // Serializes final WBF request completion against power-stop callbacks. A
 // result is either committed before suspend begins, or the suspend epoch is
 // visible before the worker can commit it.
@@ -467,7 +496,8 @@ struct CaptureBusyGuard {
     }
     ~CaptureBusyGuard() {
         if (acquired) {
-            g_captureBusy.store(false, std::memory_order_relaxed);
+            g_captureBusy.store(false, std::memory_order_release);
+            NotifyCaptureSlotReleased();
         }
     }
 };
@@ -488,6 +518,63 @@ HANDLE GetCaptureCancelEvent()
               // a null/unsignaled HANDLE as "no cancel support this boot"
               // (WaitForSingleObject/SetEvent on NULL just fail, harmlessly)
               // rather than crash, so this isn't checked here.
+}
+
+// Arms (or extends) the 5s cancel watchdog. At most one watchdog thread
+// exists; it is counted in g_watchdogThreads so EvtDriverUnload can wake and
+// drain it (the old detached thread could outlive the DLL). It returns as
+// soon as the capture slot is released. If the previous watchdog is just
+// finishing while a new cancel arrives, the new cancel may go unguarded;
+// the predecessor-unwind recovery in the next CAPTURE_DATA still frees a
+// hung slot, so that window only costs latency, never a lockout.
+void ArmCancelWatchdog()
+{
+    if (!g_captureBusy.load(std::memory_order_acquire)) {
+        return; // nothing is holding the slot: nothing to guard
+    }
+    HANDLE ev = SlotReleasedWatchEvent();
+    if (!ev) {
+        return;
+    }
+    ResetEvent(ev);
+    g_watchdogDeadlineMs.store(GetTickCount64() + 5000, std::memory_order_release);
+    if (g_watchdogActive.exchange(true)) {
+        return; // running watchdog picks up the extended deadline
+    }
+    g_watchdogThreads.fetch_add(1);
+    try {
+        std::thread([ev]() {
+            for (;;) {
+                const ULONGLONG now = GetTickCount64();
+                const ULONGLONG dl = g_watchdogDeadlineMs.load(std::memory_order_acquire);
+                if (now >= dl) {
+                    bool expected = true;
+                    if (g_captureBusy.compare_exchange_strong(expected, false,
+                                                              std::memory_order_relaxed)) {
+                        T2BioLog("CAPTURE_DATA: cancel watchdog force-cleared g_captureBusy "
+                                 "after 5s (worker did not unwind)");
+                        {
+                            std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
+                            g_stickyNcm.valid = false;
+                        }
+                        HANDLE ce = GetCaptureCancelEvent();
+                        if (ce) {
+                            ResetEvent(ce);
+                        }
+                    }
+                    break;
+                }
+                if (WaitForSingleObject(ev, static_cast<DWORD>(dl - now)) == 0) {
+                    break; // slot released normally (or driver unloading)
+                }
+            }
+            g_watchdogActive.store(false);
+            g_watchdogThreads.fetch_sub(1);
+        }).detach();
+    } catch (...) {
+        g_watchdogActive.store(false);
+        g_watchdogThreads.fetch_sub(1);
+    }
 }
 
 // Signaled while running; reset on suspend and signaled again on resume.
@@ -694,23 +781,8 @@ VOID EvtCaptureCancel(_In_ WDFREQUEST Request)
     // later CAPTURE_DATA dies with DATA_COLLECTION_IN_PROGRESS. After 5s
     // force-drop the slot so Hello can arm again. Harmless if the worker
     // already released the flag — compare_exchange only clears when still set.
-    std::thread([]() {
-        Sleep(5000);
-        bool expected = true;
-        if (g_captureBusy.compare_exchange_strong(expected, false,
-                                                  std::memory_order_relaxed)) {
-            T2BioLog("CAPTURE_DATA: cancel watchdog force-cleared g_captureBusy "
-                     "after 5s (worker did not unwind)");
-            {
-                std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
-                g_stickyNcm.valid = false;
-            }
-            HANDLE ce = GetCaptureCancelEvent();
-            if (ce) {
-                ResetEvent(ce);
-            }
-        }
-    }).detach();
+    // Coalesced + early-exit: see ArmCancelWatchdog().
+    ArmCancelWatchdog();
     bool owns = false;
     {
         std::lock_guard<std::mutex> lock(g_cancelTrackMu);
@@ -941,7 +1013,15 @@ SlotWait WaitForCancelledPredecessor(_In_ WDFREQUEST Request, CaptureBusyGuard& 
             result = SlotWait::Acquired;
             break;
         }
-        Sleep(10);
+        // Wake the moment the predecessor releases the slot instead of
+        // polling every 10ms; 20ms cap keeps the loop re-checking the
+        // deadline and covers a release that raced past the event.
+        if (HANDLE rel = SlotReleasedWaitEvent()) {
+            WaitForSingleObject(rel, 20);
+            ResetEvent(rel);
+        } else {
+            Sleep(10);
+        }
     }
     if (!scope.Release()) {
         // Request is already completed as CANCELLED; if we did get the slot
@@ -1107,7 +1187,13 @@ bool ConnectForCapture(t2::bridgexpc::Connection* outConn)
             if (s_settledGen.compare_exchange_strong(settled, gen)) {
                 T2BioLog("CAPTURE_DATA: post-Sx-resume NCM settle 500ms (realSuspendGen=%llu)",
                          static_cast<unsigned long long>(gen));
-                Sleep(500);
+                // Cancellable (same value: shortening it needs hardware
+                // validation of NCM readiness after Sx resume).
+                if (HANDLE ce = GetCaptureCancelEvent()) {
+                    WaitForSingleObject(ce, 500);
+                } else {
+                    Sleep(500);
+                }
             }
         }
     }
@@ -1503,7 +1589,13 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
                 }
                 T2BioLog("CAPTURE_DATA(verify): BridgeXPC session dropped while waiting "
                          "(attempt %d of %d) - reconnecting", attempt, kMaxSessionAttempts);
-                Sleep(200);
+                // Cancellable: a WBF cancel / suspend during the back-off no
+                // longer has to wait it out (the check right below sees it).
+                if (cancelEvent) {
+                    WaitForSingleObject(cancelEvent, 200);
+                } else {
+                    Sleep(200);
+                }
             }
 
             if (cancelScope.IsCancelled()) {
@@ -1861,7 +1953,8 @@ extern "C" VOID T2BioEvtIoDeviceControl(_In_ WDFQUEUE Queue,
         if (cancelEvent) {
             ResetEvent(cancelEvent);
         }
-        g_captureBusy.store(false, std::memory_order_relaxed);
+        g_captureBusy.store(false, std::memory_order_release);
+        NotifyCaptureSlotReleased();
         T2BioLog("  RESET -> session state cleared, STATUS_SUCCESS");
         WdfRequestComplete(Request, STATUS_SUCCESS);
         return;
@@ -2015,8 +2108,12 @@ extern "C" VOID T2BioRegisterSuspendResumeNotification(VOID)
 // and give them a bounded moment to unwind before the host may unload us.
 extern "C" VOID T2BioDrainCaptureWorkers(VOID)
 {
-    if (g_captureWorkers.load() == 0) {
+    if (g_captureWorkers.load() == 0 && g_watchdogThreads.load() == 0) {
         return;
+    }
+    // Wake a sleeping cancel watchdog so it does not outlive the DLL.
+    if (HANDLE wd = SlotReleasedWatchEvent()) {
+        SetEvent(wd);
     }
     T2BioLog("EvtDriverUnload: waiting for %d capture worker(s) to unwind", g_captureWorkers.load());
     HANDLE cancelEvent = GetCaptureCancelEvent();
@@ -2024,7 +2121,8 @@ extern "C" VOID T2BioDrainCaptureWorkers(VOID)
         SetEvent(cancelEvent);
     }
     const ULONGLONG start = GetTickCount64();
-    while (g_captureWorkers.load() != 0 && GetTickCount64() - start < 3000) {
+    while ((g_captureWorkers.load() != 0 || g_watchdogThreads.load() != 0) &&
+           GetTickCount64() - start < 3000) {
         Sleep(10);
     }
 }

@@ -664,7 +664,8 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
                            ? (StatusOrdinalHypothesis(*body.statusCode) ? StatusOrdinalHypothesis(*body.statusCode) : L"(no hypothesis)")
                            : L"(n/a)",
                        eventData.size() > kStatusEventBodyFixedFieldsBytes
-                           ? HexDump(std::vector<uint8_t>(eventData.begin() + kStatusEventBodyFixedFieldsBytes, eventData.end()),
+                           ? HexDump(eventData.data() + kStatusEventBodyFixedFieldsBytes,
+                                     eventData.size() - kStatusEventBodyFixedFieldsBytes,
                                      eventData.size() - kStatusEventBodyFixedFieldsBytes).c_str()
                            : L"(none)");
             } else if (embeddedType == kEmbeddedTypeStatistics) {

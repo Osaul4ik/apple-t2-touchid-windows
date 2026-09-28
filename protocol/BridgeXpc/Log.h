@@ -128,17 +128,29 @@ inline void Logf(const wchar_t* tag, const wchar_t* fmt, ...) {
     EmitLine(line);
 }
 
-inline std::wstring HexDump(const std::vector<uint8_t>& data, size_t maxBytes = 32) {
+// Logf() formats into a 1024-wchar buffer and silently truncates, so hex
+// past ~480 bytes never reaches the log anyway. Cap it here instead of
+// formatting (and allocating) up to 3.3KB per event only to drop it.
+inline constexpr size_t kMaxHexBytes = 480;
+
+// Table-driven: the old version called swprintf_s once per byte
+// (e.g. 3370 calls for a match_result event, 512 per status event).
+inline std::wstring HexDump(const uint8_t* data, size_t size, size_t maxBytes = 32) {
+    static constexpr wchar_t kDigits[] = L"0123456789abcdef";
+    if (maxBytes > kMaxHexBytes) maxBytes = kMaxHexBytes;
+    const size_t n = size < maxBytes ? size : maxBytes;
     std::wstring out;
-    size_t n = data.size() < maxBytes ? data.size() : maxBytes;
-    out.reserve(n * 2 + 3);
-    wchar_t b[4];
+    out.resize(n * 2);
     for (size_t i = 0; i < n; ++i) {
-        swprintf_s(b, L"%02x", data[i]);
-        out += b;
+        out[2 * i]     = kDigits[data[i] >> 4];
+        out[2 * i + 1] = kDigits[data[i] & 0x0F];
     }
-    if (data.size() > n) out += L"...";
+    if (size > n) out += L"...";
     return out;
+}
+
+inline std::wstring HexDump(const std::vector<uint8_t>& data, size_t maxBytes = 32) {
+    return HexDump(data.data(), data.size(), maxBytes);
 }
 
 inline std::wstring Widen(const std::string& s) {

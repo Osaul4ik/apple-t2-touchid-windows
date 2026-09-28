@@ -215,7 +215,7 @@ static std::vector<uint8_t> BuildClientHeloBody(int64_t bridgeXpcVersion) {
 
 ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned long interfaceIndex,
                                    uint16_t port, std::chrono::milliseconds connectTimeout) {
-    connectionLost_ = false;
+    connectionLost_.store(false);
     // The only input to "which transport does this call start on" is the
     // session cache: skip the redundant NativeIpv6 probe once it has already
     // failed since the last unlock (event-driven, not time-driven - see
@@ -395,6 +395,12 @@ bool Connection::ReadUntilMatchingReply(const std::string& expectedReqId,
 }
 
 bool Connection::GetBridgeVersion(int64_t* outVersion, std::chrono::milliseconds timeout) {
+    IoLock ioLock(*this, timeout);
+    if (!ioLock.owns()) {
+        T2_LOG("io", L"could not acquire connection I/O lock within %lldms",
+               static_cast<long long>((timeout).count()));
+        return false;
+    }
     std::string reqId = NewRequestUuid();
     if (reqId.empty()) return false;
     auto req = EncodeRequestEnvelope(reqId, {0});
@@ -424,6 +430,12 @@ bool Connection::GetBridgeVersion(int64_t* outVersion, std::chrono::milliseconds
 }
 
 bool Connection::SetClientVersion(int64_t version, std::chrono::milliseconds timeout) {
+    IoLock ioLock(*this, timeout);
+    if (!ioLock.owns()) {
+        T2_LOG("io", L"could not acquire connection I/O lock within %lldms",
+               static_cast<long long>((timeout).count()));
+        return false;
+    }
     std::string reqId = NewRequestUuid();
     if (reqId.empty()) return false;
     auto req = EncodeRequestEnvelope(reqId, {10, version});
@@ -446,6 +458,12 @@ bool Connection::SendBiometricCommand(const std::vector<uint8_t>& innerBmMessage
                                        std::vector<uint8_t>* outReply,
                                        std::chrono::milliseconds timeout,
                                        int64_t* outCommandStatus) {
+    IoLock ioLock(*this, timeout);
+    if (!ioLock.owns()) {
+        T2_LOG("sendBiometricCommand", L"could not acquire connection I/O lock within %lldms",
+               static_cast<long long>(timeout.count()));
+        return false;
+    }
     if (outCommandStatus) *outCommandStatus = 0;
     std::string reqId = NewRequestUuid();
     if (reqId.empty()) return false;
@@ -601,6 +619,12 @@ bool Connection::SendBiometricCommand(const std::vector<uint8_t>& innerBmMessage
 }
 
 bool Connection::GetFdrCalibration(std::vector<uint8_t>* outBlob, std::chrono::milliseconds timeout) {
+    IoLock ioLock(*this, timeout);
+    if (!ioLock.owns()) {
+        T2_LOG("io", L"could not acquire connection I/O lock within %lldms",
+               static_cast<long long>((timeout).count()));
+        return false;
+    }
     std::string reqId = NewRequestUuid();
     if (reqId.empty()) return false;
     auto req = EncodeRequestEnvelope(reqId, {11});
@@ -694,6 +718,7 @@ bool Connection::GetFdrCalibration(std::vector<uint8_t>* outBlob, std::chrono::m
 }
 
 size_t Connection::DiscardPendingEvents(std::vector<std::vector<uint8_t>>* outDiscardedPayloads) {
+    IoLock ioLock(*this, std::chrono::milliseconds(500));
     const size_t n = pendingEvents_.size();
     if (n > 0) {
         T2_LOG("discardPending",
@@ -717,12 +742,19 @@ size_t Connection::DiscardPendingEvents(std::vector<std::vector<uint8_t>>* outDi
 // large enough not to turn an idle "waiting for a finger" session into a
 // busy-poll. Not tied to kCaptureMatchWindow — that one bounds the whole
 // session, this one bounds cancel latency within it.
-static constexpr std::chrono::milliseconds kCancelPollSlice{200};
+// 200ms -> 100ms: with ioMu_ a cancel sender waits for the current slice
+// to end, so the slice now bounds cancel-send latency too. 10 wakeups/s
+// while idle is still negligible.
+static constexpr std::chrono::milliseconds kCancelPollSlice{100};
 
-bool Connection::WaitForEvent(std::vector<uint8_t>* outEventPayload,
-                               std::chrono::steady_clock::time_point deadline,
-                               HANDLE cancelEvent) {
-    for (;;) {
+Connection::WaitStep Connection::WaitForEventStep(std::vector<uint8_t>* outEventPayload,
+                                                   std::chrono::steady_clock::time_point deadline,
+                                                   HANDLE cancelEvent) {
+    {
+        // Let a pending cancel/command sender in between slices (see ioMu_).
+        if (ioWaiters_.load(std::memory_order_acquire) > 0) Sleep(1);
+        IoLock ioLock(*this, kCancelPollSlice);
+        if (!ioLock.owns()) return WaitStep::Again;
         // Checked at the TOP of every iteration — including before the
         // very first ReadFrame — so a cancel that arrives while this
         // socket's previous recv() was already unblocked by a real SEP
@@ -730,7 +762,7 @@ bool Connection::WaitForEvent(std::vector<uint8_t>* outEventPayload,
         // seen without waiting for one more slice.
         if (cancelEvent && Connection::IsEventSignaled(cancelEvent)) {
             T2_LOG("waitForEvent", L"cancelEvent signaled, giving up (design doc §9.4)");
-            return false;
+            return WaitStep::Fail;
         }
 
         // LINUX PARITY FIX: drain events already observed (and acked) by
@@ -747,13 +779,13 @@ bool Connection::WaitForEvent(std::vector<uint8_t>* outEventPayload,
             pendingEvents_.pop_front();
             T2_LOG("waitForEvent", L"delivering queued event, payload=%zuB, "
                    "%zu still queued", outEventPayload->size(), pendingEvents_.size());
-            return true;
+            return WaitStep::Deliver;
         }
 
         auto now = std::chrono::steady_clock::now();
         if (now >= deadline) {
             T2_LOG("waitForEvent", L"deadline reached, giving up");
-            return false;
+            return WaitStep::Fail;
         }
         auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
         // Clamp to the poll slice only when there's actually a cancelEvent
@@ -787,9 +819,9 @@ bool Connection::WaitForEvent(std::vector<uint8_t>* outEventPayload,
                 if (!cancelEvent) {
                     T2_LOG("waitForEvent", L"ReadFrame failed/timed out, %lldms remained",
                            static_cast<long long>(remaining.count()));
-                    return false;
+                    return WaitStep::Fail;
                 }
-                continue; // slice elapsed with no data — loop back, re-check cancelEvent and deadline
+                return WaitStep::Again; // slice elapsed with no data — loop back, re-check cancelEvent and deadline
             }
             // FIX (20.09.2026): this used to be a bare `continue` for EVERY
             // ReadFrame failure whenever a cancelEvent was in play. A peer
@@ -800,19 +832,19 @@ bool Connection::WaitForEvent(std::vector<uint8_t>* outEventPayload,
             // Windows happened to cancel. A dead or torn stream can never
             // deliver a match_result again: fail closed and let the caller
             // decide (reconnect, or complete the request with an error).
-            connectionLost_ = true;
+            connectionLost_.store(true);
             T2_LOG("waitForEvent",
                    L"connection lost while waiting for an event (peer closed/reset or "
                    L"torn frame) - giving up instead of retrying on a dead socket");
-            return false;
+            return WaitStep::Fail;
         }
-        if (frame.type != FrameType::Message) continue; // ignore stray HELO-typed noise, keep waiting
+        if (frame.type != FrameType::Message) return WaitStep::Again; // ignore stray HELO-typed noise, keep waiting
 
         auto env = ParseMessageBody(frame.body);
         if (!env) {
             T2_LOG("waitForEvent", L"ParseMessageBody failed, body=%zuB %s",
                    frame.body.size(), HexDump(frame.body).c_str());
-            return false; // malformed -> fail closed, do not keep guessing
+            return WaitStep::Fail; // malformed -> fail closed, do not keep guessing
         }
 
         if (!env->isReply) {
@@ -821,7 +853,7 @@ bool Connection::WaitForEvent(std::vector<uint8_t>* outEventPayload,
             if (!AcknowledgeEvent(env->requestId)) {
                 T2_LOG("waitForEvent", L"AcknowledgeEvent failed for reqId=%s",
                        Widen(env->requestId).c_str());
-                return false;
+                return WaitStep::Fail;
             }
             T2_LOG("waitForEvent", L"event acked, reqId=%s payload=%zuB %s",
                    Widen(env->requestId).c_str(), env->payloadPlist.size(),
@@ -839,10 +871,25 @@ bool Connection::WaitForEvent(std::vector<uint8_t>* outEventPayload,
                    // prints an enrolled identity UUID in the clear.
                    HexDump(env->payloadPlist, 512).c_str());
             *outEventPayload = env->payloadPlist;
-            return true;
+            return WaitStep::Deliver;
         }
         // A stray reply to something we're not waiting on: ignore, keep looping.
         T2_LOG("waitForEvent", L"ignoring stray reply, reqId=%s", Widen(env->requestId).c_str());
+    }
+    return WaitStep::Again;
+}
+
+bool Connection::WaitForEvent(std::vector<uint8_t>* outEventPayload,
+                               std::chrono::steady_clock::time_point deadline,
+                               HANDLE cancelEvent) {
+    // One poll slice per WaitForEventStep() call, each under ioMu_ (see
+    // Connection.h). Deadline / cancel checks live in the step.
+    for (;;) {
+        switch (WaitForEventStep(outEventPayload, deadline, cancelEvent)) {
+        case WaitStep::Deliver: return true;
+        case WaitStep::Fail:    return false;
+        case WaitStep::Again:   break;
+        }
     }
 }
 
@@ -902,7 +949,7 @@ bool Connection::ReadFrame(RawFrame* out, std::chrono::milliseconds timeout,
     ParseResult pr = ParseFrameHeader(headerBuf, sizeof(headerBuf), &hdr);
     if (pr != ParseResult::Ok) {
         T2_LOG("readFrame", L"ParseFrameHeader failed, result=%d, header=%s",
-               static_cast<int>(pr), HexDump(std::vector<uint8_t>(headerBuf, headerBuf + 16)).c_str());
+               static_cast<int>(pr), HexDump(headerBuf, sizeof(headerBuf), sizeof(headerBuf)).c_str());
         if (why) *why = ReadFailure::Error;
         return false;
     }

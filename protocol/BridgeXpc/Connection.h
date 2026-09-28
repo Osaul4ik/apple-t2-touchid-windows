@@ -8,6 +8,8 @@
 #include <string>
 #include <chrono>
 #include <deque>
+#include <mutex>
+#include <atomic>
 
 namespace t2::bridgexpc {
 
@@ -143,11 +145,11 @@ public:
     // connection can never deliver a match_result again, so callers must
     // stop waiting on it (and may open a fresh connection) instead of
     // treating it like an idle wait. Cleared by Connect().
-    bool ConnectionLost() const { return connectionLost_; }
+    bool ConnectionLost() const { return connectionLost_.load(std::memory_order_relaxed); }
 
 private:
     SOCKET socket_ = INVALID_SOCKET;
-    bool connectionLost_ = false;
+    std::atomic<bool> connectionLost_{false};
 
     // Why ReadFrame() returned false. IdleTimeout = SO_RCVTIMEO expired
     // with ZERO bytes of a new frame received (the stream is still in sync,
@@ -172,6 +174,43 @@ private:
                                 std::chrono::milliseconds timeout,
                                 const wchar_t* logTag);
     std::deque<std::vector<uint8_t>> pendingEvents_;
+
+    // ---- I/O serialization (perf/robustness fix) ----
+    // The cancel path (Queue.cpp EvtCaptureCancel / suspend ->
+    // BestEffortCancelActiveMatch) sends cmd 0x0c on THIS connection from
+    // another thread while the capture worker is blocked in
+    // WaitForEvent()/recv(). Two threads doing send+recv on one stream
+    // socket interleave frames: the logs show ParseFrameHeader failures on
+    // a bplist body ("62706c6973743030...") and "torn frame" after every
+    // cancel, which kills the session and forces a full reconnect.
+    // ioMu_ makes each wire transaction atomic: SendBiometricCommand /
+    // GetFdrCalibration / Get/SetVersion hold it for the whole
+    // request+reply, WaitForEvent holds it for ONE poll slice at a time, so
+    // a cancel waits at most ~one slice (kCancelPollSlice) instead of
+    // racing. ioWaiters_ lets the worker yield between slices so the
+    // (non-fair) mutex cannot starve the cancel sender.
+    std::timed_mutex ioMu_;
+    std::atomic<int> ioWaiters_{0};
+    class IoLock {
+    public:
+        IoLock(Connection& c, std::chrono::milliseconds wait) : c_(c) {
+            c_.ioWaiters_.fetch_add(1, std::memory_order_acq_rel);
+            owns_ = c_.ioMu_.try_lock_for(wait);
+            c_.ioWaiters_.fetch_sub(1, std::memory_order_acq_rel);
+        }
+        ~IoLock() { if (owns_) c_.ioMu_.unlock(); }
+        IoLock(const IoLock&) = delete;
+        IoLock& operator=(const IoLock&) = delete;
+        bool owns() const { return owns_; }
+    private:
+        Connection& c_;
+        bool owns_ = false;
+    };
+    enum class WaitStep { Deliver, Fail, Again };
+    WaitStep WaitForEventStep(std::vector<uint8_t>* outEventPayload,
+                              std::chrono::steady_clock::time_point deadline,
+                              HANDLE cancelEvent);
+
 };
 
 } // namespace t2::bridgexpc
