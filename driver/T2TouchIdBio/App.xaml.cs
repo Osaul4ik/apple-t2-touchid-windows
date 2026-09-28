@@ -23,20 +23,20 @@ namespace T2TouchId.SepVaultGui
 
             if (tunnel || native)
             {
-                // Apply before/without requiring the window to be interactive.
-                var result = MainWindow.ApplyTransportFromCommandLine(tunnel: tunnel && !native);
+                // Fully qualify: App.MainWindow is a Window property and would
+                // shadow the MainWindow class name.
+                bool result = T2TouchId.SepVaultGui.MainWindow.ApplyTransportFromCommandLine(
+                    tunnel: tunnel && !native);
                 if (quit)
                 {
-                    // Non-zero if apply failed (no admin / no T2Ncm).
                     Environment.Exit(result ? 0 : 1);
                     return;
                 }
             }
 
-            var window = new MainWindow();
+            var window = new T2TouchId.SepVaultGui.MainWindow();
             if (tunnel || native)
             {
-                // Refresh UI to match what we just applied.
                 window.RefreshTransportUi();
             }
             window.Show();
