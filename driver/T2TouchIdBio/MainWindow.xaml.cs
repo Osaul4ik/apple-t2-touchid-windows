@@ -36,6 +36,7 @@ namespace T2TouchId.SepVaultGui
             InitializeComponent();
             LoadSepStatus();
             LoadLogFlags();
+            LoadShortVerify();
             LoadTransportMode();
         }
 
@@ -340,6 +341,78 @@ namespace T2TouchId.SepVaultGui
                 LogStatusText.Text = "Збережено. UMDF/BridgeXpc підхоплять одразу; kernel — після наступного sleep або перезавантаження драйвера.";
                 LogStatusText.Foreground = DotOk;
             }
+        }
+
+        // ---- Short Verify (HKLM\SOFTWARE\T2TouchIdBio\ShortVerify) ----
+        // Read by the UMDF driver (Queue.cpp, LoadShortVerify) before every
+        // StartMatch attempt. Missing value = 0 = full Linux-parity sequence.
+        private const string BioRegPath = @"SOFTWARE\T2TouchIdBio";
+        private const string ShortVerifyValue = "ShortVerify";
+        private bool _shortVerifyLoading;
+
+        private static bool ReadShortVerify()
+        {
+            try
+            {
+                using var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(BioRegPath, writable: false);
+                object? v = key?.GetValue(ShortVerifyValue);
+                if (v is int i) return i != 0;
+                if (v is long l) return l != 0;
+                return false;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool WriteShortVerify(bool enabled)
+        {
+            try
+            {
+                using var key = Microsoft.Win32.Registry.LocalMachine.CreateSubKey(BioRegPath, true);
+                if (key == null) return false;
+                key.SetValue(ShortVerifyValue, enabled ? 1 : 0, Microsoft.Win32.RegistryValueKind.DWord);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private void LoadShortVerify()
+        {
+            _shortVerifyLoading = true;
+            try
+            {
+                ShortVerifyCheck.IsChecked = ReadShortVerify();
+                ShortVerifyStatusText.Text = ShortVerifyCheck.IsChecked == true
+                    ? "Увімкнено: ResetSensor і LoadCalibration пропускаються."
+                    : "Вимкнено: повна послідовність (Linux parity).";
+                ShortVerifyStatusText.Foreground = new SolidColorBrush(Color.FromRgb(0x66, 0x66, 0x66));
+            }
+            finally
+            {
+                _shortVerifyLoading = false;
+            }
+        }
+
+        private void OnShortVerifyChanged(object sender, RoutedEventArgs e)
+        {
+            if (_shortVerifyLoading) return;
+
+            bool enabled = ShortVerifyCheck.IsChecked == true;
+            if (!WriteShortVerify(enabled))
+            {
+                ShortVerifyStatusText.Text = "Не вдалось записати HKLM (запустіть GUI від імені адміністратора).";
+                ShortVerifyStatusText.Foreground = DotError;
+                return;
+            }
+            ShortVerifyStatusText.Text = enabled
+                ? "Збережено: Short Verify увімкнено, діє з наступної сесії verify."
+                : "Збережено: повна послідовність, діє з наступної сесії verify.";
+            ShortVerifyStatusText.Foreground = DotOk;
         }
 
         // Reads the driver's in-memory bootstrap status and updates the

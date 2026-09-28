@@ -111,6 +111,17 @@
                 </StackPanel>
             </Border>
 
+            <!-- ===================== Verify sequence card ===================== -->
+            <Border Style="{StaticResource Card}">
+                <StackPanel>
+                    <TextBlock Style="{StaticResource SectionHeader}" Text="Верифікація — послідовність команд"/>
+                    <TextBlock TextWrapping="Wrap" Foreground="#666666" FontSize="12" Margin="0,0,0,10"
+                               Text="За замовчуванням перед кожним StartMatch виконується повна послідовність, як у Linux (t2-fprintd): ResetSensor, Cancel, LoadCalibration, IdentityList, gate 0x51→0x42→0x51. Short Verify пропускає ResetSensor і LoadCalibration; Cancel, IdentityList і gate стабільності лишаються. Пишеться в HKLM\SOFTWARE\T2TouchIdBio\ShortVerify, діє з наступної сесії verify. Потрібні права адміністратора."/>
+                    <CheckBox x:Name="ShortVerifyCheck" Content="Short Verify (коротка послідовність)" Margin="0,0,0,6" Checked="OnShortVerifyChanged" Unchecked="OnShortVerifyChanged"/>
+                    <TextBlock x:Name="ShortVerifyStatusText" TextWrapping="Wrap" Foreground="#666666" FontSize="11" Margin="0,8,0,0"/>
+                </StackPanel>
+            </Border>
+
             <Border Style="{StaticResource Card}">
                 <StackPanel>
                     <TextBlock Style="{StaticResource SectionHeader}" Text="Мережа — BridgeXPC транспорт"/>

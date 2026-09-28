@@ -1259,6 +1259,26 @@ t2::wbdi::BirOptions LoadBirOptions()
     return t2::wbdi::BirOptionsFromVariant(variant);
 }
 
+// "Short Verify" (SepVault GUI checkbox). Read before every StartMatch attempt,
+// like LoadBirOptions, so a toggle applies to the next session without a rebuild.
+//   HKLM\SOFTWARE\T2TouchIdBio\ShortVerify  (REG_DWORD, GUI writes 0/1)
+//     0 / missing: full Linux-parity sequence (shipped default, VerifyConfig).
+//     nonzero:     skip ResetSensor (cmd 2) and LoadCalibration ([11] + cmd 0x20)
+//                  - the same two VerifyConfig knobs as the CLI's
+//                  --no-reset-sensor / --no-load-calibration. Everything that
+//                  guards the match stays: Cancel (0x0c), IdentityList (0x42)
+//                  and the fail-closed 0x51 -> 0x42 -> 0x51 stability gate.
+bool LoadShortVerify()
+{
+    DWORD value = 0;
+    DWORD cb = sizeof(value);
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\T2TouchIdBio", L"ShortVerify",
+                     RRF_RT_REG_DWORD, nullptr, &value, &cb) != ERROR_SUCCESS) {
+        return false;
+    }
+    return value != 0;
+}
+
 // PURPOSE_ENROLL / _ENROLL_FOR_VERIFICATION / _ENROLL_FOR_IDENTIFICATION
 // (design doc 4): does NOT collect a new biometric sample. Runs the same
 // WarmUp() identity-list read the CLI's `warmup`/`identities` commands use
@@ -1455,6 +1475,12 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
                 // this mark - i.e. unless the SEP has never before handed us
                 // this exact event.
                 cfg.rejectOrdinalAtOrBelow = g_lastObservedSepOrdinal.load(std::memory_order_acquire);
+                const bool shortVerify = LoadShortVerify();
+                cfg.skipResetSensor = shortVerify;
+                cfg.skipLoadCalibration = shortVerify;
+                if (shortVerify) {
+                    T2BioLog("CAPTURE_DATA(verify): Short Verify ON - skipping ResetSensor + LoadCalibration");
+                }
                 VerificationEngine engine(cfg);
                 matchedUuid.reset();
                 uint64_t highestOrdinalSeen = 0;
