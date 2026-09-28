@@ -422,6 +422,37 @@ struct StickyNcmEndpoint {
 };
 StickyNcmEndpoint g_stickyNcm;
 
+// Shared sticky helpers — one place for clear / resolve (lock, unlock, retry, warmup).
+inline void ClearStickyNcm()
+{
+    std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
+    g_stickyNcm.valid = false;
+}
+
+// Sticky-first peer for tunnel/probe background work. Returns false if none.
+bool ResolvePeerStickyFirst(unsigned long* ifIndex, in6_addr* peer6)
+{
+    {
+        std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
+        if (g_stickyNcm.valid &&
+            g_stickyNcm.ep.peerSource != t2::discovery::PeerSource::None) {
+            *ifIndex = g_stickyNcm.ep.ifIndex;
+            *peer6 = g_stickyNcm.ep.peerLinkLocal;
+            return true;
+        }
+    }
+    for (const auto& ep : t2::discovery::FindT2NcmEndpoints()) {
+        if (ep.peerSource == t2::discovery::PeerSource::None) {
+            continue;
+        }
+        *ifIndex = ep.ifIndex;
+        *peer6 = ep.peerLinkLocal;
+        return true;
+    }
+    return false;
+}
+
+
 struct CaptureBusyGuard {
     bool acquired = false;
     CaptureBusyGuard() { TryAcquire(); }
@@ -592,26 +623,9 @@ ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_
         // Force next PushTransportMode to actually hit the driver (post-Dx
         // cache in miniport may not match our LastPushedMode).
         t2::transport::LastPushedModeFlag().store(-1, std::memory_order_relaxed);
-        // If cold-boot warmup was interrupted by Dx (status deferred/failed
-        // without a successful ok), allow ScheduleColdBootWarmupIfNeeded again.
-        if (!t2::transport::IsColdBootWarmupDone()) {
-            // nothing — still pending
-        } else {
-            // Warmup may have marked done after Dx-forced failures; only clear
-            // when status is not "ok" so a successful pre-sleep warmup sticks.
-            // (Read is best-effort; worst case we skip retry.)
-        }
-        // Resume hygiene (no service restarts — WBF owns Activate/CAPTURE):
-        // 1) Drop sticky NCM / match-replay (adapter and connection may change).
-        // 2) Wake the still-pending capture worker. It clears the suspend
-        //    signal only after observing the new generation and confirming
-        //    that WBF did not cancel the request. Keep g_captureBusy owned by
-        //    that worker; clearing it here could race a second SEP session.
+        // Resume hygiene: drop sticky/replay; pending CAPTURE restarts via resume event.
         ClearMatchReplay();
-        {
-            std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
-            g_stickyNcm.valid = false;
-        }
+        ClearStickyNcm();
         // No clock to arm here anymore - g_lastObservedSepOrdinal (declared
         // above) is keyed off the SEP's own event sequence numbers, not off
         // when resume happened, so resume itself needs no bookkeeping beyond
@@ -1211,30 +1225,13 @@ ConnectWait ConnectForCaptureWithRetry(HANDLE cancelEvent, t2::bridgexpc::Connec
         const bool nowTunnel = t2::transport::ShouldSkipNativeIpv6Probe();
         if (wasNative && nowTunnel) {
             wasNative = false;
-            {
-                std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
-                g_stickyNcm.valid = false;
-            }
-            T2BioLog("CAPTURE_DATA: v6 dead -> Ipv4Tunnel armed; immediate reconnect for NEW verify");
-            // Sticky-first peer refresh before tunnel reconnect.
-            {
-                bool prepared = false;
-                {
-                    std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
-                    if (g_stickyNcm.valid &&
-                        g_stickyNcm.ep.peerSource != t2::discovery::PeerSource::None) {
-                        t2::transport::PrepareTunnelPeer(
-                            g_stickyNcm.ep.ifIndex, g_stickyNcm.ep.peerLinkLocal);
-                        prepared = true;
-                    }
-                }
-                if (!prepared) {
-                    for (const auto& ep : t2::discovery::FindT2NcmEndpoints()) {
-                        if (ep.peerSource == t2::discovery::PeerSource::None) continue;
-                        t2::transport::PrepareTunnelPeer(ep.ifIndex, ep.peerLinkLocal);
-                        break;
-                    }
-                }
+            // Mode flipped mid-retry: drop sticky (path changed) and arm peer once.
+            ClearStickyNcm();
+            T2BioLog("CAPTURE_DATA: v6 dead -> Ipv4Tunnel; immediate reconnect");
+            unsigned long ifIndex = 0;
+            in6_addr peer6{};
+            if (ResolvePeerStickyFirst(&ifIndex, &peer6)) {
+                t2::transport::PrepareTunnelPeer(ifIndex, peer6);
             }
             continue; // no backoff
         }
@@ -1279,22 +1276,12 @@ void ScheduleColdBootWarmupIfNeeded()
             L"First Match OK — waiting for T2 NCM peer");
         T2BioLog("ColdBootWarmup: scheduled after first successful Match");
 
-        t2::discovery::NcmEndpoint sticky{};
-        bool haveSticky = false;
-        {
-            std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
-            if (g_stickyNcm.valid) {
-                sticky = g_stickyNcm.ep;
-                haveSticky = true;
-            }
-        }
-
         bool warmed = false;
         bool deferredDx = false;
         for (int attempt = 0; attempt < 16 && !warmed; ++attempt) {
             if (t2::transport::IsTransportIoSuspended()) {
                 deferredDx = true;
-                T2BioLog("ColdBootWarmup: Dx active - aborting attempts (will retry later)");
+                T2BioLog("ColdBootWarmup: Dx active - will retry later");
                 break;
             }
             if (attempt > 0) {
@@ -1302,25 +1289,7 @@ void ScheduleColdBootWarmupIfNeeded()
             }
             unsigned long ifIndex = 0;
             in6_addr peer6{};
-            bool got = false;
-            if (haveSticky && sticky.peerSource != t2::discovery::PeerSource::None) {
-                ifIndex = sticky.ifIndex;
-                peer6 = sticky.peerLinkLocal;
-                got = true;
-                haveSticky = false;
-            } else {
-                const auto endpoints = t2::discovery::FindT2NcmEndpoints();
-                for (const auto& ep : endpoints) {
-                    if (ep.peerSource == t2::discovery::PeerSource::None) {
-                        continue;
-                    }
-                    ifIndex = ep.ifIndex;
-                    peer6 = ep.peerLinkLocal;
-                    got = true;
-                    break;
-                }
-            }
-            if (!got) {
+            if (!ResolvePeerStickyFirst(&ifIndex, &peer6)) {
                 if (attempt == 0) {
                     T2BioLog("ColdBootWarmup: no peer yet - retrying");
                 }
@@ -2235,28 +2204,9 @@ LRESULT CALLBACK SessionLockWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                 std::thread([]() {
                     unsigned long ifIndex = 0;
                     in6_addr peer6{};
-                    bool got = false;
-                    {
-                        std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
-                        if (g_stickyNcm.valid &&
-                            g_stickyNcm.ep.peerSource != t2::discovery::PeerSource::None) {
-                            ifIndex = g_stickyNcm.ep.ifIndex;
-                            peer6 = g_stickyNcm.ep.peerLinkLocal;
-                            got = true;
-                        }
-                    }
-                    if (!got) {
-                        for (const auto& ep : t2::discovery::FindT2NcmEndpoints()) {
-                            if (ep.peerSource == t2::discovery::PeerSource::None) continue;
-                            ifIndex = ep.ifIndex;
-                            peer6 = ep.peerLinkLocal;
-                            got = true;
-                            break;
-                        }
-                    }
-                    if (got) {
+                    if (ResolvePeerStickyFirst(&ifIndex, &peer6)) {
                         t2::transport::PrepareTunnelPeer(ifIndex, peer6);
-                        T2BioLog("LockRefresh: Ipv4Tunnel peer refreshed (sticky-first)");
+                        T2BioLog("LockRefresh: Ipv4Tunnel peer refreshed");
                     }
                 }).detach();
             }
@@ -2270,42 +2220,20 @@ LRESULT CALLBACK SessionLockWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                 return 0;
             }
             std::thread([unlockN]() {
-                // Sticky-first; only update session flags — Connect applies driver mode.
                 unsigned long ifIndex = 0;
                 in6_addr peer6{};
-                bool got = false;
-                {
-                    std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
-                    if (g_stickyNcm.valid &&
-                        g_stickyNcm.ep.peerSource != t2::discovery::PeerSource::None) {
-                        ifIndex = g_stickyNcm.ep.ifIndex;
-                        peer6 = g_stickyNcm.ep.peerLinkLocal;
-                        got = true;
-                    }
-                }
-                if (!got) {
-                    for (const auto& ep : t2::discovery::FindT2NcmEndpoints()) {
-                        if (ep.peerSource == t2::discovery::PeerSource::None) continue;
-                        ifIndex = ep.ifIndex;
-                        peer6 = ep.peerLinkLocal;
-                        got = true;
-                        break;
-                    }
-                }
-                if (!got) {
+                if (!ResolvePeerStickyFirst(&ifIndex, &peer6)) {
                     T2BioLog("UnlockProbe: no peer yet (unlock#%u, every-4th)", unlockN);
                     return;
                 }
-                const bool reachable = t2::transport::ProbeNativeIpv6Reachable(
-                    peer6, ifIndex, t2::transport::kUnlockProbeTimeout);
-                if (reachable) {
+                // Session flags only — Connect applies driver mode on next CAPTURE.
+                if (t2::transport::ProbeNativeIpv6Reachable(
+                        peer6, ifIndex, t2::transport::kUnlockProbeTimeout)) {
                     t2::transport::RecordNativeIpv6Success();
-                    T2BioLog("UnlockProbe: NativeIpv6 reachable (unlock#%u, every-4th) "
-                             "- session flag only", unlockN);
+                    T2BioLog("UnlockProbe: v6 reachable (unlock#%u)", unlockN);
                 } else {
                     t2::transport::RecordNativeIpv6Failure();
-                    T2BioLog("UnlockProbe: NativeIpv6 unreachable (unlock#%u, every-4th) "
-                             "- session flag only", unlockN);
+                    T2BioLog("UnlockProbe: v6 dead (unlock#%u)", unlockN);
                 }
             }).detach();
         }
