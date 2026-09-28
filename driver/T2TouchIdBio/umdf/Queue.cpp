@@ -2056,68 +2056,85 @@ LRESULT CALLBACK SessionLockWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             std::lock_guard<std::mutex> commitLock(g_captureRequestCommitMu);
             BeginCaptureSessionLock("SessionLockNotify(WTS_SESSION_LOCK)");
         } else if (wParam == WTS_SESSION_UNLOCK) {
-            // Not a capture-invalidation boundary (nothing to cancel here).
-            // Transport-mode design (TransportMode.h + user AutoSwitch spec):
-            //
-            // 1) Cold boot / every unlock: in background prepare the IPv4
-            //    tunnel path (PrepareTunnelPeer = ARP neighbor + push peer
-            //    to T2Ncm.sys) — analogue of the `network` / static-IP setup —
-            //    so a later VPN that blocks IPv6 can fall back without a
-            //    cold ARP miss. We do NOT flip the live mode to tunnel here
-            //    until the probe says IPv6 is unreachable.
-            // 2) Always TEST NativeIpv6 with a throwaway probe (100ms). Result
-            //    updates the session skip-flag; no real Connect() is used.
-            // 3) Every 4th unlock: force a full re-check cycle — ensure tunnel
-            //    infra is live, probe v6, and if reachable switch back to
-            //    NativeIpv6 (RecordNativeIpv6Success); if not, stay on tunnel.
-            // Detached so a slow probe never blocks the message loop.
+            // Transport unlock path (no spam):
+            //  A) Once per cold boot (first unlock while ColdBootWarmupDone
+            //     unset): full IPv4 tunnel pre-warm, then restore NativeIpv6.
+            //     Status -> Session\WarmupStatus for GUI.
+            //  B) Every 4th unlock only: lightweight NativeIpv6 reachability
+            //     probe (~100ms) for VPN recovery. Other unlocks do nothing.
             static std::atomic<unsigned> s_unlockCount{0};
             const unsigned unlockN = s_unlockCount.fetch_add(1, std::memory_order_relaxed) + 1;
             const bool everyFourth = (unlockN % 4u) == 0u;
-            std::thread([everyFourth, unlockN]() {
+            const bool needColdWarmup = !t2::transport::IsColdBootWarmupDone();
+            if (!needColdWarmup && !everyFourth) {
+                return 0; // nothing to do this unlock
+            }
+            std::thread([everyFourth, unlockN, needColdWarmup]() {
+                // ---- Cold-boot IPv4 pre-warm (once per boot) ----
+                if (needColdWarmup) {
+                    t2::transport::WriteWarmupStatus(L"waiting-peer",
+                        L"Waiting for T2 NCM peer after first unlock");
+                    T2BioLog("ColdBootWarmup: start (unlock#%u)", unlockN);
+                    bool warmed = false;
+                    for (int attempt = 0; attempt < 16 && !warmed; ++attempt) {
+                        if (attempt > 0) {
+                            Sleep(500);
+                        }
+                        const auto endpoints = t2::discovery::FindT2NcmEndpoints();
+                        for (const auto& ep : endpoints) {
+                            if (ep.peerSource == t2::discovery::PeerSource::None) {
+                                continue;
+                            }
+                            wchar_t detail[128];
+                            swprintf_s(detail, L"ifIndex=%lu attempt=%d",
+                                       static_cast<unsigned long>(ep.ifIndex), attempt + 1);
+                            t2::transport::WriteWarmupStatus(L"warming", detail);
+                            warmed = t2::transport::RunColdBootTunnelWarmup(
+                                ep.ifIndex, ep.peerLinkLocal);
+                            T2BioLog("ColdBootWarmup: %s (ifIndex=%lu attempt=%d)",
+                                     warmed ? "OK" : "FAILED",
+                                     static_cast<unsigned long>(ep.ifIndex), attempt + 1);
+                            break;
+                        }
+                        if (!warmed && attempt == 0) {
+                            T2BioLog("ColdBootWarmup: no peer yet - retrying");
+                        }
+                    }
+                    if (!warmed) {
+                        t2::transport::WriteWarmupStatus(L"failed",
+                            L"No T2 NCM peer within 8s after first unlock");
+                        T2BioLog("ColdBootWarmup: gave up - no peer");
+                        t2::transport::MarkColdBootWarmupDone();
+                    }
+                }
+
+                // ---- VPN recovery probe (every 4th unlock only) ----
+                if (!everyFourth) {
+                    return;
+                }
                 const auto endpoints = t2::discovery::FindT2NcmEndpoints();
-                bool hadPeer = false;
                 for (const auto& ep : endpoints) {
                     if (ep.peerSource == t2::discovery::PeerSource::None) {
                         continue;
                     }
-                    hadPeer = true;
-
-                    // Background IPv4 tunnel prep (cold-boot + ongoing).
-                    // Warms ARP / driver peer so a 400ms live fallback works.
-                    t2::transport::PrepareTunnelPeer(ep.ifIndex, ep.peerLinkLocal);
-                    T2BioLog("UnlockProbe: prepared IPv4 tunnel peer (ifIndex=%lu) unlock#%u%s",
-                             static_cast<unsigned long>(ep.ifIndex), unlockN,
-                             everyFourth ? " [every-4th full cycle]" : "");
-
-                    if (everyFourth) {
-                        // Periodic full cycle: ensure driver tunnel rewrite
-                        // is armed, then test whether v6 is back.
-                        (void)t2::transport::PushTransportModeToDriver(
-                            t2::transport::TransportMode::Ipv4Tunnel);
-                    }
-
                     const bool reachable = t2::transport::ProbeNativeIpv6Reachable(
                         ep.peerLinkLocal, ep.ifIndex, t2::transport::kUnlockProbeTimeout);
                     if (reachable) {
                         t2::transport::RecordNativeIpv6Success();
                         (void)t2::transport::PushTransportModeToDriver(
                             t2::transport::TransportMode::NativeIpv6);
-                        T2BioLog("UnlockProbe: NativeIpv6 reachable - next Connect() tries it first"
-                                 " (unlock#%u)", unlockN);
+                        T2BioLog("UnlockProbe: NativeIpv6 reachable (unlock#%u, every-4th)",
+                                 unlockN);
                     } else {
                         t2::transport::RecordNativeIpv6Failure();
                         (void)t2::transport::PushTransportModeToDriver(
                             t2::transport::TransportMode::Ipv4Tunnel);
-                        T2BioLog("UnlockProbe: NativeIpv6 unreachable within 100ms - staying on"
-                                 " Ipv4Tunnel (unlock#%u)", unlockN);
+                        T2BioLog("UnlockProbe: NativeIpv6 unreachable - Ipv4Tunnel "
+                                 "(unlock#%u, every-4th)", unlockN);
                     }
                     return;
                 }
-                if (!hadPeer) {
-                    T2BioLog("UnlockProbe: no T2 NCM endpoint with a known peer yet - skipped"
-                             " (unlock#%u)", unlockN);
-                }
+                T2BioLog("UnlockProbe: no peer yet (unlock#%u, every-4th)", unlockN);
             }).detach();
         }
         // Every other WM_WTSSESSION_CHANGE type is intentionally ignored.

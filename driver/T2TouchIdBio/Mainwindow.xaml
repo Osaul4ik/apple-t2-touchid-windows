@@ -120,6 +120,10 @@
                     <TextBlock TextWrapping="Wrap" Foreground="#666666" FontSize="11" Margin="0,0,0,4"
                                Text="Рекомендовано на інтерфейсі T2Ncm: IPv4 169.254.84.1/16 і neighbor 169.254.x.y → MAC T2 (після першого RX tunnel сам запам'ятає peer fe80)."/>
                     <TextBlock x:Name="TransportStatusText" TextWrapping="Wrap" Foreground="#666666" FontSize="11"/>
+                    <TextBlock Text="Cold-boot IPv4 pre-warm:" FontWeight="SemiBold" FontSize="11" Margin="0,10,0,2"/>
+                    <TextBlock x:Name="WarmupStatusText" TextWrapping="Wrap" Foreground="#666666" FontSize="11"
+                               Text="— (очікує першого unlock після cold boot)"/>
+                    <TextBlock x:Name="WarmupDetailText" TextWrapping="Wrap" Foreground="#888888" FontSize="10" Margin="0,2,0,0"/>
                 </StackPanel>
             </Border>
 

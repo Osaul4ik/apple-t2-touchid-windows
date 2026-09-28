@@ -16,6 +16,7 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Media;
+using System.Windows.Threading;
 using Microsoft.Win32;
 
 namespace T2TouchId.SepVaultGui
@@ -36,6 +37,12 @@ namespace T2TouchId.SepVaultGui
             LoadSepStatus();
             LoadLogFlags();
             LoadTransportMode();
+            LoadWarmupStatus();
+            // Poll cold-boot warmup status while the window is open so the
+            // user sees waiting-peer → warming → ok without manual refresh.
+            var warmupTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2) };
+            warmupTimer.Tick += (_, __) => LoadWarmupStatus();
+            warmupTimer.Start();
         }
 
 
@@ -57,6 +64,9 @@ namespace T2TouchId.SepVaultGui
         // volatile it never survives a reboot, matching that same default.
         private const string SessionRegPath = @"SOFTWARE\T2TouchId\Network\Session";
         private const string SkipNativeIpv6ProbeValue = "SkipNativeIpv6Probe";
+        private const string ColdBootWarmupDoneValue = "ColdBootWarmupDone";
+        private const string WarmupStatusValue = "WarmupStatus";
+        private const string WarmupDetailValue = "WarmupDetail";
         private bool _transportLoading;
 
         private void LoadTransportMode()
@@ -81,6 +91,45 @@ namespace T2TouchId.SepVaultGui
             finally
             {
                 _transportLoading = false;
+            }
+        }
+
+
+        private void LoadWarmupStatus()
+        {
+            try
+            {
+                using var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(SessionRegPath, false);
+                if (key == null)
+                {
+                    WarmupStatusText.Text = "idle — ще не було unlock після cold boot";
+                    WarmupDetailText.Text = "";
+                    return;
+                }
+                var done = key.GetValue(ColdBootWarmupDoneValue);
+                var status = key.GetValue(WarmupStatusValue) as string;
+                var detail = key.GetValue(WarmupDetailValue) as string;
+                if (status == null || status.Length == 0)
+                {
+                    WarmupStatusText.Text = done is int i && i != 0
+                        ? "done (статус не записано)"
+                        : "idle — ще не було unlock після cold boot";
+                    WarmupDetailText.Text = "";
+                    return;
+                }
+                WarmupStatusText.Text = status;
+                WarmupDetailText.Text = detail ?? "";
+                if (status == "ok")
+                    WarmupStatusText.Foreground = new SolidColorBrush(Color.FromRgb(0x2E, 0x7D, 0x32));
+                else if (status != null && status.StartsWith("failed"))
+                    WarmupStatusText.Foreground = DotError;
+                else
+                    WarmupStatusText.Foreground = new SolidColorBrush(Color.FromRgb(0x66, 0x66, 0x66));
+            }
+            catch
+            {
+                WarmupStatusText.Text = "(немає доступу до HKLM Session)";
+                WarmupDetailText.Text = "";
             }
         }
 
@@ -190,7 +239,12 @@ namespace T2TouchId.SepVaultGui
         }
 
 
-        private void OnRefreshStatus(object sender, RoutedEventArgs e) => LoadSepStatus();
+        private void OnRefreshStatus(object sender, RoutedEventArgs e)
+        {
+            LoadSepStatus();
+            LoadTransportMode();
+            LoadWarmupStatus();
+        }
 
         // ---- Per-driver DebugView logging (HKLM\SOFTWARE\T2TouchId\Logging) ----
         private const string LogRegPath = @"SOFTWARE\T2TouchId\Logging";
