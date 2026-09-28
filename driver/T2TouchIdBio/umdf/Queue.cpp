@@ -1063,11 +1063,6 @@ bool ConnectForCapture(t2::bridgexpc::Connection* outConn)
 {
     const ULONGLONG t0 = GetTickCount64();
 
-    // VPN may have come up while unlocked with no lock-notification race.
-    // Arm tunnel before sticky/native so this CAPTURE can verify, not just
-    // burn 400ms and fail.
-    t2::transport::ArmTunnelIfVpnActive();
-
     // If the session transport flipped (NativeIpv6 ↔ Ipv4Tunnel) since the
     // sticky endpoint was cached, the old TCP path is almost certainly dead
     // (VPN just came up, or just went down). Trying sticky first would only
@@ -2082,29 +2077,24 @@ LRESULT CALLBACK SessionLockWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         if (wParam == WTS_SESSION_LOCK) {
             std::lock_guard<std::mutex> commitLock(g_captureRequestCommitMu);
             BeginCaptureSessionLock("SessionLockNotify(WTS_SESSION_LOCK)");
-            // Pre-arm BEFORE lock-screen CAPTURE when a VPN is up — without a
-            // T2 v6 probe (those would fire on every lock). Detects VPN via
-            // host adapters; if none, no-op. If VPN (or already SkipNative),
-            // push tunnel + PrepareTunnelPeer so the first finger can Connect
-            // and send verify over Ipv4Tunnel immediately.
-            std::thread([]() {
-                t2::transport::ArmTunnelIfVpnActive();
-                if (!t2::transport::ShouldSkipNativeIpv6Probe()) {
-                    return; // still native, nothing to refresh
-                }
-                (void)t2::transport::PushTransportModeToDriver(
-                    t2::transport::TransportMode::Ipv4Tunnel);
-                const auto endpoints = t2::discovery::FindT2NcmEndpoints();
-                for (const auto& ep : endpoints) {
-                    if (ep.peerSource == t2::discovery::PeerSource::None) {
-                        continue;
+            // Only refresh tunnel peer when v6 is already known dead for this
+            // session (SkipNative set by a prior Connect v6 failure). No VPN
+            // heuristics and no T2 probe on every lock.
+            if (t2::transport::ShouldSkipNativeIpv6Probe()) {
+                std::thread([]() {
+                    (void)t2::transport::PushTransportModeToDriver(
+                        t2::transport::TransportMode::Ipv4Tunnel);
+                    const auto endpoints = t2::discovery::FindT2NcmEndpoints();
+                    for (const auto& ep : endpoints) {
+                        if (ep.peerSource == t2::discovery::PeerSource::None) {
+                            continue;
+                        }
+                        t2::transport::PrepareTunnelPeer(ep.ifIndex, ep.peerLinkLocal);
+                        T2BioLog("LockRefresh: Ipv4Tunnel peer refreshed");
+                        return;
                     }
-                    t2::transport::PrepareTunnelPeer(ep.ifIndex, ep.peerLinkLocal);
-                    T2BioLog("LockArm: Ipv4Tunnel ready for lock-screen CAPTURE");
-                    return;
-                }
-                T2BioLog("LockArm: tunnel mode but no peer yet");
-            }).detach();
+                }).detach();
+            }
         } else if (wParam == WTS_SESSION_UNLOCK) {
             // Transport unlock path (no spam):
             //  A) Once per cold boot (first unlock while ColdBootWarmupDone
