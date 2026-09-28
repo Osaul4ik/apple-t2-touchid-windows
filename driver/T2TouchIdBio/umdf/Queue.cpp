@@ -1111,8 +1111,6 @@ bool ConnectForCapture(t2::bridgexpc::Connection* outConn)
             }
         }
     }
-    // Serialize with cold-boot tunnel warmup (driver mode flip).
-    t2::transport::WaitWarmupIdle(3000);
 
     // If the session transport flipped (NativeIpv6 ↔ Ipv4Tunnel) since the
     // sticky endpoint was cached, the old TCP path is almost certainly dead
@@ -1207,7 +1205,6 @@ ConnectWait ConnectForCaptureWithRetry(HANDLE cancelEvent, t2::bridgexpc::Connec
 {
     const ULONGLONG start = GetTickCount64();
     DWORD backoffMs = kConnectRetryFirstMs;
-    bool wasNative = !t2::transport::ShouldSkipNativeIpv6Probe();
     for (unsigned attempt = 1;; ++attempt) {
         if (ConnectForCapture(outConn)) {
             if (attempt > 1) {
@@ -1223,19 +1220,6 @@ ConnectWait ConnectForCaptureWithRetry(HANDLE cancelEvent, t2::bridgexpc::Connec
         // Native just failed and Connect() armed tunnel (SkipNative now set).
         // Drop sticky and retry immediately — caller will then send a NEW
         // verify on a clean Ipv4Tunnel Connection (not a half-dead v6 session).
-        const bool nowTunnel = t2::transport::ShouldSkipNativeIpv6Probe();
-        if (wasNative && nowTunnel) {
-            wasNative = false;
-            // Mode flipped mid-retry: drop sticky (path changed) and arm peer once.
-            ClearStickyNcm();
-            T2BioLog("CAPTURE_DATA: v6 dead -> Ipv4Tunnel; immediate reconnect");
-            unsigned long ifIndex = 0;
-            in6_addr peer6{};
-            if (ResolvePeerStickyFirst(&ifIndex, &peer6)) {
-                t2::transport::PrepareTunnelPeer(ifIndex, peer6);
-            }
-            continue; // no backoff
-        }
         const ULONGLONG waited = GetTickCount64() - start;
         if (waited >= kConnectRetryWindowMs) {
             T2BioLog("CAPTURE_DATA: BridgeXPC still unreachable after %llu ms - giving up",
@@ -1255,76 +1239,6 @@ ConnectWait ConnectForCaptureWithRetry(HANDLE cancelEvent, t2::bridgexpc::Connec
     }
 }
 
-// Cold-boot IPv4 tunnel pre-warm: once per boot, after the FIRST successful
-// fingerprint Match (not WTS_SESSION_UNLOCK — that can fire with no peer yet
-// or before the bio service has a sticky endpoint, leaving GUI on "idle").
-// Orient on Match: peer is known, sticky NCM is valid, user just proved the
-// native path works. Arm tunnel infra in the background, then restore v6.
-void ScheduleColdBootWarmupIfNeeded()
-{
-    if (t2::transport::IsColdBootWarmupDone()) {
-        return;
-    }
-    // One in-flight worker per process; if Dx interrupted it, s_started is
-    // cleared below so a later Match / resume can retry.
-    static std::atomic<bool> s_started{false};
-    bool expected = false;
-    if (!s_started.compare_exchange_strong(expected, true)) {
-        return;
-    }
-    std::thread([]() {
-        t2::transport::WriteWarmupStatus(L"waiting-peer",
-            L"First Match OK — waiting for T2 NCM peer");
-        T2BioLog("ColdBootWarmup: scheduled after first successful Match");
-
-        bool warmed = false;
-        bool deferredDx = false;
-        for (int attempt = 0; attempt < 16 && !warmed; ++attempt) {
-            if (t2::transport::IsTransportIoSuspended()) {
-                deferredDx = true;
-                T2BioLog("ColdBootWarmup: Dx active - will retry later");
-                break;
-            }
-            if (attempt > 0) {
-                Sleep(500);
-            }
-            unsigned long ifIndex = 0;
-            in6_addr peer6{};
-            if (!ResolvePeerStickyFirst(&ifIndex, &peer6)) {
-                if (attempt == 0) {
-                    T2BioLog("ColdBootWarmup: no peer yet - retrying");
-                }
-                continue;
-            }
-            wchar_t detail[128];
-            swprintf_s(detail, L"ifIndex=%lu attempt=%d (after Match)",
-                       static_cast<unsigned long>(ifIndex), attempt + 1);
-            t2::transport::WriteWarmupStatus(L"warming", detail);
-            warmed = t2::transport::RunColdBootTunnelWarmup(ifIndex, peer6);
-            T2BioLog("ColdBootWarmup: %s (ifIndex=%lu attempt=%d)",
-                     warmed ? "OK" : "FAILED",
-                     static_cast<unsigned long>(ifIndex), attempt + 1);
-            if (!warmed && t2::transport::IsTransportIoSuspended()) {
-                deferredDx = true;
-                break;
-            }
-        }
-        if (warmed) {
-            // RunColdBoot already MarkColdBootWarmupDone on success
-        } else if (deferredDx) {
-            // Do NOT mark done — allow another Match / explicit retry after resume.
-            t2::transport::WriteWarmupStatus(L"deferred",
-                L"Interrupted by sleep — will retry after next Match");
-            T2BioLog("ColdBootWarmup: deferred due to Dx - s_started reset");
-            s_started.store(false, std::memory_order_release);
-        } else {
-            t2::transport::WriteWarmupStatus(L"failed",
-                L"No T2 NCM peer within 8s after first Match");
-            T2BioLog("ColdBootWarmup: gave up - no peer after Match");
-            t2::transport::MarkColdBootWarmupDone();
-        }
-    }).detach();
-}
 
 
 // A/B switch for the BIR layout (see WbdiBir.h BirOptions). Read on every capture so a
@@ -1699,7 +1613,6 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
         ArmMatchReplay(matchedUuid); // next CAPTURE = 2nd of the WBF pair
         // First successful Match this boot → cold-boot IPv4 tunnel pre-warm.
         // Peer/sticky are valid here; WTS_SESSION_UNLOCK is too early/unreliable.
-        ScheduleColdBootWarmupIfNeeded();
     } else {
         ClearMatchReplay();
     }
@@ -2199,44 +2112,8 @@ LRESULT CALLBACK SessionLockWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         if (wParam == WTS_SESSION_LOCK) {
             std::lock_guard<std::mutex> commitLock(g_captureRequestCommitMu);
             BeginCaptureSessionLock("SessionLockNotify(WTS_SESSION_LOCK)");
-            // v6 already dead: refresh ARP/peer only. Mode is owned by Connect
-            // (no Push here — avoids IOCTL storm; LastPushed/driver stay put).
-            if (t2::transport::ShouldSkipNativeIpv6Probe()) {
-                std::thread([]() {
-                    unsigned long ifIndex = 0;
-                    in6_addr peer6{};
-                    if (ResolvePeerStickyFirst(&ifIndex, &peer6)) {
-                        t2::transport::PrepareTunnelPeer(ifIndex, peer6);
-                        T2BioLog("LockRefresh: Ipv4Tunnel peer refreshed");
-                    }
-                }).detach();
-            }
         } else if (wParam == WTS_SESSION_UNLOCK) {
-            // Cold-boot warmup is NOT here — it runs after the first successful
-            // Match (ScheduleColdBootWarmupIfNeeded). Unlock only does the
-            // every-4th lightweight v6 probe for VPN recovery.
-            static std::atomic<unsigned> s_unlockCount{0};
-            const unsigned unlockN = s_unlockCount.fetch_add(1, std::memory_order_relaxed) + 1;
-            if ((unlockN % 4u) != 0u) {
-                return 0;
-            }
-            std::thread([unlockN]() {
-                unsigned long ifIndex = 0;
-                in6_addr peer6{};
-                if (!ResolvePeerStickyFirst(&ifIndex, &peer6)) {
-                    T2BioLog("UnlockProbe: no peer yet (unlock#%u, every-4th)", unlockN);
-                    return;
-                }
-                // Session flags only — Connect applies driver mode on next CAPTURE.
-                if (t2::transport::ProbeNativeIpv6Reachable(
-                        peer6, ifIndex, t2::transport::kUnlockProbeTimeout)) {
-                    t2::transport::RecordNativeIpv6Success();
-                    T2BioLog("UnlockProbe: v6 reachable (unlock#%u)", unlockN);
-                } else {
-                    t2::transport::RecordNativeIpv6Failure();
-                    T2BioLog("UnlockProbe: v6 dead (unlock#%u)", unlockN);
-                }
-            }).detach();
+            // Manual transport mode only — no unlock probe / AutoSwitch.
         }
         // Every other WM_WTSSESSION_CHANGE type is intentionally ignored.
         return 0;

@@ -183,11 +183,6 @@ static std::vector<uint8_t> BuildClientHeloBody(int64_t bridgeXpcVersion) {
 // SAME Connect() call. This is intentionally much shorter than
 // connectTimeout as a whole: a real T2 link-local peer that is actually
 // reachable over IPv6 answers a local-segment SYN in low single-digit
-// milliseconds, so 400ms already generously covers that case while still
-// failing fast on a Cisco/WFP setup that drops the SYN (or its SYN-ACK)
-// silently rather than rejecting it (a rejection would return WSAECONNREFUSED
-// immediately anyway, well under 400ms).
-constexpr std::chrono::milliseconds kIpv6FirstConnectTimeout{400};
 
 ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned long interfaceIndex,
                                    uint16_t port, std::chrono::milliseconds connectTimeout) {
@@ -202,128 +197,19 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
     // flag; it was removed (see TransportMode.h) precisely because it and
     // this flag could disagree, so the GUI now sets this exact flag instead.
     bool tunnel = t2::transport::ShouldSkipNativeIpv6Probe();
-    // Mirror the flag into the running driver on every connect attempt.
-    // T2NcmTunnelRefreshMode only re-reads the registry at
-    // MiniportInitializeEx/MiniportRestart, so without this push a plain
-    // registry write can leave DeviceContext->TunnelModeEnabled stale -
-    // silently turning every tunnel-mode frame into a no-op passthrough that
-    // the IPv6-only T2 side drops. See PushTransportModeToDriver's own
-    // comment in TransportMode.h for the full chain.
+    // Manual mode only: GUI/cmd sets SkipNativeIpv6Probe. No timed v6→tunnel fallback.
     t2::transport::PushTransportModeToDriver(
-        tunnel ? t2::transport::TransportMode::Ipv4Tunnel : t2::transport::TransportMode::NativeIpv6);
-    bool fellBackFromIpv6 = false;
-    const auto attemptStart = std::chrono::steady_clock::now();
-    T2_LOG("connect", L"connect begin: ifIndex=%lu port=%u timeout=%lldms mode=%s",
-           interfaceIndex, static_cast<unsigned>(port),
-           static_cast<long long>(connectTimeout.count()),
-           tunnel ? L"Ipv4Tunnel (NativeIpv6 probe skipped - failed earlier this lock cycle "
-                    L"or forced via GUI, waiting for next unlock/uncheck)"
-                  : L"NativeIpv6 (default, may fall back)");
-    if (!t2::EnsureWinsock()) {
-        T2_LOG("connect", L"WSAStartup failed");
-        return ConnectResult::ConnectFailed;
-    }
-
-    if (!tunnel) {
-        socket_ = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
-        if (socket_ == INVALID_SOCKET) {
-            T2_LOG("connect", L"socket(AF_INET6) failed, WSAGetLastError=%d", WSAGetLastError());
-            return ConnectResult::ConnectFailed;
-        }
-        sockaddr_in6 addr{};
-        addr.sin6_family = AF_INET6;
-        addr.sin6_port = htons(port);
-        addr.sin6_addr = linkLocalAddress;
-        addr.sin6_scope_id = interfaceIndex;
-        // Deliberately NOT std::min(...) — same macro hazard documented at
-        // WaitForEvent's own remaining/kCancelPollSlice clamp further down
-        // this file (<windows.h>'s function-like `min` macro, no NOMINMAX
-        // in this build): a plain comparison sidesteps it entirely.
-        const auto v6Timeout = (connectTimeout < kIpv6FirstConnectTimeout)
-                                    ? connectTimeout
-                                    : kIpv6FirstConnectTimeout;
-        int v6Err = 0;
-        if (ConnectWithTimeout(socket_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr), v6Timeout,
-                               &v6Err)) {
-            SetSocketTimeout(socket_, SO_RCVTIMEO, connectTimeout);
-            SetSocketTimeout(socket_, SO_SNDTIMEO, connectTimeout);
-            T2_LOG("connect", L"TCP connected: ifIndex=%lu port=%u (waiting for peer HELO)",
-                   interfaceIndex, static_cast<unsigned>(port));
-            // Confirmed working THIS attempt - clear the skip flag left
-            // over from an earlier failure this lock cycle (VPN
-            // disconnected, screen unlocked, resumed from sleep, ...) so
-            // the very next call goes straight back to trying NativeIpv6
-            // first too.
-            t2::transport::RecordNativeIpv6Success();
-        } else if (v6Err == WSAECONNREFUSED) {
-            // COLD-BOOT FIX. A TCP RST means the SYN crossed IPv6 to the T2
-            // and the T2 answered - the IPv6 path WORKS; only this port is
-            // not listening. That is exactly what a stale cached BridgeXPC
-            // port looks like after a cold boot (the T2 rebooted too and
-            // bridgeOS picked a new port; portcache.ini survives the
-            // reboot). This used to fall into the branch below and call
-            // RecordNativeIpv6Failure(), pinning the whole first lock cycle
-            // (= the logon screen after a cold boot) to the slow IPv4
-            // tunnel + tunnel-tuned port scan although IPv6 was fine.
-            // ProbeNativeIpv6Reachable (TransportMode.h) already counts
-            // REFUSED as reachable; this makes Connect() consistent with it.
-            // Report a plain ConnectFailed so discovery moves on to its
-            // next candidate / full scan, still over IPv6.
-            T2_LOG("connect", L"NativeIpv6: RST from peer (WSAECONNREFUSED) - IPv6 path is "
-                   L"alive, port %u is just not listening (stale cached port?); NOT falling "
-                   L"back to Ipv4Tunnel", static_cast<unsigned>(port));
-            closesocket(socket_);
-            socket_ = INVALID_SOCKET;
-            t2::transport::RecordNativeIpv6Success();
-            return ConnectResult::ConnectFailed;
-        } else {
-            // v6 dead: arm tunnel and CONTINUE this Connect() on AF_INET.
-            // Returning ConnectFailed here made discovery/CAPTURE give up on the
-            // first lock after VPN before a clean tunnel+verify could run —
-            // user saw "no reaction"; the next lock (already SkipNative) worked
-            // after ~1.5s. Same-call fallback + PrepareTunnelPeer + new HELO
-            // is the NEW session path; HandleCaptureVerify still sends a fresh
-            // StartMatch/verify on the connection we return.
-            T2_LOG("connect", L"NativeIpv6 first connect did not complete within %lldms "
-                   L"(WSA error=%d) - falling back to Ipv4Tunnel for this attempt "
-                   L"(then fresh HELO + verify on tunnel)",
-                   static_cast<long long>(v6Timeout.count()), v6Err);
-            closesocket(socket_);
-            socket_ = INVALID_SOCKET;
-            t2::transport::RecordNativeIpv6Failure();
-            if (!t2::transport::PushTransportModeToDriver(t2::transport::TransportMode::Ipv4Tunnel)) {
-                // Do not AF_INET blindly with driver still on native rewrite —
-                // that is the "fallback seems to happen but doesn't work" path.
-                T2_LOG("connect", L"NativeIpv6 timed out and T2Ncm.sys could not switch to "
-                       L"tunnel mode - failing this connect for retry "
-                       L"(Dx gate, ACL, or driver not ready)");
-                return ConnectResult::ConnectFailed;
-            }
-            tunnel = true;
-            fellBackFromIpv6 = true;
-        }
-    }
+        tunnel ? t2::transport::TransportMode::Ipv4Tunnel
+               : t2::transport::TransportMode::NativeIpv6);
 
     if (tunnel) {
-        // Seed T2Ncm peer IPv6 + static IPv4 neighbor (ARP) before SYN.
         t2::transport::PrepareTunnelPeer(interfaceIndex, linkLocalAddress);
-        // After VPN flips us to tunnel, the first TX must not race synthesized
-        // local IPv6 (kernel log). One poke per process after mode arm is enough.
-        {
-            static std::atomic<bool> s_datapathWarmed{false};
-            if (fellBackFromIpv6 || !s_datapathWarmed.load(std::memory_order_relaxed)) {
-                t2::transport::ForceTunnelDatapathWarm(interfaceIndex, linkLocalAddress);
-                s_datapathWarmed.store(true, std::memory_order_relaxed);
-            }
-        }
         const in_addr peer4 = t2::transport::MapPeerToIpv4(linkLocalAddress);
         socket_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (socket_ == INVALID_SOCKET) {
             T2_LOG("connect", L"socket(AF_INET) failed, WSAGetLastError=%d", WSAGetLastError());
             return ConnectResult::ConnectFailed;
         }
-        // Force the T2 NCM interface (Cisco/VPN often has a default route that
-        // would otherwise steal 169.254/16).
         DWORD ifIndexNet = htonl(static_cast<DWORD>(interfaceIndex));
         if (setsockopt(socket_, IPPROTO_IP, IP_UNICAST_IF,
                        reinterpret_cast<const char*>(&ifIndexNet),
@@ -339,37 +225,41 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
                peer4.S_un.S_un_b.s_b1, peer4.S_un.S_un_b.s_b2,
                peer4.S_un.S_un_b.s_b3, peer4.S_un.S_un_b.s_b4,
                static_cast<unsigned>(port), interfaceIndex);
-        // If this is a same-call fallback from a timed-out IPv6 attempt,
-        // don't hand the tunnel a fresh full connectTimeout on top of the
-        // 400ms already spent - subtract the elapsed time (floored, so a
-        // near-exhausted caller-supplied budget still gets a small, useful
-        // window rather than 0/negative) so the whole Connect() call stays
-        // bounded close to the caller's original connectTimeout.
-        auto tunnelTimeout = connectTimeout;
-        if (fellBackFromIpv6) {
-            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - attemptStart);
-            const auto remaining = connectTimeout - elapsed;
-            constexpr std::chrono::milliseconds kMinTunnelBudget{300};
-            // Same std::max(...) macro hazard as above — plain comparison.
-            tunnelTimeout = (remaining > kMinTunnelBudget) ? remaining : kMinTunnelBudget;
-        }
         if (!ConnectWithTimeout(socket_, reinterpret_cast<sockaddr*>(&addr4), sizeof(addr4),
-                                 tunnelTimeout)) {
-            T2_LOG("connect", L"connect(AF_INET) failed WSA=%d — need T2Ncm tunnel rewrite + "
-                   L"IPv4 neighbor for mapped 169.254 address",
-                   WSAGetLastError());
+                                 connectTimeout)) {
+            T2_LOG("connect", L"connect(AF_INET) failed WSA=%d", WSAGetLastError());
             Close();
             return ConnectResult::ConnectFailed;
         }
         SetSocketTimeout(socket_, SO_RCVTIMEO, connectTimeout);
         SetSocketTimeout(socket_, SO_SNDTIMEO, connectTimeout);
-        T2_LOG("connect", L"TCP connected (IPv4 tunnel%s): ifIndex=%lu port=%u (waiting for peer HELO)",
-               fellBackFromIpv6 ? L", fallback from timed-out IPv6" : L"",
+        T2_LOG("connect", L"TCP connected (IPv4 tunnel): ifIndex=%lu port=%u (waiting for peer HELO)",
+               interfaceIndex, static_cast<unsigned>(port));
+    } else {
+        socket_ = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+        if (socket_ == INVALID_SOCKET) {
+            T2_LOG("connect", L"socket(AF_INET6) failed, WSAGetLastError=%d", WSAGetLastError());
+            return ConnectResult::ConnectFailed;
+        }
+        sockaddr_in6 addr{};
+        addr.sin6_family = AF_INET6;
+        addr.sin6_port = htons(port);
+        addr.sin6_addr = linkLocalAddress;
+        addr.sin6_scope_id = interfaceIndex;
+        T2_LOG("connect", L"NativeIpv6 ifIndex=%lu port=%u",
+               interfaceIndex, static_cast<unsigned>(port));
+        if (!ConnectWithTimeout(socket_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr),
+                                 connectTimeout)) {
+            T2_LOG("connect", L"connect(AF_INET6) failed WSA=%d", WSAGetLastError());
+            Close();
+            return ConnectResult::ConnectFailed;
+        }
+        SetSocketTimeout(socket_, SO_RCVTIMEO, connectTimeout);
+        SetSocketTimeout(socket_, SO_SNDTIMEO, connectTimeout);
+        T2_LOG("connect", L"TCP connected (Native IPv6): ifIndex=%lu port=%u (waiting for peer HELO)",
                interfaceIndex, static_cast<unsigned>(port));
     }
 
-    // T2 sends HELO first (VERIFIED FROM SOURCE, Milestone 1 section 7).
     RawFrame helo;
     if (!ReadFrame(&helo, connectTimeout) || helo.type != FrameType::Helo) {
         T2_LOG("connect", L"HELO read failed or wrong frame type "

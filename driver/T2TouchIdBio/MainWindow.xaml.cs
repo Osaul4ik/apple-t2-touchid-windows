@@ -37,36 +37,21 @@ namespace T2TouchId.SepVaultGui
             LoadSepStatus();
             LoadLogFlags();
             LoadTransportMode();
-            LoadWarmupStatus();
-            // Poll cold-boot warmup status while the window is open so the
-            // user sees waiting-peer → warming → ok without manual refresh.
-            var warmupTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2) };
-            warmupTimer.Tick += (_, __) => LoadWarmupStatus();
-            warmupTimer.Start();
+        }
+
+        public void RefreshTransportUi()
+        {
+            LoadTransportMode();
         }
 
 
-        // ---- Network transport mode ----
-        // There used to be a SEPARATE, persistent override here
-        // (HKLM\SOFTWARE\T2TouchId\Network\TransportMode, non-volatile) that
-        // the checkbox wrote on its own, independently of the auto
-        // probe/fallback cache Connection.cpp uses at runtime
-        // (SessionRegPath\SkipNativeIpv6Probe, volatile). That let the two
-        // disagree — e.g. a checked box surviving a reboot would silently
-        // pin every future boot to the tunnel, fighting the "always try v6
-        // first at cold boot" default. That override is gone: the checkbox
-        // now reads/writes the exact same session flag Connection.cpp reads
-        // (t2::transport::kSkipNativeIpv6ProbeValue in TransportMode.h) —
-        // checking it has the same effect as a real NativeIpv6 probe failure
-        // (skip straight to Ipv4Tunnel until the next unlock), and
-        // unchecking it has the same effect as a probe success (try
-        // NativeIpv6 again on the very next connect). Because the key is
-        // volatile it never survives a reboot, matching that same default.
+        // ---- Network transport mode (manual only) ----
+        // Session flag: HKLM\SOFTWARE\T2TouchId\Network\Session\SkipNativeIpv6Probe
+        // Live: IOCTL to \\.\T2Ncm + optional peer push + TCP warm poke.
         private const string SessionRegPath = @"SOFTWARE\T2TouchId\Network\Session";
+        private const string NetworkRegPath = @"SOFTWARE\T2TouchId\Network";
         private const string SkipNativeIpv6ProbeValue = "SkipNativeIpv6Probe";
-        private const string ColdBootWarmupDoneValue = "ColdBootWarmupDone";
-        private const string WarmupStatusValue = "WarmupStatus";
-        private const string WarmupDetailValue = "WarmupDetail";
+        private const string PeerIpv6Value = "PeerIpv6";
         private bool _transportLoading;
 
         private void LoadTransportMode()
@@ -77,16 +62,21 @@ namespace T2TouchId.SepVaultGui
                 bool tunnel = false;
                 try
                 {
-                    using var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(SessionRegPath, false);
+                    using var key = Registry.LocalMachine.OpenSubKey(SessionRegPath, false);
                     if (key?.GetValue(SkipNativeIpv6ProbeValue) is int i)
                         tunnel = i != 0;
                 }
-                catch { /* default native - matches cold-boot default */ }
+                catch { /* default native */ }
                 Ipv4TunnelCheck.IsChecked = tunnel;
                 TransportStatusText.Text = tunnel
-                    ? "Режим цього сеансу: IPv4 tunnel (SkipNativeIpv6Probe=1)."
-                    : "Режим цього сеансу: Native IPv6 (SkipNativeIpv6Probe не встановлено).";
+                    ? "Режим: IPv4 tunnel (ручний)."
+                    : "Режим: Native IPv6 (ручний).";
                 TransportStatusText.Foreground = new SolidColorBrush(Color.FromRgb(0x66, 0x66, 0x66));
+                if (WarmupStatusText != null)
+                {
+                    WarmupStatusText.Text = "Авто-перемикання вимкнено. Використовуйте чекбокс або cmd: --tunnel / --native";
+                    WarmupDetailText.Text = "Приклад: SepVaultGui.exe --tunnel --quit";
+                }
             }
             finally
             {
@@ -94,103 +84,73 @@ namespace T2TouchId.SepVaultGui
             }
         }
 
+        /// <summary>
+        /// Apply transport from GUI checkbox or command line. Warms immediately
+        /// (registry + live mode IOCTL + peer IOCTL + throwaway TCP SYN).
+        /// </summary>
+        public static bool ApplyTransportFromCommandLine(bool tunnel)
+        {
+            return ApplyTransportCore(tunnel, out string status);
+        }
 
-        private void LoadWarmupStatus()
+        private static bool ApplyTransportCore(bool tunnel, out string status)
         {
             try
             {
-                using var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(SessionRegPath, false);
-                if (key == null)
+                using (var key = Registry.LocalMachine.CreateSubKey(SessionRegPath, true))
                 {
-                    WarmupStatusText.Text = "idle — ще не було unlock після першого Match";
-                    WarmupDetailText.Text = "";
-                    return;
+                    if (key == null)
+                    {
+                        status = "Не вдалось відкрити Session key";
+                        return false;
+                    }
+                    if (tunnel)
+                        key.SetValue(SkipNativeIpv6ProbeValue, 1, RegistryValueKind.DWord);
+                    else
+                        key.DeleteValue(SkipNativeIpv6ProbeValue, throwOnMissingValue: false);
                 }
-                var done = key.GetValue(ColdBootWarmupDoneValue);
-                var status = key.GetValue(WarmupStatusValue) as string;
-                var detail = key.GetValue(WarmupDetailValue) as string;
-                if (status == null || status.Length == 0)
+
+                bool pushed = PushTransportModeToDriver(tunnel ? 1 : 0);
+                bool peerOk = true;
+                if (tunnel)
                 {
-                    WarmupStatusText.Text = done is int i && i != 0
-                        ? "done (статус не записано)"
-                        : "idle — ще не було unlock після першого Match";
-                    WarmupDetailText.Text = "";
-                    return;
+                    peerOk = PushPersistedPeerToDriver();
+                    // Best-effort datapath warm so T2Ncm learns local addresses.
+                    WarmTunnelDatapathFromPersistedPeer();
                 }
-                WarmupStatusText.Text = status;
-                WarmupDetailText.Text = detail ?? "";
-                if (status == "ok")
-                    WarmupStatusText.Foreground = new SolidColorBrush(Color.FromRgb(0x2E, 0x7D, 0x32));
-                else if (status != null && status.StartsWith("failed"))
-                    WarmupStatusText.Foreground = DotError;
-                else
-                    WarmupStatusText.Foreground = new SolidColorBrush(Color.FromRgb(0x66, 0x66, 0x66));
+
+                status = tunnel
+                    ? (pushed
+                        ? "IPv4 tunnel увімкнено (registry + live IOCTL" + (peerOk ? ", peer" : ", peer skip") + ", warm)."
+                        : "IPv4 tunnel: registry OK, але \\\\.\\T2Ncm недоступний.")
+                    : (pushed
+                        ? "Native IPv6 увімкнено (registry + live IOCTL)."
+                        : "Native IPv6: registry OK, але \\\\.\\T2Ncm недоступний.");
+                return true;
             }
-            catch
+            catch (UnauthorizedAccessException)
             {
-                WarmupStatusText.Text = "(немає доступу до HKLM Session)";
-                WarmupDetailText.Text = "";
+                status = "Немає прав на HKLM — запустіть від імені адміністратора.";
+                return false;
+            }
+            catch (Exception ex)
+            {
+                status = "Помилка: " + ex.Message;
+                return false;
             }
         }
 
         private void OnTransportModeChanged(object sender, RoutedEventArgs e)
         {
             if (_transportLoading) return;
-            try
-            {
-                bool tunnel = Ipv4TunnelCheck.IsChecked == true;
-                // RegistryOptions.Volatile matters only for the FIRST-EVER
-                // creation of this key - if Connection.cpp already created it
-                // (RecordNativeIpv6Failure, TransportMode.h) this just opens
-                // the existing volatile key as-is. Without it, a GUI-first
-                // creation would leave a plain (non-volatile) key behind that
-                // DOES survive a reboot - exactly the bug this change removes.
-                using var key = Microsoft.Win32.Registry.LocalMachine.CreateSubKey(
-                    SessionRegPath, RegistryKeyPermissionCheck.ReadWriteSubTree,
-                    Microsoft.Win32.RegistryOptions.Volatile);
-                if (key == null)
-                    throw new UnauthorizedAccessException();
-                if (tunnel)
-                    key.SetValue(SkipNativeIpv6ProbeValue, 1, Microsoft.Win32.RegistryValueKind.DWord);
-                else
-                    key.DeleteValue(SkipNativeIpv6ProbeValue, throwOnMissingValue: false);
-
-                // Push it into the already-running adapter too, via
-                // IOCTL_T2NCM_SET_TRANSPORT_MODE, so toggling the checkbox
-                // works immediately on the next connect attempt without
-                // waiting for T2Ncm to reinitialize. 169.254.84.1 still needs
-                // to be on the T2Ncm adapter for tunnel mode either way.
-                bool pushedLive = PushTransportModeToDriver(tunnel ? 1 : 0);
-                string liveNote = pushedLive
-                    ? " Застосовано одразу."
-                    : " Буде застосовано при наступному підключенні T2Ncm (драйвер зараз недоступний).";
-                TransportStatusText.Text = (tunnel
-                    ? "Цей сеанс: IPv4 tunnel. Додайте 169.254.84.1 на адаптер T2Ncm, якщо ще не додано."
-                    : "Цей сеанс: Native IPv6 (спробується знову на наступному підключенні).") + liveNote
-                    + " Скидається при перезавантаженні.";
-                TransportStatusText.Foreground = DotOk;
-            }
-            catch (UnauthorizedAccessException)
-            {
-                TransportStatusText.Text = "Немає прав на HKLM — запустіть GUI від імені адміністратора.";
-                TransportStatusText.Foreground = DotError;
-            }
-            catch (Exception ex)
-            {
-                TransportStatusText.Text = "Помилка запису: " + ex.Message;
-                TransportStatusText.Foreground = DotError;
-            }
+            bool tunnel = Ipv4TunnelCheck.IsChecked == true;
+            bool ok = ApplyTransportCore(tunnel, out string status);
+            TransportStatusText.Text = status;
+            TransportStatusText.Foreground = ok ? DotOk : DotError;
         }
 
-        // ---- Live push to the running T2Ncm.sys (\\.\T2Ncm) ----
-        // IOCTL_T2NCM_SET_TRANSPORT_MODE = CTL_CODE(FILE_DEVICE_UNKNOWN=0x22,
-        // 0x903, METHOD_BUFFERED, FILE_WRITE_ACCESS) — computed the same way
-        // public.h's CTL_CODE macro does, same one-literal approach
-        // SepStatusClient.cs already uses for IOCTL_T2_GET_BOOTSTRAP_STATUS.
-        // T2Ncm.sys is reached through a fixed symbolic link
-        // (T2NCM_USER_DEVICE_PATH in public.h), not a device interface GUID,
-        // so this needs no SetupDi enumeration — just CreateFileW it directly.
         private const uint IOCTL_T2NCM_SET_TRANSPORT_MODE = 0x0022A40C;
+        private const uint IOCTL_T2NCM_SET_TUNNEL_PEER = 0x0022A408;
         private const string T2NcmDevicePath = @"\\.\T2Ncm";
 
         private const uint GENERIC_WRITE = 0x40000000;
@@ -213,13 +173,16 @@ namespace T2TouchId.SepVaultGui
 
         [DllImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool DeviceIoControl(
+            IntPtr hDevice, uint dwIoControlCode,
+            byte[] lpInBuffer, uint nInBufferSize,
+            IntPtr lpOutBuffer, uint nOutBufferSize,
+            out uint lpBytesReturned, IntPtr lpOverlapped);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool CloseHandle(IntPtr hObject);
 
-        // Returns false (never throws) whenever T2Ncm.sys isn't loaded/the
-        // adapter isn't present right now — the registry write above is
-        // what matters for correctness; this is best-effort immediacy on
-        // top of it, same "don't block the setting on the device being
-        // there" shape as PushTunnelPeerToDriver in TransportMode.h.
         private static bool PushTransportModeToDriver(int mode)
         {
             IntPtr handle = CreateFileW(T2NcmDevicePath, GENERIC_WRITE,
@@ -238,12 +201,59 @@ namespace T2TouchId.SepVaultGui
             }
         }
 
+        private static bool PushPersistedPeerToDriver()
+        {
+            try
+            {
+                using var key = Registry.LocalMachine.OpenSubKey(NetworkRegPath, false);
+                if (key?.GetValue(PeerIpv6Value) is not byte[] peer || peer.Length != 16)
+                    return false;
+                IntPtr handle = CreateFileW(T2NcmDevicePath, GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE, IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero);
+                if (handle == new IntPtr(-1))
+                    return false;
+                try
+                {
+                    return DeviceIoControl(handle, IOCTL_T2NCM_SET_TUNNEL_PEER,
+                        peer, (uint)peer.Length, IntPtr.Zero, 0, out _, IntPtr.Zero);
+                }
+                finally
+                {
+                    CloseHandle(handle);
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        // Map last 4 bytes of fe80 to 169.254.x.y (same as MapPeerToIpv4 in TransportMode.h)
+        // and fire a short non-blocking TCP connect so T2Ncm sees outbound tunnel frames.
+        private static void WarmTunnelDatapathFromPersistedPeer()
+        {
+            try
+            {
+                using var key = Registry.LocalMachine.OpenSubKey(NetworkRegPath, false);
+                if (key?.GetValue(PeerIpv6Value) is not byte[] peer || peer.Length != 16)
+                    return;
+                // in6_addr last 4 bytes at offset 12
+                var ip = new System.Net.IPAddress(new byte[] { 169, 254, peer[14], peer[15] });
+                using var client = new System.Net.Sockets.TcpClient();
+                var ar = client.BeginConnect(ip, 1, null, null);
+                ar.AsyncWaitHandle.WaitOne(TimeSpan.FromMilliseconds(100));
+                try { client.Close(); } catch { }
+            }
+            catch
+            {
+                /* best-effort */
+            }
+        }
 
         private void OnRefreshStatus(object sender, RoutedEventArgs e)
         {
             LoadSepStatus();
             LoadTransportMode();
-            LoadWarmupStatus();
         }
 
         // ---- Per-driver DebugView logging (HKLM\SOFTWARE\T2TouchId\Logging) ----
