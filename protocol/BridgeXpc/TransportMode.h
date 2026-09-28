@@ -499,7 +499,7 @@ inline ULONGLONG GetRealSuspendGeneration() {
 // Allow cold-boot warmup to be retried after a Dx-interrupted attempt.
 inline void ClearColdBootWarmupDoneForRetry() {
     HKEY key = nullptr;
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kSessionKeyPath, 0, KEY_SET_VALUE, &key) != ERROR_SUCCESS) {
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kSessionRegPath, 0, KEY_SET_VALUE, &key) != ERROR_SUCCESS) {
         return;
     }
     RegDeleteValueW(key, L"ColdBootWarmupDone");
