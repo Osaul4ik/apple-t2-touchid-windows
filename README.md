@@ -65,6 +65,8 @@ That will:
 
 In Device Manager you should see healthy nodes for transport, NCM adapter, and a biometric device (no Code 43).
 
+### 1.1 REBOOT!
+
 ### 2. Copy `user.kb` from macOS
 
 Boot into **macOS**, log in as the account whose Touch ID you want on Windows.
