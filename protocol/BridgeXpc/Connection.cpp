@@ -223,6 +223,16 @@ ConnectResult Connection::ConnectOnce(bool tunnel, const in6_addr& linkLocalAddr
         tunnel ? t2::transport::TransportMode::Ipv4Tunnel
                : t2::transport::TransportMode::NativeIpv6);
 
+    // Winsock must be up before the first socket() in this process. Until now
+    // only PortScan/RemoteXpc called EnsureWinsock(), so on a cold boot the very
+    // first ConnectOnce in a fresh WUDFHost died with WSA=10093
+    // (WSANOTINITIALISED), was reported as "cached port did not answer" and the
+    // first verify after boot paid for a full discovery pass. Idempotent.
+    if (!t2::EnsureWinsock()) {
+        T2_LOG("connect", L"WSAStartup failed");
+        return ConnectResult::ConnectFailed;
+    }
+
     const ULONGLONG tcpStart = GetTickCount64();
     int wsa = 0;
     if (tunnel) {
