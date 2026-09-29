@@ -654,6 +654,18 @@ T2NcmApplyPacketFilter(
         T2NcmReadPacketFilter(DeviceContext),
         DeviceContext->MacAddressIsPermanent);
 
+    // Skip the control transfer when the device already holds exactly
+    // this filter. CdcPacketFilterApplied is cleared by
+    // T2NcmUsbActivateDataInterface on every SET_INTERFACE (the device
+    // drops its filter then), so a TRUE flag here means the value in
+    // CdcPacketFilter is what the device is really holding. Removes the
+    // 4-5 identical back-to-back requests seen right after arm/restart.
+    if (DeviceContext->CdcPacketFilterApplied &&
+        DeviceContext->CdcPacketFilter == desired)
+    {
+        return STATUS_SUCCESS;
+    }
+
     return T2NcmSetEthernetPacketFilter(DeviceContext, desired);
 }
 

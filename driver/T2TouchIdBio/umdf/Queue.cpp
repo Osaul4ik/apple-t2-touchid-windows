@@ -1282,8 +1282,10 @@ bool ConnectForCapture(t2::bridgexpc::Connection* outConn)
 // 120s was pre-cache; 30s still covers cold-boot NCM lag without a long hang
 // when the adapter is truly missing.
 constexpr ULONGLONG kConnectRetryWindowMs = 30000;
-constexpr DWORD kConnectRetryFirstMs = 200;
-constexpr DWORD kConnectRetryMaxMs = 2000;
+// Back-off before reconnecting a dropped BridgeXPC session (was 200 ms).
+constexpr DWORD kSessionReconnectBackoffMs = 50;
+constexpr DWORD kConnectRetryFirstMs = 50;   // was 200: steady-state connect is 0-16 ms, so the first retry should be quick
+constexpr DWORD kConnectRetryMaxMs = 1000;   // was 2000: caps worst-case wait after NCM becomes ready
 
 enum class ConnectWait { Connected, Cancelled, GaveUp };
 
@@ -1592,9 +1594,9 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
                 // Cancellable: a WBF cancel / suspend during the back-off no
                 // longer has to wait it out (the check right below sees it).
                 if (cancelEvent) {
-                    WaitForSingleObject(cancelEvent, 200);
+                    WaitForSingleObject(cancelEvent, kSessionReconnectBackoffMs);
                 } else {
-                    Sleep(200);
+                    Sleep(kSessionReconnectBackoffMs);
                 }
             }
 
