@@ -184,15 +184,9 @@ inline void EnsureNetworkChangeWatch() {
 inline std::atomic<DWORD> g_nativeEmaMs{0};
 inline std::chrono::milliseconds NativeConnectBudget(std::chrono::milliseconds cap) {
     const DWORD ema = g_nativeEmaMs.load(std::memory_order_relaxed);
-    // 29.09.2026: until one native connect has succeeded in THIS process (ema == 0,
-    // i.e. right after a cold boot) the neighbor table is empty and NDP + the T2's
-    // bridgeOS listener still have to warm up; 150 ms was measured on a warm link
-    // and made the very first native attempt after boot fail (WSA=10060 at 156 ms),
-    // which committed the IPv4 tunnel for the rest of the process. Give that one
-    // unmeasured attempt 400 ms; once ema is known the 60..250 ms rule applies.
-    long long ms = (ema == 0) ? 400 : static_cast<long long>(ema) * 4 + 30;
+    long long ms = (ema == 0) ? 150 : static_cast<long long>(ema) * 4 + 30;
     if (ms < 60) ms = 60;
-    if (ms > ((ema == 0) ? 400 : 250)) ms = (ema == 0) ? 400 : 250;
+    if (ms > 250) ms = 250;
     if (cap.count() < ms) ms = cap.count();
     return std::chrono::milliseconds(ms);
 }
@@ -203,29 +197,6 @@ inline void RecordNativeSuccess(ULONGLONG tcpMs) {
     if (next == 0) next = 1;
     g_nativeEmaMs.store(next, std::memory_order_relaxed);
     g_autoTunnel.store(false, std::memory_order_relaxed);
-}
-// 29.09.2026 (cold boot): may a native TCP failure be turned into a STICKY switch
-// to the IPv4 tunnel? Only when the failure looks like a blocked path (VPN/WFP)
-// and not like a link that has not come up yet:
-//   * native already worked once in this process (ema != 0) -> it broke later
-//     (VPN connected, lock screen policy) -> latch, as before;
-//   * native has NEVER worked here -> the T2 link is probably still cold after
-//     boot (empty neighbor table, bridgeOS listener not up). Answer this call
-//     through the tunnel if it works, but only latch after the failures have
-//     lasted kColdNativeGraceMs, so one cold first attempt cannot pin the whole
-//     process to the (more fragile) tunnel. Before 22:07 today the WSANOTINITIALISED
-//     bug made the first attempt never reach the network, which hid this.
-inline constexpr ULONGLONG kColdNativeGraceMs = 8000;
-inline std::atomic<ULONGLONG> g_firstNativeFailTick{0};
-inline bool ShouldLatchAutoTunnel() {
-    if (g_nativeEmaMs.load(std::memory_order_relaxed) != 0) return true;
-    const ULONGLONG now = GetTickCount64();
-    ULONGLONG first = g_firstNativeFailTick.load(std::memory_order_relaxed);
-    if (first == 0) {
-        g_firstNativeFailTick.store(now, std::memory_order_relaxed);
-        return false;
-    }
-    return now - first >= kColdNativeGraceMs;
 }
 // Tunnel handshake completed after native failed: remember it.
 inline void CommitAutoTunnel(bool on) {
@@ -495,28 +466,20 @@ inline void RememberLastPushedLocal(const in6_addr& a) {
 struct ArpPrepCacheState {
     std::mutex mu;
     in6_addr peer{};
-    unsigned long ifIndex = 0;   // the static ARP row lives on ONE interface
     bool valid = false;
 };
 inline ArpPrepCacheState& ArpPrepCache() {
     static ArpPrepCacheState s;
     return s;
 }
-// 29.09.2026: keyed by (ifIndex, peer), not the peer alone. The T2 peer's
-// link-local address is derived from its MAC and stays the same when the NCM
-// adapter is re-enumerated (driver update/reinstall, cold boot) - but its
-// ifIndex changes (log: 2 -> 17). With a peer-only key the cache said "already
-// prepared" and skipped creating the static IPv4 ARP row on the NEW interface,
-// so the first tunnel connect waited out its whole 2000 ms with nowhere to go.
-inline bool IsArpAlreadyPrepared(unsigned long ifIndex, const in6_addr& peer6) {
+inline bool IsArpAlreadyPrepared(const in6_addr& peer6) {
     std::lock_guard<std::mutex> lock(ArpPrepCache().mu);
-    return ArpPrepCache().valid && ArpPrepCache().ifIndex == ifIndex &&
+    return ArpPrepCache().valid &&
            std::memcmp(&ArpPrepCache().peer, &peer6, sizeof(in6_addr)) == 0;
 }
-inline void RememberArpPrepared(unsigned long ifIndex, const in6_addr& peer6) {
+inline void RememberArpPrepared(const in6_addr& peer6) {
     std::lock_guard<std::mutex> lock(ArpPrepCache().mu);
     ArpPrepCache().peer = peer6;
-    ArpPrepCache().ifIndex = ifIndex;
     ArpPrepCache().valid = true;
 }
 inline void ClearLastPushedPeer() {
@@ -745,7 +708,7 @@ inline void PrepareTunnelPeer(unsigned long ifIndex, const in6_addr& peer6) {
     // still publishes the peer to the registry and (via the existing
     // IsSameAsLastPushedPeer dedupe inside it) pushes it to the driver,
     // both of which are already cheap early-outs.
-    if (IsArpAlreadyPrepared(ifIndex, peer6)) {
+    if (IsArpAlreadyPrepared(peer6)) {
         PublishTunnelPeer(peer6, nullptr);
         PushTunnelPeerToDriver(peer6);
         PushTunnelLocalToDriver(ifIndex);
@@ -776,7 +739,7 @@ inline void PrepareTunnelPeer(unsigned long ifIndex, const in6_addr& peer6) {
     PushTunnelLocalToDriver(ifIndex);
     if (haveMac) {
         EnsureTunnelIpv4Neighbor(ifIndex, MapPeerToIpv4(peer6), mac);
-        RememberArpPrepared(ifIndex, peer6);
+        RememberArpPrepared(peer6);
     }
 }
 

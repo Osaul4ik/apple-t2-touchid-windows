@@ -223,16 +223,6 @@ ConnectResult Connection::ConnectOnce(bool tunnel, const in6_addr& linkLocalAddr
         tunnel ? t2::transport::TransportMode::Ipv4Tunnel
                : t2::transport::TransportMode::NativeIpv6);
 
-    // Winsock must be up before the first socket() in this process. Until now
-    // only PortScan/RemoteXpc called EnsureWinsock(), so on a cold boot the very
-    // first ConnectOnce in a fresh WUDFHost died with WSA=10093
-    // (WSANOTINITIALISED), was reported as "cached port did not answer" and the
-    // first verify after boot paid for a full discovery pass. Idempotent.
-    if (!t2::EnsureWinsock()) {
-        T2_LOG("connect", L"WSAStartup failed");
-        return ConnectResult::ConnectFailed;
-    }
-
     const ULONGLONG tcpStart = GetTickCount64();
     int wsa = 0;
     if (tunnel) {
@@ -349,21 +339,8 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
         tunnel = false;
     }
 
-    // 29.09.2026: with auto-switch on, a tunnel-first attempt must not be
-    // allowed to burn the caller's whole timeout (log: 2000 ms on a dead tunnel,
-    // then native 150 ms, then the Windows CancelIoEx arrived before anything
-    // else could run). A live tunnel handshake takes tens of ms; if it has not
-    // completed in kTunnelFirstTcpMs the prep is stale - fail fast, the
-    // cache is invalidated and the retry re-prepares the ARP/peer state.
-    constexpr long long kTunnelFirstTcpMs = 800;
-    std::chrono::milliseconds firstTcp = connectTimeout;
-    if (autoSwitch) {
-        if (!tunnel) {
-            firstTcp = tp::NativeConnectBudget(connectTimeout);
-        } else if (firstTcp.count() > kTunnelFirstTcpMs) {
-            firstTcp = std::chrono::milliseconds(kTunnelFirstTcpMs);
-        }
-    }
+    const std::chrono::milliseconds firstTcp =
+        (autoSwitch && !tunnel) ? tp::NativeConnectBudget(connectTimeout) : connectTimeout;
     bool tcpFailed = false;
     ULONGLONG tcpMs = 0;
     const ULONGLONG t0 = GetTickCount64();
@@ -391,7 +368,7 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
     ConnectResult r2 = ConnectOnce(other, linkLocalAddress, interfaceIndex, port,
                                    fallbackTcp, connectTimeout, &tcpFailed2, &tcpMs2);
     if (!tcpFailed2) {
-        if (other && tp::ShouldLatchAutoTunnel()) tp::CommitAutoTunnel(true);
+        if (other) tp::CommitAutoTunnel(true);
         else       tp::RecordNativeSuccess(tcpMs2);
         T2_LOG("connect", L"auto-switch: %s -> %s after %llu ms (%s)",
                tunnel ? L"IPv4 tunnel" : L"Native IPv6", other ? L"IPv4 tunnel" : L"Native IPv6",
