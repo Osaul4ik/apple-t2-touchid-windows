@@ -204,6 +204,29 @@ inline void RecordNativeSuccess(ULONGLONG tcpMs) {
     g_nativeEmaMs.store(next, std::memory_order_relaxed);
     g_autoTunnel.store(false, std::memory_order_relaxed);
 }
+// 29.09.2026 (cold boot): may a native TCP failure be turned into a STICKY switch
+// to the IPv4 tunnel? Only when the failure looks like a blocked path (VPN/WFP)
+// and not like a link that has not come up yet:
+//   * native already worked once in this process (ema != 0) -> it broke later
+//     (VPN connected, lock screen policy) -> latch, as before;
+//   * native has NEVER worked here -> the T2 link is probably still cold after
+//     boot (empty neighbor table, bridgeOS listener not up). Answer this call
+//     through the tunnel if it works, but only latch after the failures have
+//     lasted kColdNativeGraceMs, so one cold first attempt cannot pin the whole
+//     process to the (more fragile) tunnel. Before 22:07 today the WSANOTINITIALISED
+//     bug made the first attempt never reach the network, which hid this.
+inline constexpr ULONGLONG kColdNativeGraceMs = 8000;
+inline std::atomic<ULONGLONG> g_firstNativeFailTick{0};
+inline bool ShouldLatchAutoTunnel() {
+    if (g_nativeEmaMs.load(std::memory_order_relaxed) != 0) return true;
+    const ULONGLONG now = GetTickCount64();
+    ULONGLONG first = g_firstNativeFailTick.load(std::memory_order_relaxed);
+    if (first == 0) {
+        g_firstNativeFailTick.store(now, std::memory_order_relaxed);
+        return false;
+    }
+    return now - first >= kColdNativeGraceMs;
+}
 // Tunnel handshake completed after native failed: remember it.
 inline void CommitAutoTunnel(bool on) {
     g_autoTunnel.store(on, std::memory_order_relaxed);

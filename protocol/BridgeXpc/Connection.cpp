@@ -391,7 +391,7 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
     ConnectResult r2 = ConnectOnce(other, linkLocalAddress, interfaceIndex, port,
                                    fallbackTcp, connectTimeout, &tcpFailed2, &tcpMs2);
     if (!tcpFailed2) {
-        if (other) tp::CommitAutoTunnel(true);
+        if (other && tp::ShouldLatchAutoTunnel()) tp::CommitAutoTunnel(true);
         else       tp::RecordNativeSuccess(tcpMs2);
         T2_LOG("connect", L"auto-switch: %s -> %s after %llu ms (%s)",
                tunnel ? L"IPv4 tunnel" : L"Native IPv6", other ? L"IPv4 tunnel" : L"Native IPv6",
