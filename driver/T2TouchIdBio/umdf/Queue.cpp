@@ -699,7 +699,12 @@ ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_
         // Connect/LockRefresh/warmup must not arm tunnel while miniport is paused.
         t2::transport::SetTransportIoSuspended(true);
         t2::transport::BumpRealSuspendGeneration();
-        t2::transport::RequestNativeReprobe(); // link/VPN state may differ after Sx
+        // Do not RequestNativeReprobe() here: VPN up/down is already covered by
+        // NotifyIpInterfaceChange -> RequestNativeReprobe(). Re-probing on every
+        // Sx under a persistent VPN causes a failed native probe + TunnelMode
+        // flip and can leave the next CAPTURE in MatchingCancelled. Unlock
+        // (WTS_SESSION_UNLOCK) and interface-change still restore Native IPv6
+        // when the VPN actually goes away.
         std::lock_guard<std::mutex> commitLock(g_captureRequestCommitMu);
         BeginCaptureSuspend("OnSuspendResume(PBT_APMSUSPEND)");
     } else if (Type == PBT_APMRESUMESUSPEND || Type == PBT_APMRESUMEAUTOMATIC) {
