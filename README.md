@@ -10,7 +10,7 @@ This project talks to the same Secure Enclave and fingerprint sensor that macOS 
 
 ---
 
-## What you get
+## ✨ What you get
 
 | Piece | Role |
 |--------|------|
@@ -25,7 +25,7 @@ After setup: power button can turn the display off and lock the PC; Touch ID can
 
 ---
 
-## Disclaimer
+## ⚠️ Disclaimer
 
 Experimental research software. **No warranty.**
 
@@ -35,7 +35,7 @@ Use only on a machine you can afford to break, and only if you understand the st
 
 ---
 
-## Requirements
+## 📋 Requirements
 
 - Intel MacBook **with T2**, Windows 10/11 x64 via Boot Camp  
 - macOS still bootable (needed once to copy `user.kb`)  
@@ -49,7 +49,7 @@ bcdedit /set testsigning on
 
 ---
 
-## Quick start
+## 🚀 Quick start
 
 ### 1. Install drivers
 
@@ -98,7 +98,7 @@ Enrollment still relies on identities already present in the SEP from macOS; thi
 
 ---
 
-## SepVault GUI options
+## ⚙️ T2TouchID_GUI options
 
 | Option | Default | Meaning |
 |--------|---------|---------|
@@ -110,7 +110,7 @@ Developer tools (logging, transport override) stay hidden until you enable **Dev
 
 ---
 
-## Network transport
+## 🌐 Network transport
 
 BridgeXPC needs a working path to the T2:
 
@@ -121,13 +121,13 @@ The GUI can force a mode under Developer tools if needed.
 
 ---
 
-## CLI (`t2touchid.exe`)
+## 💻 CLI (`t2touchid.exe`)
 
 Optional diagnostics: connect, identities, verify, bootstrap-related commands. Prefer the GUI for day-to-day setup. See `tools/t2touchid/` and design docs for command details.
 
 ---
 
-## Troubleshooting
+## 🛠️ Troubleshooting
 
 | Symptom | What to check |
 |---------|----------------|
@@ -141,7 +141,7 @@ More detail: `driver/T2TouchIdBio/docs/`, `T2NCM/docs/`.
 
 ---
 
-## Safety notes
+## 🔐 Safety notes
 
 - **Unsigned drivers** — test signing only; do not use on a production-only machine.  
 - **SEP is shared with FileVault** — a bad unlock sequence is not “just another driver bug.”  
@@ -150,7 +150,7 @@ More detail: `driver/T2TouchIdBio/docs/`, `T2NCM/docs/`.
 
 ---
 
-## Repository layout
+## 📁 Repository layout
 ```
 driver/T2TouchIdTransport/   KMDF SEP PCI driver
 driver/T2TouchIdBio/         WBDI biometric stack, GUI, bootstrap service
