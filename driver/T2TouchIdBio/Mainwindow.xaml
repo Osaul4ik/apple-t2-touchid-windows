@@ -27,6 +27,8 @@
         <SolidColorBrush x:Key="BrushSurfaceAlt" Color="#F9FAFB"/>
         <SolidColorBrush x:Key="BrushDanger" Color="#DC2626"/>
         <SolidColorBrush x:Key="BrushDangerSoft" Color="#FEF2F2"/>
+        <SolidColorBrush x:Key="BrushGreen" Color="#16A34A"/>
+        <SolidColorBrush x:Key="BrushGreenSoft" Color="#F0FDF4"/>
         <SolidColorBrush x:Key="BrushAmber" Color="#D97706"/>
         <SolidColorBrush x:Key="BrushAmberSoft" Color="#FEF3C7"/>
 
@@ -428,7 +430,7 @@
                     </StackPanel>
                 </Border>
 
-                <!-- ===================== Keybag import card ===================== -->
+                <!-- ===================== macOS Keybag card ===================== -->
                 <Border Style="{StaticResource Card}">
                     <StackPanel>
                         <Grid Margin="0,0,0,16">
@@ -440,46 +442,67 @@
                                 <TextBlock Style="{StaticResource IconGlyph}" Text="&#xE72E;"/>
                             </Border>
                             <StackPanel Grid.Column="1">
-                                <TextBlock Style="{StaticResource CardTitle}" Text="One-time keybag import"/>
+                                <TextBlock Style="{StaticResource CardTitle}" Text="macOS Keybag"/>
                                 <TextBlock Style="{StaticResource CardHint}" Margin="0,2,0,0"
                                            Text="user.kb is encrypted with DPAPI (machine scope) and stored in %ProgramData%\T2TouchId\sep-vault.bin. T2SepBootstrap reads it on every cold start."/>
                             </StackPanel>
                         </Grid>
 
-                        <TextBlock Style="{StaticResource FieldLabel}" Text="Keybag file"/>
-                        <Grid Margin="0,0,0,14">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="*"/>
-                                <ColumnDefinition Width="Auto"/>
-                            </Grid.ColumnDefinitions>
-                            <TextBox x:Name="KeybagPathBox" Grid.Column="0" IsReadOnly="True" Margin="0,0,10,0"/>
-                            <Button Grid.Column="1" Content="Browse…" Style="{StaticResource SecondaryButton}"
-                                    Click="OnBrowseKeybag"/>
-                        </Grid>
+                        <!-- Shown when sep-vault.bin already exists -->
+                        <StackPanel x:Name="VaultConfiguredPanel" Visibility="Collapsed">
+                            <Border Background="{StaticResource BrushGreenSoft}" CornerRadius="10" Padding="14,12" Margin="0,0,0,14">
+                                <StackPanel Orientation="Horizontal">
+                                    <TextBlock Text="&#xE73E;" FontFamily="Segoe MDL2 Assets" FontSize="18"
+                                               Foreground="{StaticResource BrushGreen}" VerticalAlignment="Center" Margin="0,0,10,0"/>
+                                    <StackPanel>
+                                        <TextBlock x:Name="VaultConfiguredTitle" Text="Keybag is configured"
+                                                   FontWeight="SemiBold" Foreground="{StaticResource BrushGreen}"/>
+                                        <TextBlock x:Name="VaultConfiguredHint" Style="{StaticResource CardHint}" Margin="0,2,0,0"
+                                                   Text="sep-vault.bin is present. T2SepBootstrap will use it on the next cold boot."/>
+                                    </StackPanel>
+                                </StackPanel>
+                            </Border>
+                            <Button Content="Clear keybag" Style="{StaticResource SecondaryButton}"
+                                    HorizontalAlignment="Left" Click="OnClearKeybag"/>
+                        </StackPanel>
 
-                        <Grid Margin="0,0,0,8">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="150"/>
-                                <ColumnDefinition Width="12"/>
-                                <ColumnDefinition Width="*"/>
-                            </Grid.ColumnDefinitions>
-                            <StackPanel Grid.Column="0">
-                                <TextBlock Style="{StaticResource FieldLabel}" Text="Special bag ID"/>
-                                <TextBox x:Name="SpecialBagBox" Text="-501"/>
-                            </StackPanel>
-                            <StackPanel Grid.Column="2">
-                                <TextBlock Style="{StaticResource FieldLabel}" Text="Password"/>
-                                <PasswordBox x:Name="PasswordBox"/>
-                            </StackPanel>
-                        </Grid>
+                        <!-- Shown when no vault (or after clear) -->
+                        <StackPanel x:Name="VaultImportPanel">
+                            <TextBlock Style="{StaticResource FieldLabel}" Text="Keybag file"/>
+                            <Grid Margin="0,0,0,14">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBox x:Name="KeybagPathBox" Grid.Column="0" IsReadOnly="True" Margin="0,0,10,0"/>
+                                <Button Grid.Column="1" Content="Browse…" Style="{StaticResource SecondaryButton}"
+                                        Click="OnBrowseKeybag"/>
+                            </Grid>
 
-                        <TextBlock Style="{StaticResource CardHint}" FontStyle="Italic" Margin="0,0,0,14"
-                                   Text="The same password is used for unlock(handle) and unlock(special bag)."/>
+                            <Grid Margin="0,0,0,8">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="150"/>
+                                    <ColumnDefinition Width="12"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <StackPanel Grid.Column="0">
+                                    <TextBlock Style="{StaticResource FieldLabel}" Text="Special bag ID"/>
+                                    <TextBox x:Name="SpecialBagBox" Text="-501"/>
+                                </StackPanel>
+                                <StackPanel Grid.Column="2">
+                                    <TextBlock Style="{StaticResource FieldLabel}" Text="Password"/>
+                                    <PasswordBox x:Name="PasswordBox"/>
+                                </StackPanel>
+                            </Grid>
 
-                        <TextBlock x:Name="VaultStatusText" TextWrapping="Wrap" Foreground="#B3261E" Margin="0,0,0,12"/>
+                            <TextBlock Style="{StaticResource CardHint}" FontStyle="Italic" Margin="0,0,0,14"
+                                       Text="The same password is used for unlock(handle) and unlock(special bag)."/>
 
-                        <Button Content="Save" Style="{StaticResource PrimaryButton}"
-                                HorizontalAlignment="Right" Click="OnSave"/>
+                            <TextBlock x:Name="VaultStatusText" TextWrapping="Wrap" Foreground="#B3261E" Margin="0,0,0,12"/>
+
+                            <Button Content="Save" Style="{StaticResource PrimaryButton}"
+                                    HorizontalAlignment="Right" Click="OnSave"/>
+                        </StackPanel>
                     </StackPanel>
                 </Border>
 

@@ -15,7 +15,7 @@
 // Gated by HKLM\SOFTWARE\T2TouchId\Logging (SepVault GUI):
 //   Bio=1   — general CAPTURE / WBF lines
 //   Power=1 — sleep / resume / shutdown / display / PBT lines (also shown if Bio=1)
-// Missing values default to enabled.
+// Missing values default to disabled.
 static bool T2BioMessageIsPowerRelated(_In_z_ const char* msg)
 {
     static const char* kKeys[] = {

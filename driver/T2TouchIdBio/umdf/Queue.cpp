@@ -1396,7 +1396,7 @@ bool LoadShortVerify()
     DWORD cb = sizeof(value);
     if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\T2TouchIdBio", L"ShortVerify",
                      RRF_RT_REG_DWORD, nullptr, &value, &cb) != ERROR_SUCCESS) {
-        return false;
+        return true; // default ON (fast verification)
     }
     return value != 0;
 }

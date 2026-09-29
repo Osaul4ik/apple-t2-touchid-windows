@@ -45,6 +45,7 @@ namespace T2TouchId.SepVaultGui
             LoadLogFlags();
             LoadShortVerify();
             LoadLockOnDisplayOff();
+            LoadVaultState();
             LoadTransportMode();
             LoadDevMode();
         }
@@ -469,7 +470,7 @@ namespace T2TouchId.SepVaultGui
         private const string LogRegPath = @"SOFTWARE\T2TouchId\Logging";
         private bool _logFlagsLoading;
 
-        private static bool ReadLogFlag(string name, bool defaultValue = true)
+        private static bool ReadLogFlag(string name, bool defaultValue = false)
         {
             try
             {
@@ -553,7 +554,7 @@ namespace T2TouchId.SepVaultGui
 
         // ---- Short Verify (HKLM\SOFTWARE\T2TouchIdBio\ShortVerify) ----
         // Read by the UMDF driver (Queue.cpp, LoadShortVerify) before every
-        // StartMatch attempt. Missing value = 0 = full Linux-parity sequence.
+        // StartMatch attempt. Missing value = default ON (fast verification).
         private const string BioRegPath = @"SOFTWARE\T2TouchIdBio";
         private const string ShortVerifyValue = "ShortVerify";
         private bool _shortVerifyLoading;
@@ -566,11 +567,12 @@ namespace T2TouchId.SepVaultGui
                 object? v = key?.GetValue(ShortVerifyValue);
                 if (v is int i) return i != 0;
                 if (v is long l) return l != 0;
-                return false;
+                // Missing value: default ON (fast verification).
+                return true;
             }
             catch
             {
-                return false;
+                return true;
             }
         }
 
@@ -970,6 +972,65 @@ namespace T2TouchId.SepVaultGui
             SepStatusSubtitle.Text = subtitle;
         }
 
+        // ---- macOS Keybag (sep-vault.bin) ----
+        private void LoadVaultState()
+        {
+            bool present = false;
+            try
+            {
+                present = File.Exists(VaultPath) && new FileInfo(VaultPath).Length > 0;
+            }
+            catch
+            {
+                present = false;
+            }
+
+            if (present)
+            {
+                VaultConfiguredPanel.Visibility = Visibility.Visible;
+                VaultImportPanel.Visibility = Visibility.Collapsed;
+                try
+                {
+                    var fi = new FileInfo(VaultPath);
+                    VaultConfiguredHint.Text =
+                        $"sep-vault.bin is present ({fi.Length} bytes, {fi.LastWriteTime:yyyy-MM-dd HH:mm}). " +
+                        "T2SepBootstrap will use it on the next cold boot.";
+                }
+                catch
+                {
+                    VaultConfiguredHint.Text =
+                        "sep-vault.bin is present. T2SepBootstrap will use it on the next cold boot.";
+                }
+            }
+            else
+            {
+                VaultConfiguredPanel.Visibility = Visibility.Collapsed;
+                VaultImportPanel.Visibility = Visibility.Visible;
+            }
+        }
+
+        private void OnClearKeybag(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                if (File.Exists(VaultPath))
+                    File.Delete(VaultPath);
+                _keybagBytes = null;
+                KeybagPathBox.Text = "";
+                PasswordBox.Clear();
+                VaultStatusText.Text = "";
+                VaultStatusText.Foreground = DotError;
+                LoadVaultState();
+            }
+            catch (Exception ex)
+            {
+                VaultConfiguredPanel.Visibility = Visibility.Collapsed;
+                VaultImportPanel.Visibility = Visibility.Visible;
+                VaultStatusText.Foreground = DotError;
+                VaultStatusText.Text = $"Could not delete sep-vault.bin: {ex.Message}";
+            }
+        }
+
         private void OnBrowseKeybag(object sender, RoutedEventArgs e)
         {
             var dialog = new OpenFileDialog
@@ -1030,6 +1091,9 @@ namespace T2TouchId.SepVaultGui
                 SepVaultFormat.Write(VaultPath, _keybagBytes, PasswordBox.Password, specialBag);
                 VaultStatusText.Foreground = DotOk;
                 VaultStatusText.Text = $"Saved: {VaultPath}\nYou can delete the original user.kb; the vault does not keep it in plaintext.\nRestart Windows to apply.";
+                _keybagBytes = null;
+                KeybagPathBox.Text = "";
+                LoadVaultState();
             }
             catch (Exception ex)
             {

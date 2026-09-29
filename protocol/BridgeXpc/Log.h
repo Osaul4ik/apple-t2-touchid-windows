@@ -2,8 +2,7 @@
 // Log.h — lightweight diagnostic logging for BridgeXPC + shared registry gates.
 //
 // Registry (HKLM\SOFTWARE\T2TouchId\Logging), DWORD 0/1 — toggled from the
-// SepVault GUI. Missing key/value = enabled (keep DebugView behaviour until
-// the user opts out).
+// SepVault GUI. Missing key/value = disabled (off until the user enables it).
 //   Bio        — T2TouchIdBio UMDF (CAPTURE, WBF)
 //   Transport  — T2TouchIdTransport.sys (kernel DbgPrint; see driver)
 //   Ncm        — T2Ncm.sys (kernel DbgPrint; see driver)
@@ -47,9 +46,9 @@ inline void InitFromEnvironment(bool cliVerboseFlag) {
     }
 }
 
-// Default true when the value is absent so existing installs keep logging
+// Default false when the value is absent (logging off until the GUI enables it)
 // until the GUI writes an explicit 0.
-inline bool RegistryFlag(const wchar_t* valueName, bool defaultValue = true) {
+inline bool RegistryFlag(const wchar_t* valueName, bool defaultValue = false) {
     HKEY key = nullptr;
     if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kLogRegPath, 0, KEY_READ, &key) != ERROR_SUCCESS) {
         return defaultValue;
@@ -77,7 +76,7 @@ inline constexpr ULONGLONG kFlagTtlMs = 2000;
 
 struct CachedFlag {
     std::atomic<ULONGLONG> stampMs{0};   // 0 = never read
-    std::atomic<bool> value{true};       // same default as RegistryFlag()
+    std::atomic<bool> value{false};      // same default as RegistryFlag()
 };
 
 inline bool CachedRegistryFlag(CachedFlag& cache, const wchar_t* valueName) {
