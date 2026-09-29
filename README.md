@@ -37,7 +37,7 @@ Use only on a machine you can afford to break, and only if you understand the st
 
 ## 📋 Requirements
 
-- Intel MacBook **with T2**, Windows 10/11 x64 via Boot Camp  
+- Intel MacBook **with T2**, Windows 10 x64 via Boot Camp  
 - macOS still bootable (needed once to copy `user.kb`)  
 - Administrator rights  
 - **Test signing** enabled, or Secure Boot off (drivers are not WHQL-signed)
