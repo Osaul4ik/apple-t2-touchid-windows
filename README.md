@@ -42,7 +42,7 @@ Use only on a machine you can afford to break, and only if you understand the st
 - Administrator rights  
 - **Test signing** enabled, or Secure Boot off (drivers are not WHQL-signed)
 
-```bat
+```
 bcdedit /set testsigning on
 :: reboot
 ```
@@ -69,10 +69,10 @@ In Device Manager you should see healthy nodes for transport, NCM adapter, and a
 
 Boot into **macOS**, log in as the account whose Touch ID you want on Windows.
 
-ls ~/Library/Keychains/
-# open the UUID-named folder → copy user.kb
-# e.g. to the Boot Camp volume or a USB stick
-
+```bash
+Open ~/Library/Keychains/ →
+→  the UUID-named folder → copy user.kb to the Boot Camp volume or a USB stick
+```
 
 Special bag ID is usually **`-501`** (first normal macOS user).
 
@@ -151,7 +151,6 @@ More detail: `driver/T2TouchIdBio/docs/`, `T2NCM/docs/`.
 ---
 
 ## Repository layout
-
 ```
 driver/T2TouchIdTransport/   KMDF SEP PCI driver
 driver/T2TouchIdBio/         WBDI biometric stack, GUI, bootstrap service
@@ -160,6 +159,18 @@ protocol/                    BridgeXPC, BiometricKit, AppleKeyStore clients
 tools/                       Install scripts, t2touchid CLI
 tests/                       Unit tests (no hardware)
 ```
+
+## ☕ Support
+
+If you find this project useful, consider buying me a coffee!
+
+[![Ko-fi](https://img.shields.io/badge/Support%20me%20on-Ko--fi-ff5e5b?logo=ko-fi&logoColor=white)](https://ko-fi.com/osaul4ik)
+
+---
+
+# Credits
+
+This project is based on the excellent work of the original **mac-precision-touchpad** project by imbushuo.
 
 ---
 
