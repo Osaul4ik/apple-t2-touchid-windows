@@ -39,7 +39,6 @@ Use only on a machine you can afford to break, and only if you understand the st
 
 - Intel MacBook **with T2**, Windows 10/11 x64 via Boot Camp  
 - macOS still bootable (needed once to copy `user.kb`)  
-- Visual Studio 2022 + **Windows Driver Kit** (to build)  
 - Administrator rights  
 - **Test signing** enabled, or Secure Boot off (drivers are not WHQL-signed)
 
@@ -70,11 +69,10 @@ In Device Manager you should see healthy nodes for transport, NCM adapter, and a
 
 Boot into **macOS**, log in as the account whose Touch ID you want on Windows.
 
-```bash
 ls ~/Library/Keychains/
 # open the UUID-named folder → copy user.kb
 # e.g. to the Boot Camp volume or a USB stick
-```
+
 
 Special bag ID is usually **`-501`** (first normal macOS user).
 
