@@ -12,6 +12,8 @@
          needs to run elevated, so ask for it up front rather than fail
          confusingly partway through Write(). -->
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- Embedded as the exe icon (Explorer, taskbar, title bar). -->
+    <ApplicationIcon>app.ico</ApplicationIcon>
   </PropertyGroup>
 
 </Project>
