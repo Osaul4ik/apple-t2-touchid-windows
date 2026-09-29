@@ -1,8 +1,6 @@
-# apple-t2-touchid-windows
+# T2 Touch Id for Windows
 
-<p align="center">
-  <img src="social-preview.png" alt="apple-t2-touchid-windows" width="640"/>
-</p>
+<img width="1400" height="420" alt="fDhvq" src="https://github.com/user-attachments/assets/ae5efc29-7ed3-4b4b-96b0-0978328ae352" />
 
 **Touch ID on Windows** for Intel MacBooks with an Apple T2 chip.
 
