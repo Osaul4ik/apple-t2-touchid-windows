@@ -26,6 +26,8 @@
 #include <windows.h>
 #include <wincrypt.h>
 #include <cfgmgr32.h>
+#include <wtsapi32.h>
+#include <sddl.h>
 #include <string>
 #include <vector>
 #include <fstream>
@@ -40,6 +42,8 @@ EXTERN_C const GUID GUID_DEVINTERFACE_T2TOUCHID_TRANSPORT;
 
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "cfgmgr32.lib")
+#pragma comment(lib, "wtsapi32.lib")
+#pragma comment(lib, "advapi32.lib")
 
 namespace {
 
@@ -57,9 +61,16 @@ constexpr wchar_t kLogPath[] = L"C:\\LogSEP.txt";
 // across sessions — this service runs in Session 0, the WBDI driver host
 // may not.
 constexpr wchar_t kReadyEventName[] = L"Global\\T2SepReady";
+// Auto-reset event: UMDF driver (LocalService) signals this on
+// ConsoleDisplayState=OFF when LockOnDisplayOff is enabled; this
+// service (SYSTEM, SeTcbPrivilege) performs the interactive lock.
+constexpr wchar_t kLockRequestEventName[] = L"Global\\T2TouchIdBio_LockRequest";
 
 SERVICE_STATUS gStatus = {};
 SERVICE_STATUS_HANDLE gStatusHandle = nullptr;
+HANDLE gStopEvent = nullptr;           // signaled on SERVICE_CONTROL_STOP
+HANDLE gLockRequestEvent = nullptr;   // Global\\T2TouchIdBio_LockRequest
+HANDLE gLockThread = nullptr;
 
 // File log + Application Event Log. Without a registered message-table DLL
 // Event Viewer may wrap the text in a generic "description not found"
@@ -457,12 +468,140 @@ bool RunBootstrapSequence(HANDLE readyEvent) {
     return true;
 }
 
+// Create Global\T2TouchIdBio_LockRequest with a DACL that lets LocalService
+// (WUDFHost) set the event and SYSTEM wait on it.
+HANDLE CreateLockRequestEvent()
+{
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    // SY = full; LS (Local Service) = SYNCHRONIZE|EVENT_MODIFY_STATE;
+    // BA = same; IU (Interactive Users) = same — in case host identity differs.
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"D:(A;;0x001F0003;;;SY)(A;;0x00100002;;;LS)(A;;0x00100002;;;BA)(A;;0x00100002;;;IU)",
+            SDDL_REVISION_1, &sd, nullptr)) {
+        wchar_t buf[96];
+        swprintf_s(buf, L"lock: SDDL failed err=%lu", GetLastError());
+        Log(buf);
+        return nullptr;
+    }
+    SECURITY_ATTRIBUTES sa = {};
+    sa.nLength = sizeof(sa);
+    sa.lpSecurityDescriptor = sd;
+    sa.bInheritHandle = FALSE;
+    // Auto-reset: each display-off pulse is consumed by one wait.
+    HANDLE ev = CreateEventW(&sa, /*manualReset=*/FALSE, /*initial=*/FALSE,
+                             kLockRequestEventName);
+    const DWORD err = ev ? 0 : GetLastError();
+    LocalFree(sd);
+    if (!ev) {
+        wchar_t buf[128];
+        swprintf_s(buf, L"lock: CreateEventW(%ls) failed err=%lu",
+                   kLockRequestEventName, err);
+        Log(buf);
+    } else {
+        Log(L"lock: Global\\T2TouchIdBio_LockRequest ready");
+    }
+    return ev;
+}
+
+bool LockInteractiveSession()
+{
+    DWORD sessionId = WTSGetActiveConsoleSessionId();
+    if (sessionId == 0xFFFFFFFF) {
+        Log(L"lock: no active console session");
+        return false;
+    }
+
+    HANDLE userToken = nullptr;
+    if (!WTSQueryUserToken(sessionId, &userToken)) {
+        wchar_t buf[96];
+        swprintf_s(buf, L"lock: WTSQueryUserToken(session=%lu) failed err=%lu",
+                   sessionId, GetLastError());
+        Log(buf);
+        return false;
+    }
+
+    HANDLE primaryToken = nullptr;
+    BOOL ok = DuplicateTokenEx(
+        userToken,
+        TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_QUERY |
+            TOKEN_ADJUST_DEFAULT | TOKEN_ADJUST_SESSIONID,
+        nullptr,
+        SecurityImpersonation,
+        TokenPrimary,
+        &primaryToken);
+    CloseHandle(userToken);
+    if (!ok || !primaryToken) {
+        wchar_t buf[80];
+        swprintf_s(buf, L"lock: DuplicateTokenEx failed err=%lu", GetLastError());
+        Log(buf);
+        return false;
+    }
+
+    wchar_t cmd[] = L"rundll32.exe user32.dll,LockWorkStation";
+    STARTUPINFOW si = {};
+    si.cb = sizeof(si);
+    si.lpDesktop = const_cast<wchar_t*>(L"winsta0\\default");
+    PROCESS_INFORMATION pi = {};
+
+    ok = CreateProcessAsUserW(
+        primaryToken,
+        nullptr,
+        cmd,
+        nullptr,
+        nullptr,
+        FALSE,
+        CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+        nullptr,
+        nullptr,
+        &si,
+        &pi);
+    const DWORD createErr = ok ? 0 : GetLastError();
+    CloseHandle(primaryToken);
+
+    if (!ok) {
+        wchar_t buf[96];
+        swprintf_s(buf, L"lock: CreateProcessAsUser failed err=%lu", createErr);
+        Log(buf);
+        return false;
+    }
+
+    WaitForSingleObject(pi.hProcess, 3000);
+    DWORD exitCode = 0;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+
+    wchar_t buf[96];
+    swprintf_s(buf, L"lock: OK (session=%lu, rundll32 exit=%lu)", sessionId, exitCode);
+    Log(buf);
+    return true;
+}
+
+DWORD WINAPI LockWatcherThread(LPVOID)
+{
+    Log(L"lock: watcher thread started");
+    HANDLE waits[2] = { gLockRequestEvent, gStopEvent };
+    for (;;) {
+        DWORD which = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
+        if (which == WAIT_OBJECT_0 + 1 || which == WAIT_FAILED) {
+            Log(L"lock: watcher stopping");
+            break;
+        }
+        if (which == WAIT_OBJECT_0) {
+            Log(L"lock: request received");
+            LockInteractiveSession();
+        }
+    }
+    return 0;
+}
+
 DWORD WINAPI ServiceCtrlHandler(DWORD ctrl, DWORD, LPVOID, LPVOID) {
     switch (ctrl) {
         case SERVICE_CONTROL_STOP:
         case SERVICE_CONTROL_SHUTDOWN:
             gStatus.dwCurrentState = SERVICE_STOP_PENDING;
             SetServiceStatus(gStatusHandle, &gStatus);
+            if (gStopEvent) SetEvent(gStopEvent);
             gStatus.dwCurrentState = SERVICE_STOPPED;
             SetServiceStatus(gStatusHandle, &gStatus);
             return NO_ERROR;
@@ -517,14 +656,42 @@ VOID WINAPI ServiceMain(DWORD, LPWSTR*) {
         // file, not a crash-restart loop.
     }
 
+    gStopEvent = CreateEventW(nullptr, /*manualReset=*/TRUE, /*initial=*/FALSE, nullptr);
+    gLockRequestEvent = CreateLockRequestEvent();
+    if (gLockRequestEvent && gStopEvent) {
+        gLockThread = CreateThread(nullptr, 0, LockWatcherThread, nullptr, 0, nullptr);
+        if (!gLockThread) {
+            wchar_t buf[80];
+            swprintf_s(buf, L"lock: CreateThread failed err=%lu", GetLastError());
+            Log(buf);
+        }
+    }
+
     gStatus.dwCurrentState = SERVICE_RUNNING;
     SetServiceStatus(gStatusHandle, &gStatus);
 
-    // Nothing left to do — the sequence above is the entire job. Stay
-    // resident and idle so SCM doesn't consider the service exited; actual
-    // work is one-shot per boot per the design doc.
-    while (gStatus.dwCurrentState == SERVICE_RUNNING) {
-        Sleep(5000);
+    // Stay resident: one-shot bootstrap is done; lock watcher handles
+    // display-off lock requests from the UMDF driver for the rest of the boot.
+    if (gStopEvent) {
+        WaitForSingleObject(gStopEvent, INFINITE);
+    } else {
+        while (gStatus.dwCurrentState == SERVICE_RUNNING) {
+            Sleep(5000);
+        }
+    }
+
+    if (gLockThread) {
+        WaitForSingleObject(gLockThread, 5000);
+        CloseHandle(gLockThread);
+        gLockThread = nullptr;
+    }
+    if (gLockRequestEvent) {
+        CloseHandle(gLockRequestEvent);
+        gLockRequestEvent = nullptr;
+    }
+    if (gStopEvent) {
+        CloseHandle(gStopEvent);
+        gStopEvent = nullptr;
     }
     if (readyEvent) CloseHandle(readyEvent);
 }

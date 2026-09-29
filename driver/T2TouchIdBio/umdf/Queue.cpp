@@ -1402,7 +1402,8 @@ bool LoadShortVerify()
 }
 
 // HKLM\SOFTWARE\T2TouchIdBio\LockOnDisplayOff (REG_DWORD, GUI writes 0/1)
-// When nonzero: OnConsoleDisplayState(OFF) also calls LockWorkStation().
+// When nonzero: OnConsoleDisplayState(OFF) signals Global\\T2TouchIdBio_LockRequest
+// (T2SepBootstrap performs LockWorkStation in the interactive session).
 // Intended for power-button action = Turn off the display (PBUTTONACTION 4).
 bool LoadLockOnDisplayOff()
 {
@@ -2226,170 +2227,31 @@ static const GUID kGuidConsoleDisplayState =
 
 HPOWERNOTIFY g_displayStateNotify = nullptr;
 
-// Lock the interactive console session from WUDFHost (LocalService, session 0).
+// Request the interactive session lock via T2SepBootstrap (runs as SYSTEM).
 //
-// Plain LockWorkStation() always fails here with ERROR_ACCESS_DENIED (5): the
-// caller is not on an interactive desktop. WTSQueryUserToken also needs
-// SeTcbPrivilege, which LocalService does not have.
-//
-// Strategy:
-//   1) Try WTSQueryUserToken + CreateProcessAsUser (works if the host ever
-//      runs as SYSTEM / has SeTcbPrivilege).
-//   2) Fallback: schtasks /Run of the persistent task "T2TouchIdBio_LockWorkstation"
-//      (created by the GUI while the slider is on; deleted when the slider is
-//      off). If the task is missing, create it once as a safety net — never
-//      delete from the driver, to avoid create/delete spam on every display-off.
-bool RunProcessCapture(const wchar_t* app, const wchar_t* args, DWORD timeoutMs, DWORD* exitCodeOut)
+// WUDFHost is LocalService in session 0: LockWorkStation() returns ACCESS_DENIED,
+// and WTSQueryUserToken fails with ERROR_PRIVILEGE_NOT_HELD (1314). The bootstrap
+// service has SeTcbPrivilege, so it owns the actual lock. Protocol:
+//   driver  -> SetEvent(Global\T2TouchIdBio_LockRequest)
+//   bootstrap waits -> WTSQueryUserToken + CreateProcessAsUser(rundll32 LockWorkStation)
+// The GUI only toggles HKLM\SOFTWARE\T2TouchIdBio\LockOnDisplayOff; no schtasks.
+constexpr wchar_t kLockRequestEventName[] = L"Global\\T2TouchIdBio_LockRequest";
+
+void RequestWorkstationLock()
 {
-    wchar_t cmdLine[512];
-    if (args && args[0]) {
-        if (swprintf_s(cmdLine, L"\"%s\" %s", app, args) < 0)
-            return false;
+    HANDLE ev = OpenEventW(EVENT_MODIFY_STATE, FALSE, kLockRequestEventName);
+    if (!ev) {
+        T2BioLog("RequestWorkstationLock: OpenEvent(%ls) failed err=%lu "
+                 "(is T2SepBootstrap running?)",
+                 kLockRequestEventName, GetLastError());
+        return;
+    }
+    if (!SetEvent(ev)) {
+        T2BioLog("RequestWorkstationLock: SetEvent failed err=%lu", GetLastError());
     } else {
-        if (swprintf_s(cmdLine, L"\"%s\"", app) < 0)
-            return false;
+        T2BioLog("RequestWorkstationLock: signaled %ls", kLockRequestEventName);
     }
-
-    STARTUPINFOW si = {};
-    si.cb = sizeof(si);
-    PROCESS_INFORMATION pi = {};
-    BOOL ok = CreateProcessW(
-        nullptr,
-        cmdLine,
-        nullptr,
-        nullptr,
-        FALSE,
-        CREATE_NO_WINDOW,
-        nullptr,
-        nullptr,
-        &si,
-        &pi);
-    if (!ok) {
-        T2BioLog("RunProcessCapture: CreateProcess(%ls) failed err=%lu", app, GetLastError());
-        return false;
-    }
-    DWORD wait = WaitForSingleObject(pi.hProcess, timeoutMs);
-    DWORD exitCode = 1;
-    if (wait == WAIT_OBJECT_0)
-        GetExitCodeProcess(pi.hProcess, &exitCode);
-    else
-        TerminateProcess(pi.hProcess, 1);
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-    if (exitCodeOut)
-        *exitCodeOut = exitCode;
-    return wait == WAIT_OBJECT_0 && exitCode == 0;
-}
-
-bool LockWorkstationViaSchtasks()
-{
-    // Persistent task owned by the GUI while LockOnDisplayOff is enabled.
-    // Driver only /Run's it on ConsoleDisplayState=OFF — no create/delete spam.
-    // If the task is missing (GUI never ran / was killed mid-toggle), create
-    // once as a safety net and leave it; the GUI deletes it when the slider
-    // is turned off.
-    const wchar_t* taskName = L"T2TouchIdBio_LockWorkstation";
-
-    wchar_t runArgs[128];
-    swprintf_s(runArgs, L"/Run /TN \"%s\"", taskName);
-    DWORD runExit = 1;
-    if (RunProcessCapture(L"schtasks.exe", runArgs, 8000, &runExit)) {
-        T2BioLog("LockWorkstationViaSchtasks: /Run ok (exit=%lu)", runExit);
-        return true;
-    }
-
-    T2BioLog("LockWorkstationViaSchtasks: /Run failed, ensuring task exists");
-    wchar_t createArgs[384];
-    swprintf_s(createArgs,
-        L"/Create /TN \"%s\" /TR \"rundll32.exe user32.dll,LockWorkStation\" "
-        L"/SC ONCE /ST 00:00 /RL LIMITED /F /IT",
-        taskName);
-    DWORD createExit = 1;
-    if (!RunProcessCapture(L"schtasks.exe", createArgs, 8000, &createExit)) {
-        T2BioLog("LockWorkstationViaSchtasks: /Create failed");
-        return false;
-    }
-
-    runExit = 1;
-    if (!RunProcessCapture(L"schtasks.exe", runArgs, 8000, &runExit)) {
-        T2BioLog("LockWorkstationViaSchtasks: /Run after create failed");
-        return false;
-    }
-    T2BioLog("LockWorkstationViaSchtasks: created + /Run ok (exit=%lu)", runExit);
-    return true;
-}
-
-bool LockWorkstationViaUserToken()
-{
-    DWORD sessionId = WTSGetActiveConsoleSessionId();
-    if (sessionId == 0xFFFFFFFF) {
-        T2BioLog("LockWorkstationViaUserToken: no active console session");
-        return false;
-    }
-
-    HANDLE userToken = nullptr;
-    if (!WTSQueryUserToken(sessionId, &userToken)) {
-        T2BioLog("LockWorkstationViaUserToken: WTSQueryUserToken(session=%lu) failed err=%lu",
-                 sessionId, GetLastError());
-        return false;
-    }
-
-    HANDLE primaryToken = nullptr;
-    BOOL ok = DuplicateTokenEx(
-        userToken,
-        TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ADJUST_DEFAULT | TOKEN_ADJUST_SESSIONID,
-        nullptr,
-        SecurityImpersonation,
-        TokenPrimary,
-        &primaryToken);
-    CloseHandle(userToken);
-    if (!ok || !primaryToken) {
-        T2BioLog("LockWorkstationViaUserToken: DuplicateTokenEx failed err=%lu", GetLastError());
-        return false;
-    }
-
-    wchar_t cmd[] = L"rundll32.exe user32.dll,LockWorkStation";
-    STARTUPINFOW si = {};
-    si.cb = sizeof(si);
-    si.lpDesktop = const_cast<wchar_t*>(L"winsta0\\default");
-    PROCESS_INFORMATION pi = {};
-
-    ok = CreateProcessAsUserW(
-        primaryToken,
-        nullptr,
-        cmd,
-        nullptr,
-        nullptr,
-        FALSE,
-        CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
-        nullptr,
-        nullptr,
-        &si,
-        &pi);
-    const DWORD createErr = ok ? 0 : GetLastError();
-    CloseHandle(primaryToken);
-
-    if (!ok) {
-        T2BioLog("LockWorkstationViaUserToken: CreateProcessAsUser failed err=%lu", createErr);
-        return false;
-    }
-
-    WaitForSingleObject(pi.hProcess, 2000);
-    DWORD exitCode = 0;
-    GetExitCodeProcess(pi.hProcess, &exitCode);
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-
-    T2BioLog("LockWorkstationViaUserToken: ok (session=%lu, exit=%lu)", sessionId, exitCode);
-    return true;
-}
-
-bool LockWorkstationInActiveSession()
-{
-    if (LockWorkstationViaUserToken())
-        return true;
-    T2BioLog("LockWorkstationInActiveSession: token path failed, trying schtasks fallback");
-    return LockWorkstationViaSchtasks();
+    CloseHandle(ev);
 }
 
 void OnConsoleDisplayState(DWORD state)
@@ -2410,12 +2272,9 @@ void OnConsoleDisplayState(DWORD state)
                      static_cast<unsigned long long>(kPowerButtonGraceMs));
             // Optional: lock workstation when GUI enabled LockOnDisplayOff
             // (power button typically set to Turn off the display).
+            // Bootstrap service (SYSTEM) performs the actual LockWorkStation.
             if (LoadLockOnDisplayOff()) {
-                if (LockWorkstationInActiveSession()) {
-                    T2BioLog("ConsoleDisplayState=OFF: lock OK (LockOnDisplayOff via session process)");
-                } else {
-                    T2BioLog("ConsoleDisplayState=OFF: lock failed (LockOnDisplayOff)");
-                }
+                RequestWorkstationLock();
             }
         }
     } else {

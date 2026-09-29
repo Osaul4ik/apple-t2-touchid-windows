@@ -829,55 +829,6 @@ namespace T2TouchId.SepVaultGui
             }
         }
 
-        // Persistent Task Scheduler entry used by the UMDF driver to lock the
-        // interactive session from session 0 (WUDFHost cannot call LockWorkStation).
-        // Created while the slider is ON; deleted when the slider is OFF.
-        // Driver only does `schtasks /Run` on each display-off — no spam.
-        private const string LockTaskName = "T2TouchIdBio_LockWorkstation";
-
-        private static bool RunSchtasks(string args)
-        {
-            try
-            {
-                var psi = new ProcessStartInfo
-                {
-                    FileName = "schtasks",
-                    Arguments = args,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                };
-                using var p = Process.Start(psi);
-                if (p == null) return false;
-                p.StandardOutput.ReadToEnd();
-                p.StandardError.ReadToEnd();
-                if (!p.WaitForExit(8000)) return false;
-                return p.ExitCode == 0;
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
-        /// <summary>Create (or refresh) the persistent lock task. Safe to call repeatedly.</summary>
-        private static bool EnsureLockScheduledTask()
-        {
-            // /IT = interactive session only; /RL LIMITED is enough for LockWorkStation.
-            // /SC ONCE + past /ST keeps the definition without auto-firing; we only /Run it.
-            string args =
-                $"/Create /TN \"{LockTaskName}\" /TR \"rundll32.exe user32.dll,LockWorkStation\" " +
-                "/SC ONCE /ST 00:00 /RL LIMITED /F /IT";
-            return RunSchtasks(args);
-        }
-
-        /// <summary>Remove the persistent lock task when the slider is turned off.</summary>
-        private static bool RemoveLockScheduledTask()
-        {
-            return RunSchtasks($"/Delete /TN \"{LockTaskName}\" /F");
-        }
-
         private void OnLockOnDisplayOffChanged(object sender, RoutedEventArgs e)
         {
             if (_lockOnDisplayOffLoading) return;
@@ -887,10 +838,6 @@ namespace T2TouchId.SepVaultGui
 
             bool powerOk = SetPowerButtonActionOnAllSchemes(action);
             bool regOk = WriteLockOnDisplayOff(enabled);
-
-            // Persistent schtasks entry: create while ON, delete while OFF.
-            // The UMDF driver only /Run's this task on ConsoleDisplayState=OFF.
-            bool taskOk = enabled ? EnsureLockScheduledTask() : RemoveLockScheduledTask();
 
             if (!powerOk && !regOk)
             {
@@ -912,15 +859,6 @@ namespace T2TouchId.SepVaultGui
             {
                 LockOnDisplayOffStatusText.Text =
                     "Power button updated on all plans, but could not write HKLM (run as administrator).";
-                LockOnDisplayOffStatusText.Foreground = DotWarn;
-                return;
-            }
-
-            if (!taskOk)
-            {
-                LockOnDisplayOffStatusText.Text = enabled
-                    ? "Saved power settings, but could not create the lock task (run as administrator)."
-                    : "Saved power settings, but could not delete the lock task (run as administrator).";
                 LockOnDisplayOffStatusText.Foreground = DotWarn;
                 return;
             }
