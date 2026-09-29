@@ -242,8 +242,7 @@ bool ConnectToBiometricKitBridge(const NcmEndpoint& endpoint, t2::bridgexpc::Con
         opt.concurrency = tunnelActive ? 16 : 256;
         opt.includeTcpOnly = true;
         opt.connectTimeoutMs = timeoutsMs[attempt];
-        // Ascending (ScanOptions::scanFromEnd default) — the real
-        // candidate sits near portBegin (~49000), not the high end.
+        // priorityBands default: 59xxx → 49xxx → rest (see PortScan.h).
 
         ScanProbeResult scan = ScanAndProbe(endpoint, opt);
         if (scan.servicePort != 0) {

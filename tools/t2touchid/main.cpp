@@ -698,15 +698,14 @@ static int CmdNetwork(int argc, wchar_t* argv[]) {
     opt.concurrency = tunnelActive ? 16 : 64;
     opt.connectTimeoutMs = tunnelActive ? 150 : 25;  // 10ms was flaky under concurrent scan load
     opt.includeTcpOnly = true;
-    // Ascending (ScanOptions::scanFromEnd default) — the real BiometricKit
-    // candidate has been observed near portBegin (~49000), not the high end.
+    // priorityBands default: 59xxx → 49xxx → rest (see PortScan.h).
     opt.onProgress = [](unsigned tried, unsigned total, unsigned tcp, unsigned http2) {
         std::wcout << L"  scanned " << tried << L"/" << total
                    << L"  tcp=" << tcp << L"  http2=" << http2 << L"\r" << std::flush;
     };
 
     std::wcout << L"scanning PEER ports " << opt.portBegin << L"-" << opt.portEnd
-               << L" (concurrency " << opt.concurrency
+               << L" (order: 59xxx, 49xxx, rest; concurrency " << opt.concurrency
                << L", timeout " << opt.connectTimeoutMs << L"ms)...\n";
     ScanProbeResult scan = ScanAndProbe(ep, opt);
     std::wcout << L"\n";
@@ -904,8 +903,7 @@ static bool DiscoverBiometricKitBridge(int argc, wchar_t* argv[], int firstArgIn
         opt.concurrency = tunnelActive ? 16 : 256;
         opt.includeTcpOnly = true;
         opt.connectTimeoutMs = timeoutsMs[attempt];
-        // Ascending (ScanOptions::scanFromEnd default) — the real
-        // candidate sits near portBegin (~49000), not the high end.
+        // priorityBands default: 59xxx → 49xxx → rest (see PortScan.h).
 
         ScanProbeResult scan = ScanAndProbe(ep, opt);
         if (scan.servicePort != 0) {

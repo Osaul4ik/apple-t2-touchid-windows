@@ -147,6 +147,58 @@ ProbeResult ProbePort(const NcmEndpoint& ep, uint16_t port,
 
 } // namespace
 
+// Build the probe order for [begin, end].
+//
+// priorityBands (default): hardware order from real T2 sessions —
+//   1) 59xxx  — RemoteXPC often lands here (e.g. 59602)
+//   2) 49xxx  — BridgeXPC + dense HTTP/2 cluster (e.g. 49341)
+//   3) rest of the range, ascending
+// Each band is clipped to [begin, end]; ports already covered by an
+// earlier band are not repeated.
+//
+// Linear fallback: ascending from begin, or descending from end when
+// scanFromEnd is set.
+std::vector<uint16_t> BuildPortOrder(uint16_t begin, uint16_t end,
+                                      bool priorityBands, bool scanFromEnd) {
+    std::vector<uint16_t> order;
+    if (end < begin) return order;
+    const unsigned total = static_cast<unsigned>(end - begin) + 1;
+    order.reserve(total);
+
+    if (!priorityBands) {
+        if (scanFromEnd) {
+            for (unsigned i = 0; i < total; ++i)
+                order.push_back(static_cast<uint16_t>(end - i));
+        } else {
+            for (unsigned i = 0; i < total; ++i)
+                order.push_back(static_cast<uint16_t>(begin + i));
+        }
+        return order;
+    }
+
+    // bitset-like mark for ports already scheduled (index = port - begin).
+    std::vector<uint8_t> used(total, 0);
+    auto appendBand = [&](uint16_t bandLo, uint16_t bandHi) {
+        const uint16_t lo = (bandLo > begin) ? bandLo : begin;
+        const uint16_t hi = (bandHi < end) ? bandHi : end;
+        if (hi < lo) return;
+        for (uint32_t p = lo; p <= hi; ++p) {
+            const unsigned idx = static_cast<unsigned>(p - begin);
+            if (used[idx]) continue;
+            used[idx] = 1;
+            order.push_back(static_cast<uint16_t>(p));
+        }
+    };
+
+    appendBand(59000, 59999); // 59xxx first — typical RemoteXPC
+    appendBand(49000, 49999); // 49xxx next  — BridgeXPC / decoy cluster
+    // Remainder ascending.
+    for (unsigned i = 0; i < total; ++i) {
+        if (!used[i]) order.push_back(static_cast<uint16_t>(begin + i));
+    }
+    return order;
+}
+
 std::vector<PortCandidate> ScanHttp2Preface(const NcmEndpoint& endpoint,
                                             const ScanOptions& options) {
     std::vector<PortCandidate> hits;
@@ -169,8 +221,12 @@ std::vector<PortCandidate> ScanHttp2Preface(const NcmEndpoint& endpoint,
         t2::transport::PrepareTunnelPeer(endpoint.ifIndex, endpoint.peerLinkLocal);
     }
 
-    const unsigned total =
-        static_cast<unsigned>(options.portEnd - options.portBegin) + 1;
+    const std::vector<uint16_t> portOrder = BuildPortOrder(
+        options.portBegin, options.portEnd,
+        options.priorityBands, options.scanFromEnd);
+    const unsigned total = static_cast<unsigned>(portOrder.size());
+    if (total == 0) return hits;
+
     std::atomic<unsigned> next{0};
     std::atomic<unsigned> tried{0};
     std::atomic<unsigned> tcpHits{0};
@@ -200,25 +256,16 @@ std::vector<PortCandidate> ScanHttp2Preface(const NcmEndpoint& endpoint,
 
     auto worker = [&]() {
         for (;;) {
-            // OPTIMIZATION: checked before claiming each new port so a
-            // caller that already got what it needed via onHit (below) —
-            // e.g. a fused pipeline that just verified a candidate over
-            // RemoteXPC — can abort the rest of the range immediately,
-            // instead of every worker grinding on to portEnd regardless.
+            // Checked before claiming each new port so a caller that already
+            // got what it needed via onHit (e.g. BiometricKit confirmed) can
+            // abort the rest of the range immediately.
             if (options.cancel &&
                 options.cancel->load(std::memory_order_relaxed)) {
                 break;
             }
             unsigned i = next.fetch_add(1);
             if (i >= total) break;
-            // scanFromEnd: dispatch descending from portEnd instead of
-            // ascending from portBegin — see ScanOptions::scanFromEnd for
-            // why. `i` is still a plain 0..total-1 claim counter either
-            // way, so concurrency/cancel/progress semantics are unchanged;
-            // only which physical port each claimed index maps to flips.
-            uint16_t port = options.scanFromEnd
-                ? static_cast<uint16_t>(options.portEnd - i)
-                : static_cast<uint16_t>(options.portBegin + i);
+            const uint16_t port = portOrder[i];
             ProbeResult pr =
                 ProbePort(endpoint, port, options.connectTimeoutMs, recvMs);
             if (pr.connected) {
@@ -235,11 +282,8 @@ std::vector<PortCandidate> ScanHttp2Preface(const NcmEndpoint& endpoint,
                         std::lock_guard<std::mutex> lock(hitsMu);
                         hits.push_back(c);
                     }
-                    // Fired outside hitsMu and before the progress report
-                    // below: the caller (if it wants to verify this hit
-                    // right away) should be able to start doing so, in
-                    // parallel with this worker moving on to the next
-                    // port, as soon as possible.
+                    // Fired outside hitsMu: caller can start verifying this
+                    // hit in parallel while this worker moves on.
                     if (options.onHit) options.onHit(c);
                 }
             }

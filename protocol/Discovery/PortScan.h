@@ -53,13 +53,22 @@ struct ScanOptions {
     // from starting.
     std::atomic<bool>* cancel = nullptr;
 
-    // In practice the BiometricKit BridgeXPC/RemoteXPC candidate has been
-    // observed sitting near the low end of the ephemeral range (~49000,
-    // i.e. right at portBegin), not the high end — so the default is
-    // ascending (scanFromEnd=false), same direction as the Linux
-    // reference. A caller that has independently confirmed the opposite
-    // on its own hardware can still set this to true per call; nothing
-    // here assumes one direction is universally correct.
+    // Port dispatch order within [portBegin, portEnd]:
+    //
+    //   priorityBands=true (default): hardware-tuned order observed on
+    //   real T2 sessions —
+    //     1) 59xxx  (RemoteXPC often lands here, e.g. 59602)
+    //     2) 49xxx  (BridgeXPC / dense HTTP/2 decoys, e.g. 49341)
+    //     3) everything else in the range, ascending
+    //   So a BiometricKit hit at 59xxx cancels long before the scan
+    //   grinds through the middle of the ephemeral range.
+    //
+    //   priorityBands=false: legacy linear order. scanFromEnd=false →
+    //   ascending from portBegin; scanFromEnd=true → descending from
+    //   portEnd.
+    bool priorityBands = true;
+
+    // Only used when priorityBands=false. See above.
     bool scanFromEnd = false;
 };
 
