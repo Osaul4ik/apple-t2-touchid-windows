@@ -52,13 +52,7 @@ bcdedit /set testsigning on
 
 ## Quick start
 
-### 1. Build
-
-Open the solution / projects in Visual Studio (WDK installed) and build **Release | x64**.
-
-Or use the GitHub Actions workflows under `.github/workflows/` and download the artifacts.
-
-### 2. Install drivers
+### 1. Install drivers
 
 As Administrator, run `InstallDriver.bat` from a folder that contains the built packages (`SEP\`, `NCM\`, `Bio\`, `Inst\`).
 
@@ -72,7 +66,7 @@ That will:
 
 In Device Manager you should see healthy nodes for transport, NCM adapter, and a biometric device (no Code 43).
 
-### 3. Copy `user.kb` from macOS
+### 2. Copy `user.kb` from macOS
 
 Boot into **macOS**, log in as the account whose Touch ID you want on Windows.
 
@@ -84,7 +78,7 @@ ls ~/Library/Keychains/
 
 Special bag ID is usually **`-501`** (first normal macOS user).
 
-### 4. Import the keybag (once)
+### 3. Import the keybag (once)
 
 Run **SepVault GUI** as Administrator:
 
@@ -98,7 +92,7 @@ On every cold boot, **T2SepBootstrap** unlocks the SEP with that vault.
 
 If the keybag is already configured, the GUI shows status and a **Clear keybag** button.
 
-### 5. Windows Hello
+### 4. Windows Hello
 
 Settings → Accounts → Sign-in options → Fingerprint → set up.
 
