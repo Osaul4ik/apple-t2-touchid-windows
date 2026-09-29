@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableExtensions
 
-title T2 Touch ID Driver Installer
+title T2 TouchID for Windows - Driver Installer
 
 rem ============================================================
 rem Require Administrator
@@ -18,6 +18,41 @@ if errorlevel 1 (
     exit /b 1
 )
 
+
+rem ============================================================
+rem Enable Windows Test Mode (required for unsigned drivers)
+rem ============================================================
+
+echo [0/6] Enabling Test Mode (bcdedit testsigning)...
+echo.
+
+rem Detect whether testsigning is already configured (localized Yes/No - don't parse value).
+set "TESTMODE_WAS_ON=0"
+bcdedit /enum | findstr /i "testsigning" >nul
+if not errorlevel 1 set "TESTMODE_WAS_ON=1"
+
+if "%TESTMODE_WAS_ON%"=="1" (
+    echo [OK] Test Mode is already enabled.
+) else (
+    bcdedit /set testsigning on
+    if errorlevel 1 (
+        echo.
+        echo [ERROR] Failed to enable Test Mode.
+        echo.
+        echo Possible reasons:
+        echo   - Secure Boot is enabled in firmware.
+        echo   - This script is not running as Administrator.
+        echo.
+        echo Disable Secure Boot or enable Test Mode manually, then re-run this installer.
+        echo.
+        pause
+        exit /b 1
+    )
+    echo [OK] Test Mode enabled. A reboot will be required after installation.
+)
+
+echo.
+
 rem ============================================================
 rem Base directory
 rem ============================================================
@@ -26,7 +61,7 @@ set "ROOT=%~dp0"
 
 echo.
 echo ============================================================
-echo          T2 Touch ID Driver Installer
+echo        T2 TouchID for Windows - Driver Installer
 echo ============================================================
 echo.
 echo Root:
@@ -259,6 +294,8 @@ echo.
 echo ============================================================
 echo              INSTALLATION COMPLETE
 echo ============================================================
+echo.
+echo If Test Mode was just enabled, restart Windows before using the drivers.
 echo.
 pause
 exit /b 0

@@ -24,7 +24,7 @@ env:
   BOOTSTRAP_PROJECT: T2SepBootstrap
   COINSTALLER_NAME: T2SepCoInstaller
   GUI_PROJECT: driver/T2TouchIdBio/Sepvaultgui.csproj
-  GUI_ASSEMBLY_NAME: SepVaultGui
+  GUI_ASSEMBLY_NAME: T2TouchID_GUI
   DOTNET_VERSION: '8.0.x'
 
 # ===========================================================================
@@ -288,18 +288,18 @@ jobs:
       with:
         dotnet-version: ${{ env.DOTNET_VERSION }}
 
-    - name: Restore SepVaultGui
+    - name: Restore T2TouchID_GUI
       run: dotnet restore "$env:GUI_PROJECT"
       shell: pwsh
 
-    - name: Build SepVaultGui
+    - name: Build T2TouchID_GUI
       run: |
         dotnet build "$env:GUI_PROJECT" `
           --no-restore `
           -c $env:CONFIGURATION
       shell: pwsh
 
-    - name: Publish SepVaultGui (self-contained, single-file win-x64)
+    - name: Publish T2TouchID_GUI (self-contained, single-file win-x64)
       run: |
         $ErrorActionPreference = "Stop"
         dotnet publish "$env:GUI_PROJECT" `
@@ -307,9 +307,9 @@ jobs:
           -r win-x64 `
           --self-contained true `
           -p:PublishSingleFile=true `
-          -o artifacts\SepVaultGui-full
+          -o artifacts\T2TouchID_GUI-full
 
-        $exePath = "artifacts\SepVaultGui-full\$env:GUI_ASSEMBLY_NAME.exe"
+        $exePath = "artifacts\T2TouchID_GUI-full\$env:GUI_ASSEMBLY_NAME.exe"
         if (-not (Test-Path $exePath)) {
           Write-Error "Expected published binary not found: $exePath"
           exit 1
@@ -319,16 +319,16 @@ jobs:
       shell: pwsh
 
     # =====================================================================
-    - name: Publish SepVaultGui (framework-dependent win-x64) - Min
+    - name: Publish T2TouchID_GUI (framework-dependent win-x64) - Min
       run: |
         $ErrorActionPreference = "Stop"
         dotnet publish "$env:GUI_PROJECT" `
           -c $env:CONFIGURATION `
           -r win-x64 `
           --self-contained false `
-          -o artifacts\SepVaultGui-min
+          -o artifacts\T2TouchID_GUI-min
 
-        $exePath = "artifacts\SepVaultGui-min\$env:GUI_ASSEMBLY_NAME.exe"
+        $exePath = "artifacts\T2TouchID_GUI-min\$env:GUI_ASSEMBLY_NAME.exe"
         if (-not (Test-Path $exePath)) {
           Write-Error "Expected published binary not found: $exePath"
           exit 1
@@ -338,37 +338,37 @@ jobs:
       shell: pwsh
 
     # =====================================================================
-    - name: Package standalone SepVaultGui archives (Full + Min)
+    - name: Package standalone T2TouchID_GUI archives (Full + Min)
       run: |
         $ErrorActionPreference = "Stop"
 
-        $fullStagingDir = "temp-upload-gui-full\SepVaultGui"
+        $fullStagingDir = "temp-upload-gui-full\T2TouchID_GUI"
         New-Item -ItemType Directory -Path $fullStagingDir -Force | Out-Null
-        Copy-Item -Path "artifacts\SepVaultGui-full\*" -Destination $fullStagingDir -Recurse -Force
+        Copy-Item -Path "artifacts\T2TouchID_GUI-full\*" -Destination $fullStagingDir -Recurse -Force
 
-        $minStagingDir = "temp-upload-gui-min\SepVaultGui"
+        $minStagingDir = "temp-upload-gui-min\T2TouchID_GUI"
         New-Item -ItemType Directory -Path $minStagingDir -Force | Out-Null
-        Copy-Item -Path "artifacts\SepVaultGui-min\*" -Destination $minStagingDir -Recurse -Force
+        Copy-Item -Path "artifacts\T2TouchID_GUI-min\*" -Destination $minStagingDir -Recurse -Force
 
         Add-Content -Path $env:GITHUB_ENV -Value "GUI_STAGING_DIR_FULL=temp-upload-gui-full"
         Add-Content -Path $env:GITHUB_ENV -Value "GUI_STAGING_DIR_MIN=temp-upload-gui-min"
 
-        Write-Host "OK: staged standalone SepVaultGui archives:"
+        Write-Host "OK: staged standalone T2TouchID_GUI archives:"
         Write-Host "  - $fullStagingDir (self-contained, single-file)"
         Write-Host "  - $minStagingDir (framework-dependent, needs .NET 8 Desktop Runtime)"
       shell: pwsh
 
-    - name: Upload SepVaultGui Full (standalone, self-contained)
+    - name: Upload T2TouchID_GUI Full (standalone, self-contained)
       uses: actions/upload-artifact@v4
       with:
-        name: SepVaultGui-Full-${{ env.DRIVER_VERSION }}
+        name: T2TouchID_GUI-Full-${{ env.DRIVER_VERSION }}
         path: ${{ env.GUI_STAGING_DIR_FULL }}
         if-no-files-found: error
 
-    - name: Upload SepVaultGui Min (standalone, framework-dependent)
+    - name: Upload T2TouchID_GUI Min (standalone, framework-dependent)
       uses: actions/upload-artifact@v4
       with:
-        name: SepVaultGui-Min-${{ env.DRIVER_VERSION }}
+        name: T2TouchID_GUI-Min-${{ env.DRIVER_VERSION }}
         path: ${{ env.GUI_STAGING_DIR_MIN }}
         if-no-files-found: error
 
@@ -604,7 +604,7 @@ jobs:
           "Driver version:  $env:DRIVER_VERSION",
           "Built:           $env:DRIVER_DATE (UTC build date; local runner clock)",
           "Target:          PCI\VEN_106B&DEV_1802, KMDF 1.15",
-          "SepVaultGui:     ships separately - see the SepVaultGui-Full/-Min archives, not bundled with the driver",
+          "T2TouchID_GUI:     ships separately - see the T2TouchID_GUI-Full/-Min archives, not bundled with the driver",
           "",
           "CodeQL query pack:  microsoft/windows-drivers@$env:CODEQL_DRIVERS_PACK_VERSION",
           "PREfast:            enabled (RunCodeAnalysis + EnableCppCoreCheck, warnings-as-errors)",

@@ -1,7 +1,7 @@
 <Window x:Class="T2TouchId.SepVaultGui.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="T2 Touch ID"
+        Title="T2 TouchID for Windows"
         Width="580" Height="780"
         MinWidth="520" MinHeight="600"
         ResizeMode="CanResize"
@@ -292,7 +292,7 @@
                     </Viewbox>
                 </Border>
                 <StackPanel VerticalAlignment="Center">
-                    <TextBlock Text="T2 Touch ID for Windows" FontSize="22" FontWeight="SemiBold" Foreground="White"/>
+                    <TextBlock Text="T2 TouchID for Windows" FontSize="22" FontWeight="SemiBold" Foreground="White"/>
                     <TextBlock Text="Secure Enclave status and setup" FontSize="13" Foreground="#CCFFFFFF" Margin="0,3,0,0"/>
                 </StackPanel>
             </StackPanel>

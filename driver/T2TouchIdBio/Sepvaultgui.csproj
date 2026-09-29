@@ -6,7 +6,7 @@
     <UseWPF>true</UseWPF>
     <Nullable>enable</Nullable>
     <RootNamespace>T2TouchId.SepVaultGui</RootNamespace>
-    <AssemblyName>SepVaultGui</AssemblyName>
+    <AssemblyName>T2TouchID_GUI</AssemblyName>
     <!-- One-time admin tool: writes to %ProgramData%\T2TouchId and sets an
          ACL restricted to SYSTEM/Administrators (see SepVaultFormat.cs) —
          needs to run elevated, so ask for it up front rather than fail
@@ -14,6 +14,8 @@
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <!-- Embedded as the exe icon (Explorer, taskbar, title bar). -->
     <ApplicationIcon>app.ico</ApplicationIcon>
+    <Product>T2 TouchID for Windows</Product>
+    <AssemblyTitle>T2 TouchID for Windows</AssemblyTitle>
   </PropertyGroup>
 
 </Project>

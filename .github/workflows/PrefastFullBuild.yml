@@ -60,14 +60,14 @@ env:
   BIO_ENGINE_NAME: T2TouchIdEngineAdapter
   BIO_UMDF_STAMP_VERSION: 2.15.0
 
-  # --- SepVaultGui ---
+  # --- T2TouchID_GUI ---
   GUI_PROJECT: driver/T2TouchIdBio/Sepvaultgui.csproj
-  GUI_ASSEMBLY_NAME: SepVaultGui
+  GUI_ASSEMBLY_NAME: T2TouchID_GUI
   DOTNET_VERSION: '8.0.x'
 
 jobs:
   ci:
-    name: PREfast + Build + Package (SEP, NCM, Bio, SepVaultGui)
+    name: PREfast + Build + Package (SEP, NCM, Bio, T2TouchID_GUI)
     runs-on: windows-2022
     timeout-minutes: 90
     env:
@@ -433,42 +433,42 @@ jobs:
       shell: pwsh
 
     # =====================================================================
-    # SepVaultGui - "Min" (framework-dependent) goes into the main package;
+    # T2TouchID_GUI - "Min" (framework-dependent) goes into the main package;
     # "Full" (self-contained, single-file) is uploaded as a separate artifact
     # =====================================================================
-    - name: "SepVaultGui: restore + build"
+    - name: "T2TouchID_GUI: restore + build"
       run: |
         dotnet restore "$env:GUI_PROJECT"
         dotnet build "$env:GUI_PROJECT" --no-restore -c $env:CONFIGURATION
       shell: pwsh
 
-    - name: "SepVaultGui: publish Full (self-contained, single-file win-x64)"
+    - name: "T2TouchID_GUI: publish Full (self-contained, single-file win-x64)"
       run: |
         $ErrorActionPreference = "Stop"
         dotnet publish "$env:GUI_PROJECT" `
           -c $env:CONFIGURATION -r win-x64 --self-contained true `
-          -p:PublishSingleFile=true -o artifacts\SepVaultGui-full
-        $exePath = "artifacts\SepVaultGui-full\$env:GUI_ASSEMBLY_NAME.exe"
+          -p:PublishSingleFile=true -o artifacts\T2TouchID_GUI-full
+        $exePath = "artifacts\T2TouchID_GUI-full\$env:GUI_ASSEMBLY_NAME.exe"
         if (-not (Test-Path $exePath)) { Write-Error "Expected published binary not found: $exePath"; exit 1 }
         Write-Host "OK: published $exePath"
       shell: pwsh
 
-    - name: "SepVaultGui: publish Min (framework-dependent win-x64)"
+    - name: "T2TouchID_GUI: publish Min (framework-dependent win-x64)"
       run: |
         $ErrorActionPreference = "Stop"
         dotnet publish "$env:GUI_PROJECT" `
           -c $env:CONFIGURATION -r win-x64 --self-contained false `
-          -o artifacts\SepVaultGui-min
-        $exePath = "artifacts\SepVaultGui-min\$env:GUI_ASSEMBLY_NAME.exe"
+          -o artifacts\T2TouchID_GUI-min
+        $exePath = "artifacts\T2TouchID_GUI-min\$env:GUI_ASSEMBLY_NAME.exe"
         if (-not (Test-Path $exePath)) { Write-Error "Expected published binary not found: $exePath"; exit 1 }
         Write-Host "OK: published $exePath"
       shell: pwsh
 
-    - name: Upload SepVaultGui Full (standalone, self-contained)
+    - name: Upload T2TouchID_GUI Full (standalone, self-contained)
       uses: actions/upload-artifact@v4
       with:
-        name: SepVaultGui-Full-${{ env.DRIVER_VERSION }}
-        path: artifacts/SepVaultGui-full
+        name: T2TouchID_GUI-Full-${{ env.DRIVER_VERSION }}
+        path: artifacts/T2TouchID_GUI-full
         if-no-files-found: error
 
     # =====================================================================
@@ -707,13 +707,13 @@ jobs:
         Write-Host "OK: Bio CAT generated."
       shell: pwsh
 
-    - name: "SepVaultGui: stage Min build into final package"
+    - name: "T2TouchID_GUI: stage Min build into final package"
       run: |
         $ErrorActionPreference = "Stop"
-        $pkg = "final\SepVaultGui"
+        $pkg = "final\T2TouchID_GUI"
         New-Item -ItemType Directory -Path $pkg -Force | Out-Null
-        Copy-Item -Path "artifacts\SepVaultGui-min\*" -Destination $pkg -Recurse -Force
-        Write-Host "OK: staged SepVaultGui (Min, framework-dependent) into $pkg"
+        Copy-Item -Path "artifacts\T2TouchID_GUI-min\*" -Destination $pkg -Recurse -Force
+        Write-Host "OK: staged T2TouchID_GUI (Min, framework-dependent) into $pkg"
       shell: pwsh
 
     # =====================================================================
@@ -748,7 +748,7 @@ jobs:
           )
           $toSign += @(Get-ChildItem -Path "final\Bio" -Filter "*.dll" | ForEach-Object { $_.FullName })
           $toSign += "final\Bio\$env:BIO_UMDF_NAME.cat"
-          $toSign += "final\SepVaultGui\$env:GUI_ASSEMBLY_NAME.exe"
+          $toSign += "final\T2TouchID_GUI\$env:GUI_ASSEMBLY_NAME.exe"
 
           foreach ($file in $toSign) {
             if (-not (Test-Path $file)) { Write-Error "To-sign target not found: $file"; exit 1 }
@@ -768,7 +768,7 @@ jobs:
 
     - name: Warn if package is unsigned
       if: ${{ env.SIGN_CERT_PFX == '' || env.SIGN_CERT_PASSWORD == '' }}
-      run: Write-Host "::warning::CERT/CERT_PWD secrets not set - SEP/NCM/Bio/SepVaultGui binaries are UNSIGNED. Target machine needs test-signing mode."
+      run: Write-Host "::warning::CERT/CERT_PWD secrets not set - SEP/NCM/Bio/T2TouchID_GUI binaries are UNSIGNED. Target machine needs test-signing mode."
       shell: pwsh
 
     - name: Copy installer scripts into the final package

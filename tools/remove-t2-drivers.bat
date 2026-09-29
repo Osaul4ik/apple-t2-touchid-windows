@@ -64,6 +64,56 @@ echo ============================================================
 echo  Done.
 echo  Kept: %ProgramData%\T2TouchId\sep-vault.bin ^(encrypted keybag^)
 echo ============================================================
+echo.
+
+rem ------------------------------------------------------------
+rem Optional: disable Windows Test Mode
+rem ------------------------------------------------------------
+set "TESTMODE_ON=0"
+bcdedit /enum | findstr /i "testsigning" >nul
+if not errorlevel 1 set "TESTMODE_ON=1"
+
+if "%TESTMODE_ON%"=="0" (
+    echo Test Mode does not appear to be enabled. Nothing more to do.
+    echo.
+    pause
+    exit /b 0
+)
+
+:ASK_TESTMODE
+echo Test Mode is currently enabled on this PC.
+echo Drivers that need it have been removed.
+echo.
+set /p "ANSWER=Disable Test Mode now? [Yes/No]: "
+if /i "%ANSWER%"=="Yes" goto DISABLE_TESTMODE
+if /i "%ANSWER%"=="No" (
+    echo.
+    echo Test Mode left enabled.
+    echo.
+    pause
+    exit /b 0
+)
+echo.
+echo Please type Yes or No.
+echo.
+goto ASK_TESTMODE
+
+:DISABLE_TESTMODE
+echo.
+echo Disabling Test Mode...
+bcdedit /set testsigning off
+if errorlevel 1 (
+    echo.
+    echo [ERROR] Failed to disable Test Mode.
+    echo Possible reasons: Secure Boot, or not running as Administrator.
+    echo.
+    pause
+    exit /b 1
+)
+echo.
+echo Test Mode has been DISABLED.
+echo Restart Windows for the change to take effect.
+echo.
 pause
 exit /b 0
 
