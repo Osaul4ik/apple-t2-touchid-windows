@@ -160,19 +160,22 @@ tools/                       Install scripts, t2touchid CLI
 tests/                       Unit tests (no hardware)
 ```
 
+
 ## ☕ Support
 
 If you find this project useful, consider buying me a coffee!
 
 [![Ko-fi](https://img.shields.io/badge/Support%20me%20on-Ko--fi-ff5e5b?logo=ko-fi&logoColor=white)](https://ko-fi.com/osaul4ik)
 
----
 
-# Credits
 
-This project is based on the excellent work of the original **mac-precision-touchpad** project by imbushuo.
+## 🙏 Acknowledgements
 
----
+This project was developed with reference to the excellent research and implementation work in [t2-touchid-linux](https://github.com/jmurth1234/t2-touchid-linux) by **jmurth1234**.
+
+The project was used as a technical reference to understand the T2 Touch ID communication flow and Apple-specific behavior.
+
+
 
 ## License
 
