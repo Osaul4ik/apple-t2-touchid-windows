@@ -704,7 +704,7 @@ namespace T2TouchId.SepVaultGui
                     string rest = line.Substring(idx + 5).Trim();
                     int space = rest.IndexOfAny(new[] { ' ', '\t', '(' });
                     string guid = (space > 0 ? rest.Substring(0, space) : rest).Trim();
-                    if (guid.Length == 36 && guid.Count(c => c == '-') == 4)
+                    if (guid.Length == 36 && guid.Split('-').Length == 5)
                         guids.Add(guid);
                 }
             }
