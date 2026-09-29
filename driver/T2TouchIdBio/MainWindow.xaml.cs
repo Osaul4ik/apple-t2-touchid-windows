@@ -14,6 +14,7 @@
 // in C:\LogSEP.txt.
 
 using System;
+using System.Diagnostics;
 using System.ComponentModel;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -42,6 +43,7 @@ namespace T2TouchId.SepVaultGui
             LoadSepStatus();
             LoadLogFlags();
             LoadShortVerify();
+            LoadLockOnDisplayOff();
             LoadTransportMode();
             LoadDevMode();
         }
@@ -619,6 +621,135 @@ namespace T2TouchId.SepVaultGui
                 : "Saved: full sequence. Applies from the next verification session.";
             ShortVerifyStatusText.Foreground = DotOk;
         }
+
+        // ---- Lock on display-off (HKLM\SOFTWARE\T2TouchIdBio\LockOnDisplayOff) ----
+        // Used by UMDF OnConsoleDisplayState(OFF). GUI enables the toggle only when
+        // the current power plan has power-button action = Turn off the display (4).
+        private const string LockOnDisplayOffValue = "LockOnDisplayOff";
+        private bool _lockOnDisplayOffLoading;
+
+        /// <summary>PBUTTONACTION index 4 = Turn off the display (undocumented but widely used).</summary>
+        private static bool IsPowerButtonDisplayOff()
+        {
+            try
+            {
+                int? ac = QueryPowerButtonAction("getacvalueindex");
+                int? dc = QueryPowerButtonAction("getdcvalueindex");
+                return ac == 4 || dc == 4;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static int? QueryPowerButtonAction(string getCmd)
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = "powercfg",
+                Arguments = "/" + getCmd + " SCHEME_CURRENT SUB_BUTTONS PBUTTONACTION",
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+            using var p = Process.Start(psi);
+            if (p == null) return null;
+            string output = p.StandardOutput.ReadToEnd();
+            if (!p.WaitForExit(3000)) return null;
+            // powercfg prints the index as the last integer token (decimal or hex).
+            var tokens = output.Split(new[] { ' ', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+            for (int i = tokens.Length - 1; i >= 0; i--)
+            {
+                if (int.TryParse(tokens[i], System.Globalization.NumberStyles.Integer,
+                        System.Globalization.CultureInfo.InvariantCulture, out int v))
+                    return v;
+                if (int.TryParse(tokens[i], System.Globalization.NumberStyles.HexNumber,
+                        System.Globalization.CultureInfo.InvariantCulture, out v))
+                    return v;
+            }
+            return null;
+        }
+
+        private static bool ReadLockOnDisplayOff()
+        {
+            try
+            {
+                using var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(BioRegPath, writable: false);
+                object? v = key?.GetValue(LockOnDisplayOffValue);
+                if (v is int i) return i != 0;
+                if (v is long l) return l != 0;
+                return false;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool WriteLockOnDisplayOff(bool enabled)
+        {
+            try
+            {
+                using var key = Microsoft.Win32.Registry.LocalMachine.CreateSubKey(BioRegPath, true);
+                if (key == null) return false;
+                key.SetValue(LockOnDisplayOffValue, enabled ? 1 : 0, Microsoft.Win32.RegistryValueKind.DWord);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private void LoadLockOnDisplayOff()
+        {
+            _lockOnDisplayOffLoading = true;
+            try
+            {
+                bool powerOk = IsPowerButtonDisplayOff();
+                LockOnDisplayOffCheck.IsEnabled = powerOk;
+                bool want = ReadLockOnDisplayOff();
+                LockOnDisplayOffCheck.IsChecked = powerOk && want;
+                if (!powerOk)
+                {
+                    LockOnDisplayOffStatusText.Text =
+                        "Inactive: set the power button to “Turn off the display” in Windows power options (AC or battery).";
+                    LockOnDisplayOffStatusText.Foreground = TextMuted;
+                }
+                else
+                {
+                    LockOnDisplayOffStatusText.Text = LockOnDisplayOffCheck.IsChecked == true
+                        ? "On: power-button display-off also locks the PC."
+                        : "Off: display turns off only, no lock.";
+                    LockOnDisplayOffStatusText.Foreground = TextMuted;
+                }
+            }
+            finally
+            {
+                _lockOnDisplayOffLoading = false;
+            }
+        }
+
+        private void OnLockOnDisplayOffChanged(object sender, RoutedEventArgs e)
+        {
+            if (_lockOnDisplayOffLoading) return;
+            if (!LockOnDisplayOffCheck.IsEnabled) return;
+
+            bool enabled = LockOnDisplayOffCheck.IsChecked == true;
+            if (!WriteLockOnDisplayOff(enabled))
+            {
+                LockOnDisplayOffStatusText.Text = "Could not write to HKLM (run the app as administrator).";
+                LockOnDisplayOffStatusText.Foreground = DotError;
+                return;
+            }
+            LockOnDisplayOffStatusText.Text = enabled
+                ? "Saved: lock on power-button display-off."
+                : "Saved: no lock on display-off.";
+            LockOnDisplayOffStatusText.Foreground = DotOk;
+        }
+
+
 
         // Reads the driver's in-memory bootstrap status and updates the
         // banner. Never throws into the caller - every failure mode

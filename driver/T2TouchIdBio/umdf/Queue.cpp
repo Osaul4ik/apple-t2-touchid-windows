@@ -1401,6 +1401,20 @@ bool LoadShortVerify()
     return value != 0;
 }
 
+// HKLM\SOFTWARE\T2TouchIdBio\LockOnDisplayOff (REG_DWORD, GUI writes 0/1)
+// When nonzero: OnConsoleDisplayState(OFF) also calls LockWorkStation().
+// Intended for power-button action = Turn off the display (PBUTTONACTION 4).
+bool LoadLockOnDisplayOff()
+{
+    DWORD value = 0;
+    DWORD cb = sizeof(value);
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\T2TouchIdBio", L"LockOnDisplayOff",
+                     RRF_RT_REG_DWORD, nullptr, &value, &cb) != ERROR_SUCCESS) {
+        return false;
+    }
+    return value != 0;
+}
+
 // PURPOSE_ENROLL / _ENROLL_FOR_VERIFICATION / _ENROLL_FOR_IDENTIFICATION
 // (design doc 4): does NOT collect a new biometric sample. Runs the same
 // WarmUp() identity-list read the CLI's `warmup`/`identities` commands use
@@ -2228,6 +2242,16 @@ void OnConsoleDisplayState(DWORD state)
             g_suspendGeneration.fetch_add(1, std::memory_order_acq_rel);
             T2BioLog("ConsoleDisplayState=OFF: power-button grace %llums (idle will expire)",
                      static_cast<unsigned long long>(kPowerButtonGraceMs));
+            // Optional: lock workstation when GUI enabled LockOnDisplayOff
+            // (power button typically set to Turn off the display).
+            if (LoadLockOnDisplayOff()) {
+                if (LockWorkStation()) {
+                    T2BioLog("ConsoleDisplayState=OFF: LockWorkStation OK (LockOnDisplayOff)");
+                } else {
+                    T2BioLog("ConsoleDisplayState=OFF: LockWorkStation failed err=%lu",
+                             GetLastError());
+                }
+            }
         }
     } else {
         g_powerButtonGraceUntil.store(0, std::memory_order_release);

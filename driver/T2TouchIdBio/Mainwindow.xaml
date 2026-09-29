@@ -414,6 +414,17 @@
                         </CheckBox>
 
                         <TextBlock x:Name="ShortVerifyStatusText" Style="{StaticResource StatusLine}" Margin="52,10,0,0"/>
+
+                        <CheckBox x:Name="LockOnDisplayOffCheck" Style="{StaticResource ToggleSwitch}"
+                                  Margin="0,16,0,0"
+                                  Checked="OnLockOnDisplayOffChanged" Unchecked="OnLockOnDisplayOffChanged">
+                            <StackPanel>
+                                <TextBlock Text="Lock on power-button display off" FontWeight="SemiBold"/>
+                                <TextBlock Style="{StaticResource CardHint}" Margin="0,2,0,0"
+                                           Text="When the power button is set to “Turn off the display”, also lock the workstation. The switch is disabled unless that power setting is active (AC or battery)."/>
+                            </StackPanel>
+                        </CheckBox>
+                        <TextBlock x:Name="LockOnDisplayOffStatusText" Style="{StaticResource StatusLine}" Margin="52,10,0,0"/>
                     </StackPanel>
                 </Border>
 

@@ -17,7 +17,7 @@ setlocal EnableDelayedExpansion
 ::
 :: Registry cleanup (both the 64-bit and the 32-bit registry view):
 ::   HKLM\SOFTWARE\T2TouchId      (Network, Session, Logging, Gui settings)
-::   HKLM\SOFTWARE\T2TouchIdBio   (ShortVerify, BirVariant)
+::   HKLM\SOFTWARE\T2TouchIdBio   (ShortVerify, BirVariant, LockOnDisplayOff, PostResumeSettleMs)
 ::
 :: Not touched: %ProgramData%\T2TouchId\sep-vault.bin (your encrypted keybag,
 :: so a later reinstall does not need a new import) and installed certificates.
