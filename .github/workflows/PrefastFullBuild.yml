@@ -779,10 +779,13 @@ jobs:
         $inst = "final\Inst"
         New-Item -ItemType Directory -Path $inst -Force | Out-Null
         Copy-Item -Path "tools\InstallDriver.bat" -Destination "final\InstallDriver.bat" -Force
+        # Uninstaller (removes the driver packages + clears HKLM\SOFTWARE\T2TouchId*):
+        # also in the package root, right next to InstallDriver.bat.
+        Copy-Item -Path "tools\remove-t2-drivers.bat" -Destination "final\remove-t2-drivers.bat" -Force
         Copy-Item -Path "tools\InstallCert.bat" -Destination "$inst\InstallCert.bat" -Force
         Copy-Item -Path "tools\Install-T2TouchIdBio.ps1" -Destination "$inst\Install-T2TouchIdBio.ps1" -Force
         Copy-Item -Path "tools\Set-T2NcmStaticIp.ps1" -Destination "$inst\Set-T2NcmStaticIp.ps1" -Force
-        Write-Host "OK: InstallDriver.bat in package root; InstallCert.bat + Install-T2TouchIdBio.ps1 + Set-T2NcmStaticIp.ps1 in Inst\."
+        Write-Host "OK: InstallDriver.bat + remove-t2-drivers.bat in package root; InstallCert.bat + Install-T2TouchIdBio.ps1 + Set-T2NcmStaticIp.ps1 in Inst\."
       shell: pwsh
 
     # =====================================================================
@@ -846,6 +849,7 @@ jobs:
         # installer cannot find its own files.
         $required = @(
           "InstallDriver.bat",
+          "remove-t2-drivers.bat",
           "Inst\InstallCert.bat",
           "Inst\Install-T2TouchIdBio.ps1",
           "Inst\Set-T2NcmStaticIp.ps1",

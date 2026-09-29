@@ -6,6 +6,8 @@ name: CI Apple T2 TouchId (CodeQL + PREfast + Build + Package)
 #
 # apple-t2-touchid/
 #   InstallDriver.bat  (з tools/; ставить сертифікат, SEP, NCM, Bio по порядку)
+#   remove-t2-drivers.bat  (з tools/; видаляє драйвери з Driver Store і чистить
+#                   реєстр HKLM\SOFTWARE\T2TouchId та T2TouchIdBio; запуск від адміна)
 #   Inst/           InstallCert.bat, Install-T2TouchIdBio.ps1, Set-T2NcmStaticIp.ps1
 #                   (усі з tools/) і <CertCN>.cer
 #   SEP/            T2TouchIdTransport.sys, .inf, .cat, T2SepBootstrap.exe,
@@ -57,6 +59,11 @@ concurrency:
 
 permissions:
   contents: read
+  # github/codeql-action/upload-sarif: publishes the CodeQL results to
+  # Security -> Code scanning.
+  security-events: write
+  # only needed by upload-sarif in private repositories
+  actions: read
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -475,6 +482,34 @@ jobs:
         path: |
           static-analysis-logs/
           codeql-results/
+
+    # ---------------------------------------------------------------------
+    # Publish the CodeQL results to GitHub code scanning (Security tab).
+    #  - mustrun.qls is a superset of mustfix.qls, so uploading it covers both.
+    #  - One category per component: a second upload with the same category
+    #    would replace the first one.
+    #  - Runs even when the mustfix gate above failed the job, so the alerts
+    #    that caused the failure are visible; skipped when there is no SARIF
+    #    and for fork PRs (read-only token).
+    #  - continue-on-error: an upload problem never fails the build/package.
+    #  - Needs the CodeQL *advanced* setup (or no default setup) on the repo:
+    #    with "Default setup" enabled GitHub rejects SARIF made by the CodeQL CLI.
+    # ---------------------------------------------------------------------
+    - name: "NCM: upload CodeQL results to GitHub code scanning"
+      if: ${{ !cancelled() && hashFiles('codeql-results/ncm/codeql-mustrun.sarif') != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+      uses: github/codeql-action/upload-sarif@v4
+      continue-on-error: true
+      with:
+        sarif_file: codeql-results/ncm/codeql-mustrun.sarif
+        category: windows-drivers-ncm
+
+    - name: "SEP: upload CodeQL results to GitHub code scanning"
+      if: ${{ !cancelled() && hashFiles('codeql-results/sep/codeql-mustrun.sarif') != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+      uses: github/codeql-action/upload-sarif@v4
+      continue-on-error: true
+      with:
+        sarif_file: codeql-results/sep/codeql-mustrun.sarif
+        category: windows-drivers-sep
 
     # =====================================================================
     # Bio: T2TouchIdBio (UMDF) + T2TouchIdEngineAdapter, PREfast only
@@ -921,13 +956,16 @@ jobs:
         $inst = "final\Inst"
         New-Item -ItemType Directory -Path $inst -Force | Out-Null
         Copy-Item -Path "tools\InstallDriver.bat" -Destination "final\InstallDriver.bat" -Force
+        # Uninstaller (removes the driver packages + clears HKLM\SOFTWARE\T2TouchId*):
+        # also in the package root, right next to InstallDriver.bat.
+        Copy-Item -Path "tools\remove-t2-drivers.bat" -Destination "final\remove-t2-drivers.bat" -Force
         Copy-Item -Path "tools\InstallCert.bat" -Destination "$inst\InstallCert.bat" -Force
         Copy-Item -Path "tools\Install-T2TouchIdBio.ps1" -Destination "$inst\Install-T2TouchIdBio.ps1" -Force
         # Assigns the static IPv4 tunnel address (169.254.84.1/16) to the
         # Apple T2 NCM adapter - InstallDriver.bat's new step 5/6 calls this
         # from Inst\, same layout as Install-T2TouchIdBio.ps1 above.
         Copy-Item -Path "tools\Set-T2NcmStaticIp.ps1" -Destination "$inst\Set-T2NcmStaticIp.ps1" -Force
-        Write-Host "OK: InstallDriver.bat in package root; InstallCert.bat + Install-T2TouchIdBio.ps1 + Set-T2NcmStaticIp.ps1 in Inst\."
+        Write-Host "OK: InstallDriver.bat + remove-t2-drivers.bat in package root; InstallCert.bat + Install-T2TouchIdBio.ps1 + Set-T2NcmStaticIp.ps1 in Inst\."
       shell: pwsh
 
     # =====================================================================
@@ -1005,6 +1043,7 @@ jobs:
         # installer cannot find its own files.
         $required = @(
           "InstallDriver.bat",
+          "remove-t2-drivers.bat",
           "Inst\InstallCert.bat",
           "Inst\Install-T2TouchIdBio.ps1",
           "Inst\Set-T2NcmStaticIp.ps1",

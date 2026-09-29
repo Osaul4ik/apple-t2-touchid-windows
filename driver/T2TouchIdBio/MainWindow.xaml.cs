@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // MainWindow.xaml.cs — SEP status + one-time keybag setup UI, design doc §9.1.
 //
+// Diagnostic / logging controls live in the "Developer tools" card, which is
+// hidden until the Developer mode switch (footer) is turned on.
+//
 // Vault import (OnBrowseKeybag/OnSave) still never talks to
 // protocol/AppleKeyStore or the SEP - it only ever produces sep-vault.bin,
 // same as before. T2SepBootstrap is what actually validates it against
@@ -16,6 +19,7 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Media;
+using System.Windows.Media.Animation;
 using System.Windows.Threading;
 using Microsoft.Win32;
 
@@ -26,10 +30,11 @@ namespace T2TouchId.SepVaultGui
         private const string VaultPath = @"C:\ProgramData\T2TouchId\sep-vault.bin";
         private byte[]? _keybagBytes;
 
-        private static readonly Brush DotUnknown = new SolidColorBrush(Color.FromRgb(0x9E, 0x9E, 0x9E));
-        private static readonly Brush DotOk = new SolidColorBrush(Color.FromRgb(0x1E, 0x7B, 0x34));
-        private static readonly Brush DotWarn = new SolidColorBrush(Color.FromRgb(0xB3, 0x8A, 0x00));
-        private static readonly Brush DotError = new SolidColorBrush(Color.FromRgb(0xB3, 0x26, 0x1E));
+        private static readonly Brush DotUnknown = new SolidColorBrush(Color.FromRgb(0x9C, 0xA3, 0xAF));
+        private static readonly Brush DotOk = new SolidColorBrush(Color.FromRgb(0x16, 0xA3, 0x4A));
+        private static readonly Brush DotWarn = new SolidColorBrush(Color.FromRgb(0xD9, 0x77, 0x06));
+        private static readonly Brush DotError = new SolidColorBrush(Color.FromRgb(0xDC, 0x26, 0x26));
+        private static readonly Brush TextMuted = new SolidColorBrush(Color.FromRgb(0x6B, 0x72, 0x80));
 
         public MainWindow()
         {
@@ -38,6 +43,75 @@ namespace T2TouchId.SepVaultGui
             LoadLogFlags();
             LoadShortVerify();
             LoadTransportMode();
+            LoadDevMode();
+        }
+
+        // ---- Developer mode (GUI-only switch) ----
+        // Hides the diagnostic / logging controls until it is switched on.
+        // Persisted so it survives restarts; a failed write (no admin rights)
+        // only means the switch is not remembered - it still works this session.
+        private const string GuiRegPath = @"SOFTWARE\T2TouchId\Gui";
+        private const string DevModeValue = "DevMode";
+        private bool _devModeLoading;
+
+        private static bool ReadDevMode()
+        {
+            try
+            {
+                using var key = Registry.LocalMachine.OpenSubKey(GuiRegPath, false);
+                return key?.GetValue(DevModeValue) is int i && i != 0;
+            }
+            catch { return false; }
+        }
+
+        private static void WriteDevMode(bool enabled)
+        {
+            try
+            {
+                using var key = Registry.LocalMachine.CreateSubKey(GuiRegPath, true);
+                key?.SetValue(DevModeValue, enabled ? 1 : 0, RegistryValueKind.DWord);
+            }
+            catch { /* best effort */ }
+        }
+
+        private void LoadDevMode()
+        {
+            _devModeLoading = true;
+            try
+            {
+                bool on = ReadDevMode();
+                DevModeToggle.IsChecked = on;
+                ApplyDevMode(on, animate: false);
+            }
+            finally
+            {
+                _devModeLoading = false;
+            }
+        }
+
+        private void OnDevModeChanged(object sender, RoutedEventArgs e)
+        {
+            if (_devModeLoading) return;
+            bool on = DevModeToggle.IsChecked == true;
+            WriteDevMode(on);
+            ApplyDevMode(on, animate: true);
+        }
+
+        private void ApplyDevMode(bool on, bool animate)
+        {
+            if (!on)
+            {
+                DevPanel.BeginAnimation(OpacityProperty, null);
+                DevPanel.Visibility = Visibility.Collapsed;
+                return;
+            }
+
+            DevPanel.Visibility = Visibility.Visible;
+            if (!animate) return;
+
+            DevPanel.BeginAnimation(OpacityProperty,
+                new DoubleAnimation(0, 1, new Duration(TimeSpan.FromMilliseconds(180))));
+            Dispatcher.BeginInvoke(DispatcherPriority.Loaded, new Action(() => DevPanel.BringIntoView()));
         }
 
         public void RefreshTransportUi()
@@ -123,17 +197,17 @@ namespace T2TouchId.SepVaultGui
                 Ipv4TunnelCheck.IsChecked = tunnel;
                 AutoSwitchCheck.IsChecked = auto;
                 TransportStatusText.Text = tunnel
-                    ? "Режим: IPv4 tunnel примусово (авто-перемикання не діє, доки вибрано)."
+                    ? "Mode: IPv4 tunnel forced (automatic fallback is inactive while forced)."
                     : auto
-                        ? "Режим: авто — Native IPv6; якщо недоступний (VPN) — одразу IPv4 tunnel."
-                        : "Режим: Native IPv6 (авто-перемикання вимкнено).";
-                TransportStatusText.Foreground = new SolidColorBrush(Color.FromRgb(0x66, 0x66, 0x66));
+                        ? "Mode: automatic. Native IPv6, with an instant switch to the IPv4 tunnel if it is unavailable (VPN)."
+                        : "Mode: Native IPv6 (automatic fallback is off).";
+                TransportStatusText.Foreground = TextMuted;
                 if (WarmupStatusText != null)
                 {
                     WarmupStatusText.Text = auto
-                        ? "Увімкнено (за замовчуванням)."
-                        : "Вимкнено: використовується Native IPv6 (або примусовий tunnel).";
-                    WarmupDetailText.Text = "Повернення на IPv6 — за подіями: VPN підключився/відключився, unlock, вихід зі сну. cmd: SepVaultGui.exe --auto | --no-auto";
+                        ? "Enabled (default)."
+                        : "Disabled: using Native IPv6 (or the forced tunnel).";
+                    WarmupDetailText.Text = "Returns to IPv6 on events: VPN connected/disconnected, unlock, resume from sleep. CLI: SepVaultGui.exe --auto | --no-auto";
                 }
             }
             finally
@@ -159,7 +233,7 @@ namespace T2TouchId.SepVaultGui
                 {
                     if (key == null)
                     {
-                        status = "Не вдалось відкрити Session key";
+                        status = "Could not open the Session key";
                         return false;
                     }
                     if (tunnel)
@@ -183,21 +257,21 @@ namespace T2TouchId.SepVaultGui
 
                 status = tunnel
                     ? (pushed
-                        ? "IPv4 tunnel увімкнено (registry + live IOCTL" + (peerOk ? ", peer" : ", peer skip") + ", warm)."
-                        : "IPv4 tunnel: registry OK, але \\\\.\\T2Ncm недоступний.")
+                        ? "IPv4 tunnel enabled (registry + live IOCTL" + (peerOk ? ", peer" : ", peer skip") + ", warm)."
+                        : "IPv4 tunnel: registry OK, but \\\\.\\T2Ncm is unavailable.")
                     : (pushed
-                        ? "Native IPv6 увімкнено (registry + live IOCTL)."
-                        : "Native IPv6: registry OK, але \\\\.\\T2Ncm недоступний.");
+                        ? "Native IPv6 enabled (registry + live IOCTL)."
+                        : "Native IPv6: registry OK, but \\\\.\\T2Ncm is unavailable.");
                 return true;
             }
             catch (UnauthorizedAccessException)
             {
-                status = "Немає прав на HKLM — запустіть від імені адміністратора.";
+                status = "No permission to write HKLM. Run the app as administrator.";
                 return false;
             }
             catch (Exception ex)
             {
-                status = "Помилка: " + ex.Message;
+                status = "Error: " + ex.Message;
                 return false;
             }
         }
@@ -209,15 +283,15 @@ namespace T2TouchId.SepVaultGui
             bool ok = WriteAutoSwitch(enabled);
             if (!ok)
             {
-                TransportStatusText.Text = "Не вдалось записати HKLM (запустіть GUI від імені адміністратора).";
+                TransportStatusText.Text = "Could not write to HKLM (run the app as administrator).";
                 TransportStatusText.Foreground = DotError;
                 LoadTransportMode(); // revert the checkbox to what is really stored
                 return;
             }
             LoadTransportMode();
             TransportStatusText.Text = enabled
-                ? "Авто-перемикання увімкнено — діє з наступного підключення."
-                : "Авто-перемикання вимкнено — діє з наступного підключення.";
+                ? "Automatic fallback enabled. Applies from the next connection."
+                : "Automatic fallback disabled. Applies from the next connection.";
             TransportStatusText.Foreground = DotOk;
         }
 
@@ -442,8 +516,8 @@ namespace T2TouchId.SepVaultGui
                 LogBridgeCheck.IsChecked = ReadLogFlag("BridgeXpc");
                 LogTransportCheck.IsChecked = ReadLogFlag("Transport");
                 LogNcmCheck.IsChecked = ReadLogFlag("Ncm");
-                LogStatusText.Text = "Фільтр DebugView: T2TouchId* | T2Ncm* | t2touchid. Kernel: Capture Kernel для Transport/NCM.";
-                LogStatusText.Foreground = new SolidColorBrush(Color.FromRgb(0x66, 0x66, 0x66));
+                LogStatusText.Text = "DebugView filter: T2TouchId* | T2Ncm* | t2touchid. Kernel logs (Transport/NCM) need Capture Kernel.";
+                LogStatusText.Foreground = TextMuted;
             }
             finally
             {
@@ -464,12 +538,12 @@ namespace T2TouchId.SepVaultGui
 
             if (!ok)
             {
-                LogStatusText.Text = "Не вдалось записати HKLM (запустіть GUI від імені адміністратора).";
+                LogStatusText.Text = "Could not write to HKLM (run the app as administrator).";
                 LogStatusText.Foreground = DotError;
             }
             else
             {
-                LogStatusText.Text = "Збережено. UMDF/BridgeXpc підхоплять одразу; kernel — після наступного sleep або перезавантаження драйвера.";
+                LogStatusText.Text = "Saved. UMDF/BridgeXpc pick it up immediately; kernel drivers after the next sleep or a driver reload.";
                 LogStatusText.Foreground = DotOk;
             }
         }
@@ -519,9 +593,9 @@ namespace T2TouchId.SepVaultGui
             {
                 ShortVerifyCheck.IsChecked = ReadShortVerify();
                 ShortVerifyStatusText.Text = ShortVerifyCheck.IsChecked == true
-                    ? "Увімкнено: ResetSensor і LoadCalibration пропускаються."
-                    : "Вимкнено: повна послідовність (Linux parity).";
-                ShortVerifyStatusText.Foreground = new SolidColorBrush(Color.FromRgb(0x66, 0x66, 0x66));
+                    ? "On: ResetSensor and LoadCalibration are skipped."
+                    : "Off: full sequence (Linux parity).";
+                ShortVerifyStatusText.Foreground = TextMuted;
             }
             finally
             {
@@ -536,13 +610,13 @@ namespace T2TouchId.SepVaultGui
             bool enabled = ShortVerifyCheck.IsChecked == true;
             if (!WriteShortVerify(enabled))
             {
-                ShortVerifyStatusText.Text = "Не вдалось записати HKLM (запустіть GUI від імені адміністратора).";
+                ShortVerifyStatusText.Text = "Could not write to HKLM (run the app as administrator).";
                 ShortVerifyStatusText.Foreground = DotError;
                 return;
             }
             ShortVerifyStatusText.Text = enabled
-                ? "Збережено: Short Verify увімкнено, діє з наступної сесії verify."
-                : "Збережено: повна послідовність, діє з наступної сесії verify.";
+                ? "Saved: fast verification is on. Applies from the next verification session."
+                : "Saved: full sequence. Applies from the next verification session.";
             ShortVerifyStatusText.Foreground = DotOk;
         }
 
@@ -561,17 +635,17 @@ namespace T2TouchId.SepVaultGui
             }
             catch (SepDeviceNotFoundException)
             {
-                SetBanner(DotError, "Драйвер T2TouchIdTransport не знайдено",
-                    "Переконайтесь, що драйвер встановлено і завантажено (Диспетчер пристроїв).");
+                SetBanner(DotError, "T2TouchIdTransport driver not found",
+                    "Make sure the driver is installed and loaded (Device Manager).");
             }
             catch (Win32Exception ex)
             {
-                SetBanner(DotError, "Не вдалось прочитати стан SEP",
-                    $"Помилка звернення до драйвера: {ex.Message}");
+                SetBanner(DotError, "Could not read the SEP status",
+                    $"Driver request failed: {ex.Message}");
             }
             catch (Exception ex)
             {
-                SetBanner(DotError, "Не вдалось прочитати стан SEP", ex.Message);
+                SetBanner(DotError, "Could not read the SEP status", ex.Message);
             }
         }
 
@@ -582,64 +656,65 @@ namespace T2TouchId.SepVaultGui
             switch (status.ReasonValue)
             {
                 case SepBootstrapReason.Ok:
-                    SetBanner(DotOk, "SEP готовий" + when,
-                        "Touch ID розблоковано цього завантаження — усе працює.");
+                    SetBanner(DotOk, "SEP ready" + when,
+                        "Touch ID was unlocked on this boot. Everything is working.");
                     break;
 
                 case SepBootstrapReason.Unknown:
-                    SetBanner(DotUnknown, "Стан SEP невідомий",
-                        "Сервіс T2SepBootstrap ще не звітував цього сеансу — перезавантажте комп'ютер або запустіть сервіс вручну.");
+                    SetBanner(DotUnknown, "SEP status unknown",
+                        "The T2SepBootstrap service has not reported in this session. Restart the computer or start the service manually.");
                     break;
 
                 case SepBootstrapReason.VaultMissing:
-                    SetBanner(DotWarn, "Потрібне налаштування" + when,
-                        "sep-vault.bin відсутній або пошкоджений. Заповніть форму нижче і натисніть «Зберегти».");
+                    SetBanner(DotWarn, "Setup required" + when,
+                        "sep-vault.bin is missing or damaged. Fill in the form below and click \"Save\".");
                     break;
 
                 case SepBootstrapReason.Dpapi:
-                    SetBanner(DotWarn, "Не вдалось розшифрувати vault" + when,
-                        "Можливо, sep-vault.bin скопійовано з іншого комп'ютера. Запустіть імпорт нижче ще раз на цій машині.");
+                    SetBanner(DotWarn, "Could not decrypt the vault" + when,
+                        "sep-vault.bin may have been copied from another computer. Run the import below again on this machine.");
                     break;
 
                 case SepBootstrapReason.RegisterOolFailed:
-                    SetBanner(DotError, "Помилка драйвера/транспорту" + when,
-                        "Не вдалось підготувати обмін із SEP на рівні драйвера. Спробуйте перезавантажити Windows; якщо не допоможе — дивіться C:\\LogSEP.txt.");
+                    SetBanner(DotError, "Driver / transport error" + when,
+                        "The driver could not prepare communication with the SEP. Try restarting Windows; if that does not help, see C:\\LogSEP.txt.");
                     break;
 
                 case SepBootstrapReason.SepHang:
-                    SetBanner(DotError, "SEP не відповідає" + when,
-                        "Apple Secure Enclave не відповідає на запити (апаратне зависання).");
+                    SetBanner(DotError, "SEP is not responding" + when,
+                        "The Apple Secure Enclave is not answering requests (hardware hang).");
                     SepHangPanel.Visibility = Visibility.Visible;
                     break;
 
                 case SepBootstrapReason.SepRejected:
-                    SetBanner(DotWarn, "SEP відхилив запит" + when,
-                        $"Крок «{StepLabel(status.StepValue)}»: неправильний пароль або keybag (sep_status={status.SepStatus}). Повторіть імпорт нижче з коректними даними.");
+                    SetBanner(DotWarn, "SEP rejected the request" + when,
+                        $"Step \"{StepLabel(status.StepValue)}\": wrong password or keybag (sep_status={status.SepStatus}). Repeat the import below with the correct data.");
                     break;
 
                 default:
-                    SetBanner(DotUnknown, "Стан SEP невідомий", "");
+                    SetBanner(DotUnknown, "SEP status unknown", "");
                     break;
             }
         }
 
         private static string StepLabel(SepBootstrapStep step) => step switch
         {
-            SepBootstrapStep.ReadVault => "читання vault",
-            SepBootstrapStep.UnprotectKeybag => "розшифрування keybag",
-            SepBootstrapStep.UnprotectPassword => "розшифрування пароля",
+            SepBootstrapStep.ReadVault => "reading vault",
+            SepBootstrapStep.UnprotectKeybag => "decrypting keybag",
+            SepBootstrapStep.UnprotectPassword => "decrypting password",
             SepBootstrapStep.RegisterOol => "register-ool",
             SepBootstrapStep.LoadKeybag => "load-keybag",
             SepBootstrapStep.SetSystemKeybag => "set-system-keybag",
             SepBootstrapStep.UnlockHandle => "unlock(handle)",
             SepBootstrapStep.UnlockSpecialBag => "unlock(special bag)",
-            SepBootstrapStep.Ready => "готово",
-            _ => "невідомий крок",
+            SepBootstrapStep.Ready => "ready",
+            _ => "unknown step",
         };
 
         private void SetBanner(Brush dot, string title, string subtitle)
         {
             SepStatusDot.Background = dot;
+            SepStatusHalo.Background = dot;
             SepStatusTitle.Text = title;
             SepStatusSubtitle.Text = subtitle;
         }
@@ -648,8 +723,8 @@ namespace T2TouchId.SepVaultGui
         {
             var dialog = new OpenFileDialog
             {
-                Title = "Обрати user.kb",
-                Filter = "Keybag files (*.kb)|*.kb|Усі файли (*.*)|*.*"
+                Title = "Select user.kb",
+                Filter = "Keybag files (*.kb)|*.kb|All files (*.*)|*.*"
             };
             if (dialog.ShowDialog() != true) return;
 
@@ -663,8 +738,8 @@ namespace T2TouchId.SepVaultGui
                 // reject on every future boot.
                 if (bytes.Length == 0 || bytes.Length > 16000)
                 {
-                    VaultStatusText.Foreground = Brushes.DarkRed;
-                    VaultStatusText.Text = $"user.kb має бути 1..16000 байт, обраний файл — {bytes.Length}.";
+                    VaultStatusText.Foreground = DotError;
+                    VaultStatusText.Text = $"user.kb must be 1..16000 bytes; the selected file is {bytes.Length}.";
                     return;
                 }
                 _keybagBytes = bytes;
@@ -673,8 +748,8 @@ namespace T2TouchId.SepVaultGui
             }
             catch (Exception ex)
             {
-                VaultStatusText.Foreground = Brushes.DarkRed;
-                VaultStatusText.Text = $"Не вдалось прочитати файл: {ex.Message}";
+                VaultStatusText.Foreground = DotError;
+                VaultStatusText.Text = $"Could not read the file: {ex.Message}";
             }
         }
 
@@ -682,33 +757,33 @@ namespace T2TouchId.SepVaultGui
         {
             if (_keybagBytes == null)
             {
-                VaultStatusText.Foreground = Brushes.DarkRed;
-                VaultStatusText.Text = "Спочатку оберіть user.kb.";
+                VaultStatusText.Foreground = DotError;
+                VaultStatusText.Text = "Select a user.kb file first.";
                 return;
             }
             if (!int.TryParse(SpecialBagBox.Text.Trim(), out int specialBag))
             {
-                VaultStatusText.Foreground = Brushes.DarkRed;
-                VaultStatusText.Text = "Special bag id має бути цілим числом (напр. -501).";
+                VaultStatusText.Foreground = DotError;
+                VaultStatusText.Text = "Special bag ID must be an integer (e.g. -501).";
                 return;
             }
             if (string.IsNullOrEmpty(PasswordBox.Password))
             {
-                VaultStatusText.Foreground = Brushes.DarkRed;
-                VaultStatusText.Text = "Введіть пароль.";
+                VaultStatusText.Foreground = DotError;
+                VaultStatusText.Text = "Enter the password.";
                 return;
             }
 
             try
             {
                 SepVaultFormat.Write(VaultPath, _keybagBytes, PasswordBox.Password, specialBag);
-                VaultStatusText.Foreground = Brushes.DarkGreen;
-                VaultStatusText.Text = $"Збережено: {VaultPath}\nОригінальний user.kb можна видалити — vault не тримає його в plaintext.\nПерезавантажте Windows, щоб застосувати.";
+                VaultStatusText.Foreground = DotOk;
+                VaultStatusText.Text = $"Saved: {VaultPath}\nYou can delete the original user.kb; the vault does not keep it in plaintext.\nRestart Windows to apply.";
             }
             catch (Exception ex)
             {
-                VaultStatusText.Foreground = Brushes.DarkRed;
-                VaultStatusText.Text = $"Не вдалось зберегти vault: {ex.Message}\nЗапущено з правами адміністратора?";
+                VaultStatusText.Foreground = DotError;
+                VaultStatusText.Text = $"Could not save the vault: {ex.Message}\nIs the app running as administrator?";
             }
             finally
             {
