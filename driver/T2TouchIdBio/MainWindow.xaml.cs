@@ -623,25 +623,15 @@ namespace T2TouchId.SepVaultGui
         }
 
         // ---- Lock on display-off (HKLM\SOFTWARE\T2TouchIdBio\LockOnDisplayOff) ----
-        // Used by UMDF OnConsoleDisplayState(OFF). GUI enables the toggle only when
-        // the current power plan has power-button action = Turn off the display (4).
+        // Used by UMDF OnConsoleDisplayState(OFF).
+        // Toggle ON  -> set PBUTTONACTION = 4 (Turn off the display) on ALL power schemes (AC+DC)
+        //             and enable lock-on-display-off.
+        // Toggle OFF -> set PBUTTONACTION = 1 (Sleep) on ALL power schemes (AC+DC)
+        //             and disable lock-on-display-off.
         private const string LockOnDisplayOffValue = "LockOnDisplayOff";
+        private const int PowerButtonDisplayOff = 4;
+        private const int PowerButtonSleep = 1;
         private bool _lockOnDisplayOffLoading;
-
-        /// <summary>PBUTTONACTION index 4 = Turn off the display (undocumented but widely used).</summary>
-        private static bool IsPowerButtonDisplayOff()
-        {
-            try
-            {
-                int? ac = QueryPowerButtonAction("getacvalueindex");
-                int? dc = QueryPowerButtonAction("getdcvalueindex");
-                return ac == 4 || dc == 4;
-            }
-            catch
-            {
-                return false;
-            }
-        }
 
         private static int? QueryPowerButtonAction(string getCmd)
         {
@@ -671,15 +661,120 @@ namespace T2TouchId.SepVaultGui
             return null;
         }
 
+        /// <summary>True when the active scheme has PBUTTONACTION = Turn off the display on AC or DC.</summary>
+        private static bool IsPowerButtonDisplayOff()
+        {
+            try
+            {
+                int? ac = QueryPowerButtonAction("getacvalueindex");
+                int? dc = QueryPowerButtonAction("getdcvalueindex");
+                return ac == PowerButtonDisplayOff || dc == PowerButtonDisplayOff;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>Enumerate all power scheme GUIDs from <c>powercfg /list</c>.</summary>
+        private static List<string> ListPowerSchemeGuids()
+        {
+            var guids = new List<string>();
+            try
+            {
+                var psi = new ProcessStartInfo
+                {
+                    FileName = "powercfg",
+                    Arguments = "/list",
+                    RedirectStandardOutput = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                };
+                using var p = Process.Start(psi);
+                if (p == null) return guids;
+                string output = p.StandardOutput.ReadToEnd();
+                if (!p.WaitForExit(5000)) return guids;
+
+                // Lines look like: "Power Scheme GUID: 381b4222-f694-41f0-9685-ff5bb260df2e  (Balanced) *"
+                foreach (var line in output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    int idx = line.IndexOf("GUID:", StringComparison.OrdinalIgnoreCase);
+                    if (idx < 0) continue;
+                    string rest = line.Substring(idx + 5).Trim();
+                    int space = rest.IndexOfAny(new[] { ' ', '\t', '(' });
+                    string guid = (space > 0 ? rest.Substring(0, space) : rest).Trim();
+                    if (guid.Length == 36 && guid.Count(c => c == '-') == 4)
+                        guids.Add(guid);
+                }
+            }
+            catch
+            {
+                // fall through with empty list
+            }
+            return guids;
+        }
+
+        /// <summary>
+        /// Set PBUTTONACTION on every scheme for both AC and DC.
+        /// index 4 = Turn off the display, index 1 = Sleep.
+        /// Returns true if at least one scheme was updated successfully.
+        /// </summary>
+        private static bool SetPowerButtonActionOnAllSchemes(int index)
+        {
+            var schemes = ListPowerSchemeGuids();
+            if (schemes.Count == 0)
+            {
+                // Fallback: only touch the active scheme.
+                schemes.Add("SCHEME_CURRENT");
+            }
+
+            bool anyOk = false;
+            foreach (string scheme in schemes)
+            {
+                if (RunPowerCfg($"/setacvalueindex {scheme} SUB_BUTTONS PBUTTONACTION {index}"))
+                    anyOk = true;
+                if (RunPowerCfg($"/setdcvalueindex {scheme} SUB_BUTTONS PBUTTONACTION {index}"))
+                    anyOk = true;
+            }
+
+            // Re-apply active scheme so the change takes effect immediately.
+            RunPowerCfg("/setactive SCHEME_CURRENT");
+            return anyOk;
+        }
+
+        private static bool RunPowerCfg(string args)
+        {
+            try
+            {
+                var psi = new ProcessStartInfo
+                {
+                    FileName = "powercfg",
+                    Arguments = args,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                };
+                using var p = Process.Start(psi);
+                if (p == null) return false;
+                p.StandardOutput.ReadToEnd();
+                p.StandardError.ReadToEnd();
+                if (!p.WaitForExit(5000)) return false;
+                return p.ExitCode == 0;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
         private static bool ReadLockOnDisplayOff()
         {
             try
             {
                 using var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(BioRegPath, writable: false);
                 object? v = key?.GetValue(LockOnDisplayOffValue);
-                if (v is int i) return i != 0;
-                if (v is long l) return l != 0;
-                return false;
+                return v is int i && i != 0;
             }
             catch
             {
@@ -707,23 +802,25 @@ namespace T2TouchId.SepVaultGui
             _lockOnDisplayOffLoading = true;
             try
             {
-                bool powerOk = IsPowerButtonDisplayOff();
-                LockOnDisplayOffCheck.IsEnabled = powerOk;
+                // Toggle is always available; it drives the power-button action itself.
+                LockOnDisplayOffCheck.IsEnabled = true;
                 bool want = ReadLockOnDisplayOff();
-                LockOnDisplayOffCheck.IsChecked = powerOk && want;
-                if (!powerOk)
+                // Prefer registry, but if registry is off and the live plan is already
+                // display-off, still show the switch as on so the UI matches reality.
+                bool liveDisplayOff = IsPowerButtonDisplayOff();
+                LockOnDisplayOffCheck.IsChecked = want || liveDisplayOff;
+
+                if (LockOnDisplayOffCheck.IsChecked == true)
                 {
                     LockOnDisplayOffStatusText.Text =
-                        "Inactive: set the power button to “Turn off the display” in Windows power options (AC or battery).";
-                    LockOnDisplayOffStatusText.Foreground = TextMuted;
+                        "On: power button = Turn off the display (all plans). Display-off also locks the PC.";
                 }
                 else
                 {
-                    LockOnDisplayOffStatusText.Text = LockOnDisplayOffCheck.IsChecked == true
-                        ? "On: power-button display-off also locks the PC."
-                        : "Off: display turns off only, no lock.";
-                    LockOnDisplayOffStatusText.Foreground = TextMuted;
+                    LockOnDisplayOffStatusText.Text =
+                        "Off: power button = Sleep (all plans). No lock on display-off.";
                 }
+                LockOnDisplayOffStatusText.Foreground = TextMuted;
             }
             finally
             {
@@ -734,18 +831,40 @@ namespace T2TouchId.SepVaultGui
         private void OnLockOnDisplayOffChanged(object sender, RoutedEventArgs e)
         {
             if (_lockOnDisplayOffLoading) return;
-            if (!LockOnDisplayOffCheck.IsEnabled) return;
 
             bool enabled = LockOnDisplayOffCheck.IsChecked == true;
-            if (!WriteLockOnDisplayOff(enabled))
+            int action = enabled ? PowerButtonDisplayOff : PowerButtonSleep;
+
+            bool powerOk = SetPowerButtonActionOnAllSchemes(action);
+            bool regOk = WriteLockOnDisplayOff(enabled);
+
+            if (!powerOk && !regOk)
             {
-                LockOnDisplayOffStatusText.Text = "Could not write to HKLM (run the app as administrator).";
+                LockOnDisplayOffStatusText.Text =
+                    "Could not change power settings or HKLM (run the app as administrator).";
                 LockOnDisplayOffStatusText.Foreground = DotError;
                 return;
             }
+
+            if (!powerOk)
+            {
+                LockOnDisplayOffStatusText.Text =
+                    "Registry saved, but powercfg failed (run as administrator to change all plans).";
+                LockOnDisplayOffStatusText.Foreground = DotWarn;
+                return;
+            }
+
+            if (!regOk)
+            {
+                LockOnDisplayOffStatusText.Text =
+                    "Power button updated on all plans, but could not write HKLM (run as administrator).";
+                LockOnDisplayOffStatusText.Foreground = DotWarn;
+                return;
+            }
+
             LockOnDisplayOffStatusText.Text = enabled
-                ? "Saved: lock on power-button display-off."
-                : "Saved: no lock on display-off.";
+                ? "Saved: power button = Turn off the display (all plans) + lock on display-off."
+                : "Saved: power button = Sleep (all plans). Lock on display-off off.";
             LockOnDisplayOffStatusText.Foreground = DotOk;
         }
 

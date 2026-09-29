@@ -421,7 +421,7 @@
                             <StackPanel>
                                 <TextBlock Text="Lock on power-button display off" FontWeight="SemiBold"/>
                                 <TextBlock Style="{StaticResource CardHint}" Margin="0,2,0,0"
-                                           Text="When the power button is set to “Turn off the display”, also lock the workstation. The switch is disabled unless that power setting is active (AC or battery)."/>
+                                           Text="On: sets the power button to “Turn off the display” on all power plans (AC + battery) and locks the PC when the display turns off. Off: sets the power button to Sleep on all plans."/>
                             </StackPanel>
                         </CheckBox>
                         <TextBlock x:Name="LockOnDisplayOffStatusText" Style="{StaticResource StatusLine}" Margin="52,10,0,0"/>
