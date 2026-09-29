@@ -713,7 +713,13 @@ ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_
         t2::transport::ClearLastPushedPeer();
         // Resume hygiene: drop sticky/replay; pending CAPTURE restarts via resume event.
         ClearMatchReplay();
-        ClearStickyNcm();
+        // 29.09.2026: sticky NCM endpoint is NO LONGER dropped here. The old
+        // clear forced PickDefaultT2Endpoint after every wake (hardware log:
+        // "endpoint lookup 563 ms"). It is safe to keep: ConnectForCapture
+        // already falls back to full rediscovery if the sticky connect fails
+        // (ifIndex/peer changed), and a sticky connect that gets a valid
+        // BridgeXPC HELO can only be the T2 bridge. Mode flips (native <-> tunnel)
+        // still drop it in ConnectForCapture.
         // No clock to arm here anymore - g_lastObservedSepOrdinal (declared
         // above) is keyed off the SEP's own event sequence numbers, not off
         // when resume happened, so resume itself needs no bookkeeping beyond
@@ -1172,6 +1178,20 @@ void CompleteCaptureData(_In_ WDFREQUEST Request, HRESULT winBioHresult,
 // already logged why) if the SEP/T2 side cannot be reached at all - the
 // caller maps that to WINBIO_E_DEVICE_FAILURE, never to a Match/NoMatch
 // verdict, because "couldn't ask the SEP" is not an answer from the SEP.
+// Post-Sx-resume settle before the first BridgeXPC connect (see ConnectForCapture).
+DWORD LoadPostResumeSettleMs()
+{
+    constexpr DWORD kDefaultMs = 100;
+    constexpr DWORD kMaxMs = 2000;
+    DWORD v = kDefaultMs;
+    DWORD cb = sizeof(v);
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\T2TouchIdBio", L"PostResumeSettleMs",
+                     RRF_RT_REG_DWORD, nullptr, &v, &cb) != ERROR_SUCCESS) {
+        return kDefaultMs;
+    }
+    return v > kMaxMs ? kMaxMs : v;
+}
+
 // Sticky adapter selection: g_stickyNcm (declared near RecentMatchCache).
 bool ConnectForCapture(t2::bridgexpc::Connection* outConn)
 {
@@ -1185,14 +1205,23 @@ bool ConnectForCapture(t2::bridgexpc::Connection* outConn)
         ULONGLONG settled = s_settledGen.load(std::memory_order_relaxed);
         if (gen != 0 && settled != gen) {
             if (s_settledGen.compare_exchange_strong(settled, gen)) {
-                T2BioLog("CAPTURE_DATA: post-Sx-resume NCM settle 500ms (realSuspendGen=%llu)",
+                // 29.09.2026: was a fixed 500 ms. Hardware log shows T2Ncm already
+                // back in Running (RX loop started, flow ring created) BEFORE this
+                // wait began, and ConnectForCaptureWithRetry retries in 50 ms steps
+                // if the T2 is not answering yet - so the fixed wait was pure added
+                // latency on the unlock-after-wake path. Default now 100 ms;
+                // override with HKLM\SOFTWARE\T2TouchIdBio\PostResumeSettleMs
+                // (REG_DWORD, ms; 500 restores the old behaviour).
+                const DWORD settleMs = LoadPostResumeSettleMs();
+                T2BioLog("CAPTURE_DATA: post-Sx-resume NCM settle %lums (realSuspendGen=%llu)",
+                         static_cast<unsigned long>(settleMs),
                          static_cast<unsigned long long>(gen));
-                // Cancellable (same value: shortening it needs hardware
-                // validation of NCM readiness after Sx resume).
-                if (HANDLE ce = GetCaptureCancelEvent()) {
-                    WaitForSingleObject(ce, 500);
-                } else {
-                    Sleep(500);
+                if (settleMs != 0) {
+                    if (HANDLE ce = GetCaptureCancelEvent()) {
+                        WaitForSingleObject(ce, settleMs);
+                    } else {
+                        Sleep(settleMs);
+                    }
                 }
             }
         }

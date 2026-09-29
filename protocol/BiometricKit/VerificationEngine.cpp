@@ -666,7 +666,7 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
                        eventData.size() > kStatusEventBodyFixedFieldsBytes
                            ? HexDump(eventData.data() + kStatusEventBodyFixedFieldsBytes,
                                      eventData.size() - kStatusEventBodyFixedFieldsBytes,
-                                     eventData.size() - kStatusEventBodyFixedFieldsBytes).c_str()
+                                     (std::min<size_t>)(eventData.size() - kStatusEventBodyFixedFieldsBytes, 48)).c_str()
                            : L"(none)");
             } else if (embeddedType == kEmbeddedTypeStatistics) {
                 StatisticsEventBody stats = ParseStatisticsEventBody(eventData);
