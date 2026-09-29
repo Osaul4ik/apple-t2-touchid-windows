@@ -349,8 +349,21 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
         tunnel = false;
     }
 
-    const std::chrono::milliseconds firstTcp =
-        (autoSwitch && !tunnel) ? tp::NativeConnectBudget(connectTimeout) : connectTimeout;
+    // 29.09.2026: with auto-switch on, a tunnel-first attempt must not be
+    // allowed to burn the caller's whole timeout (log: 2000 ms on a dead tunnel,
+    // then native 150 ms, then the Windows CancelIoEx arrived before anything
+    // else could run). A live tunnel handshake takes tens of ms; if it has not
+    // completed in kTunnelFirstTcpMs the prep is stale - fail fast, the
+    // cache is invalidated and the retry re-prepares the ARP/peer state.
+    constexpr long long kTunnelFirstTcpMs = 800;
+    std::chrono::milliseconds firstTcp = connectTimeout;
+    if (autoSwitch) {
+        if (!tunnel) {
+            firstTcp = tp::NativeConnectBudget(connectTimeout);
+        } else if (firstTcp.count() > kTunnelFirstTcpMs) {
+            firstTcp = std::chrono::milliseconds(kTunnelFirstTcpMs);
+        }
+    }
     bool tcpFailed = false;
     ULONGLONG tcpMs = 0;
     const ULONGLONG t0 = GetTickCount64();
