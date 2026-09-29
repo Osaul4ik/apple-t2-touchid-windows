@@ -1,4 +1,4 @@
-# T2 Touch ID for Windows
+# T2 TouchID for Windows
 
 <img width="1400" height="420" alt="fDhvq" src="https://github.com/user-attachments/assets/ae5efc29-7ed3-4b4b-96b0-0978328ae352" />
 
