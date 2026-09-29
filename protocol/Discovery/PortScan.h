@@ -21,7 +21,7 @@ struct PortCandidate {
 struct ScanOptions {
     uint16_t portBegin = 49152;
     uint16_t portEnd = 65535;
-    unsigned concurrency = 64;
+    unsigned concurrency = 256;
     // Linux default --probe-timeout 0.15 (150ms). Lowered here: observed
     // RTT to the T2 peer over this NCM link is ~1ms, so 150ms was far
     // more headroom than the link needs for a single probe. 20ms leaves
