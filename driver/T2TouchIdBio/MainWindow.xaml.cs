@@ -14,6 +14,7 @@
 // in C:\LogSEP.txt.
 
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.ComponentModel;
 using System.IO;
