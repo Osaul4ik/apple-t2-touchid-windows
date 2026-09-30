@@ -1,21 +1,30 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // PortCache.cpp — see PortCache.h for the contract and why this exists.
 //
-// Storage format: %ProgramData%\t2touchid\portcache.ini, one entry per
-// line as "AA:BB:CC:DD:EE:FF=12345" or "AA:BB:CC:DD:EE:FF=12345,6789".
-// Deliberately plain text — a single scalar per adapter; safe to delete
-// (next successful connect re-creates it after a full port scan).
+// Storage: one REG_SZ value per T2 adapter under
+//   HKLM\SOFTWARE\T2TouchId\Network\PortCache
+// value name = adapter MAC "AA:BB:CC:DD:EE:FF", data = "12345" or "12345,6789"
+// (BridgeXPC port[,RemoteXPC port]). Deliberately plain text — a single scalar
+// per adapter; safe to delete (next successful connect re-creates it after a
+// full port scan).
+//
+// Why the registry and not a file: the UMDF host (WUDFHost, LocalService) could
+// not reliably create %ProgramData%\t2touchid\portcache.ini, so the cache never
+// got written and every cold boot paid a full scan. The registry is where this
+// project already keeps everything the service and the CLI/GUI share
+// (PeerIpv6, AutoSwitch — see TransportMode.h), and Set-T2NcmStaticIp.ps1
+// already grants LocalService write access to the Network key with
+// ContainerInherit, so this subkey inherits it.
 //
 // Contract for callers (BridgeDiscovery / CLI):
-//   - LoadCachedPort returns false when the file is missing, unreadable,
-//     has no entry for this MAC, or the entry has an empty / invalid port.
-//     That is the signal to run a full scan — never treat a missing or
-//     empty cache as a reason to block.
-//   - SaveCachedPort is best-effort but must actually create the directory
-//     and file when possible (UMDF runs as LocalService; %ProgramData% is
-//     the shared location that both CLI and driver can use).
+//   - LoadCachedPort returns false when there is no value for this MAC or the
+//     value has an empty / invalid port. That is the signal to run a full scan
+//     — never treat a missing or empty cache as a reason to block.
+//   - SaveCachedPort is best-effort; a failure is logged with the Win32 error
+//     (5 = the LocalService ACL is missing) and the in-process map still works.
 #include "PortCache.h"
 #include "../BridgeXpc/Log.h"
+#include "../BridgeXpc/TransportMode.h"
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -24,12 +33,6 @@
 #endif
 #include <windows.h>
 #include <string>
-#include <vector>
-#include <utility>
-#include <fstream>
-#include <sstream>
-#include <algorithm>
-#include <cctype>
 #include <cstdio>
 #include <map>
 #include <mutex>
@@ -37,14 +40,14 @@
 namespace t2::discovery {
 namespace {
 
-// Process-lifetime cache, consulted BEFORE the file below.
+// Process-lifetime cache, consulted BEFORE the registry below.
 //
-// Why it exists: the file cache under %ProgramData% is shared, but a failed
-// or delayed first write still left every CAPTURE_DATA in the same WUDFHost
-// process paying a full 16k-port scan. The process outlives every capture,
-// so a plain static map makes every capture after the first skip the scan.
-// Like the file, it is only a hint: the caller still verifies the port with
-// a live HELO and falls back to a scan on any miss.
+// Why it exists: a failed or delayed first registry write would still leave
+// every CAPTURE_DATA in the same WUDFHost process paying a full 16k-port scan.
+// The process outlives every capture, so a plain static map makes every capture
+// after the first skip the scan. Like the registry value, it is only a hint:
+// the caller still verifies the port with a live HELO and falls back to a scan
+// on any miss.
 struct MemPorts { uint16_t port = 0; uint16_t rsd = 0; };
 std::mutex g_memMu;
 std::map<std::string, MemPorts>& MemCache() {
@@ -66,39 +69,20 @@ std::string Trim(const std::string& s) {
     return s.substr(b, e - b + 1);
 }
 
-std::string ToUpperAscii(std::string s) {
-    std::transform(s.begin(), s.end(), s.begin(),
-                    [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+// Keys and values here are pure ASCII (hex, ':', digits, ','), so a plain
+// per-character widen/narrow is exact.
+std::wstring Widen(const std::string& s) {
+    return std::wstring(s.begin(), s.end());
+}
+
+std::string Narrow(const wchar_t* w) {
+    std::string s;
+    for (; *w; ++w) s.push_back(static_cast<char>(*w));
     return s;
 }
 
-// Machine-wide cache under %ProgramData%\t2touchid so the UMDF host
-// (WUDFHost, LocalService) and the interactive CLI share one file.
-// Returns "" if neither ProgramData nor ALLUSERSPROFILE is set — callers
-// then just scan.
-std::string CacheDir() {
-    char buf[MAX_PATH];
-    DWORD n = GetEnvironmentVariableA("ProgramData", buf, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH) n = GetEnvironmentVariableA("ALLUSERSPROFILE", buf, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH) return "";
-    std::string dir = buf;
-    dir += "\\t2touchid";
-    return dir;
-}
-
-// Old per-user location, still read (never written) so an existing CLI
-// cache keeps working until the new file is populated.
-std::string LegacyCacheFilePath() {
-    char buf[MAX_PATH];
-    DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", buf, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH) return "";
-    return std::string(buf) + "\\t2touchid\\portcache.ini";
-}
-
-std::string CacheFilePath() {
-    std::string dir = CacheDir();
-    if (dir.empty()) return "";
-    return dir + "\\portcache.ini";
+std::wstring PortCacheRegPath() {
+    return std::wstring(t2::transport::kNetworkRegPath) + L"\\PortCache";
 }
 
 // Parse "port" or "port,rsdPort". Returns false when the service port is
@@ -130,80 +114,19 @@ bool ParsePortValue(const std::string& raw, uint16_t* outPort, uint16_t* outRsd)
     return true;
 }
 
-// Reads every "KEY=VALUE" line into an ordered vector. Missing/unreadable
-// file or lines with empty values yield no entries (cache miss).
-std::vector<std::pair<std::string, std::string>> ReadEntries(const std::string& path) {
-    std::vector<std::pair<std::string, std::string>> entries;
-    if (path.empty()) return entries;
-    std::ifstream in(path);
-    if (!in.is_open()) return entries;
-    std::string line;
-    while (std::getline(in, line)) {
-        std::string trimmed = Trim(line);
-        if (trimmed.empty() || trimmed[0] == '#') continue;
-        size_t eq = trimmed.find('=');
-        if (eq == std::string::npos) continue;
-        std::string key = ToUpperAscii(Trim(trimmed.substr(0, eq)));
-        std::string value = Trim(trimmed.substr(eq + 1));
-        // Empty value (e.g. "AA:BB:...=") is intentionally skipped — that is
-        // a cache miss and must trigger a full scan, not a connect to port 0.
-        if (key.empty() || value.empty()) continue;
-        entries.emplace_back(std::move(key), std::move(value));
+// Reads this MAC's value. Missing key/value, wrong type or no read access all
+// come back false (cache miss).
+bool ReadRegValue(const std::string& macKey, std::string* out) {
+    wchar_t buf[64] = {};
+    DWORD cb = sizeof(buf) - sizeof(wchar_t); // keep room for a terminator
+    const std::wstring path = PortCacheRegPath();
+    const std::wstring name = Widen(macKey);
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, path.c_str(), name.c_str(), RRF_RT_REG_SZ,
+                     nullptr, buf, &cb) != ERROR_SUCCESS) {
+        return false;
     }
-    return entries;
-}
-
-// Atomic-ish write: write to path.tmp then replace path. Avoids leaving a
-// truncated portcache.ini if the process dies mid-write (which would look
-// like "file exists but no port" on the next unlock).
-bool WriteEntries(const std::string& path,
-                   const std::vector<std::pair<std::string, std::string>>& entries) {
-    if (path.empty()) return false;
-    const std::string tmp = path + ".tmp";
-    {
-        std::ofstream out(tmp, std::ios::trunc);
-        if (!out.is_open()) return false;
-        out << "# t2touchid port cache - last known-good BiometricKit BridgeXPC\n"
-               "# port[,RemoteXPC port] per T2 adapter (keyed by MAC). Safe to delete; the tool\n"
-               "# just falls back to a full port scan next run.\n";
-        for (const auto& kv : entries) {
-            // Never persist an empty value — that would re-create the
-            // "file exists, port not written" hang on the next boot.
-            if (kv.first.empty() || kv.second.empty()) continue;
-            out << kv.first << "=" << kv.second << "\n";
-        }
-        out.flush();
-        if (!out.good()) {
-            out.close();
-            DeleteFileA(tmp.c_str());
-            return false;
-        }
-    }
-    // MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH
-    if (!MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        // Fallback: direct rewrite if MoveFileEx fails (e.g. cross-volume).
-        std::ofstream out(path, std::ios::trunc);
-        if (!out.is_open()) {
-            DeleteFileA(tmp.c_str());
-            return false;
-        }
-        std::ifstream in(tmp);
-        if (in.is_open()) {
-            out << in.rdbuf();
-        }
-        out.close();
-        DeleteFileA(tmp.c_str());
-        return static_cast<bool>(out);
-    }
+    *out = Narrow(buf);
     return true;
-}
-
-bool EnsureCacheDir(const std::string& dir) {
-    if (dir.empty()) return false;
-    if (CreateDirectoryA(dir.c_str(), nullptr)) return true;
-    const DWORD err = GetLastError();
-    if (err == ERROR_ALREADY_EXISTS) return true;
-    return GetFileAttributesA(dir.c_str()) != INVALID_FILE_ATTRIBUTES;
 }
 
 } // namespace
@@ -211,9 +134,10 @@ bool EnsureCacheDir(const std::string& dir) {
 bool LoadCachedPort(const NcmEndpoint& endpoint, uint16_t* outPort, uint16_t* outRsdPort) {
     if (!endpoint.hasMac) return false; // no stable key to look up
 
+    const std::string key = FormatMacKey(endpoint.mac);
     {
         std::lock_guard<std::mutex> lock(g_memMu);
-        auto it = MemCache().find(FormatMacKey(endpoint.mac));
+        auto it = MemCache().find(key);
         if (it != MemCache().end() && it->second.port != 0) {
             if (outPort) *outPort = it->second.port;
             if (outRsdPort) *outRsdPort = it->second.rsd;
@@ -221,38 +145,24 @@ bool LoadCachedPort(const NcmEndpoint& endpoint, uint16_t* outPort, uint16_t* ou
         }
     }
 
-    std::string key = FormatMacKey(endpoint.mac);
-    auto entries = ReadEntries(CacheFilePath());          // machine-wide file first
+    // No value, or an empty / non-numeric / out-of-range port ⇒ return false ⇒
+    // caller runs a full port scan.
+    std::string raw;
+    uint16_t port = 0, rsd = 0;
+    if (!ReadRegValue(key, &raw) || !ParsePortValue(raw, &port, &rsd)) {
+        return false;
+    }
+    if (outPort) *outPort = port;
+    if (outRsdPort) *outRsdPort = rsd;
+    // Warm the process cache so the next CAPTURE in this WUDFHost skips the
+    // registry read as well.
     {
-        auto legacy = ReadEntries(LegacyCacheFilePath()); // then old per-user one
-        entries.insert(entries.end(), legacy.begin(), legacy.end());
+        std::lock_guard<std::mutex> lock(g_memMu);
+        MemPorts& m = MemCache()[key];
+        m.port = port;
+        m.rsd = rsd;
     }
-
-    // File missing, empty, or only comments/blank lines ⇒ entries empty ⇒
-    // return false ⇒ caller runs a full port scan. Same if our MAC has no
-    // line, or the line has an empty / non-numeric / out-of-range port.
-    for (const auto& kv : entries) {
-        if (kv.first != key) continue;
-        uint16_t port = 0, rsd = 0;
-        if (!ParsePortValue(kv.second, &port, &rsd)) {
-            // Corrupt or empty port for this MAC: skip this line (do not
-            // treat as a hit). Keep scanning entries in case a later line
-            // for the same MAC is valid; if none are, fall through to false.
-            continue;
-        }
-        if (outPort) *outPort = port;
-        if (outRsdPort) *outRsdPort = rsd;
-        // Warm the process cache so the next CAPTURE in this WUDFHost skips
-        // the file read as well.
-        {
-            std::lock_guard<std::mutex> lock(g_memMu);
-            MemPorts& m = MemCache()[key];
-            m.port = port;
-            m.rsd = rsd;
-        }
-        return true;
-    }
-    return false;
+    return true;
 }
 
 void SaveCachedPort(const NcmEndpoint& endpoint, uint16_t port, uint16_t rsdPort) {
@@ -262,49 +172,40 @@ void SaveCachedPort(const NcmEndpoint& endpoint, uint16_t port, uint16_t rsdPort
     const std::string key = FormatMacKey(endpoint.mac);
 
     {
-        // Always remember it for this process, even if the file below can't
-        // be written (UMDF sandbox / ACL edge cases).
+        // Always remember it for this process, even if the registry write
+        // below fails (UMDF ACL edge cases).
         std::lock_guard<std::mutex> lock(g_memMu);
         MemPorts& m = MemCache()[key];
         m.port = port;
         m.rsd = rsdPort;
     }
 
-    std::string dir = CacheDir();
-    if (dir.empty()) {
-        T2_LOG("discovery", L"SaveCachedPort: no ProgramData - file cache disabled");
-        return;
-    }
-    if (!EnsureCacheDir(dir)) {
-        T2_LOG("discovery", L"SaveCachedPort: CreateDirectory(%hs) failed err=%lu",
-               dir.c_str(), GetLastError());
-        return;
-    }
-
-    std::string path = CacheFilePath();
-    if (path.empty()) return;
-
     std::string value = std::to_string(port);
     if (rsdPort != 0) value += "," + std::to_string(rsdPort);
+    const std::wstring wvalue = Widen(value);
+    const std::wstring path = PortCacheRegPath();
+    const std::wstring name = Widen(key);
 
-    auto entries = ReadEntries(path);
-    bool updated = false;
-    for (auto& kv : entries) {
-        if (kv.first == key) {
-            kv.second = value;
-            updated = true;
-            break;
-        }
-    }
-    if (!updated) entries.emplace_back(key, value);
-
-    if (!WriteEntries(path, entries)) {
-        T2_LOG("discovery", L"SaveCachedPort: write %hs failed err=%lu - next boot will re-scan",
-               path.c_str(), GetLastError());
+    HKEY hKey = nullptr;
+    LSTATUS rc = RegCreateKeyExW(HKEY_LOCAL_MACHINE, path.c_str(), 0, nullptr,
+                                 REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, nullptr,
+                                 &hKey, nullptr);
+    if (rc != ERROR_SUCCESS) {
+        T2_LOG("discovery", L"SaveCachedPort: RegCreateKeyEx(%s) failed err=%lu - next boot will re-scan",
+               path.c_str(), static_cast<unsigned long>(rc));
         return;
     }
-    T2_LOG("discovery", L"SaveCachedPort: wrote %hs port=%u rsd=%u",
-           path.c_str(), static_cast<unsigned>(port), static_cast<unsigned>(rsdPort));
+    rc = RegSetValueExW(hKey, name.c_str(), 0, REG_SZ,
+                        reinterpret_cast<const BYTE*>(wvalue.c_str()),
+                        static_cast<DWORD>((wvalue.size() + 1) * sizeof(wchar_t)));
+    RegCloseKey(hKey);
+    if (rc != ERROR_SUCCESS) {
+        T2_LOG("discovery", L"SaveCachedPort: RegSetValueEx failed err=%lu - next boot will re-scan",
+               static_cast<unsigned long>(rc));
+        return;
+    }
+    T2_LOG("discovery", L"SaveCachedPort: wrote %s\\%s = %s",
+           path.c_str(), name.c_str(), wvalue.c_str());
 }
 
 } // namespace t2::discovery
