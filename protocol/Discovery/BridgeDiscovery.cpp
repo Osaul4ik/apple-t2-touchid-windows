@@ -206,67 +206,90 @@ bool ConnectToBiometricKitBridge(const NcmEndpoint& endpoint, t2::bridgexpc::Con
         }
     }
 
-    // Cold path (no cached port, or the cached one did not answer): a full
-    // port scan is next. Over a blocked IPv6 path that scan probes 16k ports
-    // into a void for seconds, so decide the transport first with one bounded
-    // native SYN. The tunnel is armed only provisionally here and is rolled
-    // back below if the scan finds nothing (T2 simply not ready yet).
-    bool provisionalTunnel = false;
-    if (!t2::transport::IsTunnelModeActive() && t2::transport::IsAutoSwitchEnabled()) {
-        if (!t2::transport::PreflightNativeIpv6(endpoint.peerLinkLocal, endpoint.ifIndex)) {
-            t2::transport::CommitAutoTunnel(true);
-            provisionalTunnel = true;
-            T2_LOG("discovery", L"native IPv6 unreachable - scanning over the IPv4 tunnel");
-        }
-    }
+    // Cold path (no cached port, or the cached one did not answer).
+    // Order, by design (cold boot with an empty registry must still find
+    // the port):
+    //   1. cache            - handled above
+    //   2. full scan over NATIVE IPv6
+    //   3. full scan over the IPv4 TUNNEL - only if 2 found nothing
+    // The old code let ONE 156 ms native SYN (PreflightNativeIpv6) decide to
+    // skip step 2 entirely. Right after a cold boot the NCM link / neighbor
+    // entry is often not ready for that single SYN, so we jumped straight to
+    // the tunnel without ever scanning v6. The preflight is now only a hint
+    // that shortens the native pass (1 attempt instead of 2) when it looks
+    // blocked (VPN); it never replaces the scan.
+    const bool tunnelForced = t2::transport::IsTunnelForced();
+    const bool autoSwitch = t2::transport::IsAutoSwitchEnabled();
+    bool tunnelArmedHere = false;
     auto rollbackProvisionalTunnel = [&]() {
-        if (!provisionalTunnel) return;
+        if (!tunnelArmedHere) return;
+        tunnelArmedHere = false;
         t2::transport::CommitAutoTunnel(false);
         t2::transport::PushTransportModeToDriver(t2::transport::TransportMode::NativeIpv6);
     };
 
+    // One full scan pass on the given transport. Native and tunnel need
+    // different concurrency/timeouts (see CacheTrustBudgetMs comment).
+    auto scanPass = [&](bool tunnel, unsigned maxAttempts, uint16_t* outPort, uint16_t* outRsd) -> bool {
+        static const unsigned timeoutsMsNative[] = {20, 60};
+        static const unsigned timeoutsMsTunnel[] = {150, 400};
+        const unsigned* timeoutsMs = tunnel ? timeoutsMsTunnel : timeoutsMsNative;
+        unsigned attempts = 2;
+        if (maxAttempts != 0 && maxAttempts < attempts) attempts = maxAttempts;
+        const ULONGLONG startMs = GetTickCount64();
+        uint16_t port = 0, rsd = 0;
+        for (unsigned attempt = 0; attempt < attempts; ++attempt) {
+            if (cancelled()) break;
+            ScanOptions opt;
+            opt.cancelEvent = cancelEvent;
+            opt.concurrency = tunnel ? 16 : 256;
+            opt.includeTcpOnly = true;
+            opt.connectTimeoutMs = timeoutsMs[attempt];
+            ScanProbeResult scan = ScanAndProbe(endpoint, opt);
+            if (scan.servicePort != 0) { port = scan.servicePort; rsd = scan.rsdPort; break; }
+        }
+        T2_LOG("discovery", L"full port scan (%s, %u-wide, %u ms) finished in %llu ms, found port %u%s",
+               tunnel ? L"IPv4 tunnel" : L"Native IPv6", tunnel ? 16u : 256u,
+               timeoutsMs[attempts - 1],
+               static_cast<unsigned long long>(GetTickCount64() - startMs),
+               static_cast<unsigned>(port), cancelled() ? L" (cancelled)" : L"");
+        if (port == 0) return false;
+        // Verify with a live HELO on the transport this pass used.
+        ConnectResult cr = outConn->Connect(endpoint.peerLinkLocal, endpoint.ifIndex, port,
+                                             std::chrono::milliseconds(2000));
+        if (cr != ConnectResult::Ok) {
+            T2_LOG("discovery", L"scan found port %u but HELO failed (ConnectResult=%d)",
+                   static_cast<unsigned>(port), static_cast<int>(cr));
+            return false;
+        }
+        *outPort = port;
+        *outRsd = rsd;
+        return true;
+    };
+
     uint16_t foundPort = 0;
     uint16_t foundRsdPort = 0;
-    const ULONGLONG scanStartMs = GetTickCount64();
-    const bool tunnelActive = t2::transport::IsTunnelModeActive();
-    // Native timings/concurrency (see the CacheTrustBudgetMs comment
-    // above for why tunnel mode needs its own numbers): 256 concurrent
-    // sockets is fine when each one is a native connect(), but under the
-    // tunnel every one of those SYNs is serialized onto the same USB
-    // bulk-OUT pipe and rewritten by T2Ncm.sys, so firing 256 at once
-    // just floods that single pipe faster than replies (rewritten back
-    // on RX) can come in — 20ms was never a real round-trip budget for
-    // that path. 16-wide keeps the scan from stacking more in-flight
-    // SYNs than one physical link can carry; 150ms/400ms give a
-    // rewritten round trip realistic room to land.
-    const unsigned timeoutsMsNative[] = {20, 60};
-    const unsigned timeoutsMsTunnel[] = {150, 400};
-    const unsigned* timeoutsMs = tunnelActive ? timeoutsMsTunnel : timeoutsMsNative;
-    const unsigned kAttempts = tunnelActive
-        ? static_cast<unsigned>(sizeof(timeoutsMsTunnel) / sizeof(timeoutsMsTunnel[0]))
-        : static_cast<unsigned>(sizeof(timeoutsMsNative) / sizeof(timeoutsMsNative[0]));
-    for (unsigned attempt = 0; attempt < kAttempts; ++attempt) {
-        if (cancelled()) break;
-        ScanOptions opt;
-        opt.cancelEvent = cancelEvent;
-        opt.concurrency = tunnelActive ? 16 : 256;
-        opt.includeTcpOnly = true;
-        opt.connectTimeoutMs = timeoutsMs[attempt];
-        // priorityBands default: 59xxx → 49xxx → rest (see PortScan.h).
+    bool found = false;
 
-        ScanProbeResult scan = ScanAndProbe(endpoint, opt);
-        if (scan.servicePort != 0) {
-            foundPort = scan.servicePort;
-            foundRsdPort = scan.rsdPort;
-            break;
-        }
+    // Pass 2: native IPv6 (skipped only when the user forced the tunnel).
+    if (!tunnelForced) {
+        t2::transport::CommitAutoTunnel(false);
+        const bool nativeHint = t2::transport::PreflightNativeIpv6(endpoint.peerLinkLocal,
+                                                                    endpoint.ifIndex);
+        T2_LOG("discovery", L"scanning over native IPv6 (preflight hint: %s)",
+               nativeHint ? L"reachable" : L"unreachable");
+        found = scanPass(false, nativeHint ? 2u : 1u, &foundPort, &foundRsdPort);
     }
-    T2_LOG("discovery", L"full port scan (%s, %u-wide, %u/%u ms) finished in %llu ms, found port %u",
-           tunnelActive ? L"IPv4 tunnel" : L"Native IPv6",
-           tunnelActive ? 16u : 256u, timeoutsMs[0], timeoutsMs[kAttempts - 1],
-           static_cast<unsigned long long>(GetTickCount64() - scanStartMs),
-           static_cast<unsigned>(foundPort));
-    if (foundPort == 0) {
+
+    // Pass 3: IPv4 tunnel, only after native found nothing.
+    if (!found && !cancelled() && (tunnelForced || autoSwitch)) {
+        t2::transport::CommitAutoTunnel(true);
+        tunnelArmedHere = !tunnelForced;
+        T2_LOG("discovery", L"native IPv6 scan found nothing - scanning over the IPv4 tunnel");
+        found = scanPass(true, 2, &foundPort, &foundRsdPort);
+    }
+
+    if (!found) {
         rollbackProvisionalTunnel();
         if (!cancelled() && endpoint.peerSource == PeerSource::LastKnown) {
             t2::transport::DistrustPersistedPeer(); // next discovery does the full lookup
@@ -274,12 +297,6 @@ bool ConnectToBiometricKitBridge(const NcmEndpoint& endpoint, t2::bridgexpc::Con
         return false;
     }
 
-    ConnectResult cr = outConn->Connect(endpoint.peerLinkLocal, endpoint.ifIndex, foundPort,
-                                         std::chrono::milliseconds(2000));
-    if (cr != ConnectResult::Ok) {
-        rollbackProvisionalTunnel();
-        return false;
-    }
     SaveCachedPort(endpoint, foundPort, foundRsdPort);
     if (outServicePort) *outServicePort = foundPort;
     if (outRsdPort) *outRsdPort = foundRsdPort;
