@@ -65,9 +65,16 @@ bool PickDefaultT2Endpoint(NcmEndpoint* outEndpoint);
 // cache re-verify) receives the RemoteXPC port that advertised it, 0
 // otherwise. A successful connect is cached for next time exactly like the
 // CLI does (SaveCachedPort), regardless of which path found it.
+//
+// cancelEvent (optional Win32 event HANDLE, typed void* like
+// ScanOptions::cancelEvent): when signaled, an in-progress port scan stops
+// and no further scan attempt starts, so a cancelled CAPTURE_DATA does not
+// keep the USB bulk pipe busy. A cancelled discovery returns false WITHOUT
+// distrusting the persisted peer (a cancel says nothing about the peer).
 bool ConnectToBiometricKitBridge(const NcmEndpoint& endpoint,
                                   t2::bridgexpc::Connection* outConn,
                                   uint16_t* outServicePort = nullptr,
-                                  uint16_t* outRsdPort = nullptr);
+                                  uint16_t* outRsdPort = nullptr,
+                                  void* cancelEvent = nullptr);
 
 } // namespace t2::discovery

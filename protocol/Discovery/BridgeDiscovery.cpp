@@ -180,12 +180,19 @@ bool PickDefaultT2Endpoint(NcmEndpoint* outEndpoint) {
 }
 
 bool ConnectToBiometricKitBridge(const NcmEndpoint& endpoint, t2::bridgexpc::Connection* outConn,
-                                  uint16_t* outServicePort, uint16_t* outRsdPort) {
+                                  uint16_t* outServicePort, uint16_t* outRsdPort,
+                                  void* cancelEvent) {
     using t2::bridgexpc::ConnectResult;
 
     if (outConn == nullptr || endpoint.peerSource == PeerSource::None) {
         return false;
     }
+
+    auto cancelled = [&]() {
+        return cancelEvent != nullptr &&
+               WaitForSingleObject(static_cast<HANDLE>(cancelEvent), 0) == WAIT_OBJECT_0;
+    };
+    if (cancelled()) return false;
 
     // Cache fast path — same policy as the CLI: try it first, fall through
     // to a full scan on any miss, never trust it without a live HELO.
@@ -238,7 +245,9 @@ bool ConnectToBiometricKitBridge(const NcmEndpoint& endpoint, t2::bridgexpc::Con
         ? static_cast<unsigned>(sizeof(timeoutsMsTunnel) / sizeof(timeoutsMsTunnel[0]))
         : static_cast<unsigned>(sizeof(timeoutsMsNative) / sizeof(timeoutsMsNative[0]));
     for (unsigned attempt = 0; attempt < kAttempts; ++attempt) {
+        if (cancelled()) break;
         ScanOptions opt;
+        opt.cancelEvent = cancelEvent;
         opt.concurrency = tunnelActive ? 16 : 256;
         opt.includeTcpOnly = true;
         opt.connectTimeoutMs = timeoutsMs[attempt];
@@ -251,12 +260,14 @@ bool ConnectToBiometricKitBridge(const NcmEndpoint& endpoint, t2::bridgexpc::Con
             break;
         }
     }
-    T2_LOG("discovery", L"full port scan finished in %llu ms, found port %u",
+    T2_LOG("discovery", L"full port scan (%s, %u-wide, %u/%u ms) finished in %llu ms, found port %u",
+           tunnelActive ? L"IPv4 tunnel" : L"Native IPv6",
+           tunnelActive ? 16u : 256u, timeoutsMs[0], timeoutsMs[kAttempts - 1],
            static_cast<unsigned long long>(GetTickCount64() - scanStartMs),
            static_cast<unsigned>(foundPort));
     if (foundPort == 0) {
         rollbackProvisionalTunnel();
-        if (endpoint.peerSource == PeerSource::LastKnown) {
+        if (!cancelled() && endpoint.peerSource == PeerSource::LastKnown) {
             t2::transport::DistrustPersistedPeer(); // next discovery does the full lookup
         }
         return false;

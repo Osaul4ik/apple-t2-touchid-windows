@@ -251,8 +251,15 @@ ConnectResult Connection::ConnectOnce(bool tunnel, const in6_addr& linkLocalAddr
                                 tcpTimeout, &wsa)) {
             T2_LOG("connect", L"connect(AF_INET) failed WSA=%d (%llu ms)", wsa,
                    static_cast<unsigned long long>(GetTickCount64() - tcpStart));
-            t2::transport::InvalidateTunnelPrepCache(); // re-prepare neighbor/peer next time
             Close();
+            if (wsa == WSAECONNREFUSED) {
+                // RST from the T2 (rewritten back by T2Ncm.sys): the tunnel path
+                // WORKS, only this port is dead (e.g. a port cached from an
+                // earlier boot). Not a transport failure - see the native branch.
+                *outTcpMs = GetTickCount64() - tcpStart;
+                return ConnectResult::ConnectFailed;
+            }
+            t2::transport::InvalidateTunnelPrepCache(); // re-prepare neighbor/peer next time
             *outTcpFailed = true;
             return ConnectResult::ConnectFailed;
         }
@@ -275,6 +282,16 @@ ConnectResult Connection::ConnectOnce(bool tunnel, const in6_addr& linkLocalAddr
             T2_LOG("connect", L"connect(AF_INET6) failed WSA=%d (%llu ms)", wsa,
                    static_cast<unsigned long long>(GetTickCount64() - tcpStart));
             Close();
+            if (wsa == WSAECONNREFUSED) {
+                // RST from the T2: the SYN got there and back, so native IPv6
+                // WORKS and only this port is dead (a stale cached port after a
+                // T2/boot change). Treating it as "transport dead" made Connect()
+                // needlessly flip to the tunnel (IOCTLs, ARP prep, a driver left in
+                // tunnel mode) on every stale-port try. ConnectWithTimeout exists
+                // to make exactly this distinction; *outTcpFailed stays false.
+                *outTcpMs = GetTickCount64() - tcpStart;
+                return ConnectResult::ConnectFailed;
+            }
             *outTcpFailed = true;
             return ConnectResult::ConnectFailed;
         }

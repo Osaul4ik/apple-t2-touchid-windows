@@ -1198,7 +1198,7 @@ DWORD LoadPostResumeSettleMs()
 }
 
 // Sticky adapter selection: g_stickyNcm (declared near RecentMatchCache).
-bool ConnectForCapture(t2::bridgexpc::Connection* outConn)
+bool ConnectForCapture(t2::bridgexpc::Connection* outConn, HANDLE cancelEvent = nullptr)
 {
     const ULONGLONG t0 = GetTickCount64();
 
@@ -1262,7 +1262,7 @@ bool ConnectForCapture(t2::bridgexpc::Connection* outConn)
         }
     }
     if (haveSticky) {
-        if (t2::discovery::ConnectToBiometricKitBridge(stickyEp, outConn)) {
+        if (t2::discovery::ConnectToBiometricKitBridge(stickyEp, outConn, nullptr, nullptr, cancelEvent)) {
             T2BioLog("CAPTURE_DATA: connected via sticky NCM endpoint "
                      "(discovery+connect %llu ms)",
                      static_cast<unsigned long long>(GetTickCount64() - t0));
@@ -1279,7 +1279,7 @@ bool ConnectForCapture(t2::bridgexpc::Connection* outConn)
         return false;
     }
     const ULONGLONG t1 = GetTickCount64();
-    if (!t2::discovery::ConnectToBiometricKitBridge(ep, outConn)) {
+    if (!t2::discovery::ConnectToBiometricKitBridge(ep, outConn, nullptr, nullptr, cancelEvent)) {
         T2BioLog("CAPTURE_DATA: BiometricKit BridgeXPC discovery/connect failed "
                  "(endpoint lookup %llu ms, discovery+connect %llu ms)",
                  static_cast<unsigned long long>(t1 - t0),
@@ -1328,7 +1328,7 @@ ConnectWait ConnectForCaptureWithRetry(HANDLE cancelEvent, t2::bridgexpc::Connec
     const ULONGLONG start = GetTickCount64();
     DWORD backoffMs = kConnectRetryFirstMs;
     for (unsigned attempt = 1;; ++attempt) {
-        if (ConnectForCapture(outConn)) {
+        if (ConnectForCapture(outConn, cancelEvent)) {
             if (attempt > 1) {
                 T2BioLog("CAPTURE_DATA: BridgeXPC reachable after %u attempts (%llu ms) mode=%s",
                          attempt, static_cast<unsigned long long>(GetTickCount64() - start),

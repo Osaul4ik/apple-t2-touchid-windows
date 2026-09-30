@@ -53,6 +53,12 @@ struct ScanOptions {
     // from starting.
     std::atomic<bool>* cancel = nullptr;
 
+    // Optional Win32 event (HANDLE, typed void* to keep this header free of
+    // <windows.h>) that also stops the scan when signaled - lets a caller tie
+    // the scan to an outside cancel (WBF CancelIoEx) that `cancel` above, which
+    // ScanAndProbe owns for its own early exit, cannot carry.
+    void* cancelEvent = nullptr;
+
     // Port dispatch order within [portBegin, portEnd]:
     //
     //   priorityBands=true (default): hardware-tuned order observed on

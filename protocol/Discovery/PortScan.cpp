@@ -219,6 +219,12 @@ std::vector<PortCandidate> ScanHttp2Preface(const NcmEndpoint& endpoint,
     // before it starts probing, not after.
     if (t2::transport::IsTunnelModeActive()) {
         t2::transport::PrepareTunnelPeer(endpoint.ifIndex, endpoint.peerLinkLocal);
+    } else {
+        // Mirror of the above: a native scan needs T2Ncm.sys in native mode.
+        // A failed tunnel fallback elsewhere leaves the driver in tunnel mode
+        // (which rewrites EVERY inbound IPv6 frame to IPv4, so no native
+        // SYN-ACK would ever reach this scan). No-op when already native.
+        t2::transport::PushTransportModeToDriver(t2::transport::TransportMode::NativeIpv6);
     }
 
     const std::vector<uint16_t> portOrder = BuildPortOrder(
@@ -261,6 +267,10 @@ std::vector<PortCandidate> ScanHttp2Preface(const NcmEndpoint& endpoint,
             // abort the rest of the range immediately.
             if (options.cancel &&
                 options.cancel->load(std::memory_order_relaxed)) {
+                break;
+            }
+            if (options.cancelEvent &&
+                WaitForSingleObject(static_cast<HANDLE>(options.cancelEvent), 0) == WAIT_OBJECT_0) {
                 break;
             }
             unsigned i = next.fetch_add(1);

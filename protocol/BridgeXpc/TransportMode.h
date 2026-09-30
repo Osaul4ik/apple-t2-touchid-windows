@@ -702,6 +702,14 @@ inline void PrepareTunnelPeer(unsigned long ifIndex, const in6_addr& peer6) {
         T2_LOG("tunnel", L"PrepareTunnelPeer: skipped (system suspending / Dx)");
         return;
     }
+    // Invariant: an AF_INET tunnel socket only works while T2Ncm.sys itself is
+    // in tunnel mode (otherwise TX is sent as bare IPv4 and the T2 drops it).
+    // Every tunnel user (Connection, PortScan, RemoteXPC) goes through here, so
+    // arming the mode at this single choke point means "userspace says tunnel,
+    // driver still native" cannot happen - e.g. cold-discovery's provisional
+    // tunnel (CommitAutoTunnel only flips a flag in this process) scanning into
+    // a void. Deduped by LastPushedModeFlag, so it is a no-op when already armed.
+    PushTransportModeToDriver(TransportMode::Ipv4Tunnel);
     // Fast path: same peer as last time we successfully prepared it, and
     // nothing has invalidated that since (see InvalidateTunnelPrepCache).
     // Skips the neighbor-table walk and the ARP create/set syscalls -
