@@ -188,9 +188,10 @@ bool ConnectToBiometricKitBridge(const NcmEndpoint& endpoint, t2::bridgexpc::Con
         return false;
     }
 
-    auto cancelled = [&]() {
-        return cancelEvent != nullptr &&
-               WaitForSingleObject(static_cast<HANDLE>(cancelEvent), 0) == WAIT_OBJECT_0;
+    // Connection::IsEventSignaled, not WAIT_OBJECT_0: under UMDF_USING_NTSTATUS that
+    // macro needs STATUS_WAIT_0 (ntstatus.h), which protocol/ TUs do not include.
+    auto cancelled = [&]() -> bool {
+        return t2::bridgexpc::Connection::IsEventSignaled(static_cast<HANDLE>(cancelEvent));
     };
     if (cancelled()) return false;
 

@@ -6,6 +6,7 @@
 #include "PortScan.h"
 #include "../BridgeXpc/Winsock.h"
 #include "../BridgeXpc/TransportMode.h"
+#include "../BridgeXpc/Connection.h"
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <vector>
@@ -270,7 +271,7 @@ std::vector<PortCandidate> ScanHttp2Preface(const NcmEndpoint& endpoint,
                 break;
             }
             if (options.cancelEvent &&
-                WaitForSingleObject(static_cast<HANDLE>(options.cancelEvent), 0) == WAIT_OBJECT_0) {
+                t2::bridgexpc::Connection::IsEventSignaled(static_cast<HANDLE>(options.cancelEvent))) {
                 break;
             }
             unsigned i = next.fetch_add(1);
