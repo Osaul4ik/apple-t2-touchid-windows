@@ -366,6 +366,16 @@ GateResult RunReadinessGate(NcmEndpoint* ep, void* cancelEvent, unsigned maxMs) 
     constexpr ULONGLONG kNoAddressMs = 1500;  // no link-local this long after link-up => IPv6 unusable
     constexpr DWORD kPollMs = 25;
 
+    // V6Unavailable must be self-healing: it is only a verdict about what the stack
+    // looked like at one moment. If a link-local address exists now (DAD after a slow
+    // cold boot, IPv6 re-bound), native IPv6 is possible again - re-evaluate instead
+    // of staying pinned to "no v6" until something else resets the Generation.
+    if (ep->ipv6Bound && t2::transport::IsV6Unavailable() &&
+        QueryLinkLocalState(ep->ifIndex) != LinkLocalState::None) {
+        t2::transport::ClearV6Unavailable();
+        T2_LOG("discovery", L"readiness gate: link-local IPv6 present again - V6Unavailable cleared");
+    }
+
     if (!ep->ipv6Bound) {
         // IPv6 component unbound on the adapter: nothing to wait for, native is impossible.
         t2::transport::MarkV6Unavailable();

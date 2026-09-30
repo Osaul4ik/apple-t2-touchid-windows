@@ -240,6 +240,9 @@ inline ULONGLONG ReprobeSafetyNetMs() {
 }
 
 inline void RequestNativeReprobe() {
+    // Unlock / resume / interface add-delete: the picture may have changed, so a
+    // stale "IPv6 unavailable" verdict must not survive it.
+    ClearV6Unavailable();
     g_lastReprobeRequestTick.store(GetTickCount64(), std::memory_order_relaxed);
     g_reprobeDue.store(true, std::memory_order_relaxed);
 }

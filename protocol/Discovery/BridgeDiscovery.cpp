@@ -55,7 +55,7 @@ struct Budgets {
 };
 const Budgets& BudgetsFor(bool tunnel) {
     static const Budgets native{1500, 3000, 256, {20, 60}};
-    static const Budgets tunnelB{3000, 5000, 16, {150, 400}};
+    static const Budgets tunnelB{3000, 5000, 256, {20, 20}}; // same as native, per owner request
     return tunnel ? tunnelB : native;
 }
 constexpr ULONGLONG kEvidenceScanMs = 1000;  // native scan used AS evidence (no cache to probe)
@@ -453,7 +453,10 @@ StepResult NativeStep(const NcmEndpoint& ep, Connection* conn, void* cancelEvent
     // probe (the scan itself is then the evidence), or when tunnel fallback is off.
     const bool noCheapProbe = !ct.hadCache && !tp::IsRstProof();
     if (answered || noCheapProbe || !autoSwitch) {
-        const ULONGLONG budget = (proven || !autoSwitch) ? BudgetsFor(false).attemptMs : kEvidenceScanMs;
+        // Without a cached port there is no tunnel fallback (see ConnectToBiometricKitBridge),
+        // so the native scan is not just evidence: give it the full budget.
+        const ULONGLONG budget = (proven || !autoSwitch || !ct.hadCache) ? BudgetsFor(false).attemptMs
+                                                                        : kEvidenceScanMs;
         ScanOutcome so = RunScanAttempt(ep, false, budget, cancelEvent);
         if (so.servicePort != 0) {
             // Save at the moment of confirmation, before the final connect and
@@ -479,7 +482,7 @@ StepResult NativeStep(const NcmEndpoint& ep, Connection* conn, void* cancelEvent
 }
 
 // ---- Step D: IPv4 tunnel ------------------------------------------------------
-StepResult TunnelStep(NcmEndpoint* ep, Connection* conn, void* cancelEvent) {
+StepResult TunnelStep(NcmEndpoint* ep, Connection* conn, void* cancelEvent, bool allowScan) {
     StepResult sr;
     tp::TransportPhase phase(static_cast<HANDLE>(cancelEvent));
     phase.mode.Enter(tp::TransportMode::Ipv4Tunnel);
@@ -521,6 +524,13 @@ StepResult TunnelStep(NcmEndpoint* ep, Connection* conn, void* cancelEvent) {
     if (Cancelled(cancelEvent)) return sr;
     bool alive = ct.ev == PathEvidence::Positive || ct.ev == PathEvidence::Refused;
     bool silent = ct.ev == PathEvidence::Silent;
+    if (!allowScan) {
+        // Cold boot is v6-only: the tunnel is only for re-using a port that v6 already
+        // found (cached HELO). It never scans by itself.
+        sr.pathAlive = alive;
+        sr.sawSilent = silent;
+        return sr;
+    }
 
     ScanOutcome so = RunScanAttempt(*ep, true, BudgetsFor(true).attemptMs, cancelEvent);
     if (so.servicePort != 0) {
@@ -555,7 +565,7 @@ std::atomic<unsigned long> g_gateIfIndex{0};
 GateResult EnsureGate(NcmEndpoint* ep, void* cancelEvent) {
     if (g_gateGeneration.load(std::memory_order_acquire) == tp::CurrentGeneration() &&
         g_gateIfIndex.load(std::memory_order_relaxed) == ep->ifIndex &&
-        ep->peerSource != PeerSource::None) {
+        ep->peerSource != PeerSource::None && !tp::IsV6Unavailable()) {
         return tp::IsV6Unavailable() ? GateResult::V6Unavailable : GateResult::Ready;
     }
     const GateResult g = RunReadinessGate(ep, cancelEvent);
@@ -639,9 +649,20 @@ bool ConnectToBiometricKitBridge(const NcmEndpoint& endpoint, t2::bridgexpc::Con
         sawSilent = result.sawSilent;
     }
     bool tunnelTried = false;
-    if (!result.ok && !Cancelled(cancelEvent) && (forced || (autoSwitch && !nativeAlive))) {
+    // Tunnel policy: cold boot has no VPN, so the start is native IPv6 ONLY. The tunnel
+    // is used when (a) the user forced it, or (b) native is silent AND a port is already
+    // cached (found earlier over v6): then one HELO over the tunnel is enough, no scan.
+    // A tunnel SCAN happens only when forced or when IPv6 is unusable on the adapter.
+    bool haveCachedPort = false;
+    {
+        uint16_t cp = 0;
+        haveCachedPort = LoadCachedPort(ep, &cp);
+    }
+    const bool tunnelScanAllowed = forced || tp::IsV6Unavailable();
+    if (!result.ok && !Cancelled(cancelEvent) &&
+        (forced || (autoSwitch && !nativeAlive && (haveCachedPort || tunnelScanAllowed)))) {
         tunnelTried = true;
-        result = TunnelStep(&ep, outConn, cancelEvent);
+        result = TunnelStep(&ep, outConn, cancelEvent, tunnelScanAllowed);
         sawSilent = sawSilent || result.sawSilent;
     }
 
