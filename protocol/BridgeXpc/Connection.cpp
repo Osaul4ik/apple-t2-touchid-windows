@@ -328,6 +328,14 @@ ConnectResult Connection::ConnectOnce(bool tunnel, const in6_addr& linkLocalAddr
 //    other one within this same call. Only a SUCCESSFUL fallback is remembered.
 ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned long interfaceIndex,
                                   uint16_t port, std::chrono::milliseconds connectTimeout) {
+    // Fresh WUDFHost has no prior WSAStartup. Without this the first
+    // cached-port Connect fails with 10093 (WSANOTINITIALISED), is logged
+    // as "cached port did not answer", and cold-boot CAPTURE falls into a
+    // full scan or a flaky retry — sensor never arms for the first touch.
+    if (!t2::EnsureWinsock()) {
+        T2_LOG("connect", L"EnsureWinsock failed - cannot create sockets");
+        return ConnectResult::ConnectFailed;
+    }
     namespace tp = t2::transport;
     connectionLost_.store(false);
     tp::EnsureNetworkChangeWatch();
