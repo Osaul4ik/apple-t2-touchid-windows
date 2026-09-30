@@ -42,6 +42,12 @@ $ErrorActionPreference = 'Stop'
 try {
     $regPath = 'HKLM:\SOFTWARE\T2TouchId\Network'
     if (-not (Test-Path $regPath)) { New-Item -Path $regPath -Force | Out-Null }
+    # Create the PortCache subkey up front (inherits the ACL below) so the UMDF host's
+    # first port save cannot fail with err 5 and leave every boot paying a full scan.
+    foreach ($sub in 'PortCache') {
+        $subPath = Join-Path $regPath $sub
+        if (-not (Test-Path $subPath)) { New-Item -Path $subPath -Force | Out-Null }
+    }
     $acl  = Get-Acl $regPath
     $rule = New-Object System.Security.AccessControl.RegistryAccessRule(
         'NT AUTHORITY\LOCAL SERVICE', 'SetValue,CreateSubKey,Delete,ReadKey',
