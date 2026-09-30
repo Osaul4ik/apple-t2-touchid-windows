@@ -216,9 +216,13 @@ ConnectResult Connection::ConnectOnce(bool tunnel, const in6_addr& linkLocalAddr
                                       unsigned long interfaceIndex, uint16_t port,
                                       std::chrono::milliseconds tcpTimeout,
                                       std::chrono::milliseconds heloTimeout,
-                                      bool* outTcpFailed, ULONGLONG* outTcpMs) {
+                                      bool* outTcpFailed, ULONGLONG* outTcpMs,
+                                      t2::transport::PathEvidence* outEvidence) {
     *outTcpFailed = false;
     *outTcpMs = 0;
+    t2::transport::PathEvidence evidenceLocal = t2::transport::PathEvidence::Silent;
+    t2::transport::PathEvidence& evidence = outEvidence ? *outEvidence : evidenceLocal;
+    evidence = t2::transport::PathEvidence::Silent;
     t2::transport::PushTransportModeToDriver(
         tunnel ? t2::transport::TransportMode::Ipv4Tunnel
                : t2::transport::TransportMode::NativeIpv6);
@@ -226,11 +230,23 @@ ConnectResult Connection::ConnectOnce(bool tunnel, const in6_addr& linkLocalAddr
     const ULONGLONG tcpStart = GetTickCount64();
     int wsa = 0;
     if (tunnel) {
-        t2::transport::PrepareTunnelPeer(interfaceIndex, linkLocalAddress);
+        const t2::transport::TunnelPrep prep =
+            t2::transport::PrepareTunnelPeer(interfaceIndex, linkLocalAddress);
+        if (prep == t2::transport::TunnelPrep::NoMac || prep == t2::transport::TunnelPrep::NoPeer) {
+            // LocalError (section 4): without a peer MAC the static ARP row cannot be
+            // set, so the SYN would just die after the full TCP timeout. That says
+            // nothing about the T2 - do not burn the budget and do not count a
+            // tunnel failure; the caller re-resolves the peer.
+            T2_LOG("connect", L"Ipv4Tunnel not attemptable (%s) - LocalError",
+                   prep == t2::transport::TunnelPrep::NoMac ? L"no peer MAC" : L"no peer");
+            evidence = t2::transport::PathEvidence::LocalError;
+            return ConnectResult::ConnectFailed;
+        }
         const in_addr peer4 = t2::transport::MapPeerToIpv4(linkLocalAddress);
         socket_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (socket_ == INVALID_SOCKET) {
             T2_LOG("connect", L"socket(AF_INET) failed, WSAGetLastError=%d", WSAGetLastError());
+            evidence = t2::transport::PathEvidence::LocalError;
             return ConnectResult::ConnectFailed;
         }
         DWORD ifIndexNet = htonl(static_cast<DWORD>(interfaceIndex));
@@ -252,6 +268,7 @@ ConnectResult Connection::ConnectOnce(bool tunnel, const in6_addr& linkLocalAddr
             T2_LOG("connect", L"connect(AF_INET) failed WSA=%d (%llu ms)", wsa,
                    static_cast<unsigned long long>(GetTickCount64() - tcpStart));
             Close();
+            evidence = t2::transport::ClassifyWsaError(wsa);
             if (wsa == WSAECONNREFUSED) {
                 // RST from the T2 (rewritten back by T2Ncm.sys): the tunnel path
                 // WORKS, only this port is dead (e.g. a port cached from an
@@ -260,13 +277,14 @@ ConnectResult Connection::ConnectOnce(bool tunnel, const in6_addr& linkLocalAddr
                 return ConnectResult::ConnectFailed;
             }
             t2::transport::InvalidateTunnelPrepCache(); // re-prepare neighbor/peer next time
-            *outTcpFailed = true;
+            *outTcpFailed = true; // the handshake did not complete on this transport (evidence says why)
             return ConnectResult::ConnectFailed;
         }
     } else {
         socket_ = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
         if (socket_ == INVALID_SOCKET) {
             T2_LOG("connect", L"socket(AF_INET6) failed, WSAGetLastError=%d", WSAGetLastError());
+            evidence = t2::transport::PathEvidence::LocalError;
             return ConnectResult::ConnectFailed;
         }
         sockaddr_in6 addr{};
@@ -282,6 +300,7 @@ ConnectResult Connection::ConnectOnce(bool tunnel, const in6_addr& linkLocalAddr
             T2_LOG("connect", L"connect(AF_INET6) failed WSA=%d (%llu ms)", wsa,
                    static_cast<unsigned long long>(GetTickCount64() - tcpStart));
             Close();
+            evidence = t2::transport::ClassifyWsaError(wsa);
             if (wsa == WSAECONNREFUSED) {
                 // RST from the T2: the SYN got there and back, so native IPv6
                 // WORKS and only this port is dead (a stale cached port after a
@@ -292,10 +311,11 @@ ConnectResult Connection::ConnectOnce(bool tunnel, const in6_addr& linkLocalAddr
                 *outTcpMs = GetTickCount64() - tcpStart;
                 return ConnectResult::ConnectFailed;
             }
-            *outTcpFailed = true;
+            *outTcpFailed = true; // the handshake did not complete on this transport (evidence says why)
             return ConnectResult::ConnectFailed;
         }
     }
+    evidence = t2::transport::PathEvidence::Positive; // handshake completed
     *outTcpMs = GetTickCount64() - tcpStart;
     TuneEstablishedSocket(socket_);
     SetSocketTimeout(socket_, SO_RCVTIMEO, heloTimeout);
@@ -335,6 +355,34 @@ ConnectResult Connection::ConnectOnce(bool tunnel, const in6_addr& linkLocalAddr
     return ConnectResult::Ok;
 }
 
+// Explicit-transport entry point for the TransportManager (see Connection.h).
+// No fallback, no re-probe: the caller decides which transport to try and holds
+// the TransportPhase. A completed native handshake still feeds the adaptive
+// budget (RecordNativeSuccess), exactly like Connect().
+ConnectResult Connection::ConnectVia(bool tunnel, const in6_addr& linkLocalAddress,
+                                     unsigned long interfaceIndex, uint16_t port,
+                                     std::chrono::milliseconds tcpTimeout,
+                                     std::chrono::milliseconds heloTimeout,
+                                     t2::transport::PathEvidence* outEvidence,
+                                     ULONGLONG* outTcpMs) {
+    if (outEvidence) *outEvidence = t2::transport::PathEvidence::LocalError;
+    if (outTcpMs) *outTcpMs = 0;
+    if (!t2::EnsureWinsock()) {
+        T2_LOG("connect", L"EnsureWinsock failed - cannot create sockets");
+        return ConnectResult::ConnectFailed;
+    }
+    connectionLost_.store(false);
+    t2::transport::EnsureNetworkChangeWatch();
+    bool tcpFailed = false;
+    ULONGLONG tcpMs = 0;
+    t2::transport::PathEvidence ev = t2::transport::PathEvidence::Silent;
+    const ConnectResult r = ConnectOnce(tunnel, linkLocalAddress, interfaceIndex, port,
+                                        tcpTimeout, heloTimeout, &tcpFailed, &tcpMs, &ev);
+    if (outEvidence) *outEvidence = ev;
+    if (outTcpMs) *outTcpMs = tcpMs;
+    return r;
+}
+
 // Entry point. Transport policy lives in TransportMode.h (read its header
 // comment first). In short:
 //  * forced tunnel (GUI/--tunnel)  -> tunnel only, no probing;
@@ -360,18 +408,33 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
     const bool autoSwitch = !tp::IsTunnelForced() && tp::IsAutoSwitchEnabled();
     bool tunnel = tp::IsTunnelModeActive();
     if (autoSwitch && tunnel && tp::ConsumeNativeReprobeDue()) {
+        // Tier 1 return to native (architecture v2 section 10): this Connection
+        // has no live socket yet (we are opening it), so flipping the driver to
+        // native for a moment cannot break a running session of this process.
+        // Leaving the tunnel needs TWO positive native probes (hysteresis); the
+        // TransportPhase restores the committed (tunnel) mode on every exit.
         T2_LOG("connect", L"auto-switch: network/session changed - re-probing Native IPv6");
-        tunnel = false;
+        tp::TransportPhase phase;
+        phase.mode.Enter(tp::TransportMode::NativeIpv6);
+        if (tp::ConfirmNativeReturn(linkLocalAddress, interfaceIndex, port)) {
+            tp::CommitAutoTunnel(false); // Restore() below then leaves the driver native
+            tunnel = false;
+        } else {
+            T2_LOG("connect", L"auto-switch: native IPv6 not confirmed - staying on the IPv4 tunnel");
+        }
     }
 
     const std::chrono::milliseconds firstTcp =
         (autoSwitch && !tunnel) ? tp::NativeConnectBudget(connectTimeout) : connectTimeout;
     bool tcpFailed = false;
     ULONGLONG tcpMs = 0;
+    tp::PathEvidence ev1 = tp::PathEvidence::Silent;
     const ULONGLONG t0 = GetTickCount64();
     ConnectResult r = ConnectOnce(tunnel, linkLocalAddress, interfaceIndex, port,
-                                  firstTcp, connectTimeout, &tcpFailed, &tcpMs);
-    if (!tcpFailed) {
+                                  firstTcp, connectTimeout, &tcpFailed, &tcpMs, &ev1);
+    // LocalError (no peer MAC for the tunnel, socket() failure) is "cannot try this
+    // transport", not "the transport answered": still worth the other one.
+    if (!tcpFailed && ev1 != tp::PathEvidence::LocalError) {
         if (!tunnel) tp::RecordNativeSuccess(tcpMs); // path works -> clears auto-tunnel
         return r;                                     // Ok, or a HELO-level problem (no switch)
     }
@@ -390,9 +453,10 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
         other ? std::chrono::milliseconds(fbMs) : tp::NativeConnectBudget(connectTimeout);
     bool tcpFailed2 = false;
     ULONGLONG tcpMs2 = 0;
+    tp::PathEvidence ev2 = tp::PathEvidence::Silent;
     ConnectResult r2 = ConnectOnce(other, linkLocalAddress, interfaceIndex, port,
-                                   fallbackTcp, connectTimeout, &tcpFailed2, &tcpMs2);
-    if (!tcpFailed2) {
+                                   fallbackTcp, connectTimeout, &tcpFailed2, &tcpMs2, &ev2);
+    if (!tcpFailed2 && ev2 != tp::PathEvidence::LocalError) {
         if (other) tp::CommitAutoTunnel(true);
         else       tp::RecordNativeSuccess(tcpMs2);
         T2_LOG("connect", L"auto-switch: %s -> %s after %llu ms (%s)",

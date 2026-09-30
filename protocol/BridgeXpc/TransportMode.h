@@ -29,6 +29,7 @@
 #endif
 #include <iphlpapi.h>
 #include <netioapi.h>
+#include <sddl.h>
 #include <atomic>
 #include <mutex>
 #include <chrono>
@@ -39,6 +40,7 @@
 #include "Winsock.h"
 
 #pragma comment(lib, "Iphlpapi.lib")
+#pragma comment(lib, "Advapi32.lib")
 
 namespace t2::transport {
 
@@ -70,6 +72,16 @@ inline constexpr wchar_t kPeerMacValue[] = L"PeerMac";
 //     one side can set but the other cannot clear was the source of the old
 //     "stuck on tunnel" behaviour. Every process re-learns it with one
 //     bounded native attempt.
+//
+// CONNECT ARCHITECTURE v2 (CONNECT_ARCHITECTURE_v2.md) adds, in this file:
+//  * Generation (section 3): everything "boot dependent" (committed tunnel,
+//    V6Unavailable, scan progress) is tied to a counter that moves on real
+//    resume / NCM re-enumeration / peer change - never to "boot".
+//  * PathEvidence (section 4): a connect attempt is Positive / Silent /
+//    Refused / LocalError; only Positive proves a path, LocalError proves nothing.
+//  * TransportPhase (sections 11, 12): cross-process mutex + RAII mode scope,
+//    so the driver mode equals the committed mode whenever a phase ends, and no
+//    other process can flip it in the middle of a probe/scan.
 //
 // Native and tunnel are mutually exclusive at the driver level: while
 // T2Ncm.sys has TunnelModeEnabled set it rewrites EVERY inbound IPv6 TCP/UDP
@@ -126,36 +138,134 @@ inline bool IsAutoSwitchEnabled() {
     return ReadDwordCached(c, kNetworkRegPath, kAutoSwitchValue, 1, 1000) != 0;
 }
 
+// ---- Generation (architecture v2, section 3) -----------------------------
+// Starts at 1 in every process (process start IS a new generation). Bumped on
+// real Sx suspend/resume (BumpRealSuspendGeneration), when the NCM adapter
+// re-registers with another ifIndex/MAC and when the T2 peer address changes.
+// Value 0 is reserved for "never set".
+inline std::atomic<ULONGLONG>& GenerationCounter() {
+    static std::atomic<ULONGLONG> g{1};
+    return g;
+}
+inline ULONGLONG CurrentGeneration() { return GenerationCounter().load(std::memory_order_acquire); }
+inline ULONGLONG BumpGeneration(const wchar_t* why) {
+    const ULONGLONG n = GenerationCounter().fetch_add(1, std::memory_order_acq_rel) + 1;
+    T2_LOG("transport", L"Generation -> %llu (%s)", static_cast<unsigned long long>(n),
+           why ? why : L"?");
+    return n;
+}
+
+// Committed auto-tunnel (in-process, NOT mirrored to the registry - see 3.).
+// Only meaningful while g_autoTunnelGen == CurrentGeneration().
 inline std::atomic<bool> g_autoTunnel{false};
+inline std::atomic<ULONGLONG> g_autoTunnelGen{0};
+inline bool IsAutoTunnelCommitted() {
+    return g_autoTunnel.load(std::memory_order_relaxed) &&
+           g_autoTunnelGen.load(std::memory_order_relaxed) == CurrentGeneration();
+}
+
+// Attempt-scoped transport override: -1 none, 0 native, 1 tunnel. Set by
+// TransportPhase while an attempt probes a transport that is NOT (yet)
+// committed. This replaces the old "provisional tunnel" (CommitAutoTunnel(true)
+// followed by a rollback): nothing is committed until a handshake succeeded,
+// and the override disappears on every exit path (RAII), including cancel.
+inline std::atomic<int>& TransportOverride() {
+    static std::atomic<int> o{-1};
+    return o;
+}
 
 // THE query for "which transport is active right now" (discovery budgets,
 // port scan, RemoteXPC and Connection all read this).
 inline bool IsTunnelModeActive() {
-    return g_autoTunnel.load(std::memory_order_relaxed) || IsTunnelForced();
+    const int ov = TransportOverride().load(std::memory_order_relaxed);
+    if (ov >= 0) return ov == 1;
+    return IsAutoTunnelCommitted() || IsTunnelForced();
+}
+
+// IPv6 unusable on the T2 adapter for this Generation (unbound, or no
+// link-local address 1.5 s after the link came up). Native is not attempted.
+inline std::atomic<ULONGLONG> g_v6UnavailableGen{0};
+inline void MarkV6Unavailable() { g_v6UnavailableGen.store(CurrentGeneration(), std::memory_order_relaxed); }
+inline void ClearV6Unavailable() { g_v6UnavailableGen.store(0, std::memory_order_relaxed); }
+inline bool IsV6Unavailable() {
+    return g_v6UnavailableGen.load(std::memory_order_relaxed) == CurrentGeneration();
+}
+
+// ---- Path evidence (architecture v2, section 4) ---------------------------
+enum class PathEvidence {
+    Positive,   // SYN-ACK / HELO: the path works
+    Silent,     // nothing came back inside the budget
+    LocalError, // local problem (no route/address/MAC) - says nothing about the path
+    Refused,    // RST; a proof of the path only if assumption A0 holds
+};
+// A0 [HW]: the T2 answers a SYN to a closed port with RST. Unconfirmed, so the
+// default is "not proof"; flip HKLM\SOFTWARE\T2TouchId\Network\RstIsProof=1
+// after the hardware test (section 16, step 0).
+inline bool IsRstProof() {
+    static CachedDword c;
+    return ReadDwordCached(c, kNetworkRegPath, L"RstIsProof", 0, 1000) != 0;
+}
+inline bool IsPositiveEvidence(PathEvidence e) {
+    return e == PathEvidence::Positive || (e == PathEvidence::Refused && IsRstProof());
+}
+inline PathEvidence ClassifyWsaError(int wsa) {
+    switch (wsa) {
+        case 0:                return PathEvidence::Positive;
+        case WSAECONNREFUSED:  return PathEvidence::Refused;
+        case WSAENETUNREACH:
+        case WSAENETDOWN:
+        case WSAEADDRNOTAVAIL:
+        case WSAEAFNOSUPPORT:  return PathEvidence::LocalError;
+        // WSAEACCES is what a WFP block filter (VPN kill-switch) returns on connect():
+        // that IS the blocked-path case the tunnel exists for, not a local fault.
+        default:               return PathEvidence::Silent; // timeout, host unreachable, WFP block, aborted...
+    }
 }
 
 // ---- native re-probe triggers -----------------------------------------
-inline constexpr ULONGLONG kReprobeMinGapMs = 3000;       // flap guard
-inline constexpr ULONGLONG kReprobeSafetyNetMs = 120000;  // silent WFP changes
+inline constexpr ULONGLONG kReprobeMinGapMs = 3000;       // flap guard between probes
+inline constexpr ULONGLONG kReprobeDebounceMs = 1500;     // storm of Wi-Fi/Hyper-V/WSL events -> one probe
+inline constexpr ULONGLONG kReprobeSafetyNetDefaultMs = 120000; // silent WFP changes
 inline std::atomic<bool> g_reprobeDue{false};
+inline std::atomic<ULONGLONG> g_lastReprobeRequestTick{0};
 inline std::atomic<ULONGLONG> g_lastNativeTryTick{0};
 inline std::atomic<DWORD> g_seenReprobeNonce{0};
 
-inline void RequestNativeReprobe() { g_reprobeDue.store(true, std::memory_order_relaxed); }
+// HKLM\...\Network\ReprobeSafetyNetMs: missing = 120000, 0 = safety net off
+// (event-driven triggers only; architecture v2 open question 7).
+inline ULONGLONG ReprobeSafetyNetMs() {
+    static CachedDword c;
+    return ReadDwordCached(c, kNetworkRegPath, L"ReprobeSafetyNetMs",
+                           static_cast<DWORD>(kReprobeSafetyNetDefaultMs), 1000);
+}
 
-// True at most once per trigger, and only while auto-tunnel is active.
+inline void RequestNativeReprobe() {
+    g_lastReprobeRequestTick.store(GetTickCount64(), std::memory_order_relaxed);
+    g_reprobeDue.store(true, std::memory_order_relaxed);
+}
+
+// True at most once per trigger, and only while auto-tunnel is committed.
+// A pending event trigger must first be quiet for kReprobeDebounceMs (a burst of
+// interface events keeps pushing it back), then the kReprobeMinGapMs flap guard
+// applies. The GUI nonce is an explicit user action and skips the debounce.
 inline bool ConsumeNativeReprobeDue() {
-    if (!g_autoTunnel.load(std::memory_order_relaxed)) return false;
+    if (!IsAutoTunnelCommitted()) return false;
     const ULONGLONG now = GetTickCount64();
     const ULONGLONG last = g_lastNativeTryTick.load(std::memory_order_relaxed);
     if (last != 0 && now - last < kReprobeMinGapMs) return false; // trigger stays pending
-    bool due = g_reprobeDue.exchange(false, std::memory_order_relaxed);
+    bool due = false;
+    if (g_reprobeDue.load(std::memory_order_relaxed)) {
+        const ULONGLONG req = g_lastReprobeRequestTick.load(std::memory_order_relaxed);
+        if (req != 0 && now - req < kReprobeDebounceMs) return false; // still noisy: stays pending
+        due = g_reprobeDue.exchange(false, std::memory_order_relaxed);
+    }
     if (!due) {
         static CachedDword nonce;
         const DWORD n = ReadDwordCached(nonce, kSessionRegPath, kReprobeNonceValue, 0, 200);
         if (n != g_seenReprobeNonce.exchange(n, std::memory_order_relaxed)) due = true;
     }
-    if (!due && last != 0 && now - last >= kReprobeSafetyNetMs) due = true;
+    const ULONGLONG safety = ReprobeSafetyNetMs();
+    if (!due && safety != 0 && last != 0 && now - last >= safety) due = true;
     if (due) g_lastNativeTryTick.store(now, std::memory_order_relaxed);
     return due;
 }
@@ -197,11 +307,15 @@ inline void RecordNativeSuccess(ULONGLONG tcpMs) {
     if (next == 0) next = 1;
     g_nativeEmaMs.store(next, std::memory_order_relaxed);
     g_autoTunnel.store(false, std::memory_order_relaxed);
+    ClearV6Unavailable(); // a native handshake just worked
 }
-// Tunnel handshake completed after native failed: remember it.
+// Tunnel handshake completed after native failed: remember it for THIS Generation.
 inline void CommitAutoTunnel(bool on) {
     g_autoTunnel.store(on, std::memory_order_relaxed);
-    if (on) g_lastNativeTryTick.store(GetTickCount64(), std::memory_order_relaxed);
+    if (on) {
+        g_autoTunnelGen.store(CurrentGeneration(), std::memory_order_relaxed);
+        g_lastNativeTryTick.store(GetTickCount64(), std::memory_order_relaxed);
+    }
 }
 
 // ---- persisted-peer trust -----------------------------------------------
@@ -213,29 +327,41 @@ inline std::atomic<bool> g_persistedPeerDistrusted{false};
 inline void DistrustPersistedPeer() { g_persistedPeerDistrusted.store(true, std::memory_order_relaxed); }
 inline bool ConsumePersistedPeerDistrust() { return g_persistedPeerDistrusted.exchange(false, std::memory_order_relaxed); }
 
-// Standalone reachability probe: a throwaway TCP SYN at the T2 peer's IPv6
-// link-local address, bounded by `timeout`. A completed handshake or an RST
-// (WSAECONNREFUSED) both prove the SYN reached the peer over IPv6. Only
-// meaningful while T2Ncm is in native mode (tunnel mode rewrites the reply).
-inline bool ProbeNativeIpv6Reachable(const in6_addr& peer6, unsigned long ifIndex,
-                                     std::chrono::milliseconds timeout) {
-    if (!t2::EnsureWinsock()) return false;
+// Standalone path probe: a throwaway TCP SYN at the T2 peer's IPv6 link-local
+// address, bounded by `timeout`, classified as PathEvidence (section 4):
+//   handshake completed        -> Positive
+//   RST (WSAECONNREFUSED)      -> Refused (a proof only if RstIsProof, see A0)
+//   nothing within `timeout`   -> Silent
+//   no route / address / etc.  -> LocalError (says nothing about the path)
+// Only meaningful while T2Ncm is in native mode (tunnel mode rewrites replies).
+// `port` should be the cached BridgeXPC port: port 1 is only usable once A0 is
+// confirmed on hardware.
+inline PathEvidence ProbeNativePath(const in6_addr& peer6, unsigned long ifIndex, uint16_t port,
+                                    std::chrono::milliseconds timeout, ULONGLONG* outMs = nullptr) {
+    const ULONGLONG t0 = GetTickCount64();
+    auto done = [&](PathEvidence e) {
+        if (outMs) *outMs = GetTickCount64() - t0;
+        return e;
+    };
+    if (!t2::EnsureWinsock()) return done(PathEvidence::LocalError);
     SOCKET s = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
-    if (s == INVALID_SOCKET) return false;
+    if (s == INVALID_SOCKET) return done(PathEvidence::LocalError);
 
     sockaddr_in6 addr{};
     addr.sin6_family = AF_INET6;
-    addr.sin6_port = htons(1); // port need not be open - see comment above
+    addr.sin6_port = htons(port);
     addr.sin6_addr = peer6;
     addr.sin6_scope_id = ifIndex;
 
     u_long nonBlocking = 1;
     ioctlsocket(s, FIONBIO, &nonBlocking);
-    bool reachable = false;
+    PathEvidence ev = PathEvidence::Silent;
     const int rc = connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
     if (rc == 0) {
-        reachable = true;
-    } else if (WSAGetLastError() == WSAEWOULDBLOCK) {
+        ev = PathEvidence::Positive;
+    } else if (WSAGetLastError() != WSAEWOULDBLOCK) {
+        ev = ClassifyWsaError(WSAGetLastError()); // immediate failure
+    } else {
         fd_set writeSet, errSet;
         FD_ZERO(&writeSet);
         FD_ZERO(&errSet);
@@ -249,12 +375,12 @@ inline bool ProbeNativeIpv6Reachable(const in6_addr& peer6, unsigned long ifInde
             int err = 0;
             int errLen = sizeof(err);
             getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &errLen);
-            reachable = (err == 0 || err == WSAECONNREFUSED);
+            ev = ClassifyWsaError(err);
         }
-        // sel <= 0: nothing came back within `timeout` - not reachable.
+        // sel <= 0: nothing came back within `timeout` -> Silent.
     }
     closesocket(s);
-    return reachable;
+    return done(ev);
 }
 
 inline in_addr MapPeerToIpv4(const in6_addr& peer6) {
@@ -522,6 +648,7 @@ inline std::atomic<ULONGLONG>& RealSuspendGeneration() {
 }
 inline void BumpRealSuspendGeneration() {
     RealSuspendGeneration().fetch_add(1, std::memory_order_acq_rel);
+    BumpGeneration(L"real Sx suspend/resume"); // committed tunnel, V6Unavailable, scan progress start over
 }
 inline ULONGLONG GetRealSuspendGeneration() {
     return RealSuspendGeneration().load(std::memory_order_acquire);
@@ -657,13 +784,19 @@ inline bool PushTunnelLocalToDriver(unsigned long ifIndex) {
 // both succeed. Calling this once per Connect(), for BOTH modes (not just
 // Ipv4Tunnel), keeps the running driver a live mirror of the registry
 // instead of a snapshot from whenever it last (re)initialized.
-inline bool PushTransportModeToDriver(TransportMode mode) {
+//
+// v2 (section 2, principle 7): the driver mode is the source of truth, and the
+// process-local LastPushedModeFlag is only a hint (another process - GUI, CLI -
+// may have flipped the mode). `force` sends the IOCTL regardless of the hint;
+// TransportPhase forces at the start of every attempt/phase and on every exit.
+// Hot paths (per-connect, per-scan) keep the cheap deduped form.
+inline bool PushTransportModeToDriver(TransportMode mode, bool force = false) {
     if (IsTransportIoSuspended()) {
         T2_LOG("tunnel", L"PushTransportModeToDriver: skipped (system suspending / Dx)");
         return false;
     }
     const int want = (mode == TransportMode::Ipv4Tunnel) ? 1 : 0;
-    if (LastPushedModeFlag().load(std::memory_order_relaxed) == want) {
+    if (!force && LastPushedModeFlag().load(std::memory_order_relaxed) == want) {
         // Already live in driver from our point of view — skip IOCTL storm.
         return true;
     }
@@ -696,11 +829,20 @@ inline bool PushTransportModeToDriver(TransportMode mode) {
     return ok != FALSE;
 }
 
+// Result of PrepareTunnelPeer. NoMac / NoPeer are LocalError evidence
+// (section 4): the tunnel cannot be tried yet, which says nothing about whether
+// the T2 is ready - the caller re-resolves the peer instead of counting a failure.
+enum class TunnelPrep { Ok, NoMac, NoPeer, Suspended };
+
 // Call before AF_INET connect in tunnel mode.
-inline void PrepareTunnelPeer(unsigned long ifIndex, const in6_addr& peer6) {
+inline TunnelPrep PrepareTunnelPeer(unsigned long ifIndex, const in6_addr& peer6) {
     if (IsTransportIoSuspended()) {
         T2_LOG("tunnel", L"PrepareTunnelPeer: skipped (system suspending / Dx)");
-        return;
+        return TunnelPrep::Suspended;
+    }
+    if (IN6_IS_ADDR_UNSPECIFIED(&peer6)) {
+        T2_LOG("tunnel", L"PrepareTunnelPeer: no peer address (LocalError, not a tunnel failure)");
+        return TunnelPrep::NoPeer;
     }
     // Invariant: an AF_INET tunnel socket only works while T2Ncm.sys itself is
     // in tunnel mode (otherwise TX is sent as bare IPv4 and the T2 drops it).
@@ -720,7 +862,7 @@ inline void PrepareTunnelPeer(unsigned long ifIndex, const in6_addr& peer6) {
         PublishTunnelPeer(peer6, nullptr);
         PushTunnelPeerToDriver(peer6);
         PushTunnelLocalToDriver(ifIndex);
-        return;
+        return TunnelPrep::Ok;
     }
     UCHAR mac[6]{};
     bool haveMac = LookupPeerMac(ifIndex, peer6, mac);
@@ -748,23 +890,156 @@ inline void PrepareTunnelPeer(unsigned long ifIndex, const in6_addr& peer6) {
     if (haveMac) {
         EnsureTunnelIpv4Neighbor(ifIndex, MapPeerToIpv4(peer6), mac);
         RememberArpPrepared(peer6);
+        return TunnelPrep::Ok;
     }
+    return TunnelPrep::NoMac;
 }
 
-// Cold-discovery pre-flight (BridgeDiscovery.cpp): with no cached BridgeXPC
-// port the next step is a full port scan, which over a blocked IPv6 path
-// burns seconds probing nothing. One bounded native SYN at the peer decides
-// first. Returns true when native IPv6 works (or the answer is unknowable),
-// false when it does not - the caller then arms the tunnel provisionally.
-inline bool PreflightNativeIpv6(const in6_addr& peer6, unsigned long ifIndex) {
-    PushTransportModeToDriver(TransportMode::NativeIpv6); // probe needs a native RX path
-    const ULONGLONG t0 = GetTickCount64();
-    const bool ok = ProbeNativeIpv6Reachable(peer6, ifIndex,
-                        NativeConnectBudget(std::chrono::milliseconds(250)));
-    if (ok) RecordNativeSuccess(GetTickCount64() - t0);
-    T2_LOG("tunnel", L"PreflightNativeIpv6: %s (%llu ms)", ok ? L"reachable" : L"UNREACHABLE",
-           static_cast<unsigned long long>(GetTickCount64() - t0));
-    return ok;
+// ---- Path-silence streak -> distrust of the persisted peer (section 9) -----
+// Two consecutive attempts that produced only Silent evidence (on either
+// transport) make the persisted last-known peer suspect: the next peer
+// resolution skips it and does the full neighbor/ping lookup. This applies in
+// tunnel mode too (the old code trusted the persisted peer forever there).
+inline std::atomic<int>& PathSilentStreak() {
+    static std::atomic<int> s{0};
+    return s;
+}
+inline bool NotePathSilent() { // true when the peer was just distrusted
+    if (PathSilentStreak().fetch_add(1, std::memory_order_relaxed) + 1 >= 2) {
+        PathSilentStreak().store(0, std::memory_order_relaxed);
+        DistrustPersistedPeer();
+        InvalidateTunnelPrepCache();
+        T2_LOG("tunnel", L"2 silent attempts in a row - persisted peer distrusted, next resolve does a full lookup");
+        return true;
+    }
+    return false;
+}
+inline void NotePathAlive() { PathSilentStreak().store(0, std::memory_order_relaxed); }
+
+// ---- Cross-process transport lock + mode scope (sections 11, 12) ------------
+// Named mutex shared by the UMDF host, the CLI and the GUI. Held for one
+// "flip the driver mode + probe/scan + connect" phase, so no other process can
+// flip TunnelModeEnabled in the middle of a scan (the unexplained
+// "TunnelModeEnabled -> 0" mid-scan in the cold-boot log).
+// DACL: SYSTEM, Administrators, LocalService full; interactive/authenticated
+// users only SYNCHRONIZE|MUTEX_MODIFY_STATE (+READ_CONTROL) so the CLI/GUI can
+// take it. [HW] verify LocalService can create/open it from WUDFHost.
+inline constexpr wchar_t kTransportMutexName[] = L"Global\\T2TouchId_Transport";
+inline constexpr DWORD kTransportLockWaitMs = 2000;
+
+inline HANDLE TransportMutexHandle() {
+    static HANDLE h = [] {
+        SECURITY_ATTRIBUTES sa{};
+        sa.nLength = sizeof(sa);
+        PSECURITY_DESCRIPTOR sd = nullptr;
+        if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                L"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;LS)(A;;0x120001;;;IU)(A;;0x120001;;;AU)",
+                SDDL_REVISION_1, &sd, nullptr)) {
+            sa.lpSecurityDescriptor = sd;
+        }
+        HANDLE m = CreateMutexExW(sd ? &sa : nullptr, kTransportMutexName, 0,
+                                  SYNCHRONIZE | MUTEX_MODIFY_STATE);
+        if (!m) m = OpenMutexW(SYNCHRONIZE | MUTEX_MODIFY_STATE, FALSE, kTransportMutexName);
+        if (!m) {
+            T2_LOG("transport", L"transport mutex unavailable (GetLastError=%lu) - running without "
+                   L"cross-process exclusivity", GetLastError());
+        }
+        if (sd) LocalFree(sd);
+        return m;
+    }();
+    return h;
+}
+
+class TransportLock {
+public:
+    // Waits for the mutex OR the cancel event (whichever first). On timeout it
+    // logs once and lets the caller proceed WITHOUT exclusivity: a process that
+    // holds the mutex forever must not be able to block the fingerprint reader.
+    explicit TransportLock(HANDLE cancelEvent = nullptr, DWORD waitMs = kTransportLockWaitMs) {
+        h_ = TransportMutexHandle();
+        if (!h_) return;
+        HANDLE hs[2] = {h_, cancelEvent};
+        const DWORD n = cancelEvent ? 2 : 1;
+        const DWORD r = WaitForMultipleObjects(n, hs, FALSE, waitMs);
+        // 0 = signaled (WAIT_OBJECT_0 spelled numerically, see Connection::IsEventSignaled),
+        // 0x80 = WAIT_ABANDONED_0 (previous owner died: ownership is ours now).
+        if (r == 0 || r == 0x80) {
+            owned_ = true;
+        } else if (r == 0x102) { // WAIT_TIMEOUT
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true)) {
+                T2_LOG("transport", L"TransportLock: %lu ms timeout - another process holds the transport "
+                       L"mutex; continuing without exclusivity", waitMs);
+            }
+        }
+    }
+    ~TransportLock() { if (owned_) ReleaseMutex(h_); }
+    TransportLock(const TransportLock&) = delete;
+    TransportLock& operator=(const TransportLock&) = delete;
+    bool owned() const { return owned_; }
+private:
+    HANDLE h_ = nullptr;
+    bool owned_ = false;
+};
+
+// RAII driver-mode scope. Enter() forces the mode into the driver and makes it
+// the attempt-scoped override (so PortScan/RemoteXPC/Connection, which read
+// IsTunnelModeActive(), follow it). Restore() - also run by the destructor on
+// EVERY exit path (success, failure, cancel, exception) - drops the override and
+// forces the driver back to the COMMITTED mode:
+//     driver mode == committed mode when a phase ends          (invariant 8)
+class ModeScope {
+public:
+    ModeScope() = default;
+    ~ModeScope() { Restore(); }
+    ModeScope(const ModeScope&) = delete;
+    ModeScope& operator=(const ModeScope&) = delete;
+    void Enter(TransportMode m) {
+        entered_ = true;
+        TransportOverride().store(m == TransportMode::Ipv4Tunnel ? 1 : 0, std::memory_order_relaxed);
+        PushTransportModeToDriver(m, /*force=*/true);
+    }
+    void Restore() {
+        if (!entered_) return;
+        entered_ = false;
+        TransportOverride().store(-1, std::memory_order_relaxed);
+        PushTransportModeToDriver(IsTunnelModeActive() ? TransportMode::Ipv4Tunnel
+                                                       : TransportMode::NativeIpv6, /*force=*/true);
+    }
+private:
+    bool entered_ = false;
+};
+
+// Lock + mode scope in one object. Members are destroyed in reverse order, so
+// the mode is restored while the mutex is still held.
+struct TransportPhase {
+    explicit TransportPhase(HANDLE cancelEvent = nullptr) : lock(cancelEvent) {}
+    TransportLock lock;
+    ModeScope mode;
+};
+
+// Hysteresis for leaving the tunnel (section 10): the return to native IPv6
+// needs TWO positive probes ~300 ms apart, so one lucky SYN during a VPN flap
+// does not bounce the transport. The caller holds a TransportPhase that has
+// Enter()ed NativeIpv6. `port` must be a real BridgeXPC port (cached).
+inline bool ConfirmNativeReturn(const in6_addr& peer6, unsigned long ifIndex, uint16_t port,
+                                HANDLE cancelEvent = nullptr) {
+    if (port == 0) return false;
+    for (int i = 0; i < 2; ++i) {
+        if (i != 0) {
+            if (cancelEvent) {
+                if (WaitForSingleObject(cancelEvent, 300) == 0) return false;
+            } else {
+                Sleep(300);
+            }
+        }
+        ULONGLONG ms = 0;
+        const PathEvidence e = ProbeNativePath(peer6, ifIndex, port, std::chrono::milliseconds(100), &ms);
+        T2_LOG("tunnel", L"return-to-native probe %d/2: evidence=%d (%llu ms)", i + 1,
+               static_cast<int>(e), static_cast<unsigned long long>(ms));
+        if (!IsPositiveEvidence(e)) return false;
+    }
+    return true;
 }
 
 } // namespace t2::transport

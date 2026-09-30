@@ -34,6 +34,7 @@
 #include <windows.h>
 #include <string>
 #include <cstdio>
+#include <atomic>
 #include <map>
 #include <mutex>
 
@@ -48,7 +49,7 @@ namespace {
 // after the first skip the scan. Like the registry value, it is only a hint:
 // the caller still verifies the port with a live HELO and falls back to a scan
 // on any miss.
-struct MemPorts { uint16_t port = 0; uint16_t rsd = 0; };
+struct MemPorts { uint16_t port = 0; uint16_t rsd = 0; bool suspect = false; };
 std::mutex g_memMu;
 std::map<std::string, MemPorts>& MemCache() {
     static std::map<std::string, MemPorts> m;
@@ -129,9 +130,24 @@ bool ReadRegValue(const std::string& macKey, std::string* out) {
     return true;
 }
 
+// One health line per outage (v2 section 5): a port cache that cannot be written
+// (err 5 = the LocalService ACL is missing) is the reason EVERY boot pays a scan,
+// so it must be visible once - but not repeated on every save.
+std::atomic<bool> g_regFailureReported{false};
+void ReportRegistryHealth(const wchar_t* api, const wchar_t* path, LSTATUS rc) {
+    if (g_regFailureReported.exchange(true, std::memory_order_relaxed)) return;
+    T2_LOG("health", L"PortCache registry write failed (%s on %s, err=%lu%s): the port is cached in "
+           L"memory only, so every boot re-scans. Re-run tools\\Set-T2NcmStaticIp.ps1 as "
+           L"administrator to fix the key ACL.",
+           api, path, static_cast<unsigned long>(rc),
+           rc == ERROR_ACCESS_DENIED ? L" = access denied" : L"");
+}
+
 } // namespace
 
-bool LoadCachedPort(const NcmEndpoint& endpoint, uint16_t* outPort, uint16_t* outRsdPort) {
+bool LoadCachedPort(const NcmEndpoint& endpoint, uint16_t* outPort, uint16_t* outRsdPort,
+                    bool* outSuspect) {
+    if (outSuspect) *outSuspect = false;
     if (!endpoint.hasMac) return false; // no stable key to look up
 
     const std::string key = FormatMacKey(endpoint.mac);
@@ -141,6 +157,7 @@ bool LoadCachedPort(const NcmEndpoint& endpoint, uint16_t* outPort, uint16_t* ou
         if (it != MemCache().end() && it->second.port != 0) {
             if (outPort) *outPort = it->second.port;
             if (outRsdPort) *outRsdPort = it->second.rsd;
+            if (outSuspect) *outSuspect = it->second.suspect;
             return true;
         }
     }
@@ -165,6 +182,19 @@ bool LoadCachedPort(const NcmEndpoint& endpoint, uint16_t* outPort, uint16_t* ou
     return true;
 }
 
+void MarkCachedPortSuspect(const NcmEndpoint& endpoint, bool suspect) {
+    if (!endpoint.hasMac) return;
+    const std::string key = FormatMacKey(endpoint.mac);
+    std::lock_guard<std::mutex> lock(g_memMu);
+    auto it = MemCache().find(key);
+    if (it == MemCache().end() || it->second.port == 0) return;
+    if (it->second.suspect != suspect) {
+        it->second.suspect = suspect;
+        T2_LOG("discovery", L"cached port %u marked %s", static_cast<unsigned>(it->second.port),
+               suspect ? L"Suspect (kept; replaced only by a confirmed scan result)" : L"Good");
+    }
+}
+
 void SaveCachedPort(const NcmEndpoint& endpoint, uint16_t port, uint16_t rsdPort) {
     if (!endpoint.hasMac) return; // nothing stable to key this entry on
     if (port == 0) return;         // never persist an empty/zero port
@@ -178,6 +208,7 @@ void SaveCachedPort(const NcmEndpoint& endpoint, uint16_t port, uint16_t rsdPort
         MemPorts& m = MemCache()[key];
         m.port = port;
         m.rsd = rsdPort;
+        m.suspect = false; // a confirmed port is Good
     }
 
     std::string value = std::to_string(port);
@@ -191,8 +222,7 @@ void SaveCachedPort(const NcmEndpoint& endpoint, uint16_t port, uint16_t rsdPort
                                  REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, nullptr,
                                  &hKey, nullptr);
     if (rc != ERROR_SUCCESS) {
-        T2_LOG("discovery", L"SaveCachedPort: RegCreateKeyEx(%s) failed err=%lu - next boot will re-scan",
-               path.c_str(), static_cast<unsigned long>(rc));
+        ReportRegistryHealth(L"RegCreateKeyEx", path.c_str(), rc);
         return;
     }
     rc = RegSetValueExW(hKey, name.c_str(), 0, REG_SZ,
@@ -200,10 +230,10 @@ void SaveCachedPort(const NcmEndpoint& endpoint, uint16_t port, uint16_t rsdPort
                         static_cast<DWORD>((wvalue.size() + 1) * sizeof(wchar_t)));
     RegCloseKey(hKey);
     if (rc != ERROR_SUCCESS) {
-        T2_LOG("discovery", L"SaveCachedPort: RegSetValueEx failed err=%lu - next boot will re-scan",
-               static_cast<unsigned long>(rc));
+        ReportRegistryHealth(L"RegSetValueEx", path.c_str(), rc);
         return;
     }
+    g_regFailureReported.store(false, std::memory_order_relaxed);
     T2_LOG("discovery", L"SaveCachedPort: wrote %s\\%s = %s",
            path.c_str(), name.c_str(), wvalue.c_str());
 }

@@ -200,9 +200,20 @@ std::vector<uint16_t> BuildPortOrder(uint16_t begin, uint16_t end,
     return order;
 }
 
+unsigned PriorityBandCount(uint16_t begin, uint16_t end) {
+    if (end < begin) return 0;
+    auto overlap = [&](unsigned lo, unsigned hi) -> unsigned {
+        const unsigned l = lo > begin ? lo : begin;
+        const unsigned h = hi < end ? hi : end;
+        return h >= l ? (h - l + 1) : 0;
+    };
+    return overlap(59000, 59999) + overlap(49000, 49999);
+}
+
 std::vector<PortCandidate> ScanHttp2Preface(const NcmEndpoint& endpoint,
                                             const ScanOptions& options) {
     std::vector<PortCandidate> hits;
+    if (options.stats) *options.stats = ScanStats{};
     if (!EnsureWinsock()) return hits;
     if (endpoint.ifIndex == 0) return hits;
     if (options.portEnd < options.portBegin) return hits;
@@ -233,8 +244,20 @@ std::vector<PortCandidate> ScanHttp2Preface(const NcmEndpoint& endpoint,
         options.priorityBands, options.scanFromEnd);
     const unsigned total = static_cast<unsigned>(portOrder.size());
     if (total == 0) return hits;
+    // Resume window [startIdx, limitIdx) of the dispatch order.
+    const unsigned startIdx = options.orderSkip < total ? options.orderSkip : total;
+    unsigned limitIdx = (options.orderLimit != 0 && options.orderLimit < total) ? options.orderLimit : total;
+    if (limitIdx < startIdx) limitIdx = startIdx;
+    if (options.stats) {
+        options.stats->orderTotal = total;
+        options.stats->claimedEnd = startIdx;
+    }
+    if (startIdx >= limitIdx) {
+        if (options.stats) options.stats->exhausted = true;
+        return hits;
+    }
 
-    std::atomic<unsigned> next{0};
+    std::atomic<unsigned> next{startIdx};
     std::atomic<unsigned> tried{0};
     std::atomic<unsigned> tcpHits{0};
     std::atomic<unsigned> http2Hits{0};
@@ -242,7 +265,7 @@ std::vector<PortCandidate> ScanHttp2Preface(const NcmEndpoint& endpoint,
 
     unsigned workers = options.concurrency;
     if (workers == 0) workers = 1;
-    if (workers > total) workers = total;
+    if (workers > limitIdx - startIdx) workers = limitIdx - startIdx;
     // OPTIMIZATION: this used to cap at 64, which for the full 16384-port
     // dynamic range means 256 sequential probes per worker. The 64 number
     // was never actually load-bearing — every WaitReadable/connect select()
@@ -274,8 +297,13 @@ std::vector<PortCandidate> ScanHttp2Preface(const NcmEndpoint& endpoint,
                 t2::bridgexpc::Connection::IsEventSignaled(static_cast<HANDLE>(options.cancelEvent))) {
                 break;
             }
+            // Deadline: stop claiming NEW ports; ports already claimed still run to
+            // completion, so claimedEnd below is an honest resume point.
+            if (options.deadlineTick != 0 && GetTickCount64() >= options.deadlineTick) {
+                break;
+            }
             unsigned i = next.fetch_add(1);
-            if (i >= total) break;
+            if (i >= limitIdx) break;
             const uint16_t port = portOrder[i];
             ProbeResult pr =
                 ProbePort(endpoint, port, options.connectTimeoutMs, recvMs);
@@ -310,6 +338,14 @@ std::vector<PortCandidate> ScanHttp2Preface(const NcmEndpoint& endpoint,
     for (unsigned w = 0; w < workers; ++w) threads.emplace_back(worker);
     for (auto& th : threads) th.join();
 
+    if (options.stats) {
+        const unsigned claimed = next.load();
+        options.stats->claimedEnd = claimed < limitIdx ? claimed : limitIdx;
+        options.stats->exhausted = claimed >= limitIdx;
+        options.stats->tried = tried.load();
+        options.stats->tcpHits = tcpHits.load();
+        options.stats->http2Hits = http2Hits.load();
+    }
     std::sort(hits.begin(), hits.end(),
               [](const PortCandidate& a, const PortCandidate& b) {
                   return a.port < b.port;
