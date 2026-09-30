@@ -3,6 +3,7 @@
 #pragma once
 #include "Frame.h"
 #include "PlistPayload.h"
+#include "TransportMode.h"
 #include <winsock2.h>
 #include <ws2ipdef.h>
 #include <string>
@@ -39,6 +40,19 @@ public:
     // fallback handshake.
     ConnectResult Connect(const in6_addr& linkLocalAddress, unsigned long interfaceIndex,
                           uint16_t port, std::chrono::milliseconds connectTimeout);
+
+    // Explicit-transport connect for the TransportManager (BridgeDiscovery.cpp):
+    // ONE attempt on exactly the requested transport, no auto-switch, no
+    // re-probe. The caller owns the transport policy and the TransportPhase
+    // (mutex + driver mode). *outEvidence classifies the handshake per
+    // architecture v2 section 4 (Positive / Silent / Refused / LocalError);
+    // *outTcpMs is the TCP handshake time when it completed or got an RST.
+    ConnectResult ConnectVia(bool tunnel, const in6_addr& linkLocalAddress,
+                             unsigned long interfaceIndex, uint16_t port,
+                             std::chrono::milliseconds tcpTimeout,
+                             std::chrono::milliseconds heloTimeout,
+                             t2::transport::PathEvidence* outEvidence,
+                             ULONGLONG* outTcpMs = nullptr);
 
     // Every operation below has an explicit timeout (Milestone 2, section 22)
     // and returns false on ANY failure — never partial success.
@@ -154,7 +168,8 @@ private:
                               unsigned long interfaceIndex, uint16_t port,
                               std::chrono::milliseconds tcpTimeout,
                               std::chrono::milliseconds heloTimeout,
-                              bool* outTcpFailed, ULONGLONG* outTcpMs);
+                              bool* outTcpFailed, ULONGLONG* outTcpMs,
+                              t2::transport::PathEvidence* outEvidence = nullptr);
     SOCKET socket_ = INVALID_SOCKET;
     std::atomic<bool> connectionLost_{false};
 

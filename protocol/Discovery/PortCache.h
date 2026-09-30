@@ -41,8 +41,19 @@ namespace t2::discovery {
 //   - or `endpoint` has no MAC to key on (NcmEndpoint::hasMac == false).
 // Any of those is a cache miss: the caller must fall through to a full
 // port scan and, on success, call SaveCachedPort so the value is created.
+//
+// outSuspect (optional, v2 section 8): true when the entry was marked Suspect by
+// MarkCachedPortSuspect (an RST arrived - the T2 may just not be listening YET
+// after a reboot). A Suspect entry is still returned and still tried with a cheap
+// HELO on every step; it is only ever REPLACED by a scan that confirms another
+// port, never deleted by a single failure.
 bool LoadCachedPort(const NcmEndpoint& endpoint, uint16_t* outPort,
-                    uint16_t* outRsdPort = nullptr);
+                    uint16_t* outRsdPort = nullptr, bool* outSuspect = nullptr);
+
+// Marks (suspect=true) or clears (false) the Suspect flag of this adapter's entry.
+// In-process only: the flag exists to keep a probably-fine port from being thrown
+// away, and a fresh process simply starts by trying the port again anyway.
+void MarkCachedPortSuspect(const NcmEndpoint& endpoint, bool suspect);
 
 // Records `port` (BridgeXPC service port) and optionally `rsdPort` (the
 // RemoteXPC HTTP/2 port that advertised it) as the last known-good pair for
@@ -50,6 +61,9 @@ bool LoadCachedPort(const NcmEndpoint& endpoint, uint16_t* outPort,
 // best-effort (creates the PortCache key if needed); failure is logged with the
 // Win32 error but does not affect the in-process cache.
 // port == 0 is rejected so an empty value can never be persisted.
+// Saving always marks the entry Good (clears Suspect). Call it the moment a port is
+// CONFIRMED (scan + RemoteXPC), before the final connect and regardless of cancel,
+// so a cancelled CAPTURE_DATA never throws the finding away (v2 section 7).
 void SaveCachedPort(const NcmEndpoint& endpoint, uint16_t port, uint16_t rsdPort = 0);
 
 } // namespace t2::discovery

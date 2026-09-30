@@ -30,47 +30,47 @@
 
 namespace t2::discovery {
 
-// Convenience: FindT2NcmEndpoints().front(). Returns false if no T2 NCM
-// adapter is present at all. Does not itself require a peer to already be
-// known (see NcmEndpoint::peerSource) — that is ConnectToBiometricKitBridge's
-// job below, same as the CLI's own flow (it only requires a peer once it is
-// actually about to scan/connect).
-bool PickDefaultT2Endpoint(NcmEndpoint* outEndpoint);
+// Convenience: FindT2NcmEndpoints().front(), with the peer resolved AFTER the
+// readiness gate (link-local no longer Tentative) rather than during enumeration.
+// Returns false if no T2 NCM adapter is present at all, or when cancelled while
+// the gate waited. The endpoint may have peerSource == None (nothing known yet);
+// ConnectToBiometricKitBridge then returns false and the caller's ladder retries.
+// cancelEvent (optional Win32 event HANDLE typed void*) interrupts the gate wait.
+bool PickDefaultT2Endpoint(NcmEndpoint* outEndpoint, void* cancelEvent = nullptr);
 
-// Full discovery+connect pipeline: cache fast path (LoadCachedPort + a live
-// HELO re-verify), then — on a miss — a two-attempt (20ms, 60ms) scan-from-
-// end of the BridgeXPC port with a RemoteXPC "is this really BiometricKit"
-// checker racing each HTTP/2 hit, matching ScanAndProbe's tuning in
-// tools/t2touchid/main.cpp exactly (same constants, same rationale: the
-// real candidate sits near the top of the ephemeral range and a single
-// short-timeout pass is flaky under USB NCM jitter).
+// One bounded STEP of "find the BiometricKit BridgeXPC port and connect"
+// (CONNECT_ARCHITECTURE_v2.md sections 5-13). The caller (Queue.cpp) repeats it
+// on a backoff ladder for up to 30 s; what survives between steps and between
+// cancelled CAPTURE_DATAs is in-process state keyed by the transport Generation
+// (committed tunnel, scan progress) plus the registry port cache.
 //
-// 26.09.2026: the cache fast path is trusted (it is right almost every
-// time) but is no longer allowed to block indefinitely on a dead cache
-// entry — the whole cached-port attempt is capped at kCacheTrustBudgetMs
-// (BridgeDiscovery.cpp), so a genuinely stale cache falls through to the
-// full scan in well under a second instead of up to ~5.5s.
+//   A. readiness gate   - adapter, non-Tentative link-local, peer; no conclusions.
+//   B. "try v6"         - cached-port HELO on native, then <= 3 bounded probes.
+//                         NOT a full scan. Only Positive evidence proves a path.
+//   C. scan             - resumable, deadline-bounded, on the proven transport;
+//                         the port is saved the moment it is confirmed, before the
+//                         final connect and regardless of cancel.
+//   D. tunnel attempt   - only when v6 produced no Positive evidence (auto-switch
+//                         on) or the tunnel is forced. Nothing is committed until a
+//                         tunnel handshake succeeded.
+//   E. both empty       - returns false; nothing committed, cache and scan progress
+//                         kept, the next step alternates/continues.
 //
-// Requires endpoint.peerSource != PeerSource::None (a real neighbor-table
-// entry or a caller-supplied override) — unlike the CLI this never sends
-// its own ff02::1 discovery ping; the driver is expected to be invoked only
-// after `network`/an earlier successful connect has already populated the
-// neighbor table, or after FindNeighborPeer() has been called separately.
-// Returns false with *outConn left unconnected on any failure — no partial
-// "maybe connected" state.
+// Every driver-mode flip happens inside a TransportPhase (cross-process mutex +
+// RAII scope), so on return the driver mode equals the committed mode on every path.
 //
-// On success: outConn is connected and HELO-verified; *outServicePort (if
-// non-null) receives the BridgeXPC TCP port; *outRsdPort (if non-null,
-// and only when found via a fresh scan rather than the "path A" direct
-// cache re-verify) receives the RemoteXPC port that advertised it, 0
-// otherwise. A successful connect is cached for next time exactly like the
-// CLI does (SaveCachedPort), regardless of which path found it.
+// Peer: uses endpoint.peerLinkLocal when known; when endpoint.peerSource is None
+// the gate resolves it (neighbor table -> persisted -> ping). Returns false if there
+// is still no peer.
+//
+// On success: outConn is connected and HELO-verified; *outServicePort (if non-null)
+// receives the BridgeXPC TCP port; *outRsdPort (if non-null) the RemoteXPC port that
+// advertised it, or 0 when unknown (cache hit without RSD replay).
 //
 // cancelEvent (optional Win32 event HANDLE, typed void* like
-// ScanOptions::cancelEvent): when signaled, an in-progress port scan stops
-// and no further scan attempt starts, so a cancelled CAPTURE_DATA does not
-// keep the USB bulk pipe busy. A cancelled discovery returns false WITHOUT
-// distrusting the persisted peer (a cancel says nothing about the peer).
+// ScanOptions::cancelEvent): when signaled, the current probe/scan slice ends and no
+// further one starts, so a cancelled CAPTURE_DATA does not keep the USB bulk pipe
+// busy. Cancel neither removes the saved port nor rolls back committed state.
 bool ConnectToBiometricKitBridge(const NcmEndpoint& endpoint,
                                   t2::bridgexpc::Connection* outConn,
                                   uint16_t* outServicePort = nullptr,

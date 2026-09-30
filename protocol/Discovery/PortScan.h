@@ -6,6 +6,10 @@
 #include <vector>
 #include <functional>
 #include <atomic>
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 
 namespace t2::discovery {
 
@@ -16,6 +20,19 @@ struct PortCandidate {
     // Diagnostic: raw first bytes after connect (max 21, Linux recv size).
     unsigned char recvHead[21]{};
     int recvLen = 0;
+};
+
+// Filled by ScanHttp2Preface (ScanOptions::stats). Progress is expressed as an
+// index into the port dispatch order, so a caller can RESUME a scan that was cut
+// short by a deadline or a cancel instead of starting over (architecture v2
+// section 7: the old scan lived and died with one CAPTURE_DATA).
+struct ScanStats {
+    unsigned orderTotal = 0;     // length of the full dispatch order
+    unsigned claimedEnd = 0;     // every order index below this was probed to completion
+    unsigned tried = 0;          // probes finished during this call
+    unsigned tcpHits = 0;
+    unsigned http2Hits = 0;
+    bool exhausted = false;      // reached the end of the (limited) order
 };
 
 struct ScanOptions {
@@ -76,7 +93,25 @@ struct ScanOptions {
 
     // Only used when priorityBands=false. See above.
     bool scanFromEnd = false;
+
+    // ---- resumable / bounded scanning (architecture v2, section 7) ----
+    // Absolute GetTickCount64() value after which no NEW port is claimed (probes
+    // already in flight still finish). 0 = no deadline.
+    ULONGLONG deadlineTick = 0;
+    // Skip the first `orderSkip` entries of the dispatch order (resume point) and
+    // stop at `orderLimit` (0 = the whole order). Indexes are into the same order
+    // BuildPortOrder returns for these options.
+    unsigned orderSkip = 0;
+    unsigned orderLimit = 0;
+    ScanStats* stats = nullptr;
 };
+
+// Dispatch order used by ScanHttp2Preface (see ScanOptions::priorityBands).
+std::vector<uint16_t> BuildPortOrder(uint16_t begin, uint16_t end,
+                                     bool priorityBands, bool scanFromEnd);
+// Number of leading entries of the priority order that belong to the two priority
+// bands (59xxx, 49xxx) - i.e. "priority ranges only" is orderLimit = this.
+unsigned PriorityBandCount(uint16_t begin, uint16_t end);
 
 std::vector<PortCandidate> ScanHttp2Preface(const NcmEndpoint& endpoint,
                                             const ScanOptions& options = {});

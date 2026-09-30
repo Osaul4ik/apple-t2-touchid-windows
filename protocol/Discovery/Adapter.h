@@ -38,12 +38,40 @@ struct NcmEndpoint {
     PeerSource peerSource = PeerSource::None;
     unsigned char mac[6]{};
     bool hasMac = false;
+    // IPv6 is bound to the adapter (Ipv6IfIndex != 0). False = the IPv6 component
+    // is unchecked/removed: native IPv6 cannot work, only the tunnel can.
+    bool ipv6Bound = true;
     std::wstring friendlyName;
     std::wstring description;
 };
 
-std::vector<NcmEndpoint> FindT2NcmEndpoints();
+// resolvePeer=false skips the (potentially ~550 ms) peer lookup: used by the
+// connect path, which runs the readiness gate first (a ping sourced from a
+// Tentative link-local address goes nowhere) and resolves the peer afterwards.
+std::vector<NcmEndpoint> FindT2NcmEndpoints(bool resolvePeer = true);
 bool GetEndpointByIfIndex(unsigned long ifIndex, NcmEndpoint* out);
+
+// ---- Step A of the connect sequence: readiness gate (architecture v2, 6.A) ----
+enum class GateResult {
+    Ready,          // link-local Preferred (or IPv6 not needed), peer resolved
+    V6Unavailable,  // IPv6 unbound / no link-local 1.5 s after link up: skip native
+    TimedOut,       // link-local still Tentative after maxMs; go on anyway
+    Cancelled,
+};
+
+// Waits (bounded, cancel-aware) for the preconditions of any probe: a non-
+// Tentative link-local on the adapter, then a resolved peer. It is a precondition
+// check, NOT a probe - it never draws a conclusion about the transport, except
+// the local fact "this adapter has no usable IPv6" (V6Unavailable, per Generation).
+// Also notices NCM re-enumeration (new ifIndex/MAC) and a changed peer and bumps
+// the transport Generation. On return *ep has the peer resolved when one exists.
+GateResult RunReadinessGate(NcmEndpoint* ep, void* cancelEvent, unsigned maxMs = 3000);
+
+// Peer resolution order: neighbor table -> persisted last-known peer (unless
+// distrusted) -> multicast ping + poll (only when `allowPing`) -> persisted peer
+// even if distrusted. The ping runs whenever the table AND the persisted peer give
+// nothing, in native and tunnel mode alike. Updates ep->peerLinkLocal/peerSource.
+bool ResolveT2Peer(NcmEndpoint* ep, bool allowPing = true);
 bool ParseIpv6(const char* text, in6_addr* out);
 
 // Looks up the real T2 peer via the Windows IPv6 neighbor table

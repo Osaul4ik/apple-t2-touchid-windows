@@ -1274,7 +1274,7 @@ bool ConnectForCapture(t2::bridgexpc::Connection* outConn, HANDLE cancelEvent = 
     }
 
     t2::discovery::NcmEndpoint ep;
-    if (!t2::discovery::PickDefaultT2Endpoint(&ep)) {
+    if (!t2::discovery::PickDefaultT2Endpoint(&ep, cancelEvent)) {
         T2BioLog("CAPTURE_DATA: no T2 NCM adapter found");
         return false;
     }

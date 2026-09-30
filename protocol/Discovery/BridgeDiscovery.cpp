@@ -63,6 +63,10 @@ constexpr unsigned kMinProbesForSilent = 64; // a scan that tried fewer ports pr
 constexpr unsigned kProbeCount = 3;          // "try v6" probes
 constexpr DWORD kProbeGapMs = 300;
 
+// Plain helper instead of the std min template: windows.h defines min()/max() macros
+// that break it in this build (same reason Connection.cpp avoids it in WaitForEvent).
+inline ULONGLONG MinU64(ULONGLONG a, ULONGLONG b) { return a < b ? a : b; }
+
 bool Cancelled(void* cancelEvent) {
     return Connection::IsEventSignaled(static_cast<HANDLE>(cancelEvent));
 }
@@ -129,8 +133,8 @@ void StoreScanState(const NcmEndpoint& ep, bool tunnel, const ScanState& st) {
 // dead link does not get 256 SYNs per second for 30 s from the retry ladder.
 ULONGLONG CooldownMs(unsigned emptyPasses) {
     if (emptyPasses == 0) return 0;
-    const unsigned shift = std::min(emptyPasses - 1, 3u);
-    return std::min<ULONGLONG>(1000ull << shift, 5000);
+    const unsigned shift = (emptyPasses - 1) < 3u ? (emptyPasses - 1) : 3u;
+    return MinU64(1000ull << shift, 5000);
 }
 
 struct ScanOutcome {
@@ -195,7 +199,7 @@ ScanProbeResult ScanAndProbe(const NcmEndpoint& ep, ScanOptions opt,
 // (decoy listeners are dense on the T2, so most of these will never match).
 bool RecheckCandidates(const NcmEndpoint& ep, ScanState* st, bool tunnel, ULONGLONG deadlineTick,
                        void* cancelEvent, ScanOutcome* out) {
-    const ULONGLONG budgetEnd = std::min<ULONGLONG>(deadlineTick, GetTickCount64() + (tunnel ? 1500 : 600));
+    const ULONGLONG budgetEnd = MinU64(deadlineTick, GetTickCount64() + (tunnel ? 1500 : 600));
     unsigned checked = 0;
     for (size_t i = st->candidates.size(); i-- > 0 && checked < 3;) {
         const ULONGLONG now = GetTickCount64();
@@ -203,7 +207,7 @@ bool RecheckCandidates(const NcmEndpoint& ep, ScanState* st, bool tunnel, ULONGL
         ++checked;
         uint16_t svc = 0;
         if (ProbeServiceOnPort(ep, st->candidates[i].port, kBiometricKitService,
-                               std::chrono::milliseconds(std::min<ULONGLONG>(budgetEnd - now, 1000)), &svc)) {
+                               std::chrono::milliseconds(MinU64(budgetEnd - now, 1000)), &svc)) {
             out->servicePort = svc;
             out->rsdPort = st->candidates[i].port;
             st->candidates.erase(st->candidates.begin() + static_cast<std::ptrdiff_t>(i));
@@ -235,7 +239,7 @@ ScanOutcome RunScanAttempt(const NcmEndpoint& ep, bool tunnel, ULONGLONG attempt
         return out;
     }
     out.ranScan = true;
-    const ULONGLONG deadline = start + std::min<ULONGLONG>(attemptBudgetMs, b.attemptMs);
+    const ULONGLONG deadline = start + MinU64(attemptBudgetMs, b.attemptMs);
 
     if (RecheckCandidates(ep, &st, tunnel, deadline, cancelEvent, &out)) {
         T2_LOG("discovery", L"scan chunk: candidate re-check confirmed BiometricKit on port %u",
@@ -267,7 +271,7 @@ ScanOutcome RunScanAttempt(const NcmEndpoint& ep, bool tunnel, ULONGLONG attempt
         opt.priorityBands = true;
         opt.orderSkip = st.cursor;
         opt.orderLimit = st.passLimit;
-        opt.deadlineTick = now + std::min<ULONGLONG>(b.chunkMs, deadline - now);
+        opt.deadlineTick = now + MinU64(b.chunkMs, deadline - now);
         opt.cancelEvent = cancelEvent;
         ScanStats stats;
         opt.stats = &stats;
