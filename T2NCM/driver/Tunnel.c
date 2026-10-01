@@ -97,72 +97,44 @@ static VOID T2NcmMacToLinkLocal(_In_reads_bytes_(6) const UCHAR* Mac, _Out_write
     Ip6[15] = Mac[5];
 }
 
+/*
+ * Tunnel mode lives in driver memory, NOT in the registry.
+ *
+ * The device context is destroyed and recreated on every MiniportHaltEx /
+ * MiniportInitializeEx (adapter disable/enable, replug), so the flag cannot
+ * live there if it must survive them. A driver-global does: it survives
+ * adapter re-init, MiniportRestart and sleep/resume for as long as the driver
+ * image stays loaded, and a reboot resets it to 0 (= native IPv6) with no
+ * persistent state that could go stale. Userspace (TransportMode.h) owns the
+ * decision and pushes it via IOCTL_T2NCM_SET_TRANSPORT_MODE; the registry is
+ * only used by userspace, for the AutoSwitch setting.
+ *
+ * Interlocked access: written from the IOCTL path, read at PASSIVE from
+ * Initialize/Restart. TX/RX DPC paths keep reading the per-device cached copy
+ * (DeviceContext->TunnelModeEnabled), never this global.
+ */
+static volatile LONG g_T2NcmTunnelMode = 0;
+
+VOID T2NcmTunnelSetMode(_In_ BOOLEAN Enabled)
+{
+    InterlockedExchange(&g_T2NcmTunnelMode, Enabled ? 1 : 0);
+}
+
+BOOLEAN T2NcmTunnelGetMode(VOID)
+{
+    return InterlockedCompareExchange(&g_T2NcmTunnelMode, 0, 0) != 0;
+}
+
 VOID T2NcmTunnelRefreshMode(_In_ PT2NCM_DEVICE_CONTEXT DeviceContext)
 {
-    UNICODE_STRING path = RTL_CONSTANT_STRING(L"\\Registry\\Machine\\SOFTWARE\\T2TouchId\\Network");
-    OBJECT_ATTRIBUTES oa;
-    HANDLE key = NULL;
-    NTSTATUS status;
-    UCHAR buf[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(ULONG)];
-    ULONG resultLen = 0;
-    PKEY_VALUE_PARTIAL_INFORMATION info = (PKEY_VALUE_PARTIAL_INFORMATION)buf;
-    /* COLD-BOOT FIX: read the VOLATILE session flag userspace maintains
-     * (Network\Session\SkipNativeIpv6Probe), NOT the old persistent
-     * Network\TransportMode value. A stale TransportMode=1 left by an older
-     * build/GUI survived reboots and made the driver come up in IPv4-tunnel
-     * mode at every cold boot, contradicting "IPv6 is always tried first".
-     * The volatile key does not exist after a reboot -> enabled=FALSE. */
-    UNICODE_STRING sessionPath =
-        RTL_CONSTANT_STRING(L"\\Registry\\Machine\\SOFTWARE\\T2TouchId\\Network\\Session");
-    UNICODE_STRING valueName = RTL_CONSTANT_STRING(L"SkipNativeIpv6Probe");
-    BOOLEAN enabled = FALSE;
-
-    // PASSIVE_LEVEL only — never call from SendNetBufferLists / RX DPC.
-    NT_ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
-
-    InitializeObjectAttributes(&oa, &sessionPath, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
-    status = ZwOpenKey(&key, KEY_READ, &oa);
-    if (NT_SUCCESS(status))
-    {
-        status = ZwQueryValueKey(key, &valueName, KeyValuePartialInformation,
-                                 buf, sizeof(buf), &resultLen);
-        ZwClose(key);
-        if (NT_SUCCESS(status) && info->Type == REG_DWORD &&
-            info->DataLength >= sizeof(ULONG) &&
-            (*(ULONG*)info->Data) == 1ul)
-        {
-            enabled = TRUE;
-        }
-    }
-
-        DeviceContext->TunnelModeEnabled = enabled;
-
-    {
-        HANDLE key2 = NULL;
-        OBJECT_ATTRIBUTES oa2;
-        UNICODE_STRING path2 = path; /* same as TransportMode key */
-        UNICODE_STRING peerName = RTL_CONSTANT_STRING(L"PeerIpv6");
-        UCHAR pbuf[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + 16];
-        ULONG plen = 0;
-        PKEY_VALUE_PARTIAL_INFORMATION pinfo = (PKEY_VALUE_PARTIAL_INFORMATION)pbuf;
-
-        InitializeObjectAttributes(&oa2, &path2, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
-        if (NT_SUCCESS(ZwOpenKey(&key2, KEY_READ, &oa2))) {
-            if (NT_SUCCESS(ZwQueryValueKey(key2, &peerName, KeyValuePartialInformation,
-                                           pbuf, sizeof(pbuf), &plen)) &&
-                pinfo->Type == REG_BINARY && pinfo->DataLength >= 16) {
-                RtlCopyMemory(DeviceContext->TunnelPeerIpv6, pinfo->Data, 16);
-                DeviceContext->TunnelPeerIpv6Valid = TRUE;
-            }
-            ZwClose(key2);
-        }
-    }
+    /* Re-seed the freshly created device context from driver memory.
+     * No registry access: nothing here can fail or block. */
+    DeviceContext->TunnelModeEnabled = T2NcmTunnelGetMode();
 
     T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
-        "T2Ncm: TunnelModeEnabled=%u PeerIpv6Valid=%u (cached PASSIVE)\n",
-        enabled ? 1u : 0u,
+        "T2Ncm: TunnelModeEnabled=%u PeerIpv6Valid=%u (from driver memory)\n",
+        DeviceContext->TunnelModeEnabled ? 1u : 0u,
         DeviceContext->TunnelPeerIpv6Valid ? 1u : 0u));
-
 }
 
 

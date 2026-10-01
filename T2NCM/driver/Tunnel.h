@@ -3,14 +3,19 @@
 // still speaks IPv6 link-local. Rewrite Ethernet+IP(+TCP) headers in place
 // (TX expands by 20 bytes, RX shrinks by 20).
 //
-// Registry is read ONLY at PASSIVE_LEVEL via T2NcmTunnelRefreshMode — never
-// from MiniportSend / RX DPC (ZwOpenKey + KeStackAttachProcess = bugcheck 0x5).
+// Tunnel mode is held in driver memory (see Tunnel.c); the driver does not read
+// the registry for it. TX/RX DPC paths only read the cached
+// DeviceContext->TunnelModeEnabled.
 #pragma once
 
 #include "driver.h"
 
-// Read HKLM\SOFTWARE\T2TouchId\Network\TransportMode into DeviceContext.
-// MUST be called at PASSIVE_LEVEL only (InitializeEx / Restart / work item).
+// Driver-global tunnel mode (survives adapter re-init; cleared by reboot).
+VOID    T2NcmTunnelSetMode(_In_ BOOLEAN Enabled);
+BOOLEAN T2NcmTunnelGetMode(VOID);
+
+// Copy the driver-global mode into a (re)created DeviceContext.
+// Called from InitializeEx / Restart.
 VOID T2NcmTunnelRefreshMode(_In_ PT2NCM_DEVICE_CONTEXT DeviceContext);
 
 // TX: if tunnel on and frame is IPv4 TCP/UDP to 169.254/16, rewrite to IPv6.

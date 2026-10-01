@@ -203,15 +203,11 @@ typedef struct _T2NCM_STATUS
 #define IOCTL_T2NCM_SET_TUNNEL_PEER \
     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x902, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 
-// Flip TunnelModeEnabled live, without waiting for the next
-// MiniportInitializeEx/MiniportRestart (T2NcmTunnelRefreshMode otherwise
-// only re-reads HKLM\SOFTWARE\T2TouchId\Network\TransportMode at those two
-// points, so a GUI checkbox change used to require disabling/re-enabling
-// the T2Ncm adapter, or a reboot, before it took effect). Input buffer is
-// one ULONG: 0 = Native IPv6, 1 = IPv4 tunnel — same encoding as the
-// TransportMode registry value. The GUI is expected to write the registry
-// value first (so the mode survives the next real restart) and then send
-// this IOCTL to make the running adapter match it immediately.
+// Set the tunnel mode. Applies to the running adapter immediately AND is kept
+// in driver memory, so it is re-applied after every MiniportInitializeEx /
+// MiniportRestart (adapter reset, sleep/resume) until reboot. The driver never
+// reads the registry for this. Input buffer is one ULONG: 0 = Native IPv6,
+// 1 = IPv4 tunnel.
 #define IOCTL_T2NCM_SET_TRANSPORT_MODE \
     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x903, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 

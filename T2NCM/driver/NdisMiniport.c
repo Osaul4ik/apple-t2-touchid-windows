@@ -282,12 +282,12 @@ T2NcmDispatchDeviceControl(
         }
         RtlCopyMemory(&mode, Irp->AssociatedIrp.SystemBuffer, sizeof(ULONG));
 
-        // Same field T2NcmTunnelRefreshMode sets from the registry at
-        // Initialize/Restart — writing it directly here is what makes a
-        // GUI checkbox change take effect on the already-running adapter
-        // instead of only on the next restart. Plain assignment, no
-        // Interlocked*: RefreshMode already writes this field the same
-        // way, and the TX/RX rewrite paths only ever read it.
+        // Update the driver-global mode first (this is what a later
+        // MiniportInitializeEx / MiniportRestart re-seeds from, so the mode
+        // survives adapter reset and sleep), then the running adapter's
+        // cached copy. Plain assignment on the context field: the TX/RX
+        // rewrite paths only ever read it.
+        T2NcmTunnelSetMode(mode == 1ul);
         context->TunnelModeEnabled = (mode == 1ul);
 
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
@@ -741,7 +741,7 @@ T2NcmMiniportInitializeEx(
         context->PermanentMacAddress[4], context->PermanentMacAddress[5],
         context->MacAddressIsPermanent));
 
-    // Cache TransportMode at PASSIVE — never ZwOpenKey on the send path.
+    // Seed the tunnel flag from driver memory (no registry access).
     T2NcmTunnelRefreshMode(context);
 
     return NDIS_STATUS_SUCCESS;
