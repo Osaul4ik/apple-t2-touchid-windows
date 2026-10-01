@@ -225,34 +225,6 @@ typedef struct _T2NCM_STATUS
 #define IOCTL_T2NCM_SET_TUNNEL_LOCAL \
     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x904, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 
-// Batched form of SET_TRANSPORT_MODE + SET_TUNNEL_PEER + SET_TUNNEL_LOCAL.
-// Preparing an IPv4 tunnel used to cost up to three separate open/IOCTL/close
-// round-trips from user mode; this carries whichever of the three fields the
-// caller needs in ONE request. Only the fields selected in Flags are read and
-// applied; the rest of the structure is ignored. Validation is all-or-nothing:
-// if any selected field is invalid (e.g. LocalIpv6 outside fe80::/10) NOTHING
-// is applied and STATUS_INVALID_PARAMETER is returned. Each field is applied
-// idempotently - re-sending an unchanged value is a silent no-op.
-// Older T2Ncm.sys builds reject this code with STATUS_INVALID_DEVICE_REQUEST
-// (ERROR_INVALID_FUNCTION); callers fall back to the three single-purpose IOCTLs.
-#define T2NCM_TUNNEL_CFG_MODE   0x00000001u   // apply Mode   (0 = native IPv6, 1 = IPv4 tunnel)
-#define T2NCM_TUNNEL_CFG_PEER   0x00000002u   // apply PeerIpv6
-#define T2NCM_TUNNEL_CFG_LOCAL  0x00000004u   // apply LocalIpv6 (must be inside fe80::/10)
-#define T2NCM_TUNNEL_CFG_ALL    0x00000007u
-
-#pragma pack(push, 1)
-typedef struct _T2NCM_TUNNEL_CONFIG
-{
-    UINT32 Flags;          // T2NCM_TUNNEL_CFG_* bits; must be non-zero, no unknown bits
-    UINT32 Mode;
-    UINT8  PeerIpv6[16];
-    UINT8  LocalIpv6[16];
-} T2NCM_TUNNEL_CONFIG, *PT2NCM_TUNNEL_CONFIG;   // 40 bytes
-#pragma pack(pop)
-
-#define IOCTL_T2NCM_SET_TUNNEL_CONFIG \
-    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x905, METHOD_BUFFERED, FILE_WRITE_ACCESS)
-
 // NT symbolic link the diagnostic device is reachable through. Created
 // by NdisMRegisterDeviceEx in NdisMiniport.c; open it with
 // CreateFile("\\\\.\\T2Ncm", ...).
