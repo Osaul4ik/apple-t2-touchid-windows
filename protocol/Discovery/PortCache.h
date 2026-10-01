@@ -21,6 +21,14 @@
 //
 // Missing value, or a value with no/invalid port ⇒ Load returns
 // false ⇒ caller MUST run a full scan (never hang waiting on a dead cache).
+//
+// TWO SEPARATE CACHES (native IPv6 vs IPv4 tunnel). `tunnel=false` is the original,
+// stable entry under ...\Network\PortCache; it is written ONLY by a native IPv6
+// confirmation and never touched by a tunnel session (VPN). `tunnel=true` lives under
+// ...\Network\PortCacheV4 and is written only by tunnel confirmations. Loading with
+// tunnel=true falls back to the native entry when there is no tunnel entry yet (the
+// T2 service port is the same, so it is still the best first guess); the reverse never
+// happens, so a tunnel-found port can never poison the native cache across a reboot.
 #pragma once
 #include "Adapter.h"
 #include <cstdint>
@@ -48,12 +56,13 @@ namespace t2::discovery {
 // HELO on every step; it is only ever REPLACED by a scan that confirms another
 // port, never deleted by a single failure.
 bool LoadCachedPort(const NcmEndpoint& endpoint, uint16_t* outPort,
-                    uint16_t* outRsdPort = nullptr, bool* outSuspect = nullptr);
+                    uint16_t* outRsdPort = nullptr, bool* outSuspect = nullptr,
+                    bool tunnel = false);
 
 // Marks (suspect=true) or clears (false) the Suspect flag of this adapter's entry.
 // In-process only: the flag exists to keep a probably-fine port from being thrown
 // away, and a fresh process simply starts by trying the port again anyway.
-void MarkCachedPortSuspect(const NcmEndpoint& endpoint, bool suspect);
+void MarkCachedPortSuspect(const NcmEndpoint& endpoint, bool suspect, bool tunnel = false);
 
 // Records `port` (BridgeXPC service port) and optionally `rsdPort` (the
 // RemoteXPC HTTP/2 port that advertised it) as the last known-good pair for
@@ -64,6 +73,7 @@ void MarkCachedPortSuspect(const NcmEndpoint& endpoint, bool suspect);
 // Saving always marks the entry Good (clears Suspect). Call it the moment a port is
 // CONFIRMED (scan + RemoteXPC), before the final connect and regardless of cancel,
 // so a cancelled CAPTURE_DATA never throws the finding away (v2 section 7).
-void SaveCachedPort(const NcmEndpoint& endpoint, uint16_t port, uint16_t rsdPort = 0);
+void SaveCachedPort(const NcmEndpoint& endpoint, uint16_t port, uint16_t rsdPort = 0,
+                    bool tunnel = false);
 
 } // namespace t2::discovery

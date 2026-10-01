@@ -458,7 +458,8 @@ static bool TryCachedBridgePort(const t2::discovery::NcmEndpoint& ep,
     using namespace t2::bridgexpc;
 
     uint16_t svcPort = 0, rsdPort = 0;
-    if (!LoadCachedPort(ep, &svcPort, &rsdPort)) return false;
+    const bool tunnelCache = t2::transport::IsTunnelModeActive();
+    if (!LoadCachedPort(ep, &svcPort, &rsdPort, nullptr, tunnelCache)) return false;
 
     // A: direct.
     ConnectResult crA = conn->Connect(ep.peerLinkLocal, ep.ifIndex, svcPort,
@@ -474,7 +475,7 @@ static bool TryCachedBridgePort(const t2::discovery::NcmEndpoint& ep,
         if (ProbeServiceOnPort(ep, rsdPort, kBiometricKitService, kRemoteXpcCheckTimeout, &advertised)) {
             ConnectResult crB = conn->Connect(ep.peerLinkLocal, ep.ifIndex, advertised, kRemoteXpcCheckTimeout);
             if (crB == ConnectResult::Ok) {
-                if (advertised != svcPort) SaveCachedPort(ep, advertised, rsdPort);
+                if (advertised != svcPort) SaveCachedPort(ep, advertised, rsdPort, tunnelCache);
                 *outPort = advertised;
                 return true;
             }
@@ -796,7 +797,7 @@ static int CmdNetwork(int argc, wchar_t* argv[]) {
     std::wcout << L"BridgeXPC verified: HELO OK, bridge version=" << bridgeVersion << L"\n";
     // Only cache after a live BridgeXPC connect actually succeeds — never
     // cache a port on RemoteXPC verification alone.
-    SaveCachedPort(ep, foundPort, foundRsdPort);
+    SaveCachedPort(ep, foundPort, foundRsdPort, t2::transport::IsTunnelModeActive());
     return 0;
 }
 
@@ -955,7 +956,7 @@ static bool DiscoverBiometricKitBridge(int argc, wchar_t* argv[], int firstArgIn
     // cache a port on RemoteXPC verification alone, since that's exactly
     // the "verified but BridgeXPC HELO failed" case the cache-hit path
     // above already knows how to recover from.
-    SaveCachedPort(ep, foundPort, foundRsdPort);
+    SaveCachedPort(ep, foundPort, foundRsdPort, t2::transport::IsTunnelModeActive());
     return true;
 }
 

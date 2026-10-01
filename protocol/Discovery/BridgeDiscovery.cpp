@@ -332,7 +332,7 @@ CacheTry TryCachedBridgePort(const NcmEndpoint& ep, Connection* conn, bool tunne
     CacheTry r;
     uint16_t svcPort = 0, rsdPort = 0;
     bool suspect = false;
-    if (!LoadCachedPort(ep, &svcPort, &rsdPort, &suspect)) {
+    if (!LoadCachedPort(ep, &svcPort, &rsdPort, &suspect, tunnel)) {
         T2_LOG("discovery", L"no cached BridgeXPC port for this adapter");
         return r;
     }
@@ -349,14 +349,14 @@ CacheTry TryCachedBridgePort(const NcmEndpoint& ep, Connection* conn, bool tunne
     if (crA == ConnectResult::Ok) {
         T2_LOG("discovery", L"cached port %u answered with HELO (%s) - no scan needed",
                static_cast<unsigned>(svcPort), tunnel ? L"IPv4 tunnel" : L"Native IPv6");
-        if (suspect) MarkCachedPortSuspect(ep, false);
+        if (suspect) MarkCachedPortSuspect(ep, false, tunnel);
         r.ok = true;
         return r;
     }
     T2_LOG("discovery", L"cached port %u (rsd %u%s) did not answer on %s: ConnectResult=%d evidence=%d",
            static_cast<unsigned>(svcPort), static_cast<unsigned>(rsdPort), suspect ? L", Suspect" : L"",
            tunnel ? L"IPv4 tunnel" : L"Native IPv6", static_cast<int>(crA), static_cast<int>(r.ev));
-    if (r.ev == PathEvidence::Refused) MarkCachedPortSuspect(ep, true);
+    if (r.ev == PathEvidence::Refused) MarkCachedPortSuspect(ep, true, tunnel);
 
     // Path B only makes sense when the path itself answered.
     if (rsdPort != 0 && (r.ev == PathEvidence::Positive || r.ev == PathEvidence::Refused)) {
@@ -367,8 +367,8 @@ CacheTry TryCachedBridgePort(const NcmEndpoint& ep, Connection* conn, bool tunne
             ConnectResult crB = conn->ConnectVia(tunnel, ep.peerLinkLocal, ep.ifIndex, advertised,
                                                  half, half, &evB, &r.tcpMs);
             if (crB == ConnectResult::Ok) {
-                if (advertised != svcPort) SaveCachedPort(ep, advertised, rsdPort);
-                else MarkCachedPortSuspect(ep, false);
+                if (advertised != svcPort) SaveCachedPort(ep, advertised, rsdPort, tunnel);
+                else MarkCachedPortSuspect(ep, false, tunnel);
                 r.port = advertised;
                 r.ev = PathEvidence::Positive;
                 r.ok = true;
@@ -461,7 +461,7 @@ StepResult NativeStep(const NcmEndpoint& ep, Connection* conn, void* cancelEvent
         if (so.servicePort != 0) {
             // Save at the moment of confirmation, before the final connect and
             // regardless of cancel (section 7): the finding must survive.
-            SaveCachedPort(ep, so.servicePort, so.rsdPort);
+            SaveCachedPort(ep, so.servicePort, so.rsdPort, /*tunnel=*/false);
             ULONGLONG tcpMs = 0;
             if (ConnectFoundPort(ep, conn, false, so.servicePort, &tcpMs)) {
                 tp::RecordNativeSuccess(tcpMs);
@@ -534,7 +534,7 @@ StepResult TunnelStep(NcmEndpoint* ep, Connection* conn, void* cancelEvent, bool
 
     ScanOutcome so = RunScanAttempt(*ep, true, BudgetsFor(true).attemptMs, cancelEvent);
     if (so.servicePort != 0) {
-        SaveCachedPort(*ep, so.servicePort, so.rsdPort);
+        SaveCachedPort(*ep, so.servicePort, so.rsdPort, /*tunnel=*/true);
         ULONGLONG tcpMs = 0;
         if (ConnectFoundPort(*ep, conn, true, so.servicePort, &tcpMs)) {
             tp::CommitAutoTunnel(true);
@@ -639,7 +639,7 @@ bool ConnectToBiometricKitBridge(const NcmEndpoint& endpoint, t2::bridgexpc::Con
     bool haveCachedPort = false;
     {
         uint16_t cp = 0;
-        haveCachedPort = LoadCachedPort(ep, &cp);
+        haveCachedPort = LoadCachedPort(ep, &cp, nullptr, nullptr, /*tunnel=*/true); // tunnel entry, else native one
     }
     // Committed (sticky) tunnel may scan: with an empty cache there is no way back to native.
     const bool tunnelScanAllowed = tp::IsAutoTunnelCommitted() || tp::IsV6Unavailable();

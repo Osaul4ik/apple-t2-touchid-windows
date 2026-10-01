@@ -82,8 +82,16 @@ std::string Narrow(const wchar_t* w) {
     return s;
 }
 
-std::wstring PortCacheRegPath() {
-    return std::wstring(t2::transport::kNetworkRegPath) + L"\\PortCache";
+// Native IPv6 entry: ...\\Network\\PortCache (unchanged, stable).
+// IPv4-tunnel entry:  ...\\Network\\PortCacheV4 (separate subkey, same MAC value names).
+// Both are subkeys of the Network key, so the LocalService ACL (ContainerInherit) covers both.
+std::wstring PortCacheRegPath(bool tunnel) {
+    return std::wstring(t2::transport::kNetworkRegPath) + (tunnel ? L"\\PortCacheV4" : L"\\PortCache");
+}
+
+// In-process map key: same MAC, different suffix per transport.
+std::string MemKey(const std::string& macKey, bool tunnel) {
+    return tunnel ? macKey + "|v4" : macKey;
 }
 
 // Parse "port" or "port,rsdPort". Returns false when the service port is
@@ -117,10 +125,10 @@ bool ParsePortValue(const std::string& raw, uint16_t* outPort, uint16_t* outRsd)
 
 // Reads this MAC's value. Missing key/value, wrong type or no read access all
 // come back false (cache miss).
-bool ReadRegValue(const std::string& macKey, std::string* out) {
+bool ReadRegValue(const std::string& macKey, bool tunnel, std::string* out) {
     wchar_t buf[64] = {};
     DWORD cb = sizeof(buf) - sizeof(wchar_t); // keep room for a terminator
-    const std::wstring path = PortCacheRegPath();
+    const std::wstring path = PortCacheRegPath(tunnel);
     const std::wstring name = Widen(macKey);
     if (RegGetValueW(HKEY_LOCAL_MACHINE, path.c_str(), name.c_str(), RRF_RT_REG_SZ,
                      nullptr, buf, &cb) != ERROR_SUCCESS) {
@@ -146,11 +154,12 @@ void ReportRegistryHealth(const wchar_t* api, const wchar_t* path, LSTATUS rc) {
 } // namespace
 
 bool LoadCachedPort(const NcmEndpoint& endpoint, uint16_t* outPort, uint16_t* outRsdPort,
-                    bool* outSuspect) {
+                    bool* outSuspect, bool tunnel) {
     if (outSuspect) *outSuspect = false;
     if (!endpoint.hasMac) return false; // no stable key to look up
 
-    const std::string key = FormatMacKey(endpoint.mac);
+    const std::string macKey = FormatMacKey(endpoint.mac);
+    const std::string key = MemKey(macKey, tunnel);
     {
         std::lock_guard<std::mutex> lock(g_memMu);
         auto it = MemCache().find(key);
@@ -166,7 +175,12 @@ bool LoadCachedPort(const NcmEndpoint& endpoint, uint16_t* outPort, uint16_t* ou
     // caller runs a full port scan.
     std::string raw;
     uint16_t port = 0, rsd = 0;
-    if (!ReadRegValue(key, &raw) || !ParsePortValue(raw, &port, &rsd)) {
+    if (!ReadRegValue(macKey, tunnel, &raw) || !ParsePortValue(raw, &port, &rsd)) {
+        // No tunnel entry yet: use the native one as a first guess (read-only fallback,
+        // never stored under the tunnel key; the native cache is never fed by the tunnel).
+        if (tunnel) {
+            return LoadCachedPort(endpoint, outPort, outRsdPort, outSuspect, /*tunnel=*/false);
+        }
         return false;
     }
     if (outPort) *outPort = port;
@@ -182,24 +196,26 @@ bool LoadCachedPort(const NcmEndpoint& endpoint, uint16_t* outPort, uint16_t* ou
     return true;
 }
 
-void MarkCachedPortSuspect(const NcmEndpoint& endpoint, bool suspect) {
+void MarkCachedPortSuspect(const NcmEndpoint& endpoint, bool suspect, bool tunnel) {
     if (!endpoint.hasMac) return;
-    const std::string key = FormatMacKey(endpoint.mac);
+    const std::string key = MemKey(FormatMacKey(endpoint.mac), tunnel);
     std::lock_guard<std::mutex> lock(g_memMu);
     auto it = MemCache().find(key);
     if (it == MemCache().end() || it->second.port == 0) return;
     if (it->second.suspect != suspect) {
         it->second.suspect = suspect;
-        T2_LOG("discovery", L"cached port %u marked %s", static_cast<unsigned>(it->second.port),
+        T2_LOG("discovery", L"%s cached port %u marked %s", tunnel ? L"tunnel" : L"native",
+               static_cast<unsigned>(it->second.port),
                suspect ? L"Suspect (kept; replaced only by a confirmed scan result)" : L"Good");
     }
 }
 
-void SaveCachedPort(const NcmEndpoint& endpoint, uint16_t port, uint16_t rsdPort) {
+void SaveCachedPort(const NcmEndpoint& endpoint, uint16_t port, uint16_t rsdPort, bool tunnel) {
     if (!endpoint.hasMac) return; // nothing stable to key this entry on
     if (port == 0) return;         // never persist an empty/zero port
 
-    const std::string key = FormatMacKey(endpoint.mac);
+    const std::string macKey = FormatMacKey(endpoint.mac);
+    const std::string key = MemKey(macKey, tunnel);
 
     {
         // Always remember it for this process, even if the registry write
@@ -214,8 +230,8 @@ void SaveCachedPort(const NcmEndpoint& endpoint, uint16_t port, uint16_t rsdPort
     std::string value = std::to_string(port);
     if (rsdPort != 0) value += "," + std::to_string(rsdPort);
     const std::wstring wvalue = Widen(value);
-    const std::wstring path = PortCacheRegPath();
-    const std::wstring name = Widen(key);
+    const std::wstring path = PortCacheRegPath(tunnel);
+    const std::wstring name = Widen(macKey);
 
     HKEY hKey = nullptr;
     LSTATUS rc = RegCreateKeyExW(HKEY_LOCAL_MACHINE, path.c_str(), 0, nullptr,
