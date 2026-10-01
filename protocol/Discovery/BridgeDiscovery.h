@@ -51,7 +51,7 @@ bool PickDefaultT2Endpoint(NcmEndpoint* outEndpoint, void* cancelEvent = nullptr
 //                         the port is saved the moment it is confirmed, before the
 //                         final connect and regardless of cancel.
 //   D. tunnel attempt   - only when v6 produced no Positive evidence (auto-switch
-//                         on) or the tunnel is forced. Nothing is committed until a
+//                         on). Nothing is committed until a
 //                         tunnel handshake succeeded.
 //   E. both empty       - returns false; nothing committed, cache and scan progress
 //                         kept, the next step alternates/continues.

@@ -375,9 +375,9 @@
                         <CheckBox x:Name="AutoSwitchCheck" Style="{StaticResource ToggleSwitch}"
                                   Checked="OnAutoSwitchChanged" Unchecked="OnAutoSwitchChanged">
                             <StackPanel>
-                                <TextBlock Text="Automatic IPv6 → IPv4 fallback" FontWeight="SemiBold"/>
+                                <TextBlock Text="Automatic IPv6 → IPv4 switch" FontWeight="SemiBold"/>
                                 <TextBlock Style="{StaticResource CardHint}" Margin="0,2,0,0"
-                                           Text="Tries native IPv6 first. If a VPN or firewall blocks it, the connection switches to an IPv4 tunnel instantly, and returns to IPv6 when the network changes."/>
+                                           Text="Tries native IPv6 first. If a VPN or firewall blocks it, the connection switches to an IPv4 tunnel and stays on it until the next reboot. After a reboot IPv6 is tried again."/>
                             </StackPanel>
                         </CheckBox>
 
@@ -558,22 +558,9 @@
 
                         <Border Height="1" Background="{StaticResource BrushLine}" Margin="0,18,0,18"/>
 
-                        <!-- Transport override -->
-                        <TextBlock Style="{StaticResource FieldLabel}" Text="Transport override"/>
-                        <CheckBox x:Name="Ipv4TunnelCheck" Style="{StaticResource ToggleSwitch}"
-                                  Checked="OnTransportModeChanged" Unchecked="OnTransportModeChanged">
-                            <StackPanel>
-                                <TextBlock Text="Force IPv4 tunnel" FontWeight="SemiBold"/>
-                                <TextBlock Style="{StaticResource CardHint}" Margin="0,2,0,0"
-                                           Text="Until the next reboot. While on, automatic fallback is not used."/>
-                            </StackPanel>
-                        </CheckBox>
-                        <TextBlock Style="{StaticResource CardHint}" Margin="52,10,0,0"
+                        <!-- Transport: automatic only (IPv6 -> IPv4 until reboot), no manual override -->
+                        <TextBlock Style="{StaticResource CardHint}" Margin="0,0,0,0"
                                    Text="Recommended T2Ncm interface setup: IPv4 169.254.84.1/16 and a neighbor entry 169.254.x.y → T2 MAC. After the first received frame the tunnel remembers the fe80 peer by itself."/>
-
-                        <TextBlock Text="Auto-switch state" FontWeight="SemiBold" FontSize="12" Margin="52,14,0,2"/>
-                        <TextBlock x:Name="WarmupStatusText" Style="{StaticResource StatusLine}" Margin="52,0,0,0"/>
-                        <TextBlock x:Name="WarmupDetailText" Style="{StaticResource StatusLine}" FontSize="11.5" Margin="52,2,0,0"/>
                     </StackPanel>
                 </Border>
 

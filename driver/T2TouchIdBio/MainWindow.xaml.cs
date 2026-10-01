@@ -124,19 +124,15 @@ namespace T2TouchId.SepVaultGui
         }
 
 
-        // ---- Network transport mode (manual only) ----
-        // Session flag: HKLM\SOFTWARE\T2TouchId\Network\Session\SkipNativeIpv6Probe
-        // Live: IOCTL to \\.\T2Ncm + optional peer push + TCP warm poke.
+        // ---- Network transport (automatic only) ----
+        // Auto-switch (persistent): HKLM\SOFTWARE\T2TouchId\Network\AutoSwitch, DWORD, missing == ON.
+        // Native IPv6 first; if it does not work the connection switches to the IPv4 tunnel and
+        // stays there until reboot (volatile Session\AutoTunnelSticky, written by the service).
+        // There is no manual "force IPv4".
         private const string SessionRegPath = @"SOFTWARE\T2TouchId\Network\Session";
         private const string NetworkRegPath = @"SOFTWARE\T2TouchId\Network";
-        private const string SkipNativeIpv6ProbeValue = "SkipNativeIpv6Probe";
-        private const string PeerIpv6Value = "PeerIpv6";
-        // Persistent setting (HKLM\SOFTWARE\T2TouchId\Network\AutoSwitch, DWORD).
-        // Missing == ON. Read by the native side (TransportMode.h IsAutoSwitchEnabled).
         private const string AutoSwitchValue = "AutoSwitch";
-        // Bumped on every transport change so a running Bio service re-probes
-        // Native IPv6 immediately instead of waiting for a network event.
-        private const string ReprobeNonceValue = "ReprobeNonce";
+        private const string AutoTunnelStickyValue = "AutoTunnelSticky";
         private bool _transportLoading;
 
         private static bool ReadAutoSwitch()
@@ -156,29 +152,19 @@ namespace T2TouchId.SepVaultGui
                 using var key = Registry.LocalMachine.CreateSubKey(NetworkRegPath, true);
                 if (key == null) return false;
                 key.SetValue(AutoSwitchValue, enabled ? 1 : 0, RegistryValueKind.DWord);
-                BumpReprobeNonce();
                 return true;
             }
             catch { return false; }
         }
 
-        // The Session key must be VOLATILE (gone after reboot) - a forced-tunnel
-        // box that survives a reboot silently pins every future boot. Plain
-        // CreateSubKey(path) would create it non-volatile.
-        private static RegistryKey? CreateSessionKey() =>
-            Registry.LocalMachine.CreateSubKey(SessionRegPath,
-                RegistryKeyPermissionCheck.ReadWriteSubTree, RegistryOptions.Volatile);
-
-        private static void BumpReprobeNonce()
+        private static bool ReadTunnelSticky()
         {
             try
             {
-                using var key = CreateSessionKey();
-                if (key == null) return;
-                int n = key.GetValue(ReprobeNonceValue) is int v ? v : 0;
-                key.SetValue(ReprobeNonceValue, unchecked(n + 1), RegistryValueKind.DWord);
+                using var key = Registry.LocalMachine.OpenSubKey(SessionRegPath, false);
+                return key?.GetValue(AutoTunnelStickyValue) is int i && i != 0;
             }
-            catch { /* best effort - network/session events still trigger a re-probe */ }
+            catch { return false; }
         }
 
         /// <summary>Set the persistent auto-switch flag from the command line.</summary>
@@ -189,94 +175,19 @@ namespace T2TouchId.SepVaultGui
             _transportLoading = true;
             try
             {
-                bool tunnel = false;
-                try
-                {
-                    using var key = Registry.LocalMachine.OpenSubKey(SessionRegPath, false);
-                    if (key?.GetValue(SkipNativeIpv6ProbeValue) is int i)
-                        tunnel = i != 0;
-                }
-                catch { /* default native */ }
                 bool auto = ReadAutoSwitch();
-                Ipv4TunnelCheck.IsChecked = tunnel;
+                bool sticky = auto && ReadTunnelSticky();
                 AutoSwitchCheck.IsChecked = auto;
-                TransportStatusText.Text = tunnel
-                    ? "Mode: IPv4 tunnel forced (automatic fallback is inactive while forced)."
-                    : auto
-                        ? "Mode: automatic. Native IPv6, with an instant switch to the IPv4 tunnel if it is unavailable (VPN)."
-                        : "Mode: Native IPv6 (automatic fallback is off).";
+                TransportStatusText.Text = !auto
+                    ? "Mode: Native IPv6 only (automatic switch is off)."
+                    : sticky
+                        ? "Mode: IPv4 tunnel. IPv6 was not working, so the connection switched automatically; it stays on IPv4 until the next reboot."
+                        : "Mode: automatic. Native IPv6; if it does not work, the connection switches to the IPv4 tunnel until the next reboot.";
                 TransportStatusText.Foreground = TextMuted;
-                if (WarmupStatusText != null)
-                {
-                    WarmupStatusText.Text = auto
-                        ? "Enabled (default)."
-                        : "Disabled: using Native IPv6 (or the forced tunnel).";
-                    WarmupDetailText.Text = "Returns to IPv6 on events: VPN connected/disconnected, unlock, resume from sleep. CLI: SepVaultGui.exe --auto | --no-auto";
-                }
             }
             finally
             {
                 _transportLoading = false;
-            }
-        }
-
-        /// <summary>
-        /// Apply transport from GUI checkbox or command line. Warms immediately
-        /// (registry + live mode IOCTL + peer IOCTL + throwaway TCP SYN).
-        /// </summary>
-        public static bool ApplyTransportFromCommandLine(bool tunnel)
-        {
-            return ApplyTransportCore(tunnel, out string status);
-        }
-
-        private static bool ApplyTransportCore(bool tunnel, out string status)
-        {
-            try
-            {
-                using (var key = CreateSessionKey())
-                {
-                    if (key == null)
-                    {
-                        status = "Could not open the Session key";
-                        return false;
-                    }
-                    if (tunnel)
-                        key.SetValue(SkipNativeIpv6ProbeValue, 1, RegistryValueKind.DWord);
-                    else
-                        key.DeleteValue(SkipNativeIpv6ProbeValue, throwOnMissingValue: false);
-                }
-
-                BumpReprobeNonce();
-                bool pushed = PushTransportModeToDriver(tunnel ? 1 : 0);
-                bool peerOk = true;
-                if (tunnel)
-                {
-                    peerOk = PushPersistedPeerToDriver();
-                    // Windows' real fe80 must reach the driver explicitly: with a VPN
-                    // already up no native IPv6 frame leaves for it to learn from.
-                    PushLocalLinkLocalToDriver();
-                    // Best-effort datapath warm so T2Ncm learns local addresses.
-                    WarmTunnelDatapathFromPersistedPeer();
-                }
-
-                status = tunnel
-                    ? (pushed
-                        ? "IPv4 tunnel enabled (registry + live IOCTL" + (peerOk ? ", peer" : ", peer skip") + ", warm)."
-                        : "IPv4 tunnel: registry OK, but \\\\.\\T2Ncm is unavailable.")
-                    : (pushed
-                        ? "Native IPv6 enabled (registry + live IOCTL)."
-                        : "Native IPv6: registry OK, but \\\\.\\T2Ncm is unavailable.");
-                return true;
-            }
-            catch (UnauthorizedAccessException)
-            {
-                status = "No permission to write HKLM. Run the app as administrator.";
-                return false;
-            }
-            catch (Exception ex)
-            {
-                status = "Error: " + ex.Message;
-                return false;
             }
         }
 
@@ -294,170 +205,9 @@ namespace T2TouchId.SepVaultGui
             }
             LoadTransportMode();
             TransportStatusText.Text = enabled
-                ? "Automatic fallback enabled. Applies from the next connection."
-                : "Automatic fallback disabled. Applies from the next connection.";
+                ? "Automatic switch enabled. Applies from the next connection."
+                : "Automatic switch disabled: Native IPv6 only. Applies from the next connection.";
             TransportStatusText.Foreground = DotOk;
-        }
-
-        private void OnTransportModeChanged(object sender, RoutedEventArgs e)
-        {
-            if (_transportLoading) return;
-            bool tunnel = Ipv4TunnelCheck.IsChecked == true;
-            bool ok = ApplyTransportCore(tunnel, out string status);
-            TransportStatusText.Text = status;
-            TransportStatusText.Foreground = ok ? DotOk : DotError;
-        }
-
-        private const uint IOCTL_T2NCM_SET_TRANSPORT_MODE = 0x0022A40C;
-        private const uint IOCTL_T2NCM_SET_TUNNEL_PEER = 0x0022A408;
-        private const uint IOCTL_T2NCM_SET_TUNNEL_LOCAL = 0x0022A410;
-        private const string T2NcmDevicePath = @"\\.\T2Ncm";
-
-        private const uint GENERIC_WRITE = 0x40000000;
-        private const uint FILE_SHARE_READ = 0x1;
-        private const uint FILE_SHARE_WRITE = 0x2;
-        private const uint OPEN_EXISTING = 3;
-
-        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-        private static extern IntPtr CreateFileW(
-            string lpFileName, uint dwDesiredAccess, uint dwShareMode, IntPtr lpSecurityAttributes,
-            uint dwCreationDisposition, uint dwFlagsAndAttributes, IntPtr hTemplateFile);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool DeviceIoControl(
-            IntPtr hDevice, uint dwIoControlCode,
-            ref uint lpInBuffer, uint nInBufferSize,
-            IntPtr lpOutBuffer, uint nOutBufferSize,
-            out uint lpBytesReturned, IntPtr lpOverlapped);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool DeviceIoControl(
-            IntPtr hDevice, uint dwIoControlCode,
-            byte[] lpInBuffer, uint nInBufferSize,
-            IntPtr lpOutBuffer, uint nOutBufferSize,
-            out uint lpBytesReturned, IntPtr lpOverlapped);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool CloseHandle(IntPtr hObject);
-
-        private static bool PushTransportModeToDriver(int mode)
-        {
-            IntPtr handle = CreateFileW(T2NcmDevicePath, GENERIC_WRITE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE, IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero);
-            if (handle == new IntPtr(-1))
-                return false;
-            try
-            {
-                uint value = (uint)mode;
-                return DeviceIoControl(handle, IOCTL_T2NCM_SET_TRANSPORT_MODE,
-                    ref value, sizeof(uint), IntPtr.Zero, 0, out _, IntPtr.Zero);
-            }
-            finally
-            {
-                CloseHandle(handle);
-            }
-        }
-
-        private static bool PushPersistedPeerToDriver()
-        {
-            try
-            {
-                using var key = Registry.LocalMachine.OpenSubKey(NetworkRegPath, false);
-                if (key?.GetValue(PeerIpv6Value) is not byte[] peer || peer.Length != 16)
-                    return false;
-                IntPtr handle = CreateFileW(T2NcmDevicePath, GENERIC_WRITE,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE, IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero);
-                if (handle == new IntPtr(-1))
-                    return false;
-                try
-                {
-                    return DeviceIoControl(handle, IOCTL_T2NCM_SET_TUNNEL_PEER,
-                        peer, (uint)peer.Length, IntPtr.Zero, 0, out _, IntPtr.Zero);
-                }
-                finally
-                {
-                    CloseHandle(handle);
-                }
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
-        private static bool IsT2NcmAdapter(System.Net.NetworkInformation.NetworkInterface nic)
-        {
-            string d = nic.Description ?? "";
-            string n = nic.Name ?? "";
-            if (d.Contains("T2") && d.Contains("NCM")) return true;
-            if (n.Contains("T2") && n.Contains("NCM")) return true;
-            return d.Contains("UsbNcm") || n.Contains("UsbNcm") ||
-                   d.Contains("Apple T2 USB NCM") || n.Contains("Apple T2 USB NCM");
-        }
-
-        // Read Windows' real link-local IPv6 on the T2 NCM adapter from the IP stack
-        // (no network traffic, so it works while a VPN drops IPv6) and hand it to
-        // T2Ncm.sys, which needs it as the source of every rewritten tunnel frame.
-        private static bool PushLocalLinkLocalToDriver()
-        {
-            try
-            {
-                foreach (var nic in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces())
-                {
-                    if (!IsT2NcmAdapter(nic)) continue;
-                    foreach (var ua in nic.GetIPProperties().UnicastAddresses)
-                    {
-                        var a = ua.Address;
-                        if (a.AddressFamily != System.Net.Sockets.AddressFamily.InterNetworkV6 || !a.IsIPv6LinkLocal)
-                            continue;
-                        byte[] bytes = a.GetAddressBytes();
-                        if (bytes.Length != 16) continue;
-                        IntPtr handle = CreateFileW(T2NcmDevicePath, GENERIC_WRITE,
-                            FILE_SHARE_READ | FILE_SHARE_WRITE, IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero);
-                        if (handle == new IntPtr(-1))
-                            return false;
-                        try
-                        {
-                            return DeviceIoControl(handle, IOCTL_T2NCM_SET_TUNNEL_LOCAL,
-                                bytes, (uint)bytes.Length, IntPtr.Zero, 0, out _, IntPtr.Zero);
-                        }
-                        finally
-                        {
-                            CloseHandle(handle);
-                        }
-                    }
-                }
-            }
-            catch
-            {
-                /* best-effort */
-            }
-            return false;
-        }
-
-        // Map last 4 bytes of fe80 to 169.254.x.y (same as MapPeerToIpv4 in TransportMode.h)
-        // and fire a short non-blocking TCP connect so T2Ncm sees outbound tunnel frames.
-        private static void WarmTunnelDatapathFromPersistedPeer()
-        {
-            try
-            {
-                using var key = Registry.LocalMachine.OpenSubKey(NetworkRegPath, false);
-                if (key?.GetValue(PeerIpv6Value) is not byte[] peer || peer.Length != 16)
-                    return;
-                // in6_addr last 4 bytes at offset 12
-                var ip = new System.Net.IPAddress(new byte[] { 169, 254, peer[14], peer[15] });
-                using var client = new System.Net.Sockets.TcpClient();
-                var ar = client.BeginConnect(ip, 1, null, null);
-                ar.AsyncWaitHandle.WaitOne(TimeSpan.FromMilliseconds(100));
-                try { client.Close(); } catch { }
-            }
-            catch
-            {
-                /* best-effort */
-            }
         }
 
         private void OnRefreshStatus(object sender, RoutedEventArgs e)

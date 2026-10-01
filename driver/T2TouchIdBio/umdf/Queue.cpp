@@ -2321,8 +2321,8 @@ LRESULT CALLBACK SessionLockWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             std::lock_guard<std::mutex> commitLock(g_captureRequestCommitMu);
             BeginCaptureSessionLock("SessionLockNotify(WTS_SESSION_LOCK)");
         } else if (wParam == WTS_SESSION_UNLOCK) {
-            // A VPN may have come or gone while locked: let the next Connect()
-            // re-probe Native IPv6 once if it is currently on the auto tunnel.
+            // Only drops a stale "IPv6 unavailable" verdict. A tunnel switched to
+            // automatically stays until reboot (no return to Native IPv6).
             t2::transport::RequestNativeReprobe();
         }
         // Every other WM_WTSSESSION_CHANGE type is intentionally ignored.

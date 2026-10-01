@@ -605,37 +605,20 @@ bool ConnectToBiometricKitBridge(const NcmEndpoint& endpoint, t2::bridgexpc::Con
         return false;
     }
 
-    const bool forced = tp::IsTunnelForced();
-    const bool autoSwitch = !forced && tp::IsAutoSwitchEnabled();
-    if (!forced && !autoSwitch && tp::IsAutoTunnelCommitted()) {
+    const bool autoSwitch = tp::IsAutoSwitchEnabled();
+    if (!autoSwitch && tp::IsAutoTunnelCommitted()) {
         tp::CommitAutoTunnel(false); // auto-switch was turned off: drop the learned tunnel
     }
 
-    // Alternation flag (section 6.E): after a committed tunnel failed, the NEXT
-    // step tries native first, so a VPN that went away without any interface event
-    // is found again within one ladder step.
-    static std::atomic<bool> s_altPending{false};
-
     // Decide whether this step starts on native.
-    bool tryNative = !forced;
+    bool tryNative = true;
     if (tryNative && autoSwitch && tp::IsV6Unavailable()) {
         tryNative = false; // IPv6 unusable on the adapter for this Generation
     }
     if (tryNative && autoSwitch && tp::IsAutoTunnelCommitted()) {
-        // Tunnel is the committed transport. Leave it only for a confirmed reason:
-        // the previous tunnel step failed, or a debounced re-probe trigger fired
-        // and TWO native probes agree (hysteresis, section 10).
-        bool leave = s_altPending.exchange(false);
-        if (!leave && tp::ConsumeNativeReprobeDue()) {
-            uint16_t cachedPort = 0;
-            LoadCachedPort(ep, &cachedPort);
-            tp::TransportPhase phase(static_cast<HANDLE>(cancelEvent));
-            phase.mode.Enter(tp::TransportMode::NativeIpv6);
-            leave = tp::ConfirmNativeReturn(ep.peerLinkLocal, ep.ifIndex, cachedPort,
-                                            static_cast<HANDLE>(cancelEvent));
-            T2_LOG("discovery", L"return-to-native: %s", leave ? L"confirmed by 2 probes" : L"not confirmed");
-        }
-        tryNative = leave;
+        // The automatic switch to the IPv4 tunnel already happened: it stays until reboot.
+        // No native probe, no return-to-native, no alternation.
+        tryNative = false;
     }
 
     StepResult result;
@@ -650,17 +633,18 @@ bool ConnectToBiometricKitBridge(const NcmEndpoint& endpoint, t2::bridgexpc::Con
     }
     bool tunnelTried = false;
     // Tunnel policy: cold boot has no VPN, so the start is native IPv6 ONLY. The tunnel
-    // is used when (a) the user forced it, or (b) native is silent AND a port is already
+    // is used when native is silent AND a port is already
     // cached (found earlier over v6): then one HELO over the tunnel is enough, no scan.
-    // A tunnel SCAN happens only when forced or when IPv6 is unusable on the adapter.
+    // A tunnel SCAN happens only when the tunnel is already committed (sticky) or IPv6 is unusable.
     bool haveCachedPort = false;
     {
         uint16_t cp = 0;
         haveCachedPort = LoadCachedPort(ep, &cp);
     }
-    const bool tunnelScanAllowed = forced || tp::IsV6Unavailable();
+    // Committed (sticky) tunnel may scan: with an empty cache there is no way back to native.
+    const bool tunnelScanAllowed = tp::IsAutoTunnelCommitted() || tp::IsV6Unavailable();
     if (!result.ok && !Cancelled(cancelEvent) &&
-        (forced || (autoSwitch && !nativeAlive && (haveCachedPort || tunnelScanAllowed)))) {
+        (autoSwitch && !nativeAlive && (haveCachedPort || tunnelScanAllowed))) {
         tunnelTried = true;
         result = TunnelStep(&ep, outConn, cancelEvent, tunnelScanAllowed);
         sawSilent = sawSilent || result.sawSilent;
@@ -668,7 +652,6 @@ bool ConnectToBiometricKitBridge(const NcmEndpoint& endpoint, t2::bridgexpc::Con
 
     if (result.ok) {
         tp::NotePathAlive();
-        s_altPending.store(false, std::memory_order_relaxed);
         if (outServicePort) *outServicePort = result.servicePort;
         if (outRsdPort) *outRsdPort = result.rsdPort;
         return true;
@@ -677,9 +660,6 @@ bool ConnectToBiometricKitBridge(const NcmEndpoint& endpoint, t2::bridgexpc::Con
     // Step E - nothing worked this step. State is untouched (nothing was committed),
     // the port cache and the scan progress stay, and the ladder retries from step A.
     if (!Cancelled(cancelEvent)) {
-        if (tunnelTried && !nativeTried && tp::IsAutoTunnelCommitted() && autoSwitch) {
-            s_altPending.store(true, std::memory_order_relaxed); // alternate next step
-        }
         // Only silence counts towards distrusting the persisted peer; a LocalError
         // (no MAC yet) or an alive-but-not-ready path does not.
         if (ep.peerSource == PeerSource::LastKnown && sawSilent && !result.pathAlive &&

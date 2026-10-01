@@ -372,7 +372,6 @@ ConnectResult Connection::ConnectVia(bool tunnel, const in6_addr& linkLocalAddre
         return ConnectResult::ConnectFailed;
     }
     connectionLost_.store(false);
-    t2::transport::EnsureNetworkChangeWatch();
     bool tcpFailed = false;
     ULONGLONG tcpMs = 0;
     t2::transport::PathEvidence ev = t2::transport::PathEvidence::Silent;
@@ -385,12 +384,11 @@ ConnectResult Connection::ConnectVia(bool tunnel, const in6_addr& linkLocalAddre
 
 // Entry point. Transport policy lives in TransportMode.h (read its header
 // comment first). In short:
-//  * forced tunnel (GUI/--tunnel)  -> tunnel only, no probing;
-//  * auto-switch OFF               -> native only (unless forced), old behaviour;
-//  * auto-switch ON (default)      -> start on the last-known-good transport;
-//    a native attempt gets a short adaptive TCP budget (NativeConnectBudget),
-//    and a TCP-level failure on either transport immediately retries the
-//    other one within this same call. Only a SUCCESSFUL fallback is remembered.
+//  * auto-switch OFF               -> native IPv6 only;
+//  * auto-switch ON (default)      -> start on Native IPv6 (short adaptive TCP budget,
+//    NativeConnectBudget); a TCP-level failure immediately retries over the IPv4
+//    tunnel within this same call. A SUCCESSFUL switch is sticky until reboot:
+//    there is no way back to native IPv6, and no manual force.
 ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned long interfaceIndex,
                                   uint16_t port, std::chrono::milliseconds connectTimeout) {
     // Fresh WUDFHost has no prior WSAStartup. Without this the first
@@ -403,27 +401,10 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
     }
     namespace tp = t2::transport;
     connectionLost_.store(false);
-    tp::EnsureNetworkChangeWatch();
 
-    const bool autoSwitch = !tp::IsTunnelForced() && tp::IsAutoSwitchEnabled();
+    const bool autoSwitch = tp::IsAutoSwitchEnabled();
+    if (!autoSwitch && tp::IsAutoTunnelCommitted()) tp::CommitAutoTunnel(false); // auto-switch turned off
     bool tunnel = tp::IsTunnelModeActive();
-    if (autoSwitch && tunnel && tp::ConsumeNativeReprobeDue()) {
-        // Tier 1 return to native (architecture v2 section 10): this Connection
-        // has no live socket yet (we are opening it), so flipping the driver to
-        // native for a moment cannot break a running session of this process.
-        // Leaving the tunnel needs TWO positive native probes (hysteresis); the
-        // TransportPhase restores the committed (tunnel) mode on every exit.
-        T2_LOG("connect", L"auto-switch: network/session changed - re-probing Native IPv6");
-        tp::TransportPhase phase;
-        phase.mode.Enter(tp::TransportMode::NativeIpv6);
-        if (tp::ConfirmNativeReturn(linkLocalAddress, interfaceIndex, port)) {
-            tp::CommitAutoTunnel(false); // Restore() below then leaves the driver native
-            tunnel = false;
-        } else {
-            T2_LOG("connect", L"auto-switch: native IPv6 not confirmed - staying on the IPv4 tunnel");
-        }
-    }
-
     const std::chrono::milliseconds firstTcp =
         (autoSwitch && !tunnel) ? tp::NativeConnectBudget(connectTimeout) : connectTimeout;
     bool tcpFailed = false;
@@ -438,7 +419,8 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
         if (!tunnel) tp::RecordNativeSuccess(tcpMs); // path works -> clears auto-tunnel
         return r;                                     // Ok, or a HELO-level problem (no switch)
     }
-    if (!autoSwitch) return r;
+    // Sticky tunnel: once committed there is no way back to native IPv6 before reboot.
+    if (!autoSwitch || (tunnel && tp::IsAutoTunnelCommitted())) return r;
 
     // TCP handshake did not complete: this transport is dead right now. Try
     // the other one immediately. Tunnel handshakes get a floor because the

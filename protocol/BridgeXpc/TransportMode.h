@@ -50,56 +50,39 @@ inline constexpr wchar_t kPeerMacValue[] = L"PeerMac";
 
 // ---- Transport selection: Native IPv6 vs IPv4 tunnel -------------------
 //
-// Three independent inputs decide which transport a Connect() starts on:
+// There is no manual override: no GUI/CLI "force IPv4" and no permanent-IPv4 setting.
 //
-//  1. MANUAL FORCE (session, volatile): HKLM\...\Network\Session\
-//     SkipNativeIpv6Probe = 1. Written by the GUI checkbox / SepVaultGui
-//     --tunnel. Means "always tunnel, never probe IPv6". Disappears on reboot
-//     (REG_OPTION_VOLATILE) so a forgotten box cannot pin future boots.
+//  1. AUTO-SWITCH (persistent setting, default ON): HKLM\...\Network\AutoSwitch
+//     (DWORD, missing == 1). When on, a Native IPv6 connect that fails at the TCP
+//     level (VPN/WFP dropping IPv6) is retried over the IPv4 tunnel. When off, only
+//     Native IPv6 is used.
 //
-//  2. AUTO-SWITCH (persistent setting, default ON): HKLM\...\Network\
-//     AutoSwitch (DWORD, missing == 1). Toggled from the GUI. When on, a
-//     Native IPv6 connect that fails at the TCP level (VPN/WFP dropping IPv6)
-//     is immediately retried over the IPv4 tunnel inside the same Connect()
-//     call, and the tunnel is remembered (see 3). When off, behaviour is the
-//     old manual-only one: whatever is forced, or Native IPv6.
-//
-//  3. AUTO-TUNNEL STATE (in-process only): set when a fallback to the tunnel
-//     SUCCEEDED, never on a mere native failure (a T2 that is still booting
-//     must not leave us pinned to a tunnel that does not work either). It is
-//     deliberately not mirrored into the registry: the UMDF host runs as
-//     LocalService and cannot write HKLM, and a stale cross-process copy that
-//     one side can set but the other cannot clear was the source of the old
-//     "stuck on tunnel" behaviour. Every process re-learns it with one
-//     bounded native attempt.
+//  2. STICKY TUNNEL (until reboot): set only when a switch to the tunnel SUCCEEDED
+//     (a tunnel handshake worked), never on a mere native failure. It lives in the
+//     VOLATILE Session key (Session\AutoTunnelSticky) plus an in-process flag, so
+//     every process sees it and a reboot clears it. After it is set there is NO way
+//     back to native IPv6 until reboot. The next cold boot starts from Native IPv6
+//     again and switches to the tunnel only if IPv6 does not work.
 //
 // CONNECT ARCHITECTURE v2 (CONNECT_ARCHITECTURE_v2.md) adds, in this file:
-//  * Generation (section 3): everything "boot dependent" (committed tunnel,
-//    V6Unavailable, scan progress) is tied to a counter that moves on real
-//    resume / NCM re-enumeration / peer change - never to "boot".
-//  * PathEvidence (section 4): a connect attempt is Positive / Silent /
-//    Refused / LocalError; only Positive proves a path, LocalError proves nothing.
-//  * TransportPhase (sections 11, 12): cross-process mutex + RAII mode scope,
-//    so the driver mode equals the committed mode whenever a phase ends, and no
-//    other process can flip it in the middle of a probe/scan.
+//  * Generation (section 3): scan progress / V6Unavailable are tied to a counter that
+//    moves on real resume / NCM re-enumeration / peer change (the sticky tunnel is not).
+//  * PathEvidence (section 4): a connect attempt is Positive / Silent / Refused /
+//    LocalError; only Positive proves a path, LocalError proves nothing.
+//  * TransportPhase (sections 11, 12): cross-process mutex + RAII mode scope, so the
+//    driver mode equals the committed mode whenever a phase ends, and no other
+//    process can flip it in the middle of a probe/scan.
 //
-// Native and tunnel are mutually exclusive at the driver level: while
-// T2Ncm.sys has TunnelModeEnabled set it rewrites EVERY inbound IPv6 TCP/UDP
-// frame to IPv4 (Tunnel.c, T2NcmTunnelRewriteRxIpv6ToIpv4), so a native SYN-ACK
-// would never reach the IPv6 stack. That is why the two paths are tried one
-// after the other, never raced in parallel.
-//
-// Getting back from tunnel to native is event-driven, not polled:
-//  * a real add/delete of an IP interface (a VPN coming up or going down),
-//  * WTS_SESSION_UNLOCK / real resume (Queue.cpp calls RequestNativeReprobe),
-//  * the GUI bumping Session\ReprobeNonce,
-//  * a slow safety net (kReprobeSafetyNetMs) for silent WFP policy changes.
-// A re-probe costs one bounded native SYN (NativeConnectBudget) and only while
-// auto-tunnel is active; on failure the known-good tunnel is used at once.
+// Native and tunnel are mutually exclusive at the driver level: while T2Ncm.sys has
+// TunnelModeEnabled set it rewrites EVERY inbound IPv6 TCP/UDP frame to IPv4
+// (Tunnel.c, T2NcmTunnelRewriteRxIpv6ToIpv4), so a native SYN-ACK would never reach
+// the IPv6 stack. That is why the two paths are tried one after the other.
 inline constexpr wchar_t kSessionRegPath[] = L"SOFTWARE\\T2TouchId\\Network\\Session";
-inline constexpr wchar_t kSkipNativeIpv6ProbeValue[] = L"SkipNativeIpv6Probe"; // manual force (name kept for GUI compat)
-inline constexpr wchar_t kReprobeNonceValue[] = L"ReprobeNonce";                // GUI bumps it on any transport change
 inline constexpr wchar_t kAutoSwitchValue[] = L"AutoSwitch";                    // under kNetworkRegPath, persistent
+// Set when the AUTOMATIC switch to the IPv4 tunnel succeeded. Lives in the VOLATILE Session key, so
+// it is machine-wide (UMDF host + CLI see the same value) and disappears on reboot. Never touched by
+// a GUI setting, so nothing implies a user-visible "always v4" mode.
+inline constexpr wchar_t kAutoTunnelStickyValue[] = L"AutoTunnelSticky";
 
 enum class TransportMode : DWORD {
     NativeIpv6 = 0,
@@ -129,10 +112,6 @@ inline DWORD ReadDwordCached(CachedDword& c, const wchar_t* subKey, const wchar_
     return v;
 }
 
-inline bool IsTunnelForced() {
-    static CachedDword c;
-    return ReadDwordCached(c, kSessionRegPath, kSkipNativeIpv6ProbeValue, 0, 200) != 0;
-}
 inline bool IsAutoSwitchEnabled() {
     static CachedDword c;
     return ReadDwordCached(c, kNetworkRegPath, kAutoSwitchValue, 1, 1000) != 0;
@@ -159,9 +138,29 @@ inline ULONGLONG BumpGeneration(const wchar_t* why) {
 // Only meaningful while g_autoTunnelGen == CurrentGeneration().
 inline std::atomic<bool> g_autoTunnel{false};
 inline std::atomic<ULONGLONG> g_autoTunnelGen{0};
+// Sticky-until-reboot: once the automatic switch to the IPv4 tunnel happened, it stays. It is NOT tied
+// to the Generation (resume / NCM re-enumeration / peer change do not undo it) and there is no way back
+// to native IPv6 - only a reboot clears it (volatile registry value + in-process flag).
+inline void WriteAutoTunnelSticky(bool on) {
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, kSessionRegPath, 0, nullptr, REG_OPTION_VOLATILE,
+                        KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS) {
+        T2_LOG("tunnel", L"AutoTunnelSticky: cannot open Session key (in-process flag only)");
+        return;
+    }
+    if (on) {
+        const DWORD v = 1;
+        RegSetValueExW(key, kAutoTunnelStickyValue, 0, REG_DWORD,
+                       reinterpret_cast<const BYTE*>(&v), sizeof(v));
+    } else {
+        RegDeleteValueW(key, kAutoTunnelStickyValue);
+    }
+    RegCloseKey(key);
+}
 inline bool IsAutoTunnelCommitted() {
-    return g_autoTunnel.load(std::memory_order_relaxed) &&
-           g_autoTunnelGen.load(std::memory_order_relaxed) == CurrentGeneration();
+    if (g_autoTunnel.load(std::memory_order_relaxed)) return true;
+    static CachedDword c;
+    return ReadDwordCached(c, kSessionRegPath, kAutoTunnelStickyValue, 0, 200) != 0;
 }
 
 // Attempt-scoped transport override: -1 none, 0 native, 1 tunnel. Set by
@@ -179,7 +178,7 @@ inline std::atomic<int>& TransportOverride() {
 inline bool IsTunnelModeActive() {
     const int ov = TransportOverride().load(std::memory_order_relaxed);
     if (ov >= 0) return ov == 1;
-    return IsAutoTunnelCommitted() || IsTunnelForced();
+    return IsAutoTunnelCommitted();
 }
 
 // IPv6 unusable on the T2 adapter for this Generation (unbound, or no
@@ -222,70 +221,9 @@ inline PathEvidence ClassifyWsaError(int wsa) {
     }
 }
 
-// ---- native re-probe triggers -----------------------------------------
-inline constexpr ULONGLONG kReprobeMinGapMs = 3000;       // flap guard between probes
-inline constexpr ULONGLONG kReprobeDebounceMs = 1500;     // storm of Wi-Fi/Hyper-V/WSL events -> one probe
-inline constexpr ULONGLONG kReprobeSafetyNetDefaultMs = 120000; // silent WFP changes
-inline std::atomic<bool> g_reprobeDue{false};
-inline std::atomic<ULONGLONG> g_lastReprobeRequestTick{0};
-inline std::atomic<ULONGLONG> g_lastNativeTryTick{0};
-inline std::atomic<DWORD> g_seenReprobeNonce{0};
-
-// HKLM\...\Network\ReprobeSafetyNetMs: missing = 120000, 0 = safety net off
-// (event-driven triggers only; architecture v2 open question 7).
-inline ULONGLONG ReprobeSafetyNetMs() {
-    static CachedDword c;
-    return ReadDwordCached(c, kNetworkRegPath, L"ReprobeSafetyNetMs",
-                           static_cast<DWORD>(kReprobeSafetyNetDefaultMs), 1000);
-}
-
-inline void RequestNativeReprobe() {
-    // Unlock / resume / interface add-delete: the picture may have changed, so a
-    // stale "IPv6 unavailable" verdict must not survive it.
-    ClearV6Unavailable();
-    g_lastReprobeRequestTick.store(GetTickCount64(), std::memory_order_relaxed);
-    g_reprobeDue.store(true, std::memory_order_relaxed);
-}
-
-// True at most once per trigger, and only while auto-tunnel is committed.
-// A pending event trigger must first be quiet for kReprobeDebounceMs (a burst of
-// interface events keeps pushing it back), then the kReprobeMinGapMs flap guard
-// applies. The GUI nonce is an explicit user action and skips the debounce.
-inline bool ConsumeNativeReprobeDue() {
-    if (!IsAutoTunnelCommitted()) return false;
-    const ULONGLONG now = GetTickCount64();
-    const ULONGLONG last = g_lastNativeTryTick.load(std::memory_order_relaxed);
-    if (last != 0 && now - last < kReprobeMinGapMs) return false; // trigger stays pending
-    bool due = false;
-    if (g_reprobeDue.load(std::memory_order_relaxed)) {
-        const ULONGLONG req = g_lastReprobeRequestTick.load(std::memory_order_relaxed);
-        if (req != 0 && now - req < kReprobeDebounceMs) return false; // still noisy: stays pending
-        due = g_reprobeDue.exchange(false, std::memory_order_relaxed);
-    }
-    if (!due) {
-        static CachedDword nonce;
-        const DWORD n = ReadDwordCached(nonce, kSessionRegPath, kReprobeNonceValue, 0, 200);
-        if (n != g_seenReprobeNonce.exchange(n, std::memory_order_relaxed)) due = true;
-    }
-    const ULONGLONG safety = ReprobeSafetyNetMs();
-    if (!due && safety != 0 && last != 0 && now - last >= safety) due = true;
-    if (due) g_lastNativeTryTick.store(now, std::memory_order_relaxed);
-    return due;
-}
-
-inline VOID NETIOAPI_API_ OnIpInterfaceChange(PVOID, PMIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE type) {
-    // Only real arrival/removal of an interface (VPN up/down). Parameter
-    // changes (DAD, metrics, lifetimes) fire constantly and mean nothing here.
-    if (type == MibAddInstance || type == MibDeleteInstance) RequestNativeReprobe();
-}
-inline void EnsureNetworkChangeWatch() {
-    static std::once_flag once;
-    std::call_once(once, [] {
-        HANDLE h = nullptr;
-        NotifyIpInterfaceChange(AF_UNSPEC, OnIpInterfaceChange, nullptr, FALSE, &h);
-        // Handle intentionally kept for the process lifetime.
-    });
-}
+// Unlock / resume: a stale "IPv6 unavailable" verdict must not survive it. There is no
+// return from the sticky tunnel to native IPv6 (until reboot), so nothing else to do.
+inline void RequestNativeReprobe() { ClearV6Unavailable(); }
 
 // ---- adaptive native connect budget -------------------------------------
 // A healthy T2 link-local peer answers a SYN in single-digit ms (field logs:
@@ -314,10 +252,12 @@ inline void RecordNativeSuccess(ULONGLONG tcpMs) {
 }
 // Tunnel handshake completed after native failed: remember it for THIS Generation.
 inline void CommitAutoTunnel(bool on) {
-    g_autoTunnel.store(on, std::memory_order_relaxed);
+    const bool was = g_autoTunnel.exchange(on, std::memory_order_relaxed);
     if (on) {
         g_autoTunnelGen.store(CurrentGeneration(), std::memory_order_relaxed);
-        g_lastNativeTryTick.store(GetTickCount64(), std::memory_order_relaxed);
+        if (!was) WriteAutoTunnelSticky(true); // once per process; survives host restarts, not reboot
+    } else {
+        WriteAutoTunnelSticky(false);          // only AutoSwitch turned off in the GUI gets here
     }
 }
 
@@ -1020,29 +960,5 @@ struct TransportPhase {
     TransportLock lock;
     ModeScope mode;
 };
-
-// Hysteresis for leaving the tunnel (section 10): the return to native IPv6
-// needs TWO positive probes ~300 ms apart, so one lucky SYN during a VPN flap
-// does not bounce the transport. The caller holds a TransportPhase that has
-// Enter()ed NativeIpv6. `port` must be a real BridgeXPC port (cached).
-inline bool ConfirmNativeReturn(const in6_addr& peer6, unsigned long ifIndex, uint16_t port,
-                                HANDLE cancelEvent = nullptr) {
-    if (port == 0) return false;
-    for (int i = 0; i < 2; ++i) {
-        if (i != 0) {
-            if (cancelEvent) {
-                if (WaitForSingleObject(cancelEvent, 300) == 0) return false;
-            } else {
-                Sleep(300);
-            }
-        }
-        ULONGLONG ms = 0;
-        const PathEvidence e = ProbeNativePath(peer6, ifIndex, port, std::chrono::milliseconds(100), &ms);
-        T2_LOG("tunnel", L"return-to-native probe %d/2: evidence=%d (%llu ms)", i + 1,
-               static_cast<int>(e), static_cast<unsigned long long>(ms));
-        if (!IsPositiveEvidence(e)) return false;
-    }
-    return true;
-}
 
 } // namespace t2::transport
