@@ -11,7 +11,8 @@ name: CI Apple T2 TouchId (CodeQL + PREfast + Build + Package)
 #   Inst/           InstallCert.bat, Install-T2TouchIdBio.ps1, Set-T2NcmStaticIp.ps1
 #                   (усі з tools/) і <CertCN>.cer
 #   SEP/            T2TouchIdTransport.sys, .inf, .cat, T2SepBootstrap.exe,
-#                   T2SepCoInstaller.dll, t2touchid.exe + vcpkg runtime dll(s)
+#                   T2SepCoInstaller.dll + vcpkg runtime dll(s) (no t2touchid.exe -
+#                   the CLI ships next to the GUI in T2TouchID_GUI/)
 #                   (plist-2.0.dll etc. - also listed in the .inf's
 #                   [T2SepBootstrap_CopyFiles]/[SourceDisksFiles] so PnP
 #                   installs them alongside T2SepBootstrap.exe into
@@ -641,6 +642,24 @@ jobs:
         Write-Host "OK: published $exePath"
       shell: pwsh
 
+    # t2touchid.exe is what the GUI's BridgeXPC card runs (network --rescan / verify),
+    # and it looks for it next to T2TouchID_GUI.exe. It needs plist-2.0.dll + deps
+    # from vcpkg beside it. Done BEFORE the Full upload / Min staging so both pick it up.
+    - name: "T2TouchID_GUI: bundle t2touchid.exe + runtime DLLs next to the GUI (Full + Min)"
+      run: |
+        $ErrorActionPreference = "Stop"
+        $cli = "build\t2touchid\$env:PLATFORM\$env:CONFIGURATION\t2touchid.exe"
+        if (-not (Test-Path $cli)) { Write-Error "Built CLI not found: $cli"; exit 1 }
+        $vcpkgBinDir = Join-Path $env:VCPKG_INSTALLED_DIR "bin"
+        if (-not (Test-Path $vcpkgBinDir)) { Write-Error "vcpkg bin dir not found: $vcpkgBinDir"; exit 1 }
+        foreach ($dir in @("artifacts\T2TouchID_GUI-full", "artifacts\T2TouchID_GUI-min")) {
+          Copy-Item -Path $cli -Destination $dir -Force
+          Copy-Item -Path (Join-Path $vcpkgBinDir "*.dll") -Destination $dir -Force
+          if (-not (Test-Path (Join-Path $dir "t2touchid.exe"))) { Write-Error "t2touchid.exe missing in $dir"; exit 1 }
+          Write-Host "OK: t2touchid.exe + runtime DLLs bundled into $dir"
+        }
+      shell: pwsh
+
     - name: Upload T2TouchID_GUI Full (standalone, self-contained)
       uses: actions/upload-artifact@v4
       with:
@@ -745,7 +764,6 @@ jobs:
         if (Test-Path $bootstrapPdb) { Copy-Item -Path $bootstrapPdb -Destination $pkg -Force }
 
         $vcpkgBinDir = Join-Path $env:VCPKG_INSTALLED_DIR "bin"
-        Copy-Item -Path "build\t2touchid\$env:PLATFORM\$env:CONFIGURATION\t2touchid.exe" -Destination $pkg -Force
         Copy-Item -Path (Join-Path $vcpkgBinDir "*.dll") -Destination $pkg -Force
 
         New-Item -ItemType Directory -Path (Join-Path $pkg "checks") -Force | Out-Null
@@ -769,7 +787,7 @@ jobs:
         # there with no plist-2.0.dll next to it and could not initialize -
         # SCM: "service did not respond to the start or control request in a
         # timely fashion" (error 1053 / Event 7000). The DLLs were already
-        # being copied into final\SEP\ for t2touchid.exe's own use (see the
+        # being copied into final\SEP\ (see the
         # staging step above) but the INF never knew about them. Same fix as
         # "Bio: bundle libplist runtime DLLs into package + INF": list every
         # vcpkg runtime DLL in the SAME CopyFiles section as the .exe so they
@@ -1049,7 +1067,8 @@ jobs:
           "Inst\Set-T2NcmStaticIp.ps1",
           "SEP\$env:SEP_DRIVER_NAME.inf",
           "NCM\apple-t2-ncm.inf", "NCM\apple-t2-ncm-ctrl-stub.inf", "NCM\apple-t2-composite.inf",
-          "Bio\$env:BIO_UMDF_NAME.inf"
+          "Bio\$env:BIO_UMDF_NAME.inf",
+          "T2TouchID_GUI\t2touchid.exe"
         )
         foreach ($rel in $required) {
           if (-not (Test-Path (Join-Path $pkg $rel))) { Write-Error "Package layout: missing $rel"; exit 1 }
