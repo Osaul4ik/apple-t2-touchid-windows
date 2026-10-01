@@ -18,7 +18,10 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.ComponentModel;
 using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
@@ -47,6 +50,7 @@ namespace T2TouchId.SepVaultGui
             LoadLockOnDisplayOff();
             LoadVaultState();
             LoadTransportMode();
+            LoadBridgeCache();
             LoadDevMode();
         }
 
@@ -214,6 +218,272 @@ namespace T2TouchId.SepVaultGui
         {
             LoadSepStatus();
             LoadTransportMode();
+            LoadBridgeCache();
+        }
+
+        // ---- BridgeXPC card: port cache + `network` / `verify` via t2touchid.exe ----
+        // The cache is read straight from the registry (same format PortCache.cpp writes:
+        // one REG_SZ per adapter MAC, "bridgePort[,rsdPort]"). Rescan and the fingerprint
+        // test run the CLI (t2touchid.exe next to this exe, else on PATH) and report what
+        // it really printed - nothing here is reported as success unless the CLI said so.
+        private const string PortCacheRegPath = NetworkRegPath + @"\PortCache";
+        private const string CliName = "t2touchid.exe";
+        private static readonly Brush BgOk = new SolidColorBrush(Color.FromRgb(0xF0, 0xFD, 0xF4));
+        private static readonly Brush BgWarn = new SolidColorBrush(Color.FromRgb(0xFE, 0xF3, 0xC7));
+        private static readonly Brush BgError = new SolidColorBrush(Color.FromRgb(0xFE, 0xF2, 0xF2));
+        private static readonly Brush BgNeutral = new SolidColorBrush(Color.FromRgb(0xF9, 0xFA, 0xFB));
+        private bool _bridgeBusy;
+        private int _verifiedBridgePort; // set only after a live BridgeXPC HELO from this GUI session
+
+        private readonly record struct PortCacheEntry(string Mac, int Port, int RsdPort);
+
+        private static List<PortCacheEntry> ReadPortCache()
+        {
+            var list = new List<PortCacheEntry>();
+            try
+            {
+                using var key = Registry.LocalMachine.OpenSubKey(PortCacheRegPath, false);
+                if (key == null) return list;
+                foreach (string name in key.GetValueNames())
+                {
+                    if (key.GetValue(name) is not string raw) continue;
+                    string[] parts = raw.Split(',');
+                    if (!int.TryParse(parts[0].Trim(), out int port) || port <= 0 || port > 65535) continue;
+                    int rsd = 0;
+                    if (parts.Length > 1 && int.TryParse(parts[1].Trim(), out int r) && r > 0 && r <= 65535)
+                        rsd = r;
+                    list.Add(new PortCacheEntry(name, port, rsd));
+                }
+            }
+            catch { /* unreadable == no cache */ }
+            return list;
+        }
+
+        private void SetBridgeDot(Brush brush)
+        {
+            BridgeStatusDot.Background = brush;
+            BridgeStatusHalo.Background = brush;
+        }
+
+        private void LoadBridgeCache()
+        {
+            var entries = ReadPortCache();
+            if (entries.Count == 0)
+            {
+                SetBridgeDot(DotUnknown);
+                BridgeStatusTitle.Text = "No cached port";
+                BridgeStatusSubtitle.Text =
+                    "No entry in HKLM\\" + PortCacheRegPath + ". The next connection (or Rescan) runs a full port scan.";
+                return;
+            }
+
+            bool verified = _verifiedBridgePort != 0 && entries.Any(en => en.Port == _verifiedBridgePort);
+            SetBridgeDot(verified ? DotOk : DotWarn);
+            BridgeStatusTitle.Text = entries.Count == 1
+                ? $"Cached port: {entries[0].Port}"
+                : $"{entries.Count} cached adapters";
+            BridgeStatusSubtitle.Text =
+                string.Join("\n", entries.Select(en =>
+                    $"{en.Mac}  →  BridgeXPC {en.Port}" + (en.RsdPort != 0 ? $", RemoteXPC {en.RsdPort}" : "")))
+                + (verified
+                    ? "\nVerified in this session (BridgeXPC HELO OK)."
+                    : "\nNot verified yet. Press Rescan to check it against the T2.");
+        }
+
+        private static string? FindCli()
+        {
+            try
+            {
+                string local = Path.Combine(AppContext.BaseDirectory, CliName);
+                if (File.Exists(local)) return local;
+                string path = Environment.GetEnvironmentVariable("PATH") ?? "";
+                foreach (string dir in path.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    try
+                    {
+                        string candidate = Path.Combine(dir.Trim().Trim('"'), CliName);
+                        if (File.Exists(candidate)) return candidate;
+                    }
+                    catch { /* malformed PATH entry */ }
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        private sealed record CliResult(int ExitCode, bool TimedOut, List<string> Lines);
+
+        private static async Task<CliResult> RunCliAsync(string exe, string args, TimeSpan timeout)
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = exe,
+                Arguments = args,
+                WorkingDirectory = Path.GetDirectoryName(exe) ?? AppContext.BaseDirectory,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+            using var p = new Process { StartInfo = psi };
+            p.Start();
+            Task<string> outTask = p.StandardOutput.ReadToEndAsync();
+            Task<string> errTask = p.StandardError.ReadToEndAsync();
+            Task exitTask = p.WaitForExitAsync();
+
+            bool timedOut = false;
+            if (await Task.WhenAny(exitTask, Task.Delay(timeout)) != exitTask)
+            {
+                timedOut = true;
+                try { p.Kill(true); } catch { }
+                await exitTask;
+            }
+
+            string text = await outTask + "\n" + await errTask;
+            // The scan prints \r-terminated progress ("scanned N/M ..."); drop those.
+            var lines = text.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+                            .Select(l => l.Trim())
+                            .Where(l => l.Length > 0 && !l.StartsWith("scanned ", StringComparison.Ordinal))
+                            .ToList();
+            return new CliResult(timedOut ? -1 : p.ExitCode, timedOut, lines);
+        }
+
+        private static string FailureReason(CliResult r, string fallback)
+        {
+            if (r.TimedOut) return "Timed out - the command was cancelled.";
+            string[] markers =
+            {
+                "no T2 NCM adapter", "no Preferred IPv6", "no peer to scan", "no TCP listeners",
+                "BiometricKit service not advertised", "BridgeXPC connect/HELO failed",
+                "getBridgeVersion failed", "note:", "verify-failed", "failed",
+            };
+            foreach (string m in markers)
+            {
+                string? hit = r.Lines.FirstOrDefault(l => l.Contains(m, StringComparison.OrdinalIgnoreCase));
+                if (hit != null) return hit;
+            }
+            return r.Lines.Count > 0 ? r.Lines[^1] : $"{fallback} (exit code {r.ExitCode}).";
+        }
+
+        private void SetBridgeBusy(bool busy)
+        {
+            _bridgeBusy = busy;
+            BridgeRescanButton.IsEnabled = !busy;
+            VerifyButton.IsEnabled = !busy;
+        }
+
+        private void ShowBridgeScan(string text, Brush fg)
+        {
+            BridgeScanText.Text = text;
+            BridgeScanText.Foreground = fg;
+            BridgeScanText.Visibility = Visibility.Visible;
+        }
+
+        private void ShowVerifyResult(string text, Brush fg, Brush bg)
+        {
+            VerifyResultText.Text = text;
+            VerifyResultText.Foreground = fg;
+            VerifyResultPanel.Background = bg;
+            VerifyResultPanel.Visibility = Visibility.Visible;
+        }
+
+        private static readonly Regex BridgePortRx =
+            new(@"BiometricKit BridgeXPC port:\s*(\d+)", RegexOptions.Compiled);
+        private static readonly Regex BridgeVersionRx =
+            new(@"bridge version=(-?\d+)", RegexOptions.Compiled);
+
+        private async void OnBridgeRescan(object sender, RoutedEventArgs e)
+        {
+            if (_bridgeBusy) return;
+            string? cli = FindCli();
+            if (cli == null)
+            {
+                ShowBridgeScan($"{CliName} not found next to the GUI or on PATH.", DotError);
+                return;
+            }
+
+            SetBridgeBusy(true);
+            ShowBridgeScan("Scanning the T2 for the BridgeXPC port. This can take a while (longer in IPv4 tunnel mode)...", TextMuted);
+            try
+            {
+                // --rescan: skip the cached port, scan, verify with a live HELO, then cache it.
+                CliResult r = await RunCliAsync(cli, "network --rescan", TimeSpan.FromMinutes(5));
+
+                int port = 0;
+                foreach (string line in r.Lines)
+                {
+                    var m = BridgePortRx.Match(line);
+                    if (m.Success) int.TryParse(m.Groups[1].Value, out port);
+                }
+                bool verified = r.Lines.Any(l => l.Contains("BridgeXPC verified: HELO OK", StringComparison.Ordinal));
+
+                if (verified && port > 0)
+                {
+                    _verifiedBridgePort = port;
+                    string? ver = r.Lines.Select(l => BridgeVersionRx.Match(l)).FirstOrDefault(m => m.Success)?.Groups[1].Value;
+                    string msg = $"Port {port} found, BridgeXPC HELO OK" + (ver != null ? $" (bridge version {ver})" : "") + ". Cached.";
+                    // An older t2touchid.exe ignores --rescan and answers from the cache.
+                    if (r.Lines.Any(l => l.Contains("cached - skipped port scan", StringComparison.Ordinal)))
+                        msg += " Note: this t2touchid.exe has no --rescan, so the port was re-checked from the cache without a new scan.";
+                    ShowBridgeScan(msg, DotOk);
+                }
+                else
+                {
+                    _verifiedBridgePort = 0;
+                    ShowBridgeScan("Rescan failed: " + FailureReason(r, "No BridgeXPC port confirmed"), DotError);
+                }
+            }
+            catch (Exception ex)
+            {
+                _verifiedBridgePort = 0;
+                ShowBridgeScan($"Could not run {CliName}: {ex.Message}", DotError);
+            }
+            finally
+            {
+                SetBridgeBusy(false);
+                LoadBridgeCache();
+            }
+        }
+
+        private async void OnVerifyFingerprint(object sender, RoutedEventArgs e)
+        {
+            if (_bridgeBusy) return;
+            string? cli = FindCli();
+            if (cli == null)
+            {
+                ShowVerifyResult($"{CliName} not found next to the GUI or on PATH.", DotError, BgError);
+                return;
+            }
+
+            SetBridgeBusy(true);
+            ShowVerifyResult("Place your finger on the sensor (lift and place it again if nothing happens)...", TextMuted, BgNeutral);
+            try
+            {
+                CliResult r = await RunCliAsync(cli, "verify --seconds 15", TimeSpan.FromMinutes(5));
+                bool Has(string s) => r.Lines.Any(l => l.StartsWith(s, StringComparison.Ordinal));
+
+                if (r.TimedOut)
+                    ShowVerifyResult("No answer: the command did not finish and was cancelled.", DotError, BgError);
+                else if (Has("verify-match"))
+                    ShowVerifyResult("Fingerprint read: match.", DotOk, BgOk);
+                else if (Has("verify-no-match"))
+                    ShowVerifyResult("Fingerprint read, but it is not an enrolled finger (wrong finger).", DotWarn, BgWarn);
+                else if (Has("verify-timeout"))
+                    ShowVerifyResult("No answer from the sensor: no match result arrived in time. Touch the sensor and try again.", DotError, BgError);
+                else if (Has("verify-cancelled"))
+                    ShowVerifyResult("Verification was cancelled.", DotWarn, BgWarn);
+                else
+                    ShowVerifyResult("Test failed: " + FailureReason(r, "No result from verify"), DotError, BgError);
+            }
+            catch (Exception ex)
+            {
+                ShowVerifyResult($"Could not run {CliName}: {ex.Message}", DotError, BgError);
+            }
+            finally
+            {
+                SetBridgeBusy(false);
+                LoadBridgeCache(); // a successful verify may have created/refreshed the cache entry
+            }
         }
 
         // ---- Per-driver DebugView logging (HKLM\SOFTWARE\T2TouchId\Logging) ----

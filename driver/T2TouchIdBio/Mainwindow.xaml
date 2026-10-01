@@ -354,6 +354,73 @@
                     </Grid>
                 </Border>
 
+                <!-- ===================== BridgeXPC card ===================== -->
+                <Border Style="{StaticResource Card}">
+                    <StackPanel>
+                        <Grid Margin="0,0,0,16">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <Border Grid.Column="0" Style="{StaticResource IconBadge}">
+                                <TextBlock Style="{StaticResource IconGlyph}" Text="&#xE839;"/>
+                            </Border>
+                            <StackPanel Grid.Column="1">
+                                <TextBlock Style="{StaticResource CardTitle}" Text="BridgeXPC"/>
+                                <TextBlock Style="{StaticResource CardHint}" Margin="0,2,0,0"
+                                           Text="Port of the BiometricKit service on the T2. The last known-good port is cached in the registry; Rescan runs t2touchid network."/>
+                            </StackPanel>
+                        </Grid>
+
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto"/>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+
+                            <Grid Grid.Column="0" Width="30" Height="30" VerticalAlignment="Top" Margin="0,0,14,0">
+                                <Border x:Name="BridgeStatusHalo" CornerRadius="15" Background="#9CA3AF" Opacity="0.22"/>
+                                <Border x:Name="BridgeStatusDot" Width="12" Height="12" CornerRadius="6" Background="#9CA3AF"/>
+                            </Grid>
+
+                            <StackPanel Grid.Column="1" VerticalAlignment="Center" Margin="0,0,12,0">
+                                <TextBlock x:Name="BridgeStatusTitle" Style="{StaticResource CardTitle}"
+                                           Text="No cached port"/>
+                                <TextBlock x:Name="BridgeStatusSubtitle" Style="{StaticResource CardHint}" Margin="0,2,0,0"/>
+                            </StackPanel>
+
+                            <Button Grid.Column="2" x:Name="BridgeRescanButton" Content="Rescan"
+                                    Style="{StaticResource SecondaryButton}"
+                                    VerticalAlignment="Top" Click="OnBridgeRescan"/>
+                        </Grid>
+
+                        <TextBlock x:Name="BridgeScanText" Style="{StaticResource StatusLine}"
+                                   Margin="44,12,0,0" Visibility="Collapsed"/>
+
+                        <Border Height="1" Background="{StaticResource BrushLine}" Margin="0,18,0,18"/>
+
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <StackPanel Grid.Column="0" VerticalAlignment="Center" Margin="0,0,12,0">
+                                <TextBlock Style="{StaticResource FieldLabel}" Margin="0,0,0,2" Text="Fingerprint test"/>
+                                <TextBlock Style="{StaticResource CardHint}"
+                                           Text="Runs t2touchid verify. Place a finger on the sensor when prompted."/>
+                            </StackPanel>
+                            <Button Grid.Column="1" x:Name="VerifyButton" Content="Test fingerprint"
+                                    Style="{StaticResource PrimaryButton}" Click="OnVerifyFingerprint"/>
+                        </Grid>
+
+                        <Border x:Name="VerifyResultPanel" Visibility="Collapsed" CornerRadius="10"
+                                Background="{StaticResource BrushSurfaceAlt}" Padding="14,12" Margin="0,14,0,0">
+                            <TextBlock x:Name="VerifyResultText" TextWrapping="Wrap" FontWeight="SemiBold"/>
+                        </Border>
+                    </StackPanel>
+                </Border>
+
                 <!-- ===================== Network card ===================== -->
                 <Border Style="{StaticResource Card}">
                     <StackPanel>

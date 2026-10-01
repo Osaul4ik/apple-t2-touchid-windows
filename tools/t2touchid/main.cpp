@@ -568,12 +568,15 @@ static int CmdNetwork(int argc, wchar_t* argv[]) {
 
     unsigned long ifIndexOverride = 0;
     bool doScan = true;
+    bool forceRescan = false; // --rescan: ignore the cached port, always scan (GUI "Rescan")
     std::string hostOverride; // peer IPv6 without zone
 
     for (int i = 2; i < argc; ++i) {
         std::wstring a = argv[i];
         if (a == L"--no-scan") {
             doScan = false;
+        } else if (a == L"--rescan") {
+            forceRescan = true;
         } else if (a == L"--ifindex" && i + 1 < argc) {
             ifIndexOverride = static_cast<unsigned long>(_wtoi(argv[++i]));
         } else if (a == L"--host" && i + 1 < argc) {
@@ -599,7 +602,7 @@ static int CmdNetwork(int argc, wchar_t* argv[]) {
         endpoints = FindT2NcmEndpoints();
         if (endpoints.empty()) {
             std::wcout << L"no T2 NCM adapter found.\n";
-            std::wcout << L"hint: t2touchid.exe network <ifIndex> [--host fe80::...]\n";
+            std::wcout << L"hint: t2touchid.exe network <ifIndex> [--host fe80::...] [--rescan]\n";
             return 1;
         }
     }
@@ -668,7 +671,10 @@ static int CmdNetwork(int argc, wchar_t* argv[]) {
     // before paying for a 16384-port scan. Verified by a live BridgeXPC
     // HELO (see TryCachedBridgePort) - a stale/wrong entry just falls
     // through to the full scan below, never a false "found".
-    {
+    // --rescan skips this fast path on purpose; the old cache entry is kept
+    // until the new scan confirms a port (SaveCachedPort below), so a failed
+    // rescan never throws a possibly-good entry away.
+    if (!forceRescan) {
         using namespace t2::bridgexpc;
         Connection cachedBridge;
         uint16_t cachedPort = 0;
