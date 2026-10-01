@@ -167,6 +167,75 @@ T2NcmDispatchCreateClose(
     return STATUS_SUCCESS;
 }
 
+// ---------------------------------------------------------------------------
+// Idempotent tunnel-state setters, shared by the single-purpose IOCTLs and
+// IOCTL_T2NCM_SET_TUNNEL_CONFIG. User mode re-asserts the same peer/local/mode
+// on every connect attempt and phase boundary (the driver is the source of
+// truth, so it cannot tell "unchanged" from "re-sent" on its own). Writing and
+// DbgPrint-ing an identical value each time was pure overhead and drowned the
+// log in duplicate "set live via IOCTL" lines, so a re-send now only does the
+// cheap compare and returns FALSE. Callers hold g_T2NcmDiagnosticLock shared.
+// ---------------------------------------------------------------------------
+static BOOLEAN
+T2NcmApplyTunnelMode(_In_ PT2NCM_DEVICE_CONTEXT context, _In_ BOOLEAN enabled)
+{
+    // Explicit TRUE/FALSE: the driver builds /W4 /WX, and an int-valued logical
+    // expression stored into a BOOLEAN is a C4244 candidate.
+    const BOOLEAN ctxMode = context->TunnelModeEnabled ? TRUE : FALSE;
+    const BOOLEAN changed = (ctxMode != enabled || T2NcmTunnelGetMode() != enabled) ? TRUE : FALSE;
+
+    // Always refresh both copies: the global is what a later
+    // MiniportInitializeEx / MiniportRestart re-seeds from (so the mode survives
+    // adapter reset and sleep), the context field is what TX/RX read. Both are
+    // single stores - cheaper than deciding whether to skip them.
+    T2NcmTunnelSetMode(enabled);
+    context->TunnelModeEnabled = enabled;
+
+    if (changed)
+    {
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
+            "T2Ncm: TunnelModeEnabled set live via IOCTL -> %u\n",
+            enabled ? 1u : 0u));
+    }
+    return changed;
+}
+
+static BOOLEAN
+T2NcmApplyTunnelPeer(_In_ PT2NCM_DEVICE_CONTEXT context, _In_reads_bytes_(16) const UCHAR* peer)
+{
+    if (context->TunnelPeerIpv6Valid && RtlEqualMemory(context->TunnelPeerIpv6, peer, 16))
+    {
+        return FALSE;
+    }
+    RtlCopyMemory(context->TunnelPeerIpv6, peer, 16);
+    context->TunnelPeerIpv6Valid = TRUE;
+    T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
+        "T2Ncm: TunnelPeerIpv6 set via IOCTL (tunnel rewrite armed)\n"));
+    return TRUE;
+}
+
+// Only a link-local (fe80::/10) address is ever a valid tunnel source.
+static BOOLEAN
+T2NcmTunnelLocalIsValid(_In_reads_bytes_(16) const UCHAR* local)
+{
+    return (local[0] == 0xFE && (local[1] & 0xC0) == 0x80) ? TRUE : FALSE;
+}
+
+static BOOLEAN
+T2NcmApplyTunnelLocal(_In_ PT2NCM_DEVICE_CONTEXT context, _In_reads_bytes_(16) const UCHAR* local)
+{
+    if (context->TunnelLocalIpv6Valid && RtlEqualMemory(context->TunnelLocalIpv6, local, 16))
+    {
+        return FALSE;
+    }
+    RtlCopyMemory(context->TunnelLocalIpv6, local, 16);
+    context->TunnelLocalIpv6Valid = TRUE;
+    context->TunnelLocalIpv6UnknownLogged = FALSE;
+    T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
+        "T2Ncm: TunnelLocalIpv6 set via IOCTL (real Windows link-local, no native frame needed)\n"));
+    return TRUE;
+}
+
 _Dispatch_type_(IRP_MJ_DEVICE_CONTROL)
 DRIVER_DISPATCH T2NcmDispatchDeviceControl;
 
@@ -236,10 +305,7 @@ T2NcmDispatchDeviceControl(
             status = STATUS_INVALID_PARAMETER;
             break;
         }
-        RtlCopyMemory(context->TunnelPeerIpv6, Irp->AssociatedIrp.SystemBuffer, 16);
-        context->TunnelPeerIpv6Valid = TRUE;
-        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
-            "T2Ncm: TunnelPeerIpv6 set via IOCTL (tunnel rewrite armed)\n"));
+        (VOID)T2NcmApplyTunnelPeer(context, (const UCHAR*)Irp->AssociatedIrp.SystemBuffer);
         status = STATUS_SUCCESS;
         break;
     }
@@ -255,17 +321,12 @@ T2NcmDispatchDeviceControl(
             break;
         }
         localAddr = (const UCHAR*)Irp->AssociatedIrp.SystemBuffer;
-        // Only a link-local (fe80::/10) address is ever a valid tunnel source.
-        if (localAddr[0] != 0xFE || (localAddr[1] & 0xC0) != 0x80)
+        if (!T2NcmTunnelLocalIsValid(localAddr))
         {
             status = STATUS_INVALID_PARAMETER;
             break;
         }
-        RtlCopyMemory(context->TunnelLocalIpv6, localAddr, 16);
-        context->TunnelLocalIpv6Valid = TRUE;
-        context->TunnelLocalIpv6UnknownLogged = FALSE;
-        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
-            "T2Ncm: TunnelLocalIpv6 set via IOCTL (real Windows link-local, no native frame needed)\n"));
+        (VOID)T2NcmApplyTunnelLocal(context, localAddr);
         status = STATUS_SUCCESS;
         break;
     }
@@ -282,17 +343,45 @@ T2NcmDispatchDeviceControl(
         }
         RtlCopyMemory(&mode, Irp->AssociatedIrp.SystemBuffer, sizeof(ULONG));
 
-        // Update the driver-global mode first (this is what a later
-        // MiniportInitializeEx / MiniportRestart re-seeds from, so the mode
-        // survives adapter reset and sleep), then the running adapter's
-        // cached copy. Plain assignment on the context field: the TX/RX
-        // rewrite paths only ever read it.
-        T2NcmTunnelSetMode(mode == 1ul);
-        context->TunnelModeEnabled = (mode == 1ul);
+        (VOID)T2NcmApplyTunnelMode(context, (mode == 1ul) ? TRUE : FALSE);
+        status = STATUS_SUCCESS;
+        break;
+    }
 
-        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
-            "T2Ncm: TunnelModeEnabled set live via IOCTL -> %u\n",
-            context->TunnelModeEnabled ? 1u : 0u));
+    case IOCTL_T2NCM_SET_TUNNEL_CONFIG:
+    {
+        ULONG inLen = stack->Parameters.DeviceIoControl.InputBufferLength;
+        const T2NCM_TUNNEL_CONFIG* cfg;
+
+        if (inLen < sizeof(T2NCM_TUNNEL_CONFIG) || Irp->AssociatedIrp.SystemBuffer == NULL)
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        cfg = (const T2NCM_TUNNEL_CONFIG*)Irp->AssociatedIrp.SystemBuffer;
+
+        // Validate everything BEFORE applying anything: a half-applied
+        // config (new peer, old mode) would be worse than a clean reject.
+        if (cfg->Flags == 0 || (cfg->Flags & ~T2NCM_TUNNEL_CFG_ALL) != 0 ||
+            ((cfg->Flags & T2NCM_TUNNEL_CFG_LOCAL) != 0 &&
+             !T2NcmTunnelLocalIsValid(cfg->LocalIpv6)))
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        if ((cfg->Flags & T2NCM_TUNNEL_CFG_MODE) != 0)
+        {
+            (VOID)T2NcmApplyTunnelMode(context, (cfg->Mode == 1ul) ? TRUE : FALSE);
+        }
+        if ((cfg->Flags & T2NCM_TUNNEL_CFG_PEER) != 0)
+        {
+            (VOID)T2NcmApplyTunnelPeer(context, cfg->PeerIpv6);
+        }
+        if ((cfg->Flags & T2NCM_TUNNEL_CFG_LOCAL) != 0)
+        {
+            (VOID)T2NcmApplyTunnelLocal(context, cfg->LocalIpv6);
+        }
         status = STATUS_SUCCESS;
         break;
     }
