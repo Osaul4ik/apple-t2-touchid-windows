@@ -125,6 +125,19 @@ struct VerifyConfig {
     // which this reverse-engineered protocol is not known to expose. Flag
     // for further hardware investigation, not assumed solved by this change.
     uint64_t rejectOrdinalAtOrBelow = 0;
+    // 01.10.2026 (stale-image unlock, found on hardware via Win+L): Cancel (0x0c)
+    // does NOT abort an image bridgeOS already captured. It finishes processing
+    // (72 -> 95 -> 91 -> match_result, ~155 ms after the cancel), queues the events,
+    // and delivers them to whatever connection StartMatches next - 31 s later in the
+    // log, with no finger on the sensor. The ordinal is fresh, so
+    // rejectOrdinalAtOrBelow cannot catch it.
+    // When true (default) a MATCH needs proof, in bridge time only, that this
+    // session armed the sensor (first status 90 after StartMatch = barrier), then
+    // FingerOn(63) > barrier, ImageCaptured(55) > FingerOn, match_result > 55, and
+    // (when present) the accepted image's own capture timestamp > barrier.
+    // Only ever VETOES a match, never creates one. false = old behaviour (diagnostics).
+    bool requireLiveTouchEvidence = true;
+
 
     // REVERTED (16.09.2026): defaulted to InlineIdentities (68B, no count)
     // on the strength of the same macOS unified-log capture already

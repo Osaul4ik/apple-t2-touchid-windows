@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // VerificationEngine.cpp
+#include <optional>
 #include "VerificationEngine.h"
 #include "../BridgeXpc/PlistPayload.h"
 #include "../BridgeXpc/Log.h"
@@ -273,6 +274,11 @@ bool VerificationEngine::WarmUp(bridgexpc::Connection* conn,
            L"cancel-operation, load-calibration, identity-list");
     return RunLinuxReadySequence(conn, outIdentities);
 }
+
+// ImageWasAccepted (status 95) body: u64 LE capture timestamp of the accepted image,
+// same clock as the envelope ordinal. Offset measured on two hardware captures
+// (live and stale), identical layout in both: blob offset 108 - 24-byte envelope header.
+constexpr size_t kImageWasAcceptedCaptureTsOffset = 84;
 
 VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
                                           std::optional<std::array<uint8_t, 16>>* outMatchedUuid,
@@ -590,6 +596,15 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     size_t unnamedStatusEvents = 0;
     size_t fingerTouchCycles = 0;
     size_t rejectedTouchAttempts = 0;
+    // Freshness evidence, all in the bridge's own monotonic clock (the envelope
+    // "ordinal", ~24 MHz) so no host-clock comparison is ever needed:
+    //   barrier  = ordinal of the first 90 (SensorOperationModeCapture) after our
+    //              StartMatch ack = the moment THIS session armed the sensor.
+    //              Everything delivered before it is backlog from earlier sessions.
+    //   ord63/55 = ordinals of FingerOn / ImageCaptured seen AFTER the barrier.
+    //   imageTs  = capture time of the matched image, carried in ImageWasAccepted.
+    std::optional<uint64_t> barrierOrdinal;
+    std::optional<uint64_t> ordFingerOn, ordImageCaptured, imageCaptureTs;
 
     while (steady_clock::now() < deadline) {
         std::vector<uint8_t> eventPayload;
@@ -647,6 +662,18 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
                 if (body.statusCode) {
                     const uint32_t code = *body.statusCode;
                     if (code == 63) fingerTouchCycles++;
+                    if (code == 90 && !barrierOrdinal) {
+                        barrierOrdinal = eventOrdinal;
+                    } else if (barrierOrdinal && eventOrdinal > *barrierOrdinal) {
+                        if (code == 63 && !ordFingerOn) ordFingerOn = eventOrdinal;
+                        if (code == 55 && ordFingerOn && !ordImageCaptured &&
+                            eventOrdinal > *ordFingerOn) ordImageCaptured = eventOrdinal;
+                        if (code == 95 && eventData.size() >= kImageWasAcceptedCaptureTsOffset + 8) {
+                            uint64_t ts = 0;
+                            std::memcpy(&ts, eventData.data() + kImageWasAcceptedCaptureTsOffset, 8);
+                            imageCaptureTs = ts;
+                        }
+                    }
                     if (StatusCodeIsImagePipeline(code)) imagePipelineEvents++;
                     if (!StatusCodeName(code)) unnamedStatusEvents++;
                 }
@@ -714,6 +741,29 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
                 rejectedTouchAttempts++;
                 outcome = VerifyOutcome::NoMatch;
                 break;
+            }
+            if (config_.requireLiveTouchEvidence) {
+                // Stale-image unlock guard (see VerifyConfig::requireLiveTouchEvidence).
+                // Accept only if, in bridge time, THIS session armed the sensor
+                // (barrier), then saw a finger, then captured an image, then matched,
+                // and the matched image itself was captured after the barrier.
+                const bool ordered = barrierOrdinal && ordFingerOn && ordImageCaptured &&
+                                     *barrierOrdinal < *ordFingerOn &&
+                                     *ordFingerOn < *ordImageCaptured &&
+                                     *ordImageCaptured < eventOrdinal;
+                const bool imageFresh = !imageCaptureTs || (barrierOrdinal && *imageCaptureTs > *barrierOrdinal);
+                if (!ordered || !imageFresh) {
+                    T2_LOG("verify",
+                           L"match_result outcome=MATCH rejected: no live-touch proof in this session "
+                           L"(barrier90=%d fingerOn=%d imageCaptured=%d ordered=%d imageFresh=%d) - "
+                           L"stale image/result left in bridgeOS by an earlier cancelled capture; "
+                           L"treating as NO_MATCH",
+                           barrierOrdinal ? 1 : 0, ordFingerOn ? 1 : 0, ordImageCaptured ? 1 : 0,
+                           ordered ? 1 : 0, imageFresh ? 1 : 0);
+                    rejectedTouchAttempts++;
+                    outcome = VerifyOutcome::NoMatch;
+                    break;
+                }
             }
             T2_LOG("verify", L"match_result outcome=MATCH (identity matched, UUID not logged)");
             outcome = VerifyOutcome::Match;
