@@ -37,7 +37,7 @@ Use only on a machine you can afford to break, and only if you understand the st
 
 ## 📋 Requirements
 
-- Intel MacBook **with T2**, Windows 10/11 x64 via Boot Camp  
+- Intel MacBook **with T2**, Windows 10 x64 via Boot Camp  
 - macOS still bootable (needed once to copy `user.kb`)  
 - Administrator rights  
 - **Test signing** enabled, or Secure Boot off (drivers are not WHQL-signed)
@@ -72,8 +72,8 @@ In Device Manager you should see healthy nodes for transport, NCM adapter, and a
 Boot into **macOS**, log in as the account whose Touch ID you want on Windows.
 
 ```bash
-Open ~/Library/Keychains/ →
-→  the UUID-named folder → copy user.kb to the Boot Camp volume or a USB stick
+Open UserFolder and Press ⌘ Command + ⇧ Shift + .
+then open /Library/Keychains/ UUID-named folder → copy user.kb to the Boot Camp volume or a USB stick
 ```
 
 Special bag ID is usually **`-501`** (first normal macOS user).
