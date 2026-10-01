@@ -196,7 +196,7 @@ AksResult Client::LoadKeybag(const std::vector<uint8_t>& bagBytes, int32_t* outH
     uint32_t bodyStatus = 0;
     std::memcpy(&bodyStatus, response.data() + 0, 4);
     std::memcpy(outHandle, response.data() + 4, 4); // status:u32 | handle:i32
-    if (bodyStatus != 0) return AksResult::IoError;
+    if (bodyStatus != 0) return AksResult::SepBodyRejected; // SEP answered: not a hang
     return AksResult::Ok;
 }
 
@@ -228,7 +228,7 @@ AksResult Client::MakeSystemKeybag(int32_t handle, int32_t specialUserBag,
     if (response.size() < 4) return AksResult::IoError; // status:u32, VERIFIED FROM SOURCE
     uint32_t status = 0;
     std::memcpy(&status, response.data(), 4);
-    return (status == 0) ? AksResult::Ok : AksResult::IoError;
+    return (status == 0) ? AksResult::Ok : AksResult::SepBodyRejected;
 }
 
 AksResult Client::Unlock(int32_t handle, std::vector<uint8_t>& secretUtf8, uint64_t session,
@@ -301,7 +301,7 @@ AksResult Client::Unlock(int32_t handle, std::vector<uint8_t>& secretUtf8, uint6
     if (response.size() < 4) return AksResult::IoError;
     uint32_t bodyStatus = 0;
     std::memcpy(&bodyStatus, response.data(), 4);
-    return (bodyStatus == 0) ? AksResult::Ok : AksResult::IoError;
+    return (bodyStatus == 0) ? AksResult::Ok : AksResult::SepBodyRejected;
 }
 
 AksResult Client::GetCapabilities(uint64_t selector, uint64_t* outValue) {

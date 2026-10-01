@@ -21,7 +21,9 @@ enum class AksResult {
     DeviceNotFound,
     NotReady,       // OOL not registered yet
     AccessDenied,   // driver rejected the opcode (should never happen for allow-listed ops)
-    IoError,
+    IoError,        // exchange did not complete (timeout / protocol / short reply)
+    SepBodyRejected,// exchange completed, SEP replied, but the AKS body result is nonzero
+                    // (wrong password / keybag, as in t2-aks-tool.c: `status ? 1 : 0`)
 };
 
 class Client {

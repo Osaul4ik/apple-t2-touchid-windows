@@ -149,6 +149,32 @@ void ReportStatus(t2::applekeystore::Client& client, T2_SEP_BOOTSTRAP_REASON rea
     }
 }
 
+// Maps a failed (AksResult != Ok) AKS exchange to the reason the GUI shows.
+// Contract (matches the header comment above and t2-touchid-linux):
+//   IoError          - no/invalid reply (mailbox timeout, protocol error)  -> sep-hang
+//   SepBodyRejected  - SEP answered, AKS body result != 0 (wrong password /
+//                      keybag; Linux: `status ? 1 : 0`)                    -> sep-rejected
+//   NotReady / AccessDenied / DeviceNotFound - the driver, not the SEP     -> register-ool-failed
+void ReportExchangeFailure(t2::applekeystore::Client& client, t2::applekeystore::AksResult r,
+                           T2_SEP_BOOTSTRAP_STEP step, int8_t sepStatus) {
+    using t2::applekeystore::AksResult;
+    T2_SEP_BOOTSTRAP_REASON reason = T2SepReasonSepHang;
+    const wchar_t* why = L"no reply from SEP (timeout / protocol error)";
+    if (r == AksResult::SepBodyRejected) {
+        reason = T2SepReasonSepRejected;
+        why = L"SEP replied but refused (body status != 0: wrong password or keybag)";
+    } else if (r == AksResult::NotReady || r == AksResult::AccessDenied ||
+               r == AksResult::DeviceNotFound) {
+        reason = T2SepReasonRegisterOolFailed;
+        why = L"driver not ready / access denied / device missing (not a SEP fault)";
+    }
+    wchar_t buf[192];
+    swprintf_s(buf, L"bootstrap: exchange failed (AksResult=%d): %ls", static_cast<int>(r), why);
+    Log(buf);
+    ReportStatus(client, reason, step, sepStatus);
+}
+
+
 // RAII zeroing wrapper. Every buffer that ever holds decrypted keybag bytes
 // or the plaintext password goes through this — mirrors the guarantee
 // Client::Unlock() already gives its own argument (Client.h: "zeroed by
@@ -371,7 +397,8 @@ bool RunBootstrapSequence(HANDLE readyEvent) {
 
     int32_t handle = 0;
     int8_t sepStatus = 0;
-    if (client.LoadKeybag(keybag.data, &handle, /*session=*/1, &sepStatus) != AksResult::Ok) {
+    AksResult exr = AksResult::Ok;
+    if ((exr = client.LoadKeybag(keybag.data, &handle, /*session=*/1, &sepStatus)) != AksResult::Ok) {
         // Exchange() itself never completed - the mailbox never posted a
         // reply (see mailbox.c T2_SEP_TIMEOUT_US). sepStatus is whatever
         // Exchange() left it at (its own default 0), NOT a real SEP
@@ -383,7 +410,7 @@ bool RunBootstrapSequence(HANDLE readyEvent) {
         wchar_t buf[128];
         swprintf_s(buf, L"bootstrap: load-keybag failed, sep_status=%d (SEP unresponsive)", sepStatus);
         Log(buf);
-        ReportStatus(client, T2SepReasonSepHang, T2SepStepLoadKeybag, sepStatus);
+        ReportExchangeFailure(client, exr, T2SepStepLoadKeybag, sepStatus);
         return false;
     }
     if (sepStatus != 0) {
@@ -404,12 +431,12 @@ bool RunBootstrapSequence(HANDLE readyEvent) {
         Log(buf);
     }
 
-    if (client.MakeSystemKeybag(handle, vault.specialUserBag, /*session=*/1, &sepStatus)
+    if ((exr = client.MakeSystemKeybag(handle, vault.specialUserBag, /*session=*/1, &sepStatus))
             != AksResult::Ok) {
         wchar_t buf[160];
         swprintf_s(buf, L"bootstrap: set-system-keybag failed, sep_status=%d (SEP unresponsive)", sepStatus);
         Log(buf);
-        ReportStatus(client, T2SepReasonSepHang, T2SepStepSetSystemKeybag, sepStatus);
+        ReportExchangeFailure(client, exr, T2SepStepSetSystemKeybag, sepStatus);
         return false;
     }
     if (sepStatus != 0) {
@@ -428,11 +455,11 @@ bool RunBootstrapSequence(HANDLE readyEvent) {
     // the second call since the first call is documented to zero what it
     // was given.
     std::vector<uint8_t> passwordForHandle = password.data;
-    if (client.Unlock(handle, passwordForHandle, /*session=*/1, &sepStatus) != AksResult::Ok) {
+    if ((exr = client.Unlock(handle, passwordForHandle, /*session=*/1, &sepStatus)) != AksResult::Ok) {
         wchar_t buf[128];
         swprintf_s(buf, L"bootstrap: unlock(handle) failed, sep_status=%d (SEP unresponsive)", sepStatus);
         Log(buf);
-        ReportStatus(client, T2SepReasonSepHang, T2SepStepUnlockHandle, sepStatus);
+        ReportExchangeFailure(client, exr, T2SepStepUnlockHandle, sepStatus);
         return false;
     }
     if (sepStatus != 0) {
@@ -445,12 +472,12 @@ bool RunBootstrapSequence(HANDLE readyEvent) {
     Log(L"bootstrap: unlock(handle) OK");
 
     std::vector<uint8_t> passwordForSpecialBag = password.data; // password.data not yet zeroed — see above
-    if (client.Unlock(vault.specialUserBag, passwordForSpecialBag, /*session=*/1, &sepStatus)
+    if ((exr = client.Unlock(vault.specialUserBag, passwordForSpecialBag, /*session=*/1, &sepStatus))
             != AksResult::Ok) {
         wchar_t buf[160];
         swprintf_s(buf, L"bootstrap: unlock(special bag) failed, sep_status=%d (SEP unresponsive)", sepStatus);
         Log(buf);
-        ReportStatus(client, T2SepReasonSepHang, T2SepStepUnlockSpecialBag, sepStatus);
+        ReportExchangeFailure(client, exr, T2SepStepUnlockSpecialBag, sepStatus);
         return false;
     }
     if (sepStatus != 0) {

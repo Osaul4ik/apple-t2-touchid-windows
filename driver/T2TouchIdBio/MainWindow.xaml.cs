@@ -961,7 +961,11 @@ namespace T2TouchId.SepVaultGui
 
                 case SepBootstrapReason.SepRejected:
                     SetBanner(DotWarn, "SEP rejected the request" + when,
-                        $"Step \"{StepLabel(status.StepValue)}\": wrong password or keybag (sep_status={status.SepStatus}). Repeat the import below with the correct data.");
+                        $"Step \"{StepLabel(status.StepValue)}\": " +
+                        (status.SepStatus != 0
+                            ? $"the SEP refused the request (sep_status={status.SepStatus}): wrong keybag/handle or password. "
+                            : "the SEP answered but rejected the secret (result code in the reply, not a mailbox error): wrong password or keybag. ") +
+                        "Repeat the import below with the correct data.");
                     break;
 
                 default:
