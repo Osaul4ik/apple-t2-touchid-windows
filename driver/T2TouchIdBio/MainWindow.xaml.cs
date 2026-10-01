@@ -10,8 +10,8 @@
 // hardware on the next boot (T2SepBootstrapService.cpp), and its outcome
 // is what LoadSepStatus() below reads back — via SepStatusClient's
 // IOCTL_T2_GET_BOOTSTRAP_STATUS query, not by touching AppleKeyStore
-// either. Free-text detail beyond the summary shown here still only lives
-// in C:\LogSEP.txt.
+// either. Free-text detail beyond the summary shown here is only available
+// as DebugView output of T2SepBootstrap (enable the SEP logging switch).
 
 using System;
 using System.Collections.Generic;
@@ -540,7 +540,7 @@ namespace T2TouchId.SepVaultGui
                 LogBridgeCheck.IsChecked = ReadLogFlag("BridgeXpc");
                 LogTransportCheck.IsChecked = ReadLogFlag("Transport");
                 LogNcmCheck.IsChecked = ReadLogFlag("Ncm");
-                LogStatusText.Text = "DebugView filter: T2TouchId* | T2Ncm* | t2touchid. Kernel logs (Transport/NCM) need Capture Kernel.";
+                LogStatusText.Text = "DebugView filter: T2TouchId* | T2Ncm* | t2touchid. Kernel logs (SEP driver / NCM) need Capture Kernel.";
                 LogStatusText.Foreground = TextMuted;
             }
             finally
@@ -567,7 +567,7 @@ namespace T2TouchId.SepVaultGui
             }
             else
             {
-                LogStatusText.Text = "Saved. UMDF/BridgeXpc pick it up immediately; kernel drivers after the next sleep or a driver reload.";
+                LogStatusText.Text = "Saved. User-mode parts (Bio, BridgeXPC, SEP bootstrap) pick it up within ~2 s; kernel drivers after the next sleep/resume or a driver reload.";
                 LogStatusText.Foreground = DotOk;
             }
         }
@@ -950,7 +950,7 @@ namespace T2TouchId.SepVaultGui
 
                 case SepBootstrapReason.RegisterOolFailed:
                     SetBanner(DotError, "Driver / transport error" + when,
-                        "The driver could not prepare communication with the SEP. Try restarting Windows; if that does not help, see C:\\LogSEP.txt.");
+                        "The driver could not prepare communication with the SEP. Try restarting Windows; if that does not help, enable SEP logging (Developer tools) and check DebugView.");
                     break;
 
                 case SepBootstrapReason.SepHang:

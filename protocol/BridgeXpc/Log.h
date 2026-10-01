@@ -4,8 +4,9 @@
 // Registry (HKLM\SOFTWARE\T2TouchId\Logging), DWORD 0/1 — toggled from the
 // SepVault GUI. Missing key/value = disabled (off until the user enables it).
 //   Bio        — T2TouchIdBio UMDF (CAPTURE, WBF)
-//   Transport  — T2TouchIdTransport.sys (kernel DbgPrint; see driver)
-//   Ncm        — T2Ncm.sys (kernel DbgPrint; see driver)
+//   Transport  — "SEP" switch: T2TouchIdTransport.sys (kernel DbgPrint; see
+//                driver) AND the T2SepBootstrap service (OutputDebugString)
+//   Ncm        — T2Ncm.sys + T2NcmCtrl.sys (kernel DbgPrint; see driver)
 //   BridgeXpc  — this file / Connection.cpp (connect, HELO, frames)
 //   Power      — sleep / resume / shutdown / D0 traces (Bio + user-mode)
 //
@@ -122,7 +123,11 @@ inline void Logf(const wchar_t* tag, const wchar_t* fmt, ...) {
     va_end(args);
 
     wchar_t line[1100];
-    _snwprintf_s(line, _TRUNCATE, L"[t2touchid +%lldms][%s] %s\n",
+    // Same shape as every other component: "<prefix>: [pid:tid] msg"
+    // (T2TouchIdBio / T2TouchIdEngine / T2TouchIdBootstrap), so one DebugView
+    // filter - T2TouchId* - catches all user-mode output.
+    _snwprintf_s(line, _TRUNCATE, L"T2TouchIdBridge: [%lu:%lu +%lldms][%s] %s\n",
+                 GetCurrentProcessId(), GetCurrentThreadId(),
                  static_cast<long long>(ElapsedMs()), tag, msg);
     EmitLine(line);
 }

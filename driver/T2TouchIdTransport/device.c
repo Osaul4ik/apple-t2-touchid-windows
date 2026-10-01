@@ -499,6 +499,10 @@ T2EvtDeviceD0Entry(
 {
     PT2_DEVICE_CONTEXT ctx = GetDeviceContext(Device);
 
+    // Pick up a changed SepVault GUI logging switch on every power-up
+    // (D0Entry is always PASSIVE_LEVEL) - see driver.h.
+    T2LogRefresh();
+
     // Sleep/wake audit trail (Milestone 2B §2.2 follow-up): log entry to
     // every D0Entry with the D-state we're coming from, unconditionally,
     // before any early-return below - this is what lets a DebugView/ETW

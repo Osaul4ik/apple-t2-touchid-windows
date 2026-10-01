@@ -18,6 +18,16 @@
 #include "public.h"
 
 // ---- Logging ----
+// Output goes to the kernel debug stream only (DebugView -> Capture Kernel);
+// nothing is ever written to a file. It is OFF unless the SepVault GUI
+// "SEP" switch is on: HKLM\SOFTWARE\T2TouchId\Logging\Transport = 1
+// (missing key/value = off). The registry cannot be read at DISPATCH_LEVEL,
+// so the value is cached in g_T2LogEnabled by T2LogRefresh() (PASSIVE_LEVEL
+// only: DriverEntry and every D0Entry) - a GUI change therefore takes
+// effect after the next sleep/resume or a driver reload. Every T2_LOG call
+// site is wrapped by the gate, so with logging off its arguments are not
+// even evaluated.
+//
 // DELIBERATE: DbgPrintEx (the real kernel function), NOT KdPrintEx.
 // KdPrintEx is a macro that expands to nothing when DBG is not defined -
 // and the WDK driver build system defines DBG=0 for the Release
@@ -31,7 +41,12 @@
 // mask (see docs/milestone-2-hardware-results.md follow-up note on
 // enabling the IHVDRIVER filter in DebugView / the registry), but at
 // least the call itself always executes.
-#define T2_LOG(_x_) DbgPrintEx _x_
+extern volatile LONG g_T2LogEnabled;
+
+VOID T2LogRefresh(VOID);
+
+#define T2_LOG(_x_) \
+    do { if (g_T2LogEnabled) { DbgPrintEx _x_; } } while (0)
 
 // ---- PCI identity (VERIFIED FROM SOURCE) ----
 #define T2_SEP_VENDOR_ID            0x106Bu

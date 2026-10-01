@@ -102,6 +102,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Driver.h" />
+    <ClInclude Include="LogGate.h" />
     <ClInclude Include="Device.h" />
     <ClInclude Include="UsbTransport.h" />
     <ClInclude Include="NcmProtocol.h" />

@@ -493,6 +493,9 @@ T2NcmMiniportInitializeEx(
     UNREFERENCED_PARAMETER(MiniportDriverContext);
     UNREFERENCED_PARAMETER(MiniportInitParameters);
 
+    // PASSIVE_LEVEL: pick up a changed SepVault GUI logging switch.
+    T2NcmLogRefresh();
+
     T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_TRACE_LEVEL,
         "T2Ncm: MiniportInitializeEx entered\n"));
 
@@ -881,6 +884,10 @@ T2NcmMiniportRestart(
     NTSTATUS status;
 
     UNREFERENCED_PARAMETER(RestartParameters);
+
+    // PASSIVE_LEVEL (every resume passes through here): pick up a changed
+    // SepVault GUI logging switch.
+    T2NcmLogRefresh();
 
     T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
         "T2Ncm[POWER]: MiniportRestart ENTER PowerState=%u DataPathRunning=%ld "

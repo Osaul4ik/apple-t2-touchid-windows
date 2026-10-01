@@ -615,7 +615,7 @@
                         </CheckBox>
                         <CheckBox x:Name="LogTransportCheck" Style="{StaticResource ToggleSwitch}" Margin="0,0,0,10"
                                   Checked="OnLogFlagChanged" Unchecked="OnLogFlagChanged">
-                            <TextBlock Text="T2TouchIdTransport (kernel, D0Entry/D0Exit)" TextWrapping="Wrap"/>
+                            <TextBlock Text="SEP (T2TouchIdTransport kernel + T2SepBootstrap service)" TextWrapping="Wrap"/>
                         </CheckBox>
                         <CheckBox x:Name="LogNcmCheck" Style="{StaticResource ToggleSwitch}" Margin="0,0,0,0"
                                   Checked="OnLogFlagChanged" Unchecked="OnLogFlagChanged">

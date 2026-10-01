@@ -34,8 +34,15 @@
 #include <usb.h>
 #include <usbdlib.h>
 #include <wdfusb.h>
+#include "LogGate.h"
 
-#define T2NCMCTRL_LOG(_x_) DbgPrintEx _x_
+// Same switch as T2Ncm.sys (HKLM\SOFTWARE\T2TouchId\Logging\Ncm, default
+// OFF, debug stream only); re-read at DriverEntry and every D0Entry. See
+// LogGate.h and driver.h.
+static volatile LONG g_T2NcmCtrlLogEnabled = 0;
+
+#define T2NCMCTRL_LOG(_x_) \
+    do { if (g_T2NcmCtrlLogEnabled) { DbgPrintEx _x_; } } while (0)
 #define T2NCMCTRL_DPFLTR_ID DPFLTR_IHVDRIVER_ID
 
 typedef struct _T2NCMCTRL_CONTEXT
@@ -285,6 +292,8 @@ T2NcmCtrlEvtDeviceD0Entry(
 
     UNREFERENCED_PARAMETER(PreviousState);
 
+    InterlockedExchange(&g_T2NcmCtrlLogEnabled, T2NcmReadLogSwitch());
+
     // WDF stops power-managed USB pipe targets on D0Exit, so the
     // notification reader has to be restarted here. Deliberately never
     // fails the power transition over it: draining notifications is a
@@ -366,6 +375,8 @@ DriverEntry(
     )
 {
     WDF_DRIVER_CONFIG config;
+
+    InterlockedExchange(&g_T2NcmCtrlLogEnabled, T2NcmReadLogSwitch());
 
     T2NCMCTRL_LOG((T2NCMCTRL_DPFLTR_ID, DPFLTR_TRACE_LEVEL,
         "T2NcmCtrl: DriverEntry\n"));

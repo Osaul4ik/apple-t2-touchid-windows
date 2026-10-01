@@ -129,7 +129,19 @@
 // Reuses the T2TouchIdTransport convention (see driver/T2TouchIdTransport/driver.h):
 // DbgPrintEx, not KdPrintEx, because KdPrintEx compiles to nothing when
 // DBG=0 (Release), and this driver ships test-signed Release builds.
-#define T2NCM_LOG(_x_) DbgPrintEx _x_
+//
+// Gated by HKLM\SOFTWARE\T2TouchId\Logging\Ncm (SepVault GUI "T2NCM"
+// switch), default OFF, debug stream only (never a file). The value is
+// cached in g_T2NcmLogEnabled and re-read by T2NcmLogRefresh() at
+// PASSIVE_LEVEL points only (DriverEntry, MiniportInitializeEx,
+// MiniportRestart) - see LogGate.h. With logging off the call's arguments
+// are not evaluated.
+extern volatile LONG g_T2NcmLogEnabled;
+
+VOID T2NcmLogRefresh(VOID);
+
+#define T2NCM_LOG(_x_) \
+    do { if (g_T2NcmLogEnabled) { DbgPrintEx _x_; } } while (0)
 #define T2NCM_DPFLTR_ID DPFLTR_IHVDRIVER_ID
 
 // ---- Device identity (VERIFIED FROM SOURCE: USBPcap descriptor dump) ----

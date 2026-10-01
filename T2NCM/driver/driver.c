@@ -22,10 +22,20 @@
 
 #include "Driver.h"
 #include "NdisMiniport.h"
+#include "LogGate.h"
 
 NDIS_HANDLE g_T2NcmMiniportDriverHandle = NULL;
 PT2NCM_DEVICE_CONTEXT volatile g_T2NcmDiagnosticAdapter = NULL;
 ERESOURCE g_T2NcmDiagnosticLock;
+
+// Cached HKLM\SOFTWARE\T2TouchId\Logging\Ncm switch (see driver.h).
+volatile LONG g_T2NcmLogEnabled = 0;
+
+VOID
+T2NcmLogRefresh(VOID)
+{
+    InterlockedExchange(&g_T2NcmLogEnabled, T2NcmReadLogSwitch());
+}
 
 NTSTATUS
 DriverEntry(
@@ -37,6 +47,8 @@ DriverEntry(
     NDIS_STATUS ndisStatus;
     WDF_DRIVER_CONFIG config;
     WDFDRIVER wdfDriver = NULL;
+
+    T2NcmLogRefresh();
 
     T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_TRACE_LEVEL,
         "T2Ncm: DriverEntry entered (NDIS miniport, NDIS-owned power)\n"));

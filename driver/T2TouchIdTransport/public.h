@@ -126,7 +126,7 @@ typedef struct _T2_TRANSPORT_STATUS
 // small in-memory mailbox the driver holds purely so T2SepBootstrapService
 // (which runs the actual load-keybag/unlock sequence in user mode, see
 // T2SepBootstrapService.cpp) can record the outcome once per boot, and
-// SepVaultGui can ask "what happened" without parsing C:\LogSEP.txt or
+// SepVaultGui can ask "what happened" without parsing a log file or
 // racing a separate status file on disk. The driver does not interpret
 // these values at all - it just stores whatever the service last wrote
 // and hands it back, guarded by its own lock (BootstrapStatusLock) so a

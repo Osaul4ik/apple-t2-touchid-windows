@@ -30,11 +30,10 @@
 #include <sddl.h>
 #include <string>
 #include <vector>
-#include <fstream>
-#include <ctime>
 
 #include "SepVaultFormat.h"
 #include "../../protocol/AppleKeyStore/Client.h"
+#include "../../protocol/BridgeXpc/Log.h"   // shared, TTL-cached registry gates (t2::log)
 
 // Same GUID as public.h / Client::Open — declare only (do not #include
 // public.h here: it DEFINE_GUIDs and Client.cpp already owns that symbol).
@@ -49,13 +48,6 @@ namespace {
 
 constexpr wchar_t kServiceName[] = L"T2SepBootstrap";
 constexpr wchar_t kVaultPath[] = L"C:\\ProgramData\\T2TouchId\\sep-vault.bin";
-// Plain root-of-C: path instead of the previous C:\ProgramData\T2TouchId\
-// location: ProgramData is hidden by default and needs an elevated/explicit
-// path to browse to, which made "service installed but SEP still not
-// unlocked" hard to diagnose - nothing to look at without already knowing
-// where to look. C:\LogSEP.txt is trivially findable after a reboot.
-constexpr wchar_t kLogPath[] = L"C:\\LogSEP.txt";
-
 // Named event the WBDI driver's IOCTL_BIOMETRIC_GET_SENSOR_STATUS handler
 // waits/polls on (design doc §9.2 step 8). "Global\" so it is visible
 // across sessions — this service runs in Session 0, the WBDI driver host
@@ -72,21 +64,29 @@ HANDLE gStopEvent = nullptr;           // signaled on SERVICE_CONTROL_STOP
 HANDLE gLockRequestEvent = nullptr;   // Global\\T2TouchIdBio_LockRequest
 HANDLE gLockThread = nullptr;
 
-// File log + Application Event Log. Without a registered message-table DLL
-// Event Viewer may wrap the text in a generic "description not found"
-// notice; the insertion string still carries the full message.
+// DebugView trace (no file any more). Session-0 service: run DebugView as
+// Administrator with Capture -> Capture Global Win32; filter T2TouchId*.
+// Gated by the SepVault GUI "SEP" switch, HKLM\SOFTWARE\T2TouchId\Logging\
+// Transport (the same switch as T2TouchIdTransport.sys: SEP = transport +
+// bootstrap). Missing value = off. The gate is the cached t2::log one, so a
+// disabled line costs one GetTickCount64() + an atomic load. Line format
+// matches T2BioLog: "<prefix>: [pid:tid] msg".
 void Log(const wchar_t* msg) {
-    std::wofstream f(kLogPath, std::ios::app);
-    if (f) {
-        time_t t = time(nullptr);
-        wchar_t buf[32] = {};
-        tm tmBuf{};
-        localtime_s(&tmBuf, &t);
-        wcsftime(buf, 32, L"%Y-%m-%d %H:%M:%S", &tmBuf);
-        f << L"[" << buf << L"] " << msg << L"\n";
+    if (!t2::log::TransportEnabled()) {
+        return;
     }
+    wchar_t line[1100];
+    _snwprintf_s(line, _TRUNCATE, L"T2TouchIdBootstrap: [%lu:%lu] %ls\n",
+                 GetCurrentProcessId(), GetCurrentThreadId(), msg);
+    OutputDebugStringW(line);
 }
 
+// Debug trace (above) + Application Event Log. The Event Log entry is NOT a
+// debug trace and is not gated: it is the only record of a failed bootstrap
+// that survives without DebugView attached. Without a registered
+// message-table DLL Event Viewer may wrap the text in a generic
+// "description not found" notice; the insertion string still carries the
+// full message.
 void LogEvent(WORD type, const wchar_t* msg) {
     Log(msg);
     HANDLE h = RegisterEventSourceW(nullptr, kServiceName);
@@ -136,7 +136,7 @@ void ReportStatus(t2::applekeystore::Client& client, T2_SEP_BOOTSTRAP_REASON rea
         Log(L"bootstrap: SetBootstrapStatus IOCTL failed (status not reported to driver)");
     }
     // Surface failures in Event Viewer so "fingerprint missing after boot"
-    // is diagnosable without opening C:\LogSEP.txt (Session 0 service has
+    // is diagnosable without DebugView attached (Session 0 service has
     // no UI). Success is also logged once so boot scripts can wait on it.
     wchar_t detail[192];
     swprintf_s(detail,

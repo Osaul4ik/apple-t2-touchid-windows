@@ -69,6 +69,7 @@
 
 #include <cstring>
 #include "../WbdiBir.h"
+#include "../../../protocol/BridgeXpc/Log.h"   // shared, TTL-cached Bio gate (t2::log)
 
 // ---------------------------------------------------------------------------
 // Private per-pipeline context. winbio_adapter.h only forward-declares
@@ -103,12 +104,17 @@ const GUID kAdapterId =
 // DebugView trace. Every line starts with "T2TouchIdEngine:" (DebugView filter:
 // T2TouchId*) followed by [pid:tid]. wbiosrvc is a normal service process, so
 // run DebugView as Administrator with Capture -> Capture Global Win32.
+// Gated by HKLM\SOFTWARE\T2TouchId\Logging\Bio (SepVault GUI), like the UMDF
+// driver's T2BioLog; missing value = off.
 //   -> Name   : callback entered
 //        ...  : selected arguments
 //   <- Name   : callback returned, with the HRESULT WBF will see
 // ---------------------------------------------------------------------------
 void EngLog(_In_z_ const char* fmt, ...)
 {
+    if (!t2::log::BioEnabled()) {
+        return;
+    }
     char msg[256];
     va_list ap;
     va_start(ap, fmt);
