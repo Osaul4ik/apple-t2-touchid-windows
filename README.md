@@ -72,8 +72,8 @@ In Device Manager you should see healthy nodes for transport, NCM adapter, and a
 Boot into **macOS**, log in as the account whose Touch ID you want on Windows.
 
 ```bash
-Open ~/Users/(UserName)/Library/Keychains/ →
-→  the UUID-named folder → copy user.kb to the Boot Camp volume or a USB stick
+Open UserFolder and Press ⌘ Command + ⇧ Shift + .
+then open /Library/Keychains/ UUID-named folder → copy user.kb to the Boot Camp volume or a USB stick
 ```
 
 Special bag ID is usually **`-501`** (first normal macOS user).
