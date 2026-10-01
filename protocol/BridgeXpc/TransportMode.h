@@ -597,6 +597,115 @@ inline ULONGLONG GetRealSuspendGeneration() {
     return RealSuspendGeneration().load(std::memory_order_acquire);
 }
 
+// ---- Shared \\.\T2Ncm control handle (lease-counted) ---------------------
+//
+// Every push below used to CreateFileW + DeviceIoControl + CloseHandle on its own,
+// so one Connect()/scan phase (mode + peer + local) paid for three opens.
+// A T2NcmControlLease keeps ONE handle alive for as long as at least one lease
+// exists in the process; the last lease to go closes it. TransportPhase and
+// PrepareTunnelPeer hold a lease for their duration, so all pushes inside share a
+// single handle. A push made outside any lease takes a lease for the duration of
+// that one call - i.e. exactly the old open/IOCTL/close behaviour.
+//
+// Deliberately NOT a process-lifetime handle: an idle open handle on the control
+// device would pin T2Ncm.sys and make a driver update / Disable-NetAdapter /
+// tools\remove-t2-drivers.bat need a reboot. With leases the handle exists only
+// while a phase is actually running. The handle is opened lazily by the first
+// IOCTL, not by the lease itself.
+struct T2NcmControlState {
+    std::mutex mu;
+    HANDLE h = INVALID_HANDLE_VALUE;
+    unsigned refs = 0;
+};
+inline T2NcmControlState& T2NcmControl() {
+    static T2NcmControlState s;
+    return s;
+}
+
+class T2NcmControlLease {
+public:
+    T2NcmControlLease() {
+        auto& s = T2NcmControl();
+        std::lock_guard<std::mutex> lock(s.mu);
+        ++s.refs;
+    }
+    ~T2NcmControlLease() {
+        auto& s = T2NcmControl();
+        std::lock_guard<std::mutex> lock(s.mu);
+        if (--s.refs == 0 && s.h != INVALID_HANDLE_VALUE) {
+            CloseHandle(s.h);
+            s.h = INVALID_HANDLE_VALUE;
+        }
+    }
+    T2NcmControlLease(const T2NcmControlLease&) = delete;
+    T2NcmControlLease& operator=(const T2NcmControlLease&) = delete;
+};
+
+struct T2NcmIoctlResult {
+    bool  ok = false;
+    bool  openFailed = false; // open failure is already logged by T2NcmControlIoctl
+    DWORD err = 0;            // GetLastError of the failing call (0 when ok)
+};
+
+// Errors that mean "this handle no longer refers to a live control device"
+// (driver unloaded / re-created while the handle was cached). Anything else -
+// notably ERROR_INVALID_FUNCTION from an older T2Ncm.sys - is a real answer and
+// must reach the caller unchanged.
+inline bool IsStaleControlHandleError(DWORD e) {
+    return e == ERROR_INVALID_HANDLE || e == ERROR_DEVICE_REMOVED ||
+           e == ERROR_NO_SUCH_DEVICE || e == ERROR_DEV_NOT_EXIST ||
+           e == ERROR_DEVICE_NOT_CONNECTED;
+}
+
+// One IOCTL on the shared handle. FILE_WRITE_DATA only (not GENERIC_WRITE): the
+// control device grants LocalService exactly that (see NdisMiniport.c SDDL);
+// GENERIC_WRITE also asks for WRITE_ATTRIBUTES/EA/APPEND and would be denied for
+// the service. A stale cached handle is dropped and the IOCTL retried once on a
+// fresh open.
+inline T2NcmIoctlResult T2NcmControlIoctl(const wchar_t* who, DWORD code,
+                                          LPVOID in, DWORD inSize) {
+    T2NcmControlLease lease; // keeps the handle open for the duration of this call at least
+    auto& s = T2NcmControl();
+    T2NcmIoctlResult r;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        HANDLE h;
+        {
+            std::lock_guard<std::mutex> lock(s.mu);
+            if (s.h == INVALID_HANDLE_VALUE) {
+                s.h = CreateFileW(L"\\\\.\\T2Ncm", FILE_WRITE_DATA,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                  OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (s.h == INVALID_HANDLE_VALUE) {
+                    r.openFailed = true;
+                    r.err = GetLastError();
+                    T2_LOG("tunnel", L"%s: could not open \\\\.\\T2Ncm "
+                           L"(GetLastError=%lu) - driver not loaded, or (5) access denied",
+                           who, r.err);
+                    return r;
+                }
+            }
+            h = s.h;
+        }
+        DWORD returned = 0;
+        if (DeviceIoControl(h, code, in, inSize, nullptr, 0, &returned, nullptr)) {
+            r.ok = true;
+            r.err = 0;
+            return r;
+        }
+        r.err = GetLastError();
+        if (attempt == 0 && IsStaleControlHandleError(r.err)) {
+            std::lock_guard<std::mutex> lock(s.mu);
+            if (s.h == h) { // nobody replaced it meanwhile
+                CloseHandle(s.h);
+                s.h = INVALID_HANDLE_VALUE;
+            }
+            continue; // retry once on a fresh open
+        }
+        break;
+    }
+    return r;
+}
+
 inline bool PushTunnelPeerToDriver(const in6_addr& peer6) {
     if (IsTransportIoSuspended()) {
         T2_LOG("tunnel", L"PushTunnelPeerToDriver: skipped (system suspending / Dx)");
@@ -605,28 +714,18 @@ inline bool PushTunnelPeerToDriver(const in6_addr& peer6) {
     if (IsSameAsLastPushedPeer(peer6)) {
         return true; // already armed — kill port-scan IOCTL storm
     }
-    // FILE_WRITE_DATA only (not GENERIC_WRITE): the control device grants
-    // LocalService exactly that (see NdisMiniport.c SDDL); GENERIC_WRITE also
-    // asks for WRITE_ATTRIBUTES/EA/APPEND and would be denied for the service.
-    HANDLE h = CreateFileW(L"\\\\.\\T2Ncm", FILE_WRITE_DATA,
-                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) {
-        T2_LOG("tunnel", L"PushTunnelPeerToDriver: could not open \\\\.\\T2Ncm "
-               L"(GetLastError=%lu) - driver not loaded, or (5) access denied", GetLastError());
+    const DWORD code = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x902, METHOD_BUFFERED, FILE_WRITE_ACCESS);
+    const T2NcmIoctlResult r = T2NcmControlIoctl(L"PushTunnelPeerToDriver", code,
+                                                 (LPVOID)&peer6, (DWORD)sizeof(peer6));
+    if (r.openFailed) {
         return false;
     }
-    DWORD returned = 0;
-    const DWORD code = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x902, METHOD_BUFFERED, FILE_WRITE_ACCESS);
-    BOOL ok = DeviceIoControl(h, code, (LPVOID)&peer6, (DWORD)sizeof(peer6),
-                              nullptr, 0, &returned, nullptr);
-    if (!ok) {
-        T2_LOG("tunnel", L"PushTunnelPeerToDriver: IOCTL failed, GetLastError=%lu", GetLastError());
-    } else {
-        RememberLastPushedPeer(peer6);
+    if (!r.ok) {
+        T2_LOG("tunnel", L"PushTunnelPeerToDriver: IOCTL failed, GetLastError=%lu", r.err);
+        return false;
     }
-    CloseHandle(h);
-    return ok != FALSE;
+    RememberLastPushedPeer(peer6);
+    return true;
 }
 
 // Windows' REAL link-local IPv6 address on the T2 adapter, read straight from
@@ -678,29 +777,22 @@ inline bool PushTunnelLocalToDriver(unsigned long ifIndex) {
     if (IsSameAsLastPushedLocal(local)) {
         return true; // already armed
     }
-    HANDLE h = CreateFileW(L"\\\\.\\T2Ncm", FILE_WRITE_DATA, // see PushTunnelPeerToDriver
-                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) {
-        T2_LOG("tunnel", L"PushTunnelLocalToDriver: could not open \\\\.\\T2Ncm "
-               L"(GetLastError=%lu) - driver not loaded, or (5) access denied", GetLastError());
+    const DWORD code = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x904, METHOD_BUFFERED, FILE_WRITE_ACCESS);
+    const T2NcmIoctlResult r = T2NcmControlIoctl(L"PushTunnelLocalToDriver", code,
+                                                 (LPVOID)&local, (DWORD)sizeof(local));
+    if (r.openFailed) {
         return false;
     }
-    DWORD returned = 0;
-    const DWORD code = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x904, METHOD_BUFFERED, FILE_WRITE_ACCESS);
-    BOOL ok = DeviceIoControl(h, code, (LPVOID)&local, (DWORD)sizeof(local),
-                              nullptr, 0, &returned, nullptr);
-    if (!ok) {
+    if (!r.ok) {
         // An older T2Ncm.sys without this IOCTL fails here (ERROR_INVALID_FUNCTION):
         // harmless, the driver keeps learning passively as before.
-        T2_LOG("tunnel", L"PushTunnelLocalToDriver: IOCTL failed, GetLastError=%lu", GetLastError());
-    } else {
-        RememberLastPushedLocal(local);
-        T2_LOG("tunnel", L"PushTunnelLocalToDriver: local fe80 ...%02x%02x:%02x%02x armed in driver",
-               local.s6_addr[12], local.s6_addr[13], local.s6_addr[14], local.s6_addr[15]);
+        T2_LOG("tunnel", L"PushTunnelLocalToDriver: IOCTL failed, GetLastError=%lu", r.err);
+        return false;
     }
-    CloseHandle(h);
-    return ok != FALSE;
+    RememberLastPushedLocal(local);
+    T2_LOG("tunnel", L"PushTunnelLocalToDriver: local fe80 ...%02x%02x:%02x%02x armed in driver",
+           local.s6_addr[12], local.s6_addr[13], local.s6_addr[14], local.s6_addr[15]);
+    return true;
 }
 
 // Push the TransportMode registry value into the driver LIVE, via
@@ -743,15 +835,6 @@ inline bool PushTransportModeToDriver(TransportMode mode, bool force = false) {
         // Already live in driver from our point of view — skip IOCTL storm.
         return true;
     }
-    HANDLE h = CreateFileW(L"\\\\.\\T2Ncm", FILE_WRITE_DATA, // see PushTunnelPeerToDriver
-                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) {
-        T2_LOG("tunnel", L"PushTransportModeToDriver: could not open \\\\.\\T2Ncm "
-               L"(GetLastError=%lu) - driver not loaded, or (5) access denied", GetLastError());
-        return false;
-    }
-    DWORD returned = 0;
     DWORD modeValue = static_cast<DWORD>(mode);
     // Same CTL_CODE as T2NCM/driver/Public.h's IOCTL_T2NCM_SET_TRANSPORT_MODE
     // (0x903) - hand-rolled rather than including Public.h, matching how
@@ -759,17 +842,29 @@ inline bool PushTransportModeToDriver(TransportMode mode, bool force = false) {
     // (0x902) in this file to avoid the winioctl.h double-inclusion hazard
     // documented at the top of this file.
     const DWORD code = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x903, METHOD_BUFFERED, FILE_WRITE_ACCESS);
-    BOOL ok = DeviceIoControl(h, code, &modeValue, (DWORD)sizeof(modeValue),
-                              nullptr, 0, &returned, nullptr);
-    if (!ok) {
-        T2_LOG("tunnel", L"PushTransportModeToDriver: IOCTL failed, GetLastError=%lu", GetLastError());
-    } else {
-        LastPushedModeFlag().store(want, std::memory_order_relaxed);
-        ClearLastPushedLocal(); // mode flipped: re-arm the local address on the next PrepareTunnelPeer
-        T2_LOG("tunnel", L"PushTransportModeToDriver: live TunnelModeEnabled -> %d", want);
+    const T2NcmIoctlResult r = T2NcmControlIoctl(L"PushTransportModeToDriver", code,
+                                                 &modeValue, (DWORD)sizeof(modeValue));
+    if (!r.ok) {
+        if (!r.openFailed) {
+            T2_LOG("tunnel", L"PushTransportModeToDriver: IOCTL failed, GetLastError=%lu", r.err);
+        }
+        // We no longer know what the driver holds. The re-arm decision below keys
+        // off this hint, so a stale value would wrongly dedupe a later push.
+        LastPushedModeFlag().store(-1, std::memory_order_relaxed);
+        return false;
     }
-    CloseHandle(h);
-    return ok != FALSE;
+    // Re-arm the local address only when the mode we believe the driver holds has
+    // actually changed (or is unknown, -1). A forced push that re-sends the SAME
+    // mode (TransportPhase Enter/Restore do this on every phase, by design) used to
+    // clear the cache every time and made the next PrepareTunnelPeer re-send an
+    // unchanged local address: the "mode, local, mode" burst between ClearContext
+    // and AcceptSampleData.
+    const int prev = LastPushedModeFlag().exchange(want, std::memory_order_relaxed);
+    if (prev != want) {
+        ClearLastPushedLocal();
+    }
+    T2_LOG("tunnel", L"PushTransportModeToDriver: live TunnelModeEnabled -> %d", want);
+    return true;
 }
 
 // Result of PrepareTunnelPeer. NoMac / NoPeer are LocalError evidence
@@ -783,6 +878,8 @@ inline TunnelPrep PrepareTunnelPeer(unsigned long ifIndex, const in6_addr& peer6
         T2_LOG("tunnel", L"PrepareTunnelPeer: skipped (system suspending / Dx)");
         return TunnelPrep::Suspended;
     }
+    // One control handle for the mode + peer + local pushes below (see T2NcmControlLease).
+    T2NcmControlLease controlLease;
     if (IN6_IS_ADDR_UNSPECIFIED(&peer6)) {
         T2_LOG("tunnel", L"PrepareTunnelPeer: no peer address (LocalError, not a tunnel failure)");
         return TunnelPrep::NoPeer;
@@ -957,6 +1054,10 @@ private:
 // the mode is restored while the mutex is still held.
 struct TransportPhase {
     explicit TransportPhase(HANDLE cancelEvent = nullptr) : lock(cancelEvent) {}
+    // Declared FIRST so it is destroyed LAST: the Enter()/Restore() pushes (and every
+    // push made by the phase body) share one control handle, and Restore() still has it
+    // while the mutex is held. Opened lazily by the first IOCTL, closed when the phase ends.
+    T2NcmControlLease controlLease;
     TransportLock lock;
     ModeScope mode;
 };
