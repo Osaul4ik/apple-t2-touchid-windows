@@ -820,11 +820,11 @@ inline bool PushTunnelLocalToDriver(unsigned long ifIndex) {
 // Ipv4Tunnel), keeps the running driver a live mirror of the registry
 // instead of a snapshot from whenever it last (re)initialized.
 //
-// v2 (section 2, principle 7): the driver mode is the source of truth, and the
-// process-local LastPushedModeFlag is only a hint (another process - GUI, CLI -
-// may have flipped the mode). `force` sends the IOCTL regardless of the hint;
-// TransportPhase forces at the start of every attempt/phase and on every exit.
-// Hot paths (per-connect, per-scan) keep the cheap deduped form.
+// The driver mode is the source of truth; LastPushedModeFlag is this process's exact
+// record of what it last wrote (and is the only writer, see ModeScope), reset to -1
+// whenever that can no longer be trusted. Without `force` the IOCTL is skipped when the
+// record already equals the wanted mode. `force` still sends regardless, for a caller that
+// has a reason to distrust the record; nothing in-tree needs it any more.
 inline bool PushTransportModeToDriver(TransportMode mode, bool force = false) {
     if (IsTransportIoSuspended()) {
         T2_LOG("tunnel", L"PushTransportModeToDriver: skipped (system suspending / Dx)");
@@ -853,12 +853,9 @@ inline bool PushTransportModeToDriver(TransportMode mode, bool force = false) {
         LastPushedModeFlag().store(-1, std::memory_order_relaxed);
         return false;
     }
-    // Re-arm the local address only when the mode we believe the driver holds has
-    // actually changed (or is unknown, -1). A forced push that re-sends the SAME
-    // mode (TransportPhase Enter/Restore do this on every phase, by design) used to
-    // clear the cache every time and made the next PrepareTunnelPeer re-send an
-    // unchanged local address: the "mode, local, mode" burst between ClearContext
-    // and AcceptSampleData.
+    // Re-arm the local address only when the mode the driver holds has actually changed
+    // (or was unknown, -1). A repeated write of the same mode (only a caller passing
+    // force=true can still cause one) must not discard a local address that is still valid.
     const int prev = LastPushedModeFlag().exchange(want, std::memory_order_relaxed);
     if (prev != want) {
         ClearLastPushedLocal();
@@ -1022,12 +1019,24 @@ private:
     bool owned_ = false;
 };
 
-// RAII driver-mode scope. Enter() forces the mode into the driver and makes it
+// RAII driver-mode scope. Enter() puts the attempt's mode into the driver and makes it
 // the attempt-scoped override (so PortScan/RemoteXPC/Connection, which read
 // IsTunnelModeActive(), follow it). Restore() - also run by the destructor on
 // EVERY exit path (success, failure, cancel, exception) - drops the override and
-// forces the driver back to the COMMITTED mode:
+// puts the COMMITTED mode back:
 //     driver mode == committed mode when a phase ends          (invariant 8)
+//
+// Both ends push only when the driver does NOT already hold that mode, judged by
+// LastPushedModeFlag. That is exact, not a guess: this process is the only writer of
+// the driver's mode (nothing else sends IOCTL_T2NCM_SET_TRANSPORT_MODE; the CLI only
+// reads status), and the hint is reset to "unknown" on every event that can change what
+// the driver holds - IOCTL failure, resume from Dx (Queue.cpp), InvalidateTunnelPrepCache
+// after a failed connect. An unknown hint always writes.
+// These calls used to be force=true, a leftover from when a GUI checkbox also wrote the
+// mode. Blind forcing re-sent the value the driver already had: once on Enter and again
+// on Restore of every phase, and between the native and the tunnel step of one connect
+// a Restore(native) immediately followed by Enter(tunnel) - a mode flip the driver saw
+// for microseconds and never needed.
 class ModeScope {
 public:
     ModeScope() = default;
@@ -1037,14 +1046,14 @@ public:
     void Enter(TransportMode m) {
         entered_ = true;
         TransportOverride().store(m == TransportMode::Ipv4Tunnel ? 1 : 0, std::memory_order_relaxed);
-        PushTransportModeToDriver(m, /*force=*/true);
+        PushTransportModeToDriver(m);
     }
     void Restore() {
         if (!entered_) return;
         entered_ = false;
         TransportOverride().store(-1, std::memory_order_relaxed);
         PushTransportModeToDriver(IsTunnelModeActive() ? TransportMode::Ipv4Tunnel
-                                                       : TransportMode::NativeIpv6, /*force=*/true);
+                                                       : TransportMode::NativeIpv6);
     }
 private:
     bool entered_ = false;
