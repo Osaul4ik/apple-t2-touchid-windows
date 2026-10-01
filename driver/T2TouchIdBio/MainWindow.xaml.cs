@@ -277,17 +277,17 @@ namespace T2TouchId.SepVaultGui
                 return;
             }
 
+            // A PortCache entry is only ever written after a live BridgeXPC HELO succeeded
+            // (SaveCachedPort), so an existing entry is a good port: green.
             bool verified = _verifiedBridgePort != 0 && entries.Any(en => en.Port == _verifiedBridgePort);
-            SetBridgeDot(verified ? DotOk : DotWarn);
+            SetBridgeDot(DotOk);
             BridgeStatusTitle.Text = entries.Count == 1
                 ? $"Cached port: {entries[0].Port}"
                 : $"{entries.Count} cached adapters";
             BridgeStatusSubtitle.Text =
                 string.Join("\n", entries.Select(en =>
                     $"{en.Mac}  →  BridgeXPC {en.Port}" + (en.RsdPort != 0 ? $", RemoteXPC {en.RsdPort}" : "")))
-                + (verified
-                    ? "\nVerified in this session (BridgeXPC HELO OK)."
-                    : "\nNot verified yet. Press Rescan to check it against the T2.");
+                + (verified ? "\nRe-checked just now (BridgeXPC HELO OK)." : "");
         }
 
         private static string? FindCli()
