@@ -460,6 +460,16 @@ StepResult NativeStep(const NcmEndpoint& ep, Connection* conn, void* cancelEvent
 
     // C: scan on native when the path answered, when there was nothing cheap to
     // probe (the scan itself is then the evidence), or when tunnel fallback is off.
+    //
+    // IMPORTANT: a PortCache hit from the registry (survives reboot) must NOT
+    // permanently suppress scanning when the path is silent. Under VPN/WFP the
+    // cached-port HELO and the 3 probes all come back Silent; skipping the scan
+    // here used to leave the step with no Positive evidence and, combined with
+    // "tunnel only HELO when not sticky", meant a post-reboot+VPN boot never
+    // scanned at all. When autoSwitch is on and nothing answered, we still skip
+    // the *native* full scan (IPv6 is dead; budget is better spent on the tunnel)
+    // but the caller must then allow a tunnel scan - see recoveryPingFailed /
+    // ipv6PathDead in ConnectToBiometricKitBridge.
     const bool noCheapProbe = !ct.hadCache && !tp::IsRstProof();
     if (answered || noCheapProbe || !autoSwitch) {
         // Without a cached port there is no tunnel fallback (see ConnectToBiometricKitBridge),
@@ -673,20 +683,37 @@ bool ConnectToBiometricKitBridge(const NcmEndpoint& endpoint, t2::bridgexpc::Con
     }
 
     bool tunnelTried = false;
-    // Tunnel policy:
-    //  * sticky / V6Unavailable  → full tunnel (scan allowed);
-    //  * recovery ping failed once → switch to IPv4 (scan allowed; sticky on success);
-    //  * otherwise only a cheap HELO when a port is already cached.
+    // Tunnel policy after reboot + VPN:
+    //  * sticky / V6Unavailable → full tunnel scan;
+    //  * recovery ping failed OR native path dead after we tried it → full tunnel
+    //    scan (IPv4). The registry PortCache (IPv6) survives reboot and used to
+    //    make both sides do "cheap HELO only", so a cold boot with VPN never
+    //    scanned. Driver-memory sticky is already 0 after reboot; the scan must
+    //    still run on the transport we fall over to.
+    //  * otherwise only a cheap HELO when a port is already cached (rare path).
     bool haveCachedPort = false;
     {
         uint16_t cp = 0;
         haveCachedPort = LoadCachedPort(ep, &cp, nullptr, nullptr, /*tunnel=*/true); // tunnel entry, else native one
     }
+    // Native was tried and produced no path evidence → IPv6 is unusable right now
+    // (VPN/WFP or T2 not ready). Always allow a tunnel *scan*, not just HELO.
+    // recoveryPingFailed covers the explicit "one ping attempt failed" rule;
+    // nativeTried && !nativeAlive covers the post-reboot registry-cache trap.
+    const bool ipv6PathDead = nativeTried && !nativeAlive;
     const bool tunnelScanAllowed = tp::IsAutoTunnelCommitted() || tp::IsV6Unavailable() ||
-                                   recoveryPingFailed;
+                                   recoveryPingFailed || ipv6PathDead;
     if (!result.ok && !Cancelled(cancelEvent) &&
         (autoSwitch && !nativeAlive && (haveCachedPort || tunnelScanAllowed))) {
         tunnelTried = true;
+        T2_LOG("discovery", L"tunnel step: scanAllowed=%d (sticky=%d v6unavail=%d recoveryFail=%d "
+               L"ipv6Dead=%d haveCache=%d)",
+               tunnelScanAllowed ? 1 : 0,
+               tp::IsAutoTunnelCommitted() ? 1 : 0,
+               tp::IsV6Unavailable() ? 1 : 0,
+               recoveryPingFailed ? 1 : 0,
+               ipv6PathDead ? 1 : 0,
+               haveCachedPort ? 1 : 0);
         result = TunnelStep(&ep, outConn, cancelEvent, tunnelScanAllowed);
         sawSilent = sawSilent || result.sawSilent;
     }
