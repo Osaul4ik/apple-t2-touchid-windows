@@ -22,13 +22,16 @@
 // Missing value, or a value with no/invalid port ⇒ Load returns
 // false ⇒ caller MUST run a full scan (never hang waiting on a dead cache).
 //
-// TWO SEPARATE CACHES (native IPv6 vs IPv4 tunnel). `tunnel=false` is the original,
-// stable entry under ...\Network\PortCache; it is written ONLY by a native IPv6
-// confirmation and never touched by a tunnel session (VPN). `tunnel=true` lives under
-// ...\Network\PortCacheV4 and is written only by tunnel confirmations. Loading with
-// tunnel=true falls back to the native entry when there is no tunnel entry yet (the
-// T2 service port is the same, so it is still the best first guess); the reverse never
-// happens, so a tunnel-found port can never poison the native cache across a reboot.
+// TWO SEPARATE CACHES (native IPv6 vs IPv4 tunnel).
+//
+//   tunnel=false (native IPv6): persisted under HKLM\...\Network\PortCache (registry)
+//     + process-lifetime map. Written ONLY by a native IPv6 confirmation.
+//
+//   tunnel=true  (IPv4 tunnel): process-lifetime map ONLY — never written to the
+//     registry. Cleared on process / driver restart so a tunnel-discovered port
+//     cannot outlive the boot that found it. Loading falls back to the native
+//     entry when there is no in-memory tunnel entry yet (same T2 service port);
+//     the reverse never happens.
 #pragma once
 #include "Adapter.h"
 #include <cstdint>

@@ -82,11 +82,10 @@ std::string Narrow(const wchar_t* w) {
     return s;
 }
 
-// Native IPv6 entry: ...\\Network\\PortCache (unchanged, stable).
-// IPv4-tunnel entry:  ...\\Network\\PortCacheV4 (separate subkey, same MAC value names).
-// Both are subkeys of the Network key, so the LocalService ACL (ContainerInherit) covers both.
-std::wstring PortCacheRegPath(bool tunnel) {
-    return std::wstring(t2::transport::kNetworkRegPath) + (tunnel ? L"\\PortCacheV4" : L"\\PortCache");
+// Native IPv6 only: ...\\Network\\PortCache. IPv4-tunnel cache is memory-only
+// (no registry path) so it clears on process/driver restart.
+std::wstring PortCacheRegPath() {
+    return std::wstring(t2::transport::kNetworkRegPath) + L"\\PortCache";
 }
 
 // In-process map key: same MAC, different suffix per transport.
@@ -123,12 +122,12 @@ bool ParsePortValue(const std::string& raw, uint16_t* outPort, uint16_t* outRsd)
     return true;
 }
 
-// Reads this MAC's value. Missing key/value, wrong type or no read access all
-// come back false (cache miss).
-bool ReadRegValue(const std::string& macKey, bool tunnel, std::string* out) {
+// Reads this MAC's native (IPv6) value. Missing key/value, wrong type or no
+// read access all come back false (cache miss). Tunnel cache never hits here.
+bool ReadRegValue(const std::string& macKey, std::string* out) {
     wchar_t buf[64] = {};
     DWORD cb = sizeof(buf) - sizeof(wchar_t); // keep room for a terminator
-    const std::wstring path = PortCacheRegPath(tunnel);
+    const std::wstring path = PortCacheRegPath();
     const std::wstring name = Widen(macKey);
     if (RegGetValueW(HKEY_LOCAL_MACHINE, path.c_str(), name.c_str(), RRF_RT_REG_SZ,
                      nullptr, buf, &cb) != ERROR_SUCCESS) {
@@ -171,16 +170,18 @@ bool LoadCachedPort(const NcmEndpoint& endpoint, uint16_t* outPort, uint16_t* ou
         }
     }
 
+    // Tunnel (IPv4) cache is memory-only: no registry. Fall back to native entry
+    // as a first guess (same T2 service port; never poisons the native cache).
+    if (tunnel) {
+        return LoadCachedPort(endpoint, outPort, outRsdPort, outSuspect, /*tunnel=*/false);
+    }
+
+    // Native IPv6: registry + warm the process map.
     // No value, or an empty / non-numeric / out-of-range port ⇒ return false ⇒
     // caller runs a full port scan.
     std::string raw;
     uint16_t port = 0, rsd = 0;
-    if (!ReadRegValue(macKey, tunnel, &raw) || !ParsePortValue(raw, &port, &rsd)) {
-        // No tunnel entry yet: use the native one as a first guess (read-only fallback,
-        // never stored under the tunnel key; the native cache is never fed by the tunnel).
-        if (tunnel) {
-            return LoadCachedPort(endpoint, outPort, outRsdPort, outSuspect, /*tunnel=*/false);
-        }
+    if (!ReadRegValue(macKey, &raw) || !ParsePortValue(raw, &port, &rsd)) {
         return false;
     }
     if (outPort) *outPort = port;
@@ -218,8 +219,7 @@ void SaveCachedPort(const NcmEndpoint& endpoint, uint16_t port, uint16_t rsdPort
     const std::string key = MemKey(macKey, tunnel);
 
     {
-        // Always remember it for this process, even if the registry write
-        // below fails (UMDF ACL edge cases).
+        // Always remember it for this process.
         std::lock_guard<std::mutex> lock(g_memMu);
         MemPorts& m = MemCache()[key];
         m.port = port;
@@ -227,10 +227,18 @@ void SaveCachedPort(const NcmEndpoint& endpoint, uint16_t port, uint16_t rsdPort
         m.suspect = false; // a confirmed port is Good
     }
 
+    // IPv4-tunnel cache stays in memory only (clears on process/driver restart).
+    if (tunnel) {
+        T2_LOG("discovery", L"SaveCachedPort: tunnel (IPv4) port %u cached in memory only",
+               static_cast<unsigned>(port));
+        return;
+    }
+
+    // Native IPv6: also persist to the registry so the port survives process restarts.
     std::string value = std::to_string(port);
     if (rsdPort != 0) value += "," + std::to_string(rsdPort);
     const std::wstring wvalue = Widen(value);
-    const std::wstring path = PortCacheRegPath(tunnel);
+    const std::wstring path = PortCacheRegPath();
     const std::wstring name = Widen(macKey);
 
     HKEY hKey = nullptr;

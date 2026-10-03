@@ -72,6 +72,15 @@ GateResult RunReadinessGate(NcmEndpoint* ep, void* cancelEvent, unsigned maxMs =
 // even if distrusted. The ping runs whenever the table AND the persisted peer give
 // nothing, in native and tunnel mode alike. Updates ep->peerLinkLocal/peerSource.
 bool ResolveT2Peer(NcmEndpoint* ep, bool allowPing = true);
+
+// One recovery attempt after a native TCP-level failure: multicast ICMPv6 echo
+// to ff02::1%<ifIndex> (the same prompt used at cold start to make the T2 reveal
+// its unicast fe80), then a short neighbor-table poll.
+// Returns true and updates ep->peerLinkLocal/peerSource when a T2 peer appears
+// in the table; false when the ping did not produce a usable neighbor entry.
+// Used by auto-switch: one failed recovery → fall to IPv4 until reboot.
+bool RecoverPeerViaMulticastPing(NcmEndpoint* ep, unsigned timeoutMs = 300);
+
 bool ParseIpv6(const char* text, in6_addr* out);
 
 // Looks up the real T2 peer via the Windows IPv6 neighbor table

@@ -14,8 +14,17 @@
 //   B. "try v6"             - cached-port HELO + <= 3 bounded probes, NOT a full scan
 //   C. scan on the proven transport - resumable, deadline-bounded, port saved on
 //                             confirmation
-//   D. tunnel attempt       - when v6 produced no Positive evidence
+//   C'. recovery ping       - on native TCP failure: one ff02::1 multicast ping
+//                             (same as cold-start peer reveal). If peer appears →
+//                             retry native once. If that single attempt fails →
+//                             fall to IPv4.
+//   D. tunnel attempt       - when recovery ping failed / sticky / V6Unavailable
+//                             (or a cached port exists for a cheap HELO)
 //   E. both empty           - return false; the ladder alternates and retries
+//
+// Auto-switch policy (default ON):
+//   default = IPv6; one failed recovery ping after native TCP failure → IPv4;
+//   successful tunnel handshake is sticky until reboot (no return to IPv6).
 #include "BridgeDiscovery.h"
 #include "PortCache.h"
 #include "PortScan.h"
@@ -631,18 +640,50 @@ bool ConnectToBiometricKitBridge(const NcmEndpoint& endpoint, t2::bridgexpc::Con
         nativeAlive = result.pathAlive;
         sawSilent = result.sawSilent;
     }
+
+    // Auto-switch recovery: after a native TCP-level failure, one multicast
+    // ICMPv6 ping to ff02::1 (same prompt used at cold start to reveal the
+    // T2's unicast fe80). If the peer appears → retry native once. If that
+    // single recovery attempt fails → fall to IPv4 (sticky until reboot on
+    // successful tunnel handshake).
+    bool recoveryPingFailed = false;
+    if (!result.ok && tryNative && autoSwitch && !nativeAlive &&
+        !tp::IsAutoTunnelCommitted() && !Cancelled(cancelEvent)) {
+        T2_LOG("discovery", L"native TCP failed - recovery ff02::1 ping before considering IPv4");
+        if (RecoverPeerViaMulticastPing(&ep)) {
+            // Peer (re)appeared: give native one more bounded step with the
+            // refreshed address before declaring IPv6 dead.
+            result = NativeStep(ep, outConn, cancelEvent, autoSwitch);
+            nativeAlive = result.pathAlive;
+            sawSilent = sawSilent || result.sawSilent;
+            if (result.ok) {
+                tp::NotePathAlive();
+                if (outServicePort) *outServicePort = result.servicePort;
+                if (outRsdPort) *outRsdPort = result.rsdPort;
+                return true;
+            }
+            // Native still dead after a successful peer reveal → treat as
+            // path-level failure (WFP/VPN dropping IPv6) and fall through to v4.
+            recoveryPingFailed = true;
+            T2_LOG("discovery", L"native still dead after recovery ping - switching to IPv4");
+        } else {
+            recoveryPingFailed = true;
+            T2_LOG("discovery", L"recovery ff02::1 ping unsuccessful - switching to IPv4");
+        }
+    }
+
     bool tunnelTried = false;
-    // Tunnel policy: cold boot has no VPN, so the start is native IPv6 ONLY. The tunnel
-    // is used when native is silent AND a port is already
-    // cached (found earlier over v6): then one HELO over the tunnel is enough, no scan.
-    // A tunnel SCAN happens only when the tunnel is already committed (sticky) or IPv6 is unusable.
+    // Tunnel policy:
+    //  * sticky / V6Unavailable  → full tunnel (scan allowed);
+    //  * recovery ping failed once → switch to IPv4 (scan allowed; sticky on success);
+    //  * otherwise only a cheap HELO when a port is already cached.
     bool haveCachedPort = false;
     {
         uint16_t cp = 0;
         haveCachedPort = LoadCachedPort(ep, &cp, nullptr, nullptr, /*tunnel=*/true); // tunnel entry, else native one
     }
-    // Committed (sticky) tunnel may scan: with an empty cache there is no way back to native.
-    const bool tunnelScanAllowed = tp::IsAutoTunnelCommitted() || tp::IsV6Unavailable();
+    const bool tunnelScanAllowed = tp::IsAutoTunnelCommitted() || tp::IsV6Unavailable() ||
+                                   recoveryPingFailed;
     if (!result.ok && !Cancelled(cancelEvent) &&
         (autoSwitch && !nativeAlive && (haveCachedPort || tunnelScanAllowed))) {
         tunnelTried = true;

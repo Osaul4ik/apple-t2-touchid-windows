@@ -223,6 +223,33 @@ bool ResolveT2Peer(NcmEndpoint* out, bool allowPing) {
     return false;
 }
 
+bool RecoverPeerViaMulticastPing(NcmEndpoint* ep, unsigned timeoutMs) {
+    if (!ep || ep->ifIndex == 0) return false;
+
+    // Same prompt used at cold start: one ICMPv6 echo to ff02::1 so the T2
+    // answers with its unicast fe80 and Windows populates the neighbor table.
+    PromptPeerViaMulticastPing(ep->ifIndex, timeoutMs);
+
+    const int kPollIntervalMs = 10;
+    const int kPollBudgetMs = 250;
+    for (int waited = 0; waited < kPollBudgetMs; waited += kPollIntervalMs) {
+        in6_addr peer{};
+        unsigned char mac[6]{};
+        bool haveMac = false;
+        if (FindNeighborPeer(ep->ifIndex, &peer, mac, &haveMac)) {
+            ep->peerLinkLocal = peer;
+            ep->peerSource = PeerSource::NeighborTable;
+            PersistPeerWithMac(ep->ifIndex, peer, mac, haveMac);
+            T2_LOG("discovery", L"RecoverPeerViaMulticastPing: peer revealed after ff02::1 ping");
+            return true;
+        }
+        Sleep(kPollIntervalMs);
+    }
+    T2_LOG("discovery", L"RecoverPeerViaMulticastPing: no neighbor after ff02::1 ping "
+           L"(timeoutMs=%u) - treating as IPv6 path dead for this attempt", timeoutMs);
+    return false;
+}
+
 bool FindNeighborPeer(unsigned long ifIndex, in6_addr* out,
                        unsigned char outMac[6], bool* outHaveMac) {
     if (outHaveMac) *outHaveMac = false;

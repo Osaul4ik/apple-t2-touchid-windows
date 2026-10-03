@@ -53,16 +53,19 @@ inline constexpr wchar_t kPeerMacValue[] = L"PeerMac";
 // There is no manual override: no GUI/CLI "force IPv4" and no permanent-IPv4 setting.
 //
 //  1. AUTO-SWITCH (persistent setting, default ON): HKLM\...\Network\AutoSwitch
-//     (DWORD, missing == 1). When on, a Native IPv6 connect that fails at the TCP
-//     level (VPN/WFP dropping IPv6) is retried over the IPv4 tunnel. When off, only
-//     Native IPv6 is used.
+//     (DWORD, missing == 1). Policy (owned by BridgeDiscovery):
+//       - default transport = Native IPv6;
+//       - on native TCP-level failure → one recovery multicast ping (ff02::1) to
+//         re-reveal the T2 peer (same prompt used at cold start);
+//       - if that single recovery attempt fails → fall to the IPv4 tunnel;
+//       - when off, only Native IPv6 is used.
 //
 //  2. STICKY TUNNEL (until reboot): set only when a switch to the tunnel SUCCEEDED
-//     (a tunnel handshake worked), never on a mere native failure. It lives in the
-//     VOLATILE Session key (Session\AutoTunnelSticky) plus an in-process flag, so
-//     every process sees it and a reboot clears it. After it is set there is NO way
-//     back to native IPv6 until reboot. The next cold boot starts from Native IPv6
-//     again and switches to the tunnel only if IPv6 does not work.
+//     (a tunnel handshake worked), never on a mere native failure. Stored in an
+//     in-process flag; the driver also keeps TunnelModeEnabled in its own memory
+//     (re-applied after miniport restart) until reboot. No registry. After it is
+//     set there is NO way back to native IPv6 until reboot. The next cold boot
+//     starts from Native IPv6 again and switches to the tunnel only if IPv6 fails.
 //
 // CONNECT ARCHITECTURE v2 (CONNECT_ARCHITECTURE_v2.md) adds, in this file:
 //  * Generation (section 3): scan progress / V6Unavailable are tied to a counter that
@@ -79,9 +82,9 @@ inline constexpr wchar_t kPeerMacValue[] = L"PeerMac";
 // the IPv6 stack. That is why the two paths are tried one after the other.
 inline constexpr wchar_t kSessionRegPath[] = L"SOFTWARE\\T2TouchId\\Network\\Session";
 inline constexpr wchar_t kAutoSwitchValue[] = L"AutoSwitch";                    // under kNetworkRegPath, persistent
-// Set when the AUTOMATIC switch to the IPv4 tunnel succeeded. Lives in the VOLATILE Session key, so
-// it is machine-wide (UMDF host + CLI see the same value) and disappears on reboot. Never touched by
-// a GUI setting, so nothing implies a user-visible "always v4" mode.
+// Legacy name (was volatile Session\AutoTunnelSticky). Sticky state is now
+// in-process + driver memory only; this constant is kept only so old log/docs
+// references stay searchable. Never written to the registry any more.
 inline constexpr wchar_t kAutoTunnelStickyValue[] = L"AutoTunnelSticky";
 
 enum class TransportMode : DWORD {
@@ -138,29 +141,21 @@ inline ULONGLONG BumpGeneration(const wchar_t* why) {
 // Only meaningful while g_autoTunnelGen == CurrentGeneration().
 inline std::atomic<bool> g_autoTunnel{false};
 inline std::atomic<ULONGLONG> g_autoTunnelGen{0};
-// Sticky-until-reboot: once the automatic switch to the IPv4 tunnel happened, it stays. It is NOT tied
-// to the Generation (resume / NCM re-enumeration / peer change do not undo it) and there is no way back
-// to native IPv6 - only a reboot clears it (volatile registry value + in-process flag).
-inline void WriteAutoTunnelSticky(bool on) {
-    HKEY key = nullptr;
-    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, kSessionRegPath, 0, nullptr, REG_OPTION_VOLATILE,
-                        KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS) {
-        T2_LOG("tunnel", L"AutoTunnelSticky: cannot open Session key (in-process flag only)");
-        return;
-    }
-    if (on) {
-        const DWORD v = 1;
-        RegSetValueExW(key, kAutoTunnelStickyValue, 0, REG_DWORD,
-                       reinterpret_cast<const BYTE*>(&v), sizeof(v));
-    } else {
-        RegDeleteValueW(key, kAutoTunnelStickyValue);
-    }
-    RegCloseKey(key);
+// Sticky-until-reboot: once the automatic switch to the IPv4 tunnel happened, it stays.
+// It is NOT tied to the Generation (resume / NCM re-enumeration / peer change do not
+// undo it) and there is no way back to native IPv6 until reboot.
+//
+// Storage: in-process flag only. The driver also keeps TunnelModeEnabled in its
+// own memory (IOCTL_T2NCM_SET_TRANSPORT_MODE) and re-applies it across miniport
+// restarts until reboot, so the mode itself survives. We deliberately do NOT
+// use the volatile Session registry key any more — sticky state lives in
+// process + driver memory and clears on reboot / driver unload.
+inline void WriteAutoTunnelSticky(bool /*on*/) {
+    // No-op: sticky is the in-process g_autoTunnel flag + the mode pushed to
+    // the driver. Kept as a symbol so CommitAutoTunnel call sites stay clean.
 }
 inline bool IsAutoTunnelCommitted() {
-    if (g_autoTunnel.load(std::memory_order_relaxed)) return true;
-    static CachedDword c;
-    return ReadDwordCached(c, kSessionRegPath, kAutoTunnelStickyValue, 0, 200) != 0;
+    return g_autoTunnel.load(std::memory_order_relaxed);
 }
 
 // Attempt-scoped transport override: -1 none, 0 native, 1 tunnel. Set by
@@ -250,14 +245,15 @@ inline void RecordNativeSuccess(ULONGLONG tcpMs) {
     g_autoTunnel.store(false, std::memory_order_relaxed);
     ClearV6Unavailable(); // a native handshake just worked
 }
-// Tunnel handshake completed after native failed: remember it for THIS Generation.
+// Tunnel handshake completed after native failed: sticky until reboot (in-process
+// flag + driver TunnelModeEnabled). Independent of Generation.
 inline void CommitAutoTunnel(bool on) {
     const bool was = g_autoTunnel.exchange(on, std::memory_order_relaxed);
     if (on) {
         g_autoTunnelGen.store(CurrentGeneration(), std::memory_order_relaxed);
-        if (!was) WriteAutoTunnelSticky(true); // once per process; survives host restarts, not reboot
+        if (!was) WriteAutoTunnelSticky(true); // no-op (driver already holds the mode)
     } else {
-        WriteAutoTunnelSticky(false);          // only AutoSwitch turned off in the GUI gets here
+        WriteAutoTunnelSticky(false);
     }
 }
 
