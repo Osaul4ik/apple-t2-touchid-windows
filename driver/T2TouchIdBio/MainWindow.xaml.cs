@@ -130,14 +130,36 @@ namespace T2TouchId.SepVaultGui
 
         // ---- Network transport (automatic only) ----
         // Auto-switch (persistent): HKLM\SOFTWARE\T2TouchId\Network\AutoSwitch, DWORD, missing == ON.
-        // Native IPv6 first; if it does not work the connection switches to the IPv4 tunnel and
-        // stays there until reboot (volatile Session\AutoTunnelSticky, written by the service).
+        // Native IPv6 first; if IPv6 is blocked the connection switches to the IPv4 tunnel and
+        // stays there until reboot. That sticky flag lives in T2Ncm.sys memory (cleared on
+        // reboot) and is read here with IOCTL_T2NCM_GET_TUNNEL_STATE.
         // There is no manual "force IPv4".
-        private const string SessionRegPath = @"SOFTWARE\T2TouchId\Network\Session";
         private const string NetworkRegPath = @"SOFTWARE\T2TouchId\Network";
         private const string AutoSwitchValue = "AutoSwitch";
-        private const string AutoTunnelStickyValue = "AutoTunnelSticky";
         private bool _transportLoading;
+
+        // CTL_CODE(FILE_DEVICE_UNKNOWN, 0x906, METHOD_BUFFERED, FILE_WRITE_ACCESS) - T2NCM/driver/Public.h
+        private const uint IOCTL_T2NCM_GET_TUNNEL_STATE = 0x0022A418;
+        private const uint FILE_WRITE_DATA = 0x0002;
+        private const uint NCM_FILE_SHARE_RW = 0x0003;
+        private const uint NCM_OPEN_EXISTING = 3;
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern IntPtr CreateFileW(
+            string lpFileName, uint dwDesiredAccess, uint dwShareMode, IntPtr lpSecurityAttributes,
+            uint dwCreationDisposition, uint dwFlagsAndAttributes, IntPtr hTemplateFile);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool DeviceIoControl(
+            IntPtr hDevice, uint dwIoControlCode,
+            IntPtr lpInBuffer, uint nInBufferSize,
+            IntPtr lpOutBuffer, uint nOutBufferSize,
+            out uint lpBytesReturned, IntPtr lpOverlapped);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CloseHandle(IntPtr hObject);
 
         private static bool ReadAutoSwitch()
         {
@@ -161,14 +183,26 @@ namespace T2TouchId.SepVaultGui
             catch { return false; }
         }
 
+        // T2NCM_TUNNEL_STATE { UINT32 Version; UINT32 Sticky; UINT32 Mode; } from T2Ncm.sys.
+        // Driver not loaded, access denied or an older driver without the IOCTL: false.
         private static bool ReadTunnelSticky()
         {
+            IntPtr handle = CreateFileW(@"\\.\T2Ncm", FILE_WRITE_DATA, NCM_FILE_SHARE_RW,
+                IntPtr.Zero, NCM_OPEN_EXISTING, 0, IntPtr.Zero);
+            if (handle == new IntPtr(-1)) return false;
+            IntPtr outBuffer = Marshal.AllocHGlobal(12);
             try
             {
-                using var key = Registry.LocalMachine.OpenSubKey(SessionRegPath, false);
-                return key?.GetValue(AutoTunnelStickyValue) is int i && i != 0;
+                bool ok = DeviceIoControl(handle, IOCTL_T2NCM_GET_TUNNEL_STATE,
+                    IntPtr.Zero, 0, outBuffer, 12, out uint returned, IntPtr.Zero);
+                return ok && returned >= 12 && Marshal.ReadInt32(outBuffer, 4) != 0;
             }
             catch { return false; }
+            finally
+            {
+                Marshal.FreeHGlobal(outBuffer);
+                CloseHandle(handle);
+            }
         }
 
         /// <summary>Set the persistent auto-switch flag from the command line.</summary>

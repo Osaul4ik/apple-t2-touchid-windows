@@ -38,23 +38,23 @@ namespace t2::discovery {
 // cancelEvent (optional Win32 event HANDLE typed void*) interrupts the gate wait.
 bool PickDefaultT2Endpoint(NcmEndpoint* outEndpoint, void* cancelEvent = nullptr);
 
-// One bounded STEP of "find the BiometricKit BridgeXPC port and connect"
-// (CONNECT_ARCHITECTURE_v2.md sections 5-13). The caller (Queue.cpp) repeats it
-// on a backoff ladder for up to 30 s; what survives between steps and between
-// cancelled CAPTURE_DATAs is in-process state keyed by the transport Generation
-// (committed tunnel, scan progress) plus the registry port cache.
+// One STEP of "find the BiometricKit BridgeXPC port and connect". The caller
+// (Queue.cpp) repeats it on a backoff ladder until it connects, Windows cancels,
+// or this function reports *outScansExhausted. What survives between steps: the
+// port (registry only, the same port for both transports), the sticky tunnel
+// (T2Ncm.sys memory, cleared on reboot) and the scan resume cursor.
 //
 //   A. readiness gate   - adapter, non-Tentative link-local, peer; no conclusions.
-//   B. "try v6"         - cached-port HELO on native, then <= 3 bounded probes.
-//                         NOT a full scan. Only Positive evidence proves a path.
-//   C. scan             - resumable, deadline-bounded, on the proven transport;
-//                         the port is saved the moment it is confirmed, before the
-//                         final connect and regardless of cancel.
-//   D. tunnel attempt   - only when v6 produced no Positive evidence (auto-switch
-//                         on). Nothing is committed until a
-//                         tunnel handshake succeeded.
-//   E. both empty       - returns false; nothing committed, cache and scan progress
-//                         kept, the next step alternates/continues.
+//   B. native IPv6      - HELO on the registry port; no cache / no HELO => an
+//                         immediate full-chain rescan (59000-60000, 49000-49999,
+//                         rest of 49000-65535; 256 wide, 25 ms). The port is saved
+//                         the moment it is confirmed, before the final connect and
+//                         regardless of cancel.
+//   C. IPv4 tunnel      - only when IPv6 is blocked (WSAEACCES, or no SYN-ACK and
+//                         no RST at all) or the tunnel is already sticky: HELO on the
+//                         same registry port, else a full-chain tunnel scan. A
+//                         tunnel handshake commits the sticky tunnel until reboot.
+//   D. nothing          - returns false.
 //
 // Every driver-mode flip happens inside a TransportPhase (cross-process mutex +
 // RAII scope), so on return the driver mode equals the committed mode on every path.
@@ -71,10 +71,17 @@ bool PickDefaultT2Endpoint(NcmEndpoint* outEndpoint, void* cancelEvent = nullptr
 // ScanOptions::cancelEvent): when signaled, the current probe/scan slice ends and no
 // further one starts, so a cancelled CAPTURE_DATA does not keep the USB bulk pipe
 // busy. Cancel neither removes the saved port nor rolls back committed state.
+//
+// outScansExhausted (optional): set to true on failure ONLY when a full-chain
+// scan pass COMPLETED without finding BiometricKit on the transport that decides
+// (the tunnel when IPv6 was blocked or the tunnel is sticky, otherwise native
+// IPv6). Everything else - cancel, a silent path, a cool-down, no peer/MAC yet -
+// leaves it false: "not yet", and the caller keeps retrying.
 bool ConnectToBiometricKitBridge(const NcmEndpoint& endpoint,
                                   t2::bridgexpc::Connection* outConn,
                                   uint16_t* outServicePort = nullptr,
                                   uint16_t* outRsdPort = nullptr,
-                                  void* cancelEvent = nullptr);
+                                  void* cancelEvent = nullptr,
+                                  bool* outScansExhausted = nullptr);
 
 } // namespace t2::discovery

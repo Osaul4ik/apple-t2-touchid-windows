@@ -458,8 +458,7 @@ static bool TryCachedBridgePort(const t2::discovery::NcmEndpoint& ep,
     using namespace t2::bridgexpc;
 
     uint16_t svcPort = 0, rsdPort = 0;
-    const bool tunnelCache = t2::transport::IsTunnelModeActive();
-    if (!LoadCachedPort(ep, &svcPort, &rsdPort, nullptr, tunnelCache)) return false;
+    if (!LoadCachedPort(ep, &svcPort, &rsdPort)) return false; // same port on both transports
 
     // A: direct.
     ConnectResult crA = conn->Connect(ep.peerLinkLocal, ep.ifIndex, svcPort,
@@ -475,7 +474,7 @@ static bool TryCachedBridgePort(const t2::discovery::NcmEndpoint& ep,
         if (ProbeServiceOnPort(ep, rsdPort, kBiometricKitService, kRemoteXpcCheckTimeout, &advertised)) {
             ConnectResult crB = conn->Connect(ep.peerLinkLocal, ep.ifIndex, advertised, kRemoteXpcCheckTimeout);
             if (crB == ConnectResult::Ok) {
-                if (advertised != svcPort) SaveCachedPort(ep, advertised, rsdPort, tunnelCache);
+                if (advertised != svcPort) SaveCachedPort(ep, advertised, rsdPort);
                 *outPort = advertised;
                 return true;
             }
@@ -694,25 +693,20 @@ static int CmdNetwork(int argc, wchar_t* argv[]) {
         }
     }
 
-    // See BridgeDiscovery.cpp's ConnectToBiometricKitBridge / this file's
-    // DiscoverBiometricKitBridge for why tunnel mode needs a narrower,
-    // slower scan than native: every candidate connect is serialized
-    // through T2Ncm.sys's IPv4<->IPv6 rewrite and the single USB bulk
-    // pipe pair, so native's already-tight 25ms/64-wide tuning ("10ms was
-    // flaky under concurrent scan load") is even less realistic there.
-    const bool tunnelActive = t2::transport::IsTunnelModeActive();
+    // Same scan parameters as the driver (BridgeDiscovery.cpp) on both
+    // transports: 256 wide, 25 ms per connect, 49000-65535.
     ScanOptions opt;
-    opt.concurrency = tunnelActive ? 16 : 64;
-    opt.connectTimeoutMs = tunnelActive ? 150 : 25;  // 10ms was flaky under concurrent scan load
+    opt.concurrency = 256;
+    opt.connectTimeoutMs = 25;
     opt.includeTcpOnly = true;
-    // priorityBands default: 59xxx → 49xxx → rest (see PortScan.h).
+    // priorityBands default: 59000-60000 → 49xxx → rest (see PortScan.h).
     opt.onProgress = [](unsigned tried, unsigned total, unsigned tcp, unsigned http2) {
         std::wcout << L"  scanned " << tried << L"/" << total
                    << L"  tcp=" << tcp << L"  http2=" << http2 << L"\r" << std::flush;
     };
 
     std::wcout << L"scanning PEER ports " << opt.portBegin << L"-" << opt.portEnd
-               << L" (order: 59xxx, 49xxx, rest; concurrency " << opt.concurrency
+               << L" (order: 59000-60000, 49xxx, rest; concurrency " << opt.concurrency
                << L", timeout " << opt.connectTimeoutMs << L"ms)...\n";
     ScanProbeResult scan = ScanAndProbe(ep, opt);
     std::wcout << L"\n";
@@ -797,7 +791,7 @@ static int CmdNetwork(int argc, wchar_t* argv[]) {
     std::wcout << L"BridgeXPC verified: HELO OK, bridge version=" << bridgeVersion << L"\n";
     // Only cache after a live BridgeXPC connect actually succeeds — never
     // cache a port on RemoteXPC verification alone.
-    SaveCachedPort(ep, foundPort, foundRsdPort, t2::transport::IsTunnelModeActive());
+    SaveCachedPort(ep, foundPort, foundRsdPort);
     return 0;
 }
 
@@ -892,25 +886,17 @@ static bool DiscoverBiometricKitBridge(int argc, wchar_t* argv[], int firstArgIn
     uint16_t foundPort = 0;
     uint16_t foundRsdPort = 0;
     unsigned lastHttp2Count = 0;
-    // See BridgeDiscovery.cpp's ConnectToBiometricKitBridge for why tunnel
-    // mode needs its own, much less aggressive numbers here: Native's
-    // 256-wide/20ms-60ms scan floods the single USB bulk-OUT pipe with
-    // more in-flight SYNs than a tunnel-mode round trip (userspace ->
-    // T2Ncm.sys TX rewrite -> USB -> T2 -> USB -> T2Ncm.sys RX rewrite ->
-    // userspace) can answer in time, so nothing is ever found.
-    const bool tunnelActive = t2::transport::IsTunnelModeActive();
-    const unsigned timeoutsMsNative[] = {20, 60};
-    const unsigned timeoutsMsTunnel[] = {150, 400};
-    const unsigned* timeoutsMs = tunnelActive ? timeoutsMsTunnel : timeoutsMsNative;
-    const unsigned kAttempts = tunnelActive
-        ? static_cast<unsigned>(sizeof(timeoutsMsTunnel) / sizeof(timeoutsMsTunnel[0]))
-        : static_cast<unsigned>(sizeof(timeoutsMsNative) / sizeof(timeoutsMsNative[0]));
+    // Same scan parameters as the driver (BridgeDiscovery.cpp) on both
+    // transports: 256 wide, 25 ms per connect, full chain 49000-65535. The
+    // second attempt is a plain re-pass (BiometricKit may come up meanwhile).
+    const unsigned timeoutsMs[] = {25, 25};
+    const unsigned kAttempts = static_cast<unsigned>(sizeof(timeoutsMs) / sizeof(timeoutsMs[0]));
     for (unsigned attempt = 0; attempt < kAttempts; ++attempt) {
         ScanOptions opt;
-        opt.concurrency = tunnelActive ? 16 : 256;
+        opt.concurrency = 256;
         opt.includeTcpOnly = true;
         opt.connectTimeoutMs = timeoutsMs[attempt];
-        // priorityBands default: 59xxx → 49xxx → rest (see PortScan.h).
+        // priorityBands default: 59000-60000 → 49xxx → rest (see PortScan.h).
 
         ScanProbeResult scan = ScanAndProbe(ep, opt);
         if (scan.servicePort != 0) {
@@ -956,7 +942,7 @@ static bool DiscoverBiometricKitBridge(int argc, wchar_t* argv[], int firstArgIn
     // cache a port on RemoteXPC verification alone, since that's exactly
     // the "verified but BridgeXPC HELO failed" case the cache-hit path
     // above already knows how to recover from.
-    SaveCachedPort(ep, foundPort, foundRsdPort, t2::transport::IsTunnelModeActive());
+    SaveCachedPort(ep, foundPort, foundRsdPort);
     return true;
 }
 

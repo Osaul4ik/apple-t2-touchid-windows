@@ -24,6 +24,8 @@ namespace {
 struct ProbeResult {
     bool connected = false;
     bool http2 = false;
+    bool refused = false;  // RST: the peer answered, nothing listens there
+    bool blocked = false;  // WSAEACCES: a local WFP filter refused the connect
     // First bytes received after connect (for diagnostics when SETTINGS missing).
     unsigned char head[21]{};
     int headLen = 0;
@@ -83,6 +85,8 @@ ProbeResult ProbePort(const NcmEndpoint& ep, uint16_t port,
     if (cr != 0) {
         int err = WSAGetLastError();
         if (err != WSAEWOULDBLOCK && err != WSAEINPROGRESS) {
+            r.refused = (err == WSAECONNREFUSED);
+            r.blocked = (err == WSAEACCES);
             closesocket(s);
             return r;
         }
@@ -95,14 +99,16 @@ ProbeResult ProbePort(const NcmEndpoint& ep, uint16_t port,
         tv.tv_sec = static_cast<long>(connectTimeoutMs / 1000);
         tv.tv_usec = static_cast<long>((connectTimeoutMs % 1000) * 1000);
         int sel = select(0, nullptr, &wset, &eset, &tv);
-        if (sel <= 0 || FD_ISSET(s, &eset)) {
-            closesocket(s);
+        if (sel <= 0) {
+            closesocket(s); // nothing came back within connectTimeoutMs
             return r;
         }
         int soerr = 0;
         int solen = sizeof(soerr);
         getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&soerr), &solen);
-        if (soerr != 0) {
+        if (FD_ISSET(s, &eset) || soerr != 0) {
+            r.refused = (soerr == WSAECONNREFUSED);
+            r.blocked = (soerr == WSAEACCES);
             closesocket(s);
             return r;
         }
@@ -151,8 +157,8 @@ ProbeResult ProbePort(const NcmEndpoint& ep, uint16_t port,
 // Build the probe order for [begin, end].
 //
 // priorityBands (default): hardware order from real T2 sessions —
-//   1) 59xxx  — RemoteXPC often lands here (e.g. 59602)
-//   2) 49xxx  — BridgeXPC + dense HTTP/2 cluster (e.g. 49341)
+//   1) 59000-60000 — RemoteXPC often lands here (e.g. 59602)
+//   2) 49000-49999 — BridgeXPC + dense HTTP/2 cluster (e.g. 49341)
 //   3) rest of the range, ascending
 // Each band is clipped to [begin, end]; ports already covered by an
 // earlier band are not repeated.
@@ -191,7 +197,7 @@ std::vector<uint16_t> BuildPortOrder(uint16_t begin, uint16_t end,
         }
     };
 
-    appendBand(59000, 59999); // 59xxx first — typical RemoteXPC
+    appendBand(59000, 60000); // 59xxx first — typical RemoteXPC
     appendBand(49000, 49999); // 49xxx next  — BridgeXPC / decoy cluster
     // Remainder ascending.
     for (unsigned i = 0; i < total; ++i) {
@@ -207,7 +213,7 @@ unsigned PriorityBandCount(uint16_t begin, uint16_t end) {
         const unsigned h = hi < end ? hi : end;
         return h >= l ? (h - l + 1) : 0;
     };
-    return overlap(59000, 59999) + overlap(49000, 49999);
+    return overlap(59000, 60000) + overlap(49000, 49999);
 }
 
 std::vector<PortCandidate> ScanHttp2Preface(const NcmEndpoint& endpoint,
@@ -261,6 +267,9 @@ std::vector<PortCandidate> ScanHttp2Preface(const NcmEndpoint& endpoint,
     std::atomic<unsigned> tried{0};
     std::atomic<unsigned> tcpHits{0};
     std::atomic<unsigned> http2Hits{0};
+    std::atomic<unsigned> refused{0};
+    std::atomic<unsigned> blocked{0};
+    std::atomic<bool> silentAbort{false};
     std::mutex hitsMu;
 
     unsigned workers = options.concurrency;
@@ -302,11 +311,14 @@ std::vector<PortCandidate> ScanHttp2Preface(const NcmEndpoint& endpoint,
             if (options.deadlineTick != 0 && GetTickCount64() >= options.deadlineTick) {
                 break;
             }
+            if (silentAbort.load(std::memory_order_relaxed)) break;
             unsigned i = next.fetch_add(1);
             if (i >= limitIdx) break;
             const uint16_t port = portOrder[i];
             ProbeResult pr =
                 ProbePort(endpoint, port, options.connectTimeoutMs, recvMs);
+            if (pr.refused) refused.fetch_add(1, std::memory_order_relaxed);
+            if (pr.blocked) blocked.fetch_add(1, std::memory_order_relaxed);
             if (pr.connected) {
                 tcpHits.fetch_add(1);
                 if (pr.http2) http2Hits.fetch_add(1);
@@ -327,6 +339,11 @@ std::vector<PortCandidate> ScanHttp2Preface(const NcmEndpoint& endpoint,
                 }
             }
             unsigned t = tried.fetch_add(1) + 1;
+            if (options.silentAbortAfter != 0 && t >= options.silentAbortAfter &&
+                tcpHits.load(std::memory_order_relaxed) == 0 &&
+                refused.load(std::memory_order_relaxed) == 0) {
+                silentAbort.store(true, std::memory_order_relaxed);
+            }
             if (options.onProgress && (t % 512 == 0 || t == total)) {
                 options.onProgress(t, total, tcpHits.load(), http2Hits.load());
             }
@@ -341,10 +358,13 @@ std::vector<PortCandidate> ScanHttp2Preface(const NcmEndpoint& endpoint,
     if (options.stats) {
         const unsigned claimed = next.load();
         options.stats->claimedEnd = claimed < limitIdx ? claimed : limitIdx;
-        options.stats->exhausted = claimed >= limitIdx;
+        options.stats->exhausted = claimed >= limitIdx && !silentAbort.load();
         options.stats->tried = tried.load();
         options.stats->tcpHits = tcpHits.load();
         options.stats->http2Hits = http2Hits.load();
+        options.stats->refused = refused.load();
+        options.stats->blocked = blocked.load();
+        options.stats->silentAborted = silentAbort.load();
     }
     std::sort(hits.begin(), hits.end(),
               [](const PortCandidate& a, const PortCandidate& b) {

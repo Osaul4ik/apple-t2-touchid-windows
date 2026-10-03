@@ -1198,8 +1198,13 @@ DWORD LoadPostResumeSettleMs()
 }
 
 // Sticky adapter selection: g_stickyNcm (declared near RecentMatchCache).
-bool ConnectForCapture(t2::bridgexpc::Connection* outConn, HANDLE cancelEvent = nullptr)
+// *outScansExhausted: discovery completed a full-chain scan without finding
+// BiometricKit (see ConnectToBiometricKitBridge) - the only "T2 unreachable"
+// verdict that may end a pending CAPTURE_DATA.
+bool ConnectForCapture(t2::bridgexpc::Connection* outConn, HANDLE cancelEvent,
+                       bool* outScansExhausted)
 {
+    *outScansExhausted = false;
     const ULONGLONG t0 = GetTickCount64();
 
     // After REAL Sx resume only (not WTS_SESSION_LOCK — that also bumps
@@ -1262,15 +1267,26 @@ bool ConnectForCapture(t2::bridgexpc::Connection* outConn, HANDLE cancelEvent = 
         }
     }
     if (haveSticky) {
-        if (t2::discovery::ConnectToBiometricKitBridge(stickyEp, outConn, nullptr, nullptr, cancelEvent)) {
+        bool exhausted = false;
+        if (t2::discovery::ConnectToBiometricKitBridge(stickyEp, outConn, nullptr, nullptr, cancelEvent,
+                                                       &exhausted)) {
             T2BioLog("CAPTURE_DATA: connected via sticky NCM endpoint "
                      "(discovery+connect %llu ms)",
                      static_cast<unsigned long long>(GetTickCount64() - t0));
             return true;
         }
+        {
+            std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
+            g_stickyNcm.valid = false;
+        }
+        if (exhausted) {
+            // A full-chain scan on this adapter just came back empty; scanning it
+            // again through a fresh lookup would only hit the empty-pass cool-down.
+            T2BioLog("CAPTURE_DATA: sticky NCM endpoint - full scan found no BiometricKit");
+            *outScansExhausted = true;
+            return false;
+        }
         T2BioLog("CAPTURE_DATA: sticky NCM endpoint failed - rediscovering");
-        std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
-        g_stickyNcm.valid = false;
     }
 
     t2::discovery::NcmEndpoint ep;
@@ -1279,11 +1295,13 @@ bool ConnectForCapture(t2::bridgexpc::Connection* outConn, HANDLE cancelEvent = 
         return false;
     }
     const ULONGLONG t1 = GetTickCount64();
-    if (!t2::discovery::ConnectToBiometricKitBridge(ep, outConn, nullptr, nullptr, cancelEvent)) {
+    if (!t2::discovery::ConnectToBiometricKitBridge(ep, outConn, nullptr, nullptr, cancelEvent,
+                                                    outScansExhausted)) {
         T2BioLog("CAPTURE_DATA: BiometricKit BridgeXPC discovery/connect failed "
-                 "(endpoint lookup %llu ms, discovery+connect %llu ms)",
+                 "(endpoint lookup %llu ms, discovery+connect %llu ms%s)",
                  static_cast<unsigned long long>(t1 - t0),
-                 static_cast<unsigned long long>(GetTickCount64() - t1));
+                 static_cast<unsigned long long>(GetTickCount64() - t1),
+                 *outScansExhausted ? ", full scan exhausted" : "");
         return false;
     }
     {
@@ -1309,15 +1327,19 @@ bool ConnectForCapture(t2::bridgexpc::Connection* outConn, HANDLE cancelEvent = 
 //
 // A verify CAPTURE_DATA is supposed to stay pending until a touch or Windows'
 // own CancelIoEx (design doc 9.4), so an unreachable T2 is waited out the same
-// way: retry with backoff, cancel-aware, and only give up (-> the old
-// DEVICE_FAILURE) after kConnectRetryWindowMs so a T2 that is genuinely gone
-// (NCM driver failed, no adapter) does not scan forever.
-// P3.12: sticky NCM + PortCache → steady-state connect 0–16 ms on hardware.
-// 120s was pre-cache; 30s still covers cold-boot NCM lag without a long hang
-// when the adapter is truly missing.
-constexpr ULONGLONG kConnectRetryWindowMs = 30000;
+// way: retry with backoff, cancel-aware. There is NO time limit (03.10.2026,
+// owner decision; was a 30 s window): the wait ends only when Windows cancels,
+// or when discovery reports that a full-chain scan COMPLETED without finding
+// BiometricKit (ConnectToBiometricKitBridge's outScansExhausted) - the only
+// "the T2 really has no BiometricKit for us" verdict. A missing adapter, no
+// peer yet, a silent path or a cancelled scan are all "not yet".
+// Hang guard for a caller without a cancel event only (nothing in-tree).
+constexpr ULONGLONG kConnectRetryNoCancelWindowMs = 30000;
 // Back-off before reconnecting a dropped BridgeXPC session (was 200 ms).
 constexpr DWORD kSessionReconnectBackoffMs = 50;
+// Pause after kMaxSessionAttempts consecutive session drops before the verify
+// loop reconnects again (the CAPTURE stays pending; avoids a tight reconnect loop).
+constexpr DWORD kSessionLostCooldownMs = 1000;
 constexpr DWORD kConnectRetryFirstMs = 50;   // was 200: steady-state connect is 0-16 ms, so the first retry should be quick
 constexpr DWORD kConnectRetryMaxMs = 1000;   // was 2000: caps worst-case wait after NCM becomes ready
 
@@ -1328,7 +1350,8 @@ ConnectWait ConnectForCaptureWithRetry(HANDLE cancelEvent, t2::bridgexpc::Connec
     const ULONGLONG start = GetTickCount64();
     DWORD backoffMs = kConnectRetryFirstMs;
     for (unsigned attempt = 1;; ++attempt) {
-        if (ConnectForCapture(outConn, cancelEvent)) {
+        bool scansExhausted = false;
+        if (ConnectForCapture(outConn, cancelEvent, &scansExhausted)) {
             if (attempt > 1) {
                 T2BioLog("CAPTURE_DATA: BridgeXPC reachable after %u attempts (%llu ms) mode=%s",
                          attempt, static_cast<unsigned long long>(GetTickCount64() - start),
@@ -1339,15 +1362,19 @@ ConnectWait ConnectForCaptureWithRetry(HANDLE cancelEvent, t2::bridgexpc::Connec
         if (t2::bridgexpc::Connection::IsEventSignaled(cancelEvent)) {
             return ConnectWait::Cancelled;
         }
-        // Connect() already tried BOTH transports inside this attempt (a
-        // native TCP failure is retried on the tunnel immediately), so a
-        // failure here means the T2 itself is not ready: back off and retry.
         const ULONGLONG waited = GetTickCount64() - start;
-        if (waited >= kConnectRetryWindowMs) {
-            T2BioLog("CAPTURE_DATA: BridgeXPC still unreachable after %llu ms - giving up",
+        if (scansExhausted) {
+            T2BioLog("CAPTURE_DATA: full-chain scan found no BiometricKit (attempt %u, %llu ms) - giving up",
+                     attempt, static_cast<unsigned long long>(waited));
+            return ConnectWait::GaveUp;
+        }
+        if (!cancelEvent && waited >= kConnectRetryNoCancelWindowMs) {
+            T2BioLog("CAPTURE_DATA: BridgeXPC still unreachable after %llu ms and no cancel event - giving up",
                      static_cast<unsigned long long>(waited));
             return ConnectWait::GaveUp;
         }
+        // Not reachable YET (no adapter/peer, silent path, scan interrupted or in
+        // cool-down): back off and retry - only Windows' cancel ends this wait.
         T2BioLog("CAPTURE_DATA: BridgeXPC not reachable yet (attempt %u, %llu ms) - retrying in %lu ms",
                  attempt, static_cast<unsigned long long>(waited), static_cast<unsigned long>(backoffMs));
         if (cancelEvent) {
@@ -1380,6 +1407,12 @@ t2::wbdi::BirOptions LoadBirOptions()
              static_cast<unsigned>(variant));
     return t2::wbdi::BirOptionsFromVariant(variant);
 }
+
+// Set when the last verify verdict was NoMatch (wrong finger); cleared by a Match
+// or a match window that ended with no finger (Timeout). While set, the next
+// StartMatch session runs Long (ResetSensor + LoadCalibration) even with Short
+// Verify ON. Process-global, so it also spans a new CAPTURE_DATA from WBF.
+std::atomic<bool> g_forceLongVerify{false};
 
 // "Short Verify" (SepVault GUI checkbox). Read before every StartMatch attempt,
 // like LoadBirOptions, so a toggle applies to the next session without a rebuild.
@@ -1595,7 +1628,10 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
                     break;
                 }
                 if (cw == ConnectWait::GaveUp) {
+                    // Full-chain scan exhausted: this one DOES end the CAPTURE
+                    // (DEVICE_FAILURE below), unlike a dropped session.
                     outcome = VerifyOutcome::TransportError;
+                    connectionRetryExhausted = false;
                     break;
                 }
                 if (t2::bridgexpc::Connection::IsEventSignaled(cancelEvent)) {
@@ -1612,16 +1648,31 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
                 // this mark - i.e. unless the SEP has never before handed us
                 // this exact event.
                 cfg.rejectOrdinalAtOrBelow = g_lastObservedSepOrdinal.load(std::memory_order_acquire);
-                const bool shortVerify = LoadShortVerify();
+                // Short/Long per the GUI setting - except right after a wrong
+                // finger: the next session is ALWAYS Long (ResetSensor +
+                // LoadCalibration), whatever the setting says.
+                const bool guiShort = LoadShortVerify();
+                const bool forceLong = g_forceLongVerify.load(std::memory_order_acquire);
+                const bool shortVerify = guiShort && !forceLong;
                 cfg.skipResetSensor = shortVerify;
                 cfg.skipLoadCalibration = shortVerify;
                 if (shortVerify) {
                     T2BioLog("CAPTURE_DATA(verify): Short Verify ON - skipping ResetSensor + LoadCalibration");
+                } else if (guiShort && forceLong) {
+                    T2BioLog("CAPTURE_DATA(verify): Long verify forced (previous result was NoMatch) - "
+                             "ResetSensor + LoadCalibration despite Short Verify ON");
                 }
                 VerificationEngine engine(cfg);
                 matchedUuid.reset();
                 uint64_t highestOrdinalSeen = 0;
                 outcome = engine.Verify(&conn, &matchedUuid, cancelEvent, &highestOrdinalSeen);
+                // Last verdict decides whether the NEXT session must be Long:
+                // a wrong finger forces it; a match or a quiet window clears it.
+                if (outcome == VerifyOutcome::NoMatch) {
+                    g_forceLongVerify.store(true, std::memory_order_release);
+                } else if (outcome == VerifyOutcome::Match || outcome == VerifyOutcome::Timeout) {
+                    g_forceLongVerify.store(false, std::memory_order_release);
+                }
                 // Every `ordinal` value this attempt observed - accepted,
                 // rejected-as-stale, or irrelevant status/statistics noise -
                 // is now something we've seen. Raise the mark unconditionally,
@@ -1699,7 +1750,20 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
                 break;
             }
             if (outcome == VerifyOutcome::TransportError && connectionRetryExhausted) {
-                break;
+                // The BridgeXPC session kept dropping. That alone does not end
+                // the CAPTURE (only failed full scans or Windows' cancel do):
+                // back off, then reconnect through ConnectForCaptureWithRetry,
+                // which gives up only if the cached-port HELO AND the full-chain
+                // scan both fail.
+                T2BioLog("CAPTURE_DATA(verify): BridgeXPC session lost %d times - CAPTURE stays "
+                         "pending, reconnecting after %lu ms", kMaxSessionAttempts,
+                         static_cast<unsigned long>(kSessionLostCooldownMs));
+                if (cancelEvent) {
+                    WaitForSingleObject(cancelEvent, kSessionLostCooldownMs);
+                } else {
+                    Sleep(kSessionLostCooldownMs);
+                }
+                continue; // the cancel / power checks at the top of the next round apply
             }
             if (outcome == VerifyOutcome::NoMatch) {
                 // Hybrid: end the SEP transaction (Cancel already sent) but keep

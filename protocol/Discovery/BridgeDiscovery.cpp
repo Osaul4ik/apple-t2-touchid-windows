@@ -1,30 +1,30 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // BridgeDiscovery.cpp — the TransportManager: one silent (no stdout, no argv)
 // implementation of "find the BiometricKit BridgeXPC port and connect", see
-// BridgeDiscovery.h and CONNECT_ARCHITECTURE_v2.md (section numbers below).
+// BridgeDiscovery.h and CONNECT_ARCHITECTURE_v2.md.
 //
-// One call of ConnectToBiometricKitBridge is ONE bounded step of the caller's
-// retry ladder (Queue.cpp ConnectForCaptureWithRetry: 30 s window, 50 -> 1000 ms
-// backoff). What survives between steps - and between cancelled CAPTURE_DATAs - is
-// in-process state keyed by Generation: the committed transport (TransportMode.h),
-// the confirmed port (PortCache), and the scan progress (ScanState below).
+// One call of ConnectToBiometricKitBridge is ONE step of the caller's retry
+// ladder (Queue.cpp ConnectForCaptureWithRetry). What survives between steps -
+// and between cancelled CAPTURE_DATAs - is: the BridgeXPC port (registry ONLY,
+// PortCache.h; the same port on both transports), the committed sticky tunnel
+// (T2Ncm.sys memory, TransportMode.h) and the scan progress (ScanState below,
+// a resume cursor for a pass cut short by cancel).
 //
-// Sequence per step (section 6):
-//   A. readiness gate       - preconditions only, never a conclusion (Adapter.cpp)
-//   B. "try v6"             - cached-port HELO + <= 3 bounded probes, NOT a full scan
-//   C. scan on the proven transport - resumable, deadline-bounded, port saved on
-//                             confirmation
-//   C'. recovery ping       - on native TCP failure: one ff02::1 multicast ping
-//                             (same as cold-start peer reveal). If peer appears →
-//                             retry native once. If that single attempt fails →
-//                             fall to IPv4.
-//   D. tunnel attempt       - when recovery ping failed / sticky / V6Unavailable
-//                             (or a cached port exists for a cheap HELO)
-//   E. both empty           - return false; the ladder alternates and retries
-//
-// Auto-switch policy (default ON):
-//   default = IPv6; one failed recovery ping after native TCP failure → IPv4;
-//   successful tunnel handshake is sticky until reboot (no return to IPv6).
+// Sequence per step:
+//   A. readiness gate   - preconditions only, never a conclusion (Adapter.cpp)
+//   B. native IPv6      - HELO on the registry port. No cache / no HELO =>
+//                         FULL-CHAIN rescan right away (59000-60000, 49000-49999,
+//                         rest of 49000-65535; 256 wide, 25 ms). Instant skip when
+//                         connect() says WSAEACCES (WFP block).
+//   C. IPv6 blocked     - (WSAEACCES, or the scan got no SYN-ACK and no RST at all)
+//                         -> one ff02::1 recovery ping (unless WFP) -> IPv4 tunnel:
+//                         HELO on the SAME registry port, else a full-chain tunnel
+//                         scan. A tunnel handshake commits the sticky tunnel (driver
+//                         memory) until reboot; the next cold boot starts on IPv6.
+//   D. nothing          - return false; *outScansExhausted says whether that was
+//                         a COMPLETED full pass with no BiometricKit on every
+//                         transport that applies (the caller then gives up), or
+//                         just "not yet" (cancel, silent path, cool-down, no peer).
 #include "BridgeDiscovery.h"
 #include "PortCache.h"
 #include "PortScan.h"
@@ -51,26 +51,19 @@ using t2::bridgexpc::ConnectResult;
 constexpr const char* kBiometricKitService = "com.apple.eos.BiometricKit";
 constexpr std::chrono::milliseconds kRemoteXpcCheckTimeout{2000};
 
-// ---- budgets (section 13) ---------------------------------------------------
-// Native tuning comes from real T2 sessions (RTT ~1 ms). The tunnel adds a
-// userspace -> T2Ncm TX rewrite -> USB -> T2 -> USB -> RX rewrite round trip on a
-// single serialized bulk pipe pair, so it gets fewer sockets in flight and longer
-// per-port waits (the 27.09.2026 DebugView capture of 256 SYNs flooding the pipe).
-struct Budgets {
-    ULONGLONG chunkMs;       // one scan slice
-    ULONGLONG attemptMs;     // one scan attempt (several slices)
-    unsigned concurrency;
-    unsigned connectTimeoutMs[2]; // first pass / later passes ("20 ms then 60 ms")
-};
-const Budgets& BudgetsFor(bool tunnel) {
-    static const Budgets native{1500, 3000, 256, {20, 60}};
-    static const Budgets tunnelB{3000, 5000, 256, {20, 20}}; // same as native, per owner request
-    return tunnel ? tunnelB : native;
-}
-constexpr ULONGLONG kEvidenceScanMs = 1000;  // native scan used AS evidence (no cache to probe)
-constexpr unsigned kMinProbesForSilent = 64; // a scan that tried fewer ports proves nothing
-constexpr unsigned kProbeCount = 3;          // "try v6" probes
-constexpr DWORD kProbeGapMs = 300;
+// ---- scan parameters ----------------------------------------------------------
+// Same on both transports and on every pass (owner spec): 256 sockets in flight,
+// 25 ms per connect. The attempt budget only has to fit one full pass of the
+// 16536-port chain (native: closed ports answer RST in ~1 ms; tunnel: one more
+// USB round trip through the T2Ncm rewrite) - it is a safety net, not a slice.
+constexpr uint16_t kScanBegin = 49000;
+constexpr uint16_t kScanEnd = 65535;
+constexpr unsigned kScanConcurrency = 256;
+constexpr unsigned kScanConnectTimeoutMs = 25;
+// No SYN-ACK and no RST after this many probes => the path is silent/filtered:
+// stop the pass (~2 rounds) instead of grinding through 16k dead ports.
+constexpr unsigned kSilentAbortAfter = 512;
+ULONGLONG AttemptBudgetMs(bool tunnel) { return tunnel ? 15000 : 8000; }
 
 // Plain helper instead of the std min template: windows.h defines min()/max() macros
 // that break it in this build (same reason Connection.cpp avoids it in WaitForEvent).
@@ -79,20 +72,15 @@ inline ULONGLONG MinU64(ULONGLONG a, ULONGLONG b) { return a < b ? a : b; }
 bool Cancelled(void* cancelEvent) {
     return Connection::IsEventSignaled(static_cast<HANDLE>(cancelEvent));
 }
-// Sleeps up to `ms`; true when the cancel event fired.
-bool SleepOrCancel(void* cancelEvent, DWORD ms) {
-    if (cancelEvent) return WaitForSingleObject(static_cast<HANDLE>(cancelEvent), ms) == 0;
-    Sleep(ms);
-    return false;
-}
 
-// ---- ScanState (section 7) --------------------------------------------------
+const wchar_t* TransportName(bool tunnel) { return tunnel ? L"IPv4 tunnel" : L"Native IPv6"; }
+
+// ---- ScanState ----------------------------------------------------------------
 // Progress of the port scan for one (adapter, transport), kept in-process so a
-// cancelled CAPTURE_DATA does not throw the work away. DEVIATION from the
-// architecture doc, which sketched a bitmap of completed chunks: with the tunnel's
-// 16-wide/150 ms probes a 1000-port chunk cannot finish inside a 3 s budget, so a
-// "chunk done" bitmap would never advance. A cursor into the dispatch order does:
-// every claimed port runs to completion, so the cursor is an exact resume point.
+// pass cut short by a cancelled CAPTURE_DATA resumes where it stopped instead of
+// starting over. This is resume state, NOT a port cache (the port lives only in
+// the registry). Every claimed port runs to completion, so the cursor into the
+// dispatch order is an exact resume point.
 struct Candidate {
     uint16_t port = 0;
     unsigned fails = 0;
@@ -101,10 +89,8 @@ struct ScanState {
     ULONGLONG generation = 0;
     in6_addr peer{};
     unsigned cursor = 0;        // next index in the dispatch order
-    unsigned passLimit = 0;     // order length of the pass in progress
-    unsigned emptyPasses = 0;   // passes completed without finding the service
+    unsigned emptyPasses = 0;   // full passes completed without finding the service
     ULONGLONG lastPassEnd = 0;
-    bool http2Seen = false;     // some HTTP/2 listener has been seen (T2 services are up)
     std::vector<Candidate> candidates; // HTTP/2 hits whose RemoteXPC check failed
 };
 std::mutex g_scanMu;
@@ -138,8 +124,9 @@ void StoreScanState(const NcmEndpoint& ep, bool tunnel, const ScanState& st) {
     std::lock_guard<std::mutex> lock(g_scanMu);
     ScanStates()[ScanKey(ep, tunnel)] = st;
 }
-// Cool-down after an empty pass (section 13): 1 s, doubling, capped at 5 s, so a
-// dead link does not get 256 SYNs per second for 30 s from the retry ladder.
+// Cool-down after an EMPTY full pass only (a cache miss always rescans at once):
+// 1 s, doubling, capped at 5 s, so a T2 whose services are not up yet does not
+// get 16k SYNs back to back from the retry ladder.
 ULONGLONG CooldownMs(unsigned emptyPasses) {
     if (emptyPasses == 0) return 0;
     const unsigned shift = (emptyPasses - 1) < 3u ? (emptyPasses - 1) : 3u;
@@ -149,16 +136,20 @@ ULONGLONG CooldownMs(unsigned emptyPasses) {
 struct ScanOutcome {
     uint16_t servicePort = 0;
     uint16_t rsdPort = 0;
-    bool ranScan = false;   // false: skipped by the cool-down
+    bool ranScan = false;          // false: skipped by the cool-down
+    bool passCompletedEmpty = false; // a full pass reached its end without BiometricKit
+    bool silent = false;           // aborted: no SYN-ACK and no RST (path dead/filtered)
+    bool anyTcp = false;           // some SYN was answered (SYN-ACK) => the path works
+    bool anyRefused = false;       // some RST came back => packets reach the T2
+    bool anyBlocked = false;       // WSAEACCES seen => local WFP block
     unsigned tried = 0;
-    bool anyTcp = false;    // some SYN was answered (SYN-ACK) => the path works
 };
 
-// Same concurrency shape as before: every HTTP/2 hit gets its own RemoteXPC
-// checker thread racing the still-running scan; the first confirmed BiometricKit
-// hit stops the scan. Checkers are joined before returning (no background threads
-// outlive the call). HTTP/2 hits that were NOT confirmed are reported through
-// `http2Ports` so they can be re-checked first on the next step.
+// Every HTTP/2 hit gets its own RemoteXPC checker thread racing the still-running
+// scan; the first confirmed BiometricKit hit stops the scan. Checkers are joined
+// before returning (no background threads outlive the call). HTTP/2 hits that were
+// NOT confirmed are reported through `http2Ports` so they can be re-checked first
+// on the next step.
 struct ScanProbeResult {
     uint16_t servicePort = 0;
     uint16_t rsdPort = 0;
@@ -229,100 +220,97 @@ bool RecheckCandidates(const NcmEndpoint& ep, ScanState* st, bool tunnel, ULONGL
     return false;
 }
 
-// One resumable, deadline-bounded scan attempt on `tunnel` (the caller is inside
-// the matching TransportPhase). Returns when the service is confirmed, the budget
-// is used up, the pass completed empty, or cancel fired - and stores its progress.
-ScanOutcome RunScanAttempt(const NcmEndpoint& ep, bool tunnel, ULONGLONG attemptBudgetMs,
-                           void* cancelEvent) {
+// One full-chain scan pass on `tunnel` (the caller is inside the matching
+// TransportPhase), resumed from the stored cursor. Returns when the service is
+// confirmed, the pass ended (empty or silent), the budget ran out, or cancel fired.
+ScanOutcome RunScanAttempt(const NcmEndpoint& ep, bool tunnel, void* cancelEvent) {
     ScanOutcome out;
-    const Budgets& b = BudgetsFor(tunnel);
     ScanState st = LoadScanState(ep, tunnel);
 
     const ULONGLONG start = GetTickCount64();
-    if (st.emptyPasses > 0 && st.lastPassEnd != 0 && start < st.lastPassEnd + CooldownMs(st.emptyPasses)) {
-        T2_LOG("discovery", L"scan chunk: %s cool-down (%llu ms left after empty pass %u) - skipped",
-               tunnel ? L"tunnel" : L"native",
-               static_cast<unsigned long long>(st.lastPassEnd + CooldownMs(st.emptyPasses) - start),
-               st.emptyPasses);
+    if (st.cursor == 0 && st.emptyPasses > 0 && st.lastPassEnd != 0 &&
+        start < st.lastPassEnd + CooldownMs(st.emptyPasses)) {
+        T2_LOG("discovery", L"scan (%s): cool-down after empty pass %u, %llu ms left - skipped",
+               TransportName(tunnel), st.emptyPasses,
+               static_cast<unsigned long long>(st.lastPassEnd + CooldownMs(st.emptyPasses) - start));
         StoreScanState(ep, tunnel, st);
         return out;
     }
     out.ranScan = true;
-    const ULONGLONG deadline = start + MinU64(attemptBudgetMs, b.attemptMs);
+    const ULONGLONG deadline = start + AttemptBudgetMs(tunnel);
 
     if (RecheckCandidates(ep, &st, tunnel, deadline, cancelEvent, &out)) {
-        T2_LOG("discovery", L"scan chunk: candidate re-check confirmed BiometricKit on port %u",
-               static_cast<unsigned>(out.servicePort));
+        T2_LOG("discovery", L"scan (%s): candidate re-check confirmed BiometricKit on port %u",
+               TransportName(tunnel), static_cast<unsigned>(out.servicePort));
+        StoreScanState(ep, tunnel, st);
+        return out;
+    }
+    if (Cancelled(cancelEvent)) {
         StoreScanState(ep, tunnel, st);
         return out;
     }
 
-    constexpr uint16_t kBegin = 49152, kEnd = 65535;
-    const unsigned total = static_cast<unsigned>(kEnd - kBegin) + 1;
-    const unsigned priority = PriorityBandCount(kBegin, kEnd);
+    ScanOptions opt;
+    opt.portBegin = kScanBegin;
+    opt.portEnd = kScanEnd;
+    opt.concurrency = kScanConcurrency;
+    opt.connectTimeoutMs = kScanConnectTimeoutMs;
+    opt.includeTcpOnly = true;
+    opt.priorityBands = true;
+    opt.orderSkip = st.cursor;
+    opt.orderLimit = 0; // always the whole chain
+    opt.deadlineTick = deadline;
+    opt.cancelEvent = cancelEvent;
+    // Silence is only judged on a pass that starts at the beginning: a resumed
+    // pass already proved the path alive in its first part.
+    opt.silentAbortAfter = (st.cursor == 0) ? kSilentAbortAfter : 0;
+    ScanStats stats;
+    opt.stats = &stats;
 
-    while (!Cancelled(cancelEvent)) {
-        const ULONGLONG now = GetTickCount64();
-        if (now >= deadline) break;
-        if (st.cursor == 0) {
-            // Nothing HTTP/2 seen yet means the T2 services are not up: stay in the
-            // priority bands (59xxx, 49xxx), and only every 4th empty pass pay for
-            // the whole ephemeral range.
-            const bool fullPass = (st.emptyPasses % 4) == 3;
-            st.passLimit = (st.http2Seen || fullPass) ? total : priority;
-        }
-        ScanOptions opt;
-        opt.portBegin = kBegin;
-        opt.portEnd = kEnd;
-        opt.concurrency = b.concurrency;
-        opt.includeTcpOnly = true;
-        opt.connectTimeoutMs = b.connectTimeoutMs[st.emptyPasses == 0 ? 0 : 1];
-        opt.priorityBands = true;
-        opt.orderSkip = st.cursor;
-        opt.orderLimit = st.passLimit;
-        opt.deadlineTick = now + MinU64(b.chunkMs, deadline - now);
-        opt.cancelEvent = cancelEvent;
-        ScanStats stats;
-        opt.stats = &stats;
+    std::vector<uint16_t> http2Ports;
+    const unsigned fromCursor = st.cursor;
+    ScanProbeResult r = ScanAndProbe(ep, opt, &http2Ports);
+    st.cursor = stats.claimedEnd;
+    out.tried = stats.tried;
+    out.anyTcp = stats.tcpHits > 0;
+    out.anyRefused = stats.refused > 0;
+    out.anyBlocked = stats.blocked > 0;
+    T2_LOG("discovery", L"scan (%s, %u-wide, %u ms): order %u->%u/%u, tried %u, tcp %u, http2 %u, "
+           L"rst %u, wfp-blocked %u, %llu ms%s%s", TransportName(tunnel), kScanConcurrency,
+           kScanConnectTimeoutMs, fromCursor, st.cursor, stats.orderTotal, stats.tried, stats.tcpHits,
+           stats.http2Hits, stats.refused, stats.blocked,
+           static_cast<unsigned long long>(GetTickCount64() - start),
+           r.servicePort ? L", FOUND" : L"", stats.silentAborted ? L", SILENT (aborted)" : L"");
 
-        std::vector<uint16_t> http2Ports;
-        const ULONGLONG chunkStart = GetTickCount64();
-        ScanProbeResult r = ScanAndProbe(ep, opt, &http2Ports);
-        st.cursor = stats.claimedEnd;
-        out.tried += stats.tried;
-        if (stats.tcpHits > 0) out.anyTcp = true;
-        if (stats.http2Hits > 0) st.http2Seen = true;
-        T2_LOG("discovery", L"scan chunk (%s, %u-wide, %u ms): order %u/%u, tried %u, tcp %u, http2 %u, "
-               L"%llu ms%s", tunnel ? L"IPv4 tunnel" : L"Native IPv6", b.concurrency,
-               opt.connectTimeoutMs, st.cursor, st.passLimit, stats.tried, stats.tcpHits,
-               stats.http2Hits, static_cast<unsigned long long>(GetTickCount64() - chunkStart),
-               r.servicePort ? L", FOUND" : L"");
-
-        if (r.servicePort != 0) {
-            out.servicePort = r.servicePort;
-            out.rsdPort = r.rsdPort;
-            break;
-        }
-        for (uint16_t p : http2Ports) {
-            const bool known = std::any_of(st.candidates.begin(), st.candidates.end(),
-                                           [p](const Candidate& c) { return c.port == p; });
-            if (!known && st.candidates.size() < 16) st.candidates.push_back({p, 0});
-        }
-        if (stats.exhausted) {
-            ++st.emptyPasses;
-            st.cursor = 0;
-            st.lastPassEnd = GetTickCount64();
-            T2_LOG("discovery", L"scan chunk: pass complete without BiometricKit (empty passes=%u)",
-                   st.emptyPasses);
-            break;
-        }
-        if (stats.tried == 0) break; // no progress possible right now (deadline raced)
+    if (r.servicePort != 0) {
+        out.servicePort = r.servicePort;
+        out.rsdPort = r.rsdPort;
+        st.cursor = 0;
+        st.emptyPasses = 0;
+        StoreScanState(ep, tunnel, st);
+        return out;
+    }
+    for (uint16_t p : http2Ports) {
+        const bool known = std::any_of(st.candidates.begin(), st.candidates.end(),
+                                       [p](const Candidate& c) { return c.port == p; });
+        if (!known && st.candidates.size() < 16) st.candidates.push_back({p, 0});
+    }
+    if (stats.silentAborted) {
+        out.silent = true;
+        st.cursor = 0; // nothing learned; the next pass starts over
+    } else if (stats.exhausted && !Cancelled(cancelEvent)) {
+        ++st.emptyPasses;
+        st.cursor = 0;
+        st.lastPassEnd = GetTickCount64();
+        out.passCompletedEmpty = true;
+        T2_LOG("discovery", L"scan (%s): FULL pass complete without BiometricKit (empty passes=%u)",
+               TransportName(tunnel), st.emptyPasses);
     }
     StoreScanState(ep, tunnel, st);
     return out;
 }
 
-// ---- cached port (section 8) ------------------------------------------------
+// ---- cached port ------------------------------------------------------------
 struct CacheTry {
     bool hadCache = false;
     bool ok = false;
@@ -332,17 +320,16 @@ struct CacheTry {
     ULONGLONG tcpMs = 0;
 };
 
-// Mirrors the old TryCachedBridgePort (path A: HELO on the cached BridgeXPC port;
-// path B: RSD replay through the cached RemoteXPC port) on ONE explicit transport.
-// The budget is short on native (a healthy T2 answers in single-digit ms) and long
-// on the tunnel. An RST marks the entry Suspect but never deletes it: the T2 may
-// simply not be listening yet after a reboot.
+// Path A: HELO on the registry port. Path B: RSD replay through the cached
+// RemoteXPC port. On ONE explicit transport (the port is the same on both). The
+// budget is short on native (a healthy T2 answers in single-digit ms) and longer
+// on the tunnel. A failure never deletes the entry; only a scan-confirmed port
+// overwrites it.
 CacheTry TryCachedBridgePort(const NcmEndpoint& ep, Connection* conn, bool tunnel) {
     CacheTry r;
     uint16_t svcPort = 0, rsdPort = 0;
-    bool suspect = false;
-    if (!LoadCachedPort(ep, &svcPort, &rsdPort, &suspect, tunnel)) {
-        T2_LOG("discovery", L"no cached BridgeXPC port for this adapter");
+    if (!LoadCachedPort(ep, &svcPort, &rsdPort)) {
+        T2_LOG("discovery", L"no valid cached BridgeXPC port in the registry - full rescan");
         return r;
     }
     r.hadCache = true;
@@ -357,15 +344,13 @@ CacheTry TryCachedBridgePort(const NcmEndpoint& ep, Connection* conn, bool tunne
                                          &r.ev, &r.tcpMs);
     if (crA == ConnectResult::Ok) {
         T2_LOG("discovery", L"cached port %u answered with HELO (%s) - no scan needed",
-               static_cast<unsigned>(svcPort), tunnel ? L"IPv4 tunnel" : L"Native IPv6");
-        if (suspect) MarkCachedPortSuspect(ep, false, tunnel);
+               static_cast<unsigned>(svcPort), TransportName(tunnel));
         r.ok = true;
         return r;
     }
-    T2_LOG("discovery", L"cached port %u (rsd %u%s) did not answer on %s: ConnectResult=%d evidence=%d",
-           static_cast<unsigned>(svcPort), static_cast<unsigned>(rsdPort), suspect ? L", Suspect" : L"",
-           tunnel ? L"IPv4 tunnel" : L"Native IPv6", static_cast<int>(crA), static_cast<int>(r.ev));
-    if (r.ev == PathEvidence::Refused) MarkCachedPortSuspect(ep, true, tunnel);
+    T2_LOG("discovery", L"cached port %u (rsd %u) did not answer on %s: ConnectResult=%d evidence=%d",
+           static_cast<unsigned>(svcPort), static_cast<unsigned>(rsdPort), TransportName(tunnel),
+           static_cast<int>(crA), static_cast<int>(r.ev));
 
     // Path B only makes sense when the path itself answered.
     if (rsdPort != 0 && (r.ev == PathEvidence::Positive || r.ev == PathEvidence::Refused)) {
@@ -376,8 +361,7 @@ CacheTry TryCachedBridgePort(const NcmEndpoint& ep, Connection* conn, bool tunne
             ConnectResult crB = conn->ConnectVia(tunnel, ep.peerLinkLocal, ep.ifIndex, advertised,
                                                  half, half, &evB, &r.tcpMs);
             if (crB == ConnectResult::Ok) {
-                if (advertised != svcPort) SaveCachedPort(ep, advertised, rsdPort, tunnel);
-                else MarkCachedPortSuspect(ep, false, tunnel);
+                if (advertised != svcPort) SaveCachedPort(ep, advertised, rsdPort);
                 r.port = advertised;
                 r.ev = PathEvidence::Positive;
                 r.ok = true;
@@ -406,21 +390,49 @@ struct StepResult {
     bool ok = false;
     uint16_t servicePort = 0;
     uint16_t rsdPort = 0;
-    bool pathAlive = false;   // Positive evidence for this transport was seen
-    bool sawSilent = false;   // evidence pointed at a silent path
-    bool localError = false;  // the transport could not even be attempted
+    bool pathAlive = false;      // SYN-ACK or RST seen on this transport
+    bool blocked = false;        // the transport is dead: WFP block, or silent scan
+    bool wfpBlocked = false;     // ...and specifically WSAEACCES (a ping will not help)
+    bool sawSilent = false;      // evidence pointed at a silent path
+    bool fullPassEmpty = false;  // a full-chain pass completed without BiometricKit
+    bool localError = false;     // the transport could not even be attempted
 };
 
-// ---- Step B/C: native IPv6 ----------------------------------------------------
+// Scan on the current transport and connect what it confirms. Shared by both steps.
+void ScanAndConnect(const NcmEndpoint& ep, Connection* conn, bool tunnel, void* cancelEvent,
+                    StepResult* sr, ScanOutcome* outScan) {
+    ScanOutcome so = RunScanAttempt(ep, tunnel, cancelEvent);
+    *outScan = so;
+    if (so.servicePort != 0) {
+        // Save at the moment of confirmation, before the final connect and
+        // regardless of cancel: the finding must survive. Same registry entry
+        // for both transports.
+        SaveCachedPort(ep, so.servicePort, so.rsdPort);
+        ULONGLONG tcpMs = 0;
+        if (ConnectFoundPort(ep, conn, tunnel, so.servicePort, &tcpMs)) {
+            if (!tunnel) tp::RecordNativeSuccess(tcpMs);
+            sr->ok = true;
+            sr->servicePort = so.servicePort;
+            sr->rsdPort = so.rsdPort;
+            sr->pathAlive = true;
+            return;
+        }
+        sr->pathAlive = true; // a SYN-ACK came back even though HELO did not
+    }
+    if (so.anyTcp || so.anyRefused) sr->pathAlive = true;
+    sr->fullPassEmpty = so.passCompletedEmpty;
+}
+
+// ---- Step B: native IPv6 -----------------------------------------------------
 StepResult NativeStep(const NcmEndpoint& ep, Connection* conn, void* cancelEvent, bool autoSwitch) {
     StepResult sr;
     tp::TransportPhase phase(static_cast<HANDLE>(cancelEvent));
     phase.mode.Enter(tp::TransportMode::NativeIpv6);
 
-    // B.1: cached port, live HELO on native.
+    // B.1: registry port, live HELO on native.
     CacheTry ct = TryCachedBridgePort(ep, conn, false);
     if (ct.ok) {
-        tp::RecordNativeSuccess(ct.tcpMs); // native works: clears a committed tunnel
+        tp::RecordNativeSuccess(ct.tcpMs); // native works
         sr.ok = true;
         sr.servicePort = ct.port;
         sr.rsdPort = ct.rsd;
@@ -429,79 +441,33 @@ StepResult NativeStep(const NcmEndpoint& ep, Connection* conn, void* cancelEvent
     }
     if (Cancelled(cancelEvent)) return sr;
 
-    // Evidence so far. An RST sends us to a native scan in any case, but only counts
-    // as PROOF of the path once assumption A0 is confirmed on hardware.
-    bool proven = tp::IsPositiveEvidence(ct.ev);
-    bool answered = proven || ct.ev == PathEvidence::Refused;
-    bool anySilent = ct.ev == PathEvidence::Silent;
-
-    // B.2: up to 3 bounded probes ~300 ms apart. Port: the cached one; without a
-    // cache only port 1, and only once A0 says an RST is proof.
-    if (!answered) {
-        const uint16_t probePort = ct.hadCache ? ct.port : (tp::IsRstProof() ? uint16_t{1} : uint16_t{0});
-        if (probePort != 0) {
-            for (unsigned i = 0; i < kProbeCount && !answered; ++i) {
-                if (i != 0 && SleepOrCancel(cancelEvent, kProbeGapMs)) return sr;
-                ULONGLONG ms = 0;
-                const PathEvidence ev = tp::ProbeNativePath(ep.peerLinkLocal, ep.ifIndex, probePort,
-                                                            tp::NativeConnectBudget(std::chrono::milliseconds(250)), &ms);
-                T2_LOG("discovery", L"v6 probe %u/%u port %u: evidence=%d (%llu ms)", i + 1, kProbeCount,
-                       static_cast<unsigned>(probePort), static_cast<int>(ev),
-                       static_cast<unsigned long long>(ms));
-                if (ev == PathEvidence::Silent) anySilent = true;
-                if (ev == PathEvidence::Positive || ev == PathEvidence::Refused) {
-                    answered = true;
-                    proven = tp::IsPositiveEvidence(ev);
-                }
-                // LocalError: proves nothing, neither counted nor a reason to stop.
-            }
-        }
+    // B.2: a WFP block filter answers connect() with WSAEACCES at once - IPv6 is
+    // blocked, a native scan would only collect 16k identical errors.
+    if (ct.ev == PathEvidence::Blocked && autoSwitch) {
+        T2_LOG("discovery", L"native IPv6 blocked by a local WFP filter (WSAEACCES) - skipping the "
+               L"native scan, going to the IPv4 tunnel");
+        sr.blocked = true;
+        sr.wfpBlocked = true;
+        return sr;
     }
 
-    // C: scan on native when the path answered, when there was nothing cheap to
-    // probe (the scan itself is then the evidence), or when tunnel fallback is off.
-    //
-    // IMPORTANT: a PortCache hit from the registry (survives reboot) must NOT
-    // permanently suppress scanning when the path is silent. Under VPN/WFP the
-    // cached-port HELO and the 3 probes all come back Silent; skipping the scan
-    // here used to leave the step with no Positive evidence and, combined with
-    // "tunnel only HELO when not sticky", meant a post-reboot+VPN boot never
-    // scanned at all. When autoSwitch is on and nothing answered, we still skip
-    // the *native* full scan (IPv6 is dead; budget is better spent on the tunnel)
-    // but the caller must then allow a tunnel scan - see recoveryPingFailed /
-    // ipv6PathDead in ConnectToBiometricKitBridge.
-    const bool noCheapProbe = !ct.hadCache && !tp::IsRstProof();
-    if (answered || noCheapProbe || !autoSwitch) {
-        // Without a cached port there is no tunnel fallback (see ConnectToBiometricKitBridge),
-        // so the native scan is not just evidence: give it the full budget.
-        const ULONGLONG budget = (proven || !autoSwitch || !ct.hadCache) ? BudgetsFor(false).attemptMs
-                                                                        : kEvidenceScanMs;
-        ScanOutcome so = RunScanAttempt(ep, false, budget, cancelEvent);
-        if (so.servicePort != 0) {
-            // Save at the moment of confirmation, before the final connect and
-            // regardless of cancel (section 7): the finding must survive.
-            SaveCachedPort(ep, so.servicePort, so.rsdPort, /*tunnel=*/false);
-            ULONGLONG tcpMs = 0;
-            if (ConnectFoundPort(ep, conn, false, so.servicePort, &tcpMs)) {
-                tp::RecordNativeSuccess(tcpMs);
-                sr.ok = true;
-                sr.servicePort = so.servicePort;
-                sr.rsdPort = so.rsdPort;
-                sr.pathAlive = true;
-                return sr;
-            }
-            proven = true; // a SYN-ACK came back even though HELO did not
-        }
-        if (so.anyTcp) proven = true;
-        else if (so.ranScan && so.tried >= kMinProbesForSilent) anySilent = true;
+    // B.3: no cache or no HELO => full-chain native rescan right away.
+    ScanOutcome so;
+    ScanAndConnect(ep, conn, false, cancelEvent, &sr, &so);
+    if (sr.ok) return sr;
+    if (ct.ev == PathEvidence::Positive || ct.ev == PathEvidence::Refused) sr.pathAlive = true;
+    if (!sr.pathAlive && so.ranScan && (so.silent || so.anyBlocked)) {
+        sr.blocked = true;
+        sr.wfpBlocked = so.anyBlocked;
+        sr.sawSilent = !so.anyBlocked;
+        T2_LOG("discovery", L"native IPv6 path %s: no SYN-ACK and no RST from the T2",
+               so.anyBlocked ? L"blocked by a local WFP filter" : L"silent");
     }
-    sr.pathAlive = proven;
-    sr.sawSilent = !proven && anySilent;
     return sr;
 }
 
-// ---- Step D: IPv4 tunnel ------------------------------------------------------
-StepResult TunnelStep(NcmEndpoint* ep, Connection* conn, void* cancelEvent, bool allowScan) {
+// ---- Step C: IPv4 tunnel -----------------------------------------------------
+StepResult TunnelStep(NcmEndpoint* ep, Connection* conn, void* cancelEvent) {
     StepResult sr;
     tp::TransportPhase phase(static_cast<HANDLE>(cancelEvent));
     phase.mode.Enter(tp::TransportMode::Ipv4Tunnel);
@@ -529,11 +495,12 @@ StepResult TunnelStep(NcmEndpoint* ep, Connection* conn, void* cancelEvent, bool
         return sr;
     }
 
+    // Same registry port as native (one port for both transports).
     CacheTry ct = TryCachedBridgePort(*ep, conn, true);
     if (ct.ok) {
         tp::CommitAutoTunnel(true);
-        T2_LOG("discovery", L"CommitTunnel (cached port %u, gen %llu)", static_cast<unsigned>(ct.port),
-               static_cast<unsigned long long>(tp::CurrentGeneration()));
+        T2_LOG("discovery", L"CommitTunnel (cached port %u) - sticky until reboot",
+               static_cast<unsigned>(ct.port));
         sr.ok = true;
         sr.servicePort = ct.port;
         sr.rsdPort = ct.rsd;
@@ -541,37 +508,17 @@ StepResult TunnelStep(NcmEndpoint* ep, Connection* conn, void* cancelEvent, bool
         return sr;
     }
     if (Cancelled(cancelEvent)) return sr;
-    bool alive = ct.ev == PathEvidence::Positive || ct.ev == PathEvidence::Refused;
-    bool silent = ct.ev == PathEvidence::Silent;
-    if (!allowScan) {
-        // Cold boot is v6-only: the tunnel is only for re-using a port that v6 already
-        // found (cached HELO). It never scans by itself.
-        sr.pathAlive = alive;
-        sr.sawSilent = silent;
+
+    ScanOutcome so;
+    ScanAndConnect(*ep, conn, true, cancelEvent, &sr, &so);
+    if (sr.ok) {
+        tp::CommitAutoTunnel(true);
+        T2_LOG("discovery", L"CommitTunnel (scanned port %u) - sticky until reboot",
+               static_cast<unsigned>(sr.servicePort));
         return sr;
     }
-
-    ScanOutcome so = RunScanAttempt(*ep, true, BudgetsFor(true).attemptMs, cancelEvent);
-    if (so.servicePort != 0) {
-        SaveCachedPort(*ep, so.servicePort, so.rsdPort, /*tunnel=*/true);
-        ULONGLONG tcpMs = 0;
-        if (ConnectFoundPort(*ep, conn, true, so.servicePort, &tcpMs)) {
-            tp::CommitAutoTunnel(true);
-            T2_LOG("discovery", L"CommitTunnel (scanned port %u, gen %llu)",
-                   static_cast<unsigned>(so.servicePort),
-                   static_cast<unsigned long long>(tp::CurrentGeneration()));
-            sr.ok = true;
-            sr.servicePort = so.servicePort;
-            sr.rsdPort = so.rsdPort;
-            sr.pathAlive = true;
-            return sr;
-        }
-        alive = true;
-    }
-    if (so.anyTcp) alive = true;
-    else if (so.ranScan && so.tried >= kMinProbesForSilent) silent = true;
-    sr.pathAlive = alive;
-    sr.sawSilent = !alive && silent;
+    if (ct.ev == PathEvidence::Positive || ct.ev == PathEvidence::Refused) sr.pathAlive = true;
+    sr.sawSilent = !sr.pathAlive && (so.silent || ct.ev == PathEvidence::Silent);
     return sr;
 }
 
@@ -585,7 +532,7 @@ GateResult EnsureGate(NcmEndpoint* ep, void* cancelEvent) {
     if (g_gateGeneration.load(std::memory_order_acquire) == tp::CurrentGeneration() &&
         g_gateIfIndex.load(std::memory_order_relaxed) == ep->ifIndex &&
         ep->peerSource != PeerSource::None && !tp::IsV6Unavailable()) {
-        return tp::IsV6Unavailable() ? GateResult::V6Unavailable : GateResult::Ready;
+        return GateResult::Ready;
     }
     const GateResult g = RunReadinessGate(ep, cancelEvent);
     if (g != GateResult::Cancelled) {
@@ -611,7 +558,8 @@ bool PickDefaultT2Endpoint(NcmEndpoint* outEndpoint, void* cancelEvent) {
 
 bool ConnectToBiometricKitBridge(const NcmEndpoint& endpoint, t2::bridgexpc::Connection* outConn,
                                   uint16_t* outServicePort, uint16_t* outRsdPort,
-                                  void* cancelEvent) {
+                                  void* cancelEvent, bool* outScansExhausted) {
+    if (outScansExhausted) *outScansExhausted = false;
     if (outConn == nullptr) return false;
     if (Cancelled(cancelEvent)) return false;
     NcmEndpoint ep = endpoint; // the step may refine the peer; the caller's copy is untouched
@@ -629,109 +577,80 @@ bool ConnectToBiometricKitBridge(const NcmEndpoint& endpoint, t2::bridgexpc::Con
         tp::CommitAutoTunnel(false); // auto-switch was turned off: drop the learned tunnel
     }
 
-    // Decide whether this step starts on native.
-    bool tryNative = true;
-    if (tryNative && autoSwitch && tp::IsV6Unavailable()) {
-        tryNative = false; // IPv6 unusable on the adapter for this Generation
-    }
-    if (tryNative && autoSwitch && tp::IsAutoTunnelCommitted()) {
-        // The automatic switch to the IPv4 tunnel already happened: it stays until reboot.
-        // No native probe, no return-to-native, no alternation.
-        tryNative = false;
-    }
+    // Native IPv6 is the default; skipped only when the sticky tunnel is committed
+    // (T2Ncm memory, until reboot) or IPv6 is unusable on the adapter.
+    const bool sticky = autoSwitch && tp::IsAutoTunnelCommitted();
+    const bool v6Unavailable = autoSwitch && tp::IsV6Unavailable();
+    const bool tryNative = !sticky && !v6Unavailable;
 
-    StepResult result;
-    bool nativeAlive = false;
+    StepResult native;
     bool sawSilent = false;
-    bool nativeTried = false;
     if (tryNative) {
-        nativeTried = true;
-        result = NativeStep(ep, outConn, cancelEvent, autoSwitch);
-        nativeAlive = result.pathAlive;
-        sawSilent = result.sawSilent;
-    }
+        native = NativeStep(ep, outConn, cancelEvent, autoSwitch);
+        sawSilent = native.sawSilent;
+        if (native.ok) {
+            tp::NotePathAlive();
+            if (outServicePort) *outServicePort = native.servicePort;
+            if (outRsdPort) *outRsdPort = native.rsdPort;
+            return true;
+        }
 
-    // Auto-switch recovery: after a native TCP-level failure, one multicast
-    // ICMPv6 ping to ff02::1 (same prompt used at cold start to reveal the
-    // T2's unicast fe80). If the peer appears → retry native once. If that
-    // single recovery attempt fails → fall to IPv4 (sticky until reboot on
-    // successful tunnel handshake).
-    bool recoveryPingFailed = false;
-    if (!result.ok && tryNative && autoSwitch && !nativeAlive &&
-        !tp::IsAutoTunnelCommitted() && !Cancelled(cancelEvent)) {
-        T2_LOG("discovery", L"native TCP failed - recovery ff02::1 ping before considering IPv4");
-        if (RecoverPeerViaMulticastPing(&ep)) {
-            // Peer (re)appeared: give native one more bounded step with the
-            // refreshed address before declaring IPv6 dead.
-            result = NativeStep(ep, outConn, cancelEvent, autoSwitch);
-            nativeAlive = result.pathAlive;
-            sawSilent = sawSilent || result.sawSilent;
-            if (result.ok) {
-                tp::NotePathAlive();
-                if (outServicePort) *outServicePort = result.servicePort;
-                if (outRsdPort) *outRsdPort = result.rsdPort;
-                return true;
+        // A SILENT native path may just be a stale peer address: one ff02::1
+        // multicast ping (the cold-start peer reveal). If the peer shows up, give
+        // native one more step with the refreshed address before declaring IPv6
+        // blocked. Pointless for a WFP block (WSAEACCES), so skipped there.
+        if (autoSwitch && native.blocked && !native.wfpBlocked && !Cancelled(cancelEvent)) {
+            T2_LOG("discovery", L"native IPv6 silent - recovery ff02::1 ping before switching to IPv4");
+            if (RecoverPeerViaMulticastPing(&ep)) {
+                native = NativeStep(ep, outConn, cancelEvent, autoSwitch);
+                sawSilent = sawSilent || native.sawSilent;
+                if (native.ok) {
+                    tp::NotePathAlive();
+                    if (outServicePort) *outServicePort = native.servicePort;
+                    if (outRsdPort) *outRsdPort = native.rsdPort;
+                    return true;
+                }
             }
-            // Native still dead after a successful peer reveal → treat as
-            // path-level failure (WFP/VPN dropping IPv6) and fall through to v4.
-            recoveryPingFailed = true;
-            T2_LOG("discovery", L"native still dead after recovery ping - switching to IPv4");
-        } else {
-            recoveryPingFailed = true;
-            T2_LOG("discovery", L"recovery ff02::1 ping unsuccessful - switching to IPv4");
         }
     }
 
+    // Step C - IPv4 tunnel: sticky, IPv6 unusable, or native judged blocked.
+    const bool goTunnel = autoSwitch && (sticky || v6Unavailable || (tryNative && native.blocked));
+    StepResult tunnel;
     bool tunnelTried = false;
-    // Tunnel policy after reboot + VPN:
-    //  * sticky / V6Unavailable → full tunnel scan;
-    //  * recovery ping failed OR native path dead after we tried it → full tunnel
-    //    scan (IPv4). The registry PortCache (IPv6) survives reboot and used to
-    //    make both sides do "cheap HELO only", so a cold boot with VPN never
-    //    scanned. Driver-memory sticky is already 0 after reboot; the scan must
-    //    still run on the transport we fall over to.
-    //  * otherwise only a cheap HELO when a port is already cached (rare path).
-    bool haveCachedPort = false;
-    {
-        uint16_t cp = 0;
-        haveCachedPort = LoadCachedPort(ep, &cp, nullptr, nullptr, /*tunnel=*/true); // tunnel entry, else native one
-    }
-    // Native was tried and produced no path evidence → IPv6 is unusable right now
-    // (VPN/WFP or T2 not ready). Always allow a tunnel *scan*, not just HELO.
-    // recoveryPingFailed covers the explicit "one ping attempt failed" rule;
-    // nativeTried && !nativeAlive covers the post-reboot registry-cache trap.
-    const bool ipv6PathDead = nativeTried && !nativeAlive;
-    const bool tunnelScanAllowed = tp::IsAutoTunnelCommitted() || tp::IsV6Unavailable() ||
-                                   recoveryPingFailed || ipv6PathDead;
-    if (!result.ok && !Cancelled(cancelEvent) &&
-        (autoSwitch && !nativeAlive && (haveCachedPort || tunnelScanAllowed))) {
+    if (goTunnel && !Cancelled(cancelEvent)) {
         tunnelTried = true;
-        T2_LOG("discovery", L"tunnel step: scanAllowed=%d (sticky=%d v6unavail=%d recoveryFail=%d "
-               L"ipv6Dead=%d haveCache=%d)",
-               tunnelScanAllowed ? 1 : 0,
-               tp::IsAutoTunnelCommitted() ? 1 : 0,
-               tp::IsV6Unavailable() ? 1 : 0,
-               recoveryPingFailed ? 1 : 0,
-               ipv6PathDead ? 1 : 0,
-               haveCachedPort ? 1 : 0);
-        result = TunnelStep(&ep, outConn, cancelEvent, tunnelScanAllowed);
-        sawSilent = sawSilent || result.sawSilent;
+        T2_LOG("discovery", L"tunnel step: sticky=%d v6unavail=%d nativeBlocked=%d%s",
+               sticky ? 1 : 0, v6Unavailable ? 1 : 0, native.blocked ? 1 : 0,
+               native.wfpBlocked ? L" (WFP)" : L"");
+        tunnel = TunnelStep(&ep, outConn, cancelEvent);
+        sawSilent = sawSilent || tunnel.sawSilent;
+        if (tunnel.ok) {
+            tp::NotePathAlive();
+            if (outServicePort) *outServicePort = tunnel.servicePort;
+            if (outRsdPort) *outRsdPort = tunnel.rsdPort;
+            return true;
+        }
     }
 
-    if (result.ok) {
-        tp::NotePathAlive();
-        if (outServicePort) *outServicePort = result.servicePort;
-        if (outRsdPort) *outRsdPort = result.rsdPort;
-        return true;
+    // Step D - nothing worked. Exhausted only when a full-chain pass COMPLETED empty
+    // on the transport that decides: the tunnel when we fell over to it (or are
+    // sticky on it), otherwise native. A cancelled / silent / cooled-down pass, or a
+    // LocalError (no MAC/peer yet), is "not yet", never "failed".
+    const bool exhausted = tunnelTried ? tunnel.fullPassEmpty
+                                       : (tryNative && native.fullPassEmpty && !native.blocked);
+    if (exhausted && !Cancelled(cancelEvent)) {
+        T2_LOG("discovery", L"full-chain scan exhausted on %s - BiometricKit not found",
+               tunnelTried ? L"the IPv4 tunnel (native IPv6 blocked or sticky tunnel)" : L"native IPv6");
+        if (outScansExhausted) *outScansExhausted = true;
     }
 
-    // Step E - nothing worked this step. State is untouched (nothing was committed),
-    // the port cache and the scan progress stay, and the ladder retries from step A.
     if (!Cancelled(cancelEvent)) {
         // Only silence counts towards distrusting the persisted peer; a LocalError
         // (no MAC yet) or an alive-but-not-ready path does not.
-        if (ep.peerSource == PeerSource::LastKnown && sawSilent && !result.pathAlive &&
-            !result.localError) {
+        const StepResult& last = tunnelTried ? tunnel : native;
+        if (ep.peerSource == PeerSource::LastKnown && sawSilent && !last.pathAlive &&
+            !last.localError) {
             tp::NotePathSilent();
         }
     }

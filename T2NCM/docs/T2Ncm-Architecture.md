@@ -105,6 +105,24 @@ inverted model observable from user mode — `PowerState` next to
 `DataPathRunning`, plus the two drain counters — and the new fields were
 appended so an older tool still reads every offset it knows.
 
+IPv4-tunnel state lives in driver memory, never in the registry, and a
+reboot or driver unload clears all of it:
+
+| IOCTL | Code | Purpose |
+|---|---|---|
+| `IOCTL_T2NCM_SET_TUNNEL_PEER` | 0x902 | T2 peer fe80 used by the TX rewrite |
+| `IOCTL_T2NCM_SET_TRANSPORT_MODE` | 0x903 | live mode (0 native / 1 tunnel), re-applied after re-init |
+| `IOCTL_T2NCM_SET_TUNNEL_LOCAL` | 0x904 | Windows' real link-local, the tunnel TX source |
+| `IOCTL_T2NCM_SET_TUNNEL_STICKY` | 0x905 | userspace's committed "switched to the tunnel until reboot" flag |
+| `IOCTL_T2NCM_GET_TUNNEL_STATE` | 0x906 | reads `T2NCM_TUNNEL_STATE {Version, Sticky, Mode}` |
+
+0x905 and 0x906 are `FILE_WRITE_ACCESS`, so the UMDF host's write-only
+handle can use them. They only touch driver globals, so they work while no
+adapter is published. Because the sticky flag is stored here, a restarted
+WUDFHost reads it back and stays on the tunnel instead of retrying native
+IPv6. The BridgeXPC port is not tunnel state: it is the same on both
+transports and lives only in `HKLM\SOFTWARE\T2TouchId\Network\PortCache`.
+
 **Not yet validated on hardware.** None of this has been built with a
 real WDK or run against a MacBook — there is no WDK and no T2 device in
 the environment this was written in. Expect the first hardware session to

@@ -14,6 +14,11 @@
 VOID    T2NcmTunnelSetMode(_In_ BOOLEAN Enabled);
 BOOLEAN T2NcmTunnelGetMode(VOID);
 
+// Driver-global sticky-tunnel flag (userspace's committed decision, see
+// IOCTL_T2NCM_SET_TUNNEL_STICKY). Stored only; cleared by reboot.
+VOID    T2NcmTunnelSetSticky(_In_ BOOLEAN Sticky);
+BOOLEAN T2NcmTunnelGetSticky(VOID);
+
 // Copy the driver-global mode into a (re)created DeviceContext.
 // Called from InitializeEx / Restart.
 VOID T2NcmTunnelRefreshMode(_In_ PT2NCM_DEVICE_CONTEXT DeviceContext);
