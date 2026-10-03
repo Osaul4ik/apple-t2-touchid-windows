@@ -61,11 +61,19 @@ inline constexpr wchar_t kPeerMacValue[] = L"PeerMac";
 //       - when off, only Native IPv6 is used.
 //
 //  2. STICKY TUNNEL (until reboot): set only when a switch to the tunnel SUCCEEDED
-//     (a tunnel handshake worked), never on a mere native failure. Stored in an
-//     in-process flag; the driver also keeps TunnelModeEnabled in its own memory
-//     (re-applied after miniport restart) until reboot. No registry. After it is
-//     set there is NO way back to native IPv6 until reboot. The next cold boot
-//     starts from Native IPv6 again and switches to the tunnel only if IPv6 fails.
+//     (a tunnel handshake worked), never on a mere native failure. The source of
+//     truth is T2Ncm.sys MEMORY (IOCTL_T2NCM_SET_TUNNEL_STICKY / GET_TUNNEL_STATE,
+//     a driver global): it survives a WUDFHost restart, an adapter re-init and
+//     sleep, and a reboot (or driver unload) clears it. Each process seeds its
+//     in-process copy from the driver once (EnsureStickySeededFromDriver) and
+//     pushes every change back. No registry. After it is set there is NO way back
+//     to native IPv6 until reboot. The next cold boot starts from Native IPv6 again
+//     and switches to the tunnel only if IPv6 is blocked.
+//     An older T2Ncm.sys without those IOCTLs: the in-process flag alone (the
+//     pre-IOCTL behaviour), logged once.
+//
+//  The BridgeXPC port itself is NOT transport state: it is the same port on both
+//  transports and lives only in the registry (Discovery/PortCache.h).
 //
 // CONNECT ARCHITECTURE v2 (CONNECT_ARCHITECTURE_v2.md) adds, in this file:
 //  * Generation (section 3): scan progress / V6Unavailable are tied to a counter that
@@ -80,12 +88,7 @@ inline constexpr wchar_t kPeerMacValue[] = L"PeerMac";
 // TunnelModeEnabled set it rewrites EVERY inbound IPv6 TCP/UDP frame to IPv4
 // (Tunnel.c, T2NcmTunnelRewriteRxIpv6ToIpv4), so a native SYN-ACK would never reach
 // the IPv6 stack. That is why the two paths are tried one after the other.
-inline constexpr wchar_t kSessionRegPath[] = L"SOFTWARE\\T2TouchId\\Network\\Session";
 inline constexpr wchar_t kAutoSwitchValue[] = L"AutoSwitch";                    // under kNetworkRegPath, persistent
-// Legacy name (was volatile Session\AutoTunnelSticky). Sticky state is now
-// in-process + driver memory only; this constant is kept only so old log/docs
-// references stay searchable. Never written to the registry any more.
-inline constexpr wchar_t kAutoTunnelStickyValue[] = L"AutoTunnelSticky";
 
 enum class TransportMode : DWORD {
     NativeIpv6 = 0,
@@ -137,24 +140,19 @@ inline ULONGLONG BumpGeneration(const wchar_t* why) {
     return n;
 }
 
-// Committed auto-tunnel (in-process, NOT mirrored to the registry - see 3.).
-// Only meaningful while g_autoTunnelGen == CurrentGeneration().
-inline std::atomic<bool> g_autoTunnel{false};
-inline std::atomic<ULONGLONG> g_autoTunnelGen{0};
+// Committed auto-tunnel: in-process copy of the driver's sticky flag (see 2.).
 // Sticky-until-reboot: once the automatic switch to the IPv4 tunnel happened, it stays.
 // It is NOT tied to the Generation (resume / NCM re-enumeration / peer change do not
 // undo it) and there is no way back to native IPv6 until reboot.
-//
-// Storage: in-process flag only. The driver also keeps TunnelModeEnabled in its
-// own memory (IOCTL_T2NCM_SET_TRANSPORT_MODE) and re-applies it across miniport
-// restarts until reboot, so the mode itself survives. We deliberately do NOT
-// use the volatile Session registry key any more — sticky state lives in
-// process + driver memory and clears on reboot / driver unload.
-inline void WriteAutoTunnelSticky(bool /*on*/) {
-    // No-op: sticky is the in-process g_autoTunnel flag + the mode pushed to
-    // the driver. Kept as a symbol so CommitAutoTunnel call sites stay clean.
-}
+inline std::atomic<bool> g_autoTunnel{false};
+inline std::atomic<ULONGLONG> g_autoTunnelGen{0};
+
+// Defined further down (they need the shared T2Ncm control handle).
+inline void EnsureStickySeededFromDriver();
+inline bool PushTunnelStickyToDriver(bool on);
+
 inline bool IsAutoTunnelCommitted() {
+    EnsureStickySeededFromDriver(); // one IOCTL per process, then a relaxed load
     return g_autoTunnel.load(std::memory_order_relaxed);
 }
 
@@ -191,6 +189,8 @@ enum class PathEvidence {
     Silent,     // nothing came back inside the budget
     LocalError, // local problem (no route/address/MAC) - says nothing about the path
     Refused,    // RST; a proof of the path only if assumption A0 holds
+    Blocked,    // WSAEACCES on connect: a local WFP block filter (VPN kill-switch) -
+                // the path is known dead at once, no need to wait for a timeout
 };
 // A0 [HW]: the T2 answers a SYN to a closed port with RST. Unconfirmed, so the
 // default is "not proof"; flip HKLM\SOFTWARE\T2TouchId\Network\RstIsProof=1
@@ -212,7 +212,8 @@ inline PathEvidence ClassifyWsaError(int wsa) {
         case WSAEAFNOSUPPORT:  return PathEvidence::LocalError;
         // WSAEACCES is what a WFP block filter (VPN kill-switch) returns on connect():
         // that IS the blocked-path case the tunnel exists for, not a local fault.
-        default:               return PathEvidence::Silent; // timeout, host unreachable, WFP block, aborted...
+        case WSAEACCES:        return PathEvidence::Blocked;
+        default:               return PathEvidence::Silent; // timeout, host unreachable, aborted...
     }
 }
 
@@ -242,19 +243,20 @@ inline void RecordNativeSuccess(ULONGLONG tcpMs) {
     DWORD next = (old == 0) ? static_cast<DWORD>(tcpMs) : static_cast<DWORD>((old * 3 + tcpMs) / 4);
     if (next == 0) next = 1;
     g_nativeEmaMs.store(next, std::memory_order_relaxed);
-    g_autoTunnel.store(false, std::memory_order_relaxed);
+    EnsureStickySeededFromDriver();
+    if (g_autoTunnel.exchange(false, std::memory_order_relaxed)) {
+        PushTunnelStickyToDriver(false);
+    }
     ClearV6Unavailable(); // a native handshake just worked
 }
-// Tunnel handshake completed after native failed: sticky until reboot (in-process
-// flag + driver TunnelModeEnabled). Independent of Generation.
+// Tunnel handshake completed after native failed: sticky until reboot (driver
+// memory + in-process copy). Independent of Generation. on=false only when
+// auto-switch was turned off.
 inline void CommitAutoTunnel(bool on) {
+    EnsureStickySeededFromDriver();
     const bool was = g_autoTunnel.exchange(on, std::memory_order_relaxed);
-    if (on) {
-        g_autoTunnelGen.store(CurrentGeneration(), std::memory_order_relaxed);
-        if (!was) WriteAutoTunnelSticky(true); // no-op (driver already holds the mode)
-    } else {
-        WriteAutoTunnelSticky(false);
-    }
+    if (on) g_autoTunnelGen.store(CurrentGeneration(), std::memory_order_relaxed);
+    if (was != on) PushTunnelStickyToDriver(on);
 }
 
 // ---- persisted-peer trust -----------------------------------------------
@@ -659,7 +661,9 @@ inline bool IsStaleControlHandleError(DWORD e) {
 // the service. A stale cached handle is dropped and the IOCTL retried once on a
 // fresh open.
 inline T2NcmIoctlResult T2NcmControlIoctl(const wchar_t* who, DWORD code,
-                                          LPVOID in, DWORD inSize) {
+                                          LPVOID in, DWORD inSize,
+                                          LPVOID out = nullptr, DWORD outSize = 0,
+                                          DWORD* outReturned = nullptr) {
     T2NcmControlLease lease; // keeps the handle open for the duration of this call at least
     auto& s = T2NcmControl();
     T2NcmIoctlResult r;
@@ -683,7 +687,8 @@ inline T2NcmIoctlResult T2NcmControlIoctl(const wchar_t* who, DWORD code,
             h = s.h;
         }
         DWORD returned = 0;
-        if (DeviceIoControl(h, code, in, inSize, nullptr, 0, &returned, nullptr)) {
+        if (DeviceIoControl(h, code, in, inSize, out, outSize, &returned, nullptr)) {
+            if (outReturned) *outReturned = returned;
             r.ok = true;
             r.err = 0;
             return r;
@@ -721,6 +726,88 @@ inline bool PushTunnelPeerToDriver(const in6_addr& peer6) {
         return false;
     }
     RememberLastPushedPeer(peer6);
+    return true;
+}
+
+// ---- Sticky tunnel flag in T2Ncm.sys memory (see 2. at the top) ------------
+// Same CTL_CODEs as T2NCM/driver/Public.h (hand-rolled, like 0x902/0x903 here).
+// Both are FILE_WRITE_ACCESS: the control device hands LocalService a write-only
+// handle, and the I/O manager checks only the access the code requires, so the
+// GET still returns its METHOD_BUFFERED output to the UMDF host.
+inline constexpr DWORD kIoctlSetTunnelSticky =
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x905, METHOD_BUFFERED, FILE_WRITE_ACCESS);
+inline constexpr DWORD kIoctlGetTunnelState =
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x906, METHOD_BUFFERED, FILE_WRITE_ACCESS);
+struct T2NcmTunnelStateWire { // == T2NCM_TUNNEL_STATE (Public.h)
+    ULONG Version;
+    ULONG Sticky;
+    ULONG Mode;
+};
+// 0 = not seeded yet, 1 = seeded from the driver, 2 = the driver has no such
+// IOCTL or is not reachable (in-process flag only).
+inline std::atomic<int>& StickySeedState() {
+    static std::atomic<int> s{0};
+    return s;
+}
+inline std::mutex& StickySeedMutex() {
+    static std::mutex m;
+    return m;
+}
+
+inline bool ReadTunnelStateFromDriver(T2NcmTunnelStateWire* out, DWORD* err) {
+    T2NcmTunnelStateWire st{};
+    DWORD returned = 0;
+    const T2NcmIoctlResult r = T2NcmControlIoctl(L"GetTunnelState", kIoctlGetTunnelState,
+                                                 nullptr, 0, &st, sizeof(st), &returned);
+    if (err) *err = r.err;
+    if (!r.ok || returned < sizeof(st)) return false;
+    *out = st;
+    return true;
+}
+
+// Seeds g_autoTunnel from the driver once per process. A restarted WUDFHost thus
+// stays on the tunnel the previous instance committed to (no native retry, no
+// mode-0 push into a driver that is supposed to stay in tunnel mode). Not marked
+// done while the system is suspending: the next call retries.
+inline void EnsureStickySeededFromDriver() {
+    if (StickySeedState().load(std::memory_order_acquire) != 0) return;
+    if (IsTransportIoSuspended()) return;
+    std::lock_guard<std::mutex> lock(StickySeedMutex());
+    if (StickySeedState().load(std::memory_order_relaxed) != 0) return;
+    T2NcmTunnelStateWire st{};
+    DWORD err = 0;
+    if (ReadTunnelStateFromDriver(&st, &err)) {
+        if (st.Sticky != 0) {
+            g_autoTunnel.store(true, std::memory_order_relaxed);
+            g_autoTunnelGen.store(CurrentGeneration(), std::memory_order_relaxed);
+        }
+        T2_LOG("transport", L"sticky tunnel seeded from T2Ncm memory: sticky=%lu mode=%lu",
+               st.Sticky, st.Mode);
+        StickySeedState().store(1, std::memory_order_release);
+        return;
+    }
+    T2_LOG("transport", L"T2Ncm GET_TUNNEL_STATE unavailable (GetLastError=%lu%s) - sticky "
+           L"tunnel kept in this process only", err,
+           err == ERROR_INVALID_FUNCTION ? L", older T2Ncm.sys" : L"");
+    StickySeedState().store(2, std::memory_order_release);
+}
+
+inline bool PushTunnelStickyToDriver(bool on) {
+    if (StickySeedState().load(std::memory_order_acquire) == 2) return false; // no IOCTL
+    if (IsTransportIoSuspended()) {
+        T2_LOG("tunnel", L"PushTunnelStickyToDriver: skipped (system suspending / Dx)");
+        return false;
+    }
+    ULONG v = on ? 1ul : 0ul;
+    const T2NcmIoctlResult r = T2NcmControlIoctl(L"PushTunnelStickyToDriver", kIoctlSetTunnelSticky,
+                                                 &v, sizeof(v));
+    if (!r.ok) {
+        if (!r.openFailed) {
+            T2_LOG("tunnel", L"PushTunnelStickyToDriver: IOCTL failed, GetLastError=%lu", r.err);
+        }
+        return false;
+    }
+    T2_LOG("tunnel", L"PushTunnelStickyToDriver: sticky tunnel -> %lu (driver memory, cleared on reboot)", v);
     return true;
 }
 

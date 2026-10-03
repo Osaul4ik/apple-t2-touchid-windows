@@ -117,6 +117,22 @@ Windows-акаунту або окремого enroll-проходу з explicit
 fail-closed принцип, що вже explicitly задокументований у
 `VerificationEngine.h`, просто продовжується на рівень WinBio.
 
+**Коли `TransportError` завершує CAPTURE (03.10.2026).** Таймера більше немає
+(раніше було вікно 30 с). Поки T2 недосяжний, `CAPTURE_DATA` лишається pending
+(WBF чекає на відбиток). Завершується він лише в двох випадках: Windows сам
+скасовує запит (`CancelIoEx`), або discovery повідомляє, що повний прохід
+скану (49000–65535) **завершився** без BiometricKit на транспорті, який
+вирішує: IPv4-тунель, якщо IPv6 заблоковано або тунель уже sticky, інакше
+native IPv6 (`ConnectToBiometricKitBridge(..., outScansExhausted)`). Обірвана
+BridgeXPC-сесія сама по собі CAPTURE не завершує: після паузи йде повторне
+підключення (HELO на порт із реєстру, а тоді повний скан). Сесія StartMatch,
+як і раніше, перезапускається кожні 20 с.
+
+**Short/Long verify.** Режим береться з налаштування в GUI (`ShortVerify`).
+Виняток: якщо останнім вердиктом був `NoMatch` (неправильний палець),
+наступна сесія **завжди Long** (ResetSensor + LoadCalibration). Прапорець
+знімається після `Match` або `Timeout`.
+
 ## 6. Concurrency
 
 `VerificationEngine::IsBusy()`/"one active session" вже існує. WBDI-хендлер

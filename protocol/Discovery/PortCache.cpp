@@ -16,12 +16,8 @@
 // already grants LocalService write access to the Network key with
 // ContainerInherit, so this subkey inherits it.
 //
-// Contract for callers (BridgeDiscovery / CLI):
-//   - LoadCachedPort returns false when there is no value for this MAC or the
-//     value has an empty / invalid port. That is the signal to run a full scan
-//     — never treat a missing or empty cache as a reason to block.
-//   - SaveCachedPort is best-effort; a failure is logged with the Win32 error
-//     (5 = the LocalService ACL is missing) and the in-process map still works.
+// Registry only - no in-process copy (see PortCache.h): one source of truth for
+// the UMDF host, the CLI and the GUI, and for both transports.
 #include "PortCache.h"
 #include "../BridgeXpc/Log.h"
 #include "../BridgeXpc/TransportMode.h"
@@ -35,26 +31,9 @@
 #include <string>
 #include <cstdio>
 #include <atomic>
-#include <map>
-#include <mutex>
 
 namespace t2::discovery {
 namespace {
-
-// Process-lifetime cache, consulted BEFORE the registry below.
-//
-// Why it exists: a failed or delayed first registry write would still leave
-// every CAPTURE_DATA in the same WUDFHost process paying a full 16k-port scan.
-// The process outlives every capture, so a plain static map makes every capture
-// after the first skip the scan. Like the registry value, it is only a hint:
-// the caller still verifies the port with a live HELO and falls back to a scan
-// on any miss.
-struct MemPorts { uint16_t port = 0; uint16_t rsd = 0; bool suspect = false; };
-std::mutex g_memMu;
-std::map<std::string, MemPorts>& MemCache() {
-    static std::map<std::string, MemPorts> m;
-    return m;
-}
 
 std::string FormatMacKey(const unsigned char mac[6]) {
     char buf[18];
@@ -82,48 +61,25 @@ std::string Narrow(const wchar_t* w) {
     return s;
 }
 
-// Native IPv6 only: ...\\Network\\PortCache. IPv4-tunnel cache is memory-only
-// (no registry path) so it clears on process/driver restart.
 std::wstring PortCacheRegPath() {
     return std::wstring(t2::transport::kNetworkRegPath) + L"\\PortCache";
 }
 
-// In-process map key: same MAC, different suffix per transport.
-std::string MemKey(const std::string& macKey, bool tunnel) {
-    return tunnel ? macKey + "|v4" : macKey;
-}
-
-// Parse "port" or "port,rsdPort". Returns false when the service port is
-// missing, non-numeric, or out of the valid TCP range (0 is not a valid
-// BridgeXPC port). Empty / corrupt value ⇒ cache miss ⇒ full scan.
-bool ParsePortValue(const std::string& raw, uint16_t* outPort, uint16_t* outRsd) {
-    std::string first = raw;
-    std::string second;
-    size_t comma = raw.find(',');
-    if (comma != std::string::npos) {
-        first = Trim(raw.substr(0, comma));
-        second = Trim(raw.substr(comma + 1));
+// Strict decimal parse of a whole token: digits only, 1..65535.
+bool ParsePortToken(const std::string& tok, int* out) {
+    if (tok.empty() || tok.size() > 5) return false;
+    int v = 0;
+    for (char c : tok) {
+        if (c < '0' || c > '9') return false;
+        v = v * 10 + (c - '0');
     }
-    if (first.empty()) return false;
-    int value = 0;
-    try {
-        value = std::stoi(first);
-    } catch (...) {
-        return false;
-    }
-    if (value <= 0 || value > 65535) return false;
-    int rsd = 0;
-    if (!second.empty()) {
-        try { rsd = std::stoi(second); } catch (...) { rsd = 0; }
-        if (rsd <= 0 || rsd > 65535) rsd = 0;
-    }
-    if (outPort) *outPort = static_cast<uint16_t>(value);
-    if (outRsd) *outRsd = static_cast<uint16_t>(rsd);
+    if (v <= 0 || v > 65535) return false;
+    *out = v;
     return true;
 }
 
-// Reads this MAC's native (IPv6) value. Missing key/value, wrong type or no
-// read access all come back false (cache miss). Tunnel cache never hits here.
+// Reads this MAC's value. Missing key/value, wrong type or no read access all
+// come back false (cache miss).
 bool ReadRegValue(const std::string& macKey, std::string* out) {
     wchar_t buf[64] = {};
     DWORD cb = sizeof(buf) - sizeof(wchar_t); // keep room for a terminator
@@ -137,14 +93,14 @@ bool ReadRegValue(const std::string& macKey, std::string* out) {
     return true;
 }
 
-// One health line per outage (v2 section 5): a port cache that cannot be written
-// (err 5 = the LocalService ACL is missing) is the reason EVERY boot pays a scan,
-// so it must be visible once - but not repeated on every save.
+// One health line per outage: a port cache that cannot be written (err 5 = the
+// LocalService ACL is missing) is the reason EVERY boot pays a scan, so it must
+// be visible once - but not repeated on every save.
 std::atomic<bool> g_regFailureReported{false};
 void ReportRegistryHealth(const wchar_t* api, const wchar_t* path, LSTATUS rc) {
     if (g_regFailureReported.exchange(true, std::memory_order_relaxed)) return;
-    T2_LOG("health", L"PortCache registry write failed (%s on %s, err=%lu%s): the port is cached in "
-           L"memory only, so every boot re-scans. Re-run tools\\Set-T2NcmStaticIp.ps1 as "
+    T2_LOG("health", L"PortCache registry write failed (%s on %s, err=%lu%s): the port is NOT "
+           L"cached, so every connect re-scans. Re-run tools\\Set-T2NcmStaticIp.ps1 as "
            L"administrator to fix the key ACL.",
            api, path, static_cast<unsigned long>(rc),
            rc == ERROR_ACCESS_DENIED ? L" = access denied" : L"");
@@ -152,94 +108,44 @@ void ReportRegistryHealth(const wchar_t* api, const wchar_t* path, LSTATUS rc) {
 
 } // namespace
 
-bool LoadCachedPort(const NcmEndpoint& endpoint, uint16_t* outPort, uint16_t* outRsdPort,
-                    bool* outSuspect, bool tunnel) {
-    if (outSuspect) *outSuspect = false;
-    if (!endpoint.hasMac) return false; // no stable key to look up
-
-    const std::string macKey = FormatMacKey(endpoint.mac);
-    const std::string key = MemKey(macKey, tunnel);
-    {
-        std::lock_guard<std::mutex> lock(g_memMu);
-        auto it = MemCache().find(key);
-        if (it != MemCache().end() && it->second.port != 0) {
-            if (outPort) *outPort = it->second.port;
-            if (outRsdPort) *outRsdPort = it->second.rsd;
-            if (outSuspect) *outSuspect = it->second.suspect;
-            return true;
-        }
+bool ParsePortCacheValue(const std::string& raw, uint16_t* outPort, uint16_t* outRsd) {
+    std::string first = Trim(raw);
+    std::string second;
+    const size_t comma = first.find(',');
+    if (comma != std::string::npos) {
+        second = Trim(first.substr(comma + 1));
+        first = Trim(first.substr(0, comma));
     }
-
-    // Tunnel (IPv4) cache is memory-only: no registry. Fall back to native entry
-    // as a first guess (same T2 service port; never poisons the native cache).
-    if (tunnel) {
-        return LoadCachedPort(endpoint, outPort, outRsdPort, outSuspect, /*tunnel=*/false);
-    }
-
-    // Native IPv6: registry + warm the process map.
-    // No value, or an empty / non-numeric / out-of-range port ⇒ return false ⇒
-    // caller runs a full port scan.
-    std::string raw;
-    uint16_t port = 0, rsd = 0;
-    if (!ReadRegValue(macKey, &raw) || !ParsePortValue(raw, &port, &rsd)) {
-        return false;
-    }
-    if (outPort) *outPort = port;
-    if (outRsdPort) *outRsdPort = rsd;
-    // Warm the process cache so the next CAPTURE in this WUDFHost skips the
-    // registry read as well.
-    {
-        std::lock_guard<std::mutex> lock(g_memMu);
-        MemPorts& m = MemCache()[key];
-        m.port = port;
-        m.rsd = rsd;
-    }
+    int value = 0;
+    if (!ParsePortToken(first, &value)) return false;
+    int rsd = 0;
+    if (!second.empty() && !ParsePortToken(second, &rsd)) rsd = 0;
+    if (outPort) *outPort = static_cast<uint16_t>(value);
+    if (outRsd) *outRsd = static_cast<uint16_t>(rsd);
     return true;
 }
 
-void MarkCachedPortSuspect(const NcmEndpoint& endpoint, bool suspect, bool tunnel) {
-    if (!endpoint.hasMac) return;
-    const std::string key = MemKey(FormatMacKey(endpoint.mac), tunnel);
-    std::lock_guard<std::mutex> lock(g_memMu);
-    auto it = MemCache().find(key);
-    if (it == MemCache().end() || it->second.port == 0) return;
-    if (it->second.suspect != suspect) {
-        it->second.suspect = suspect;
-        T2_LOG("discovery", L"%s cached port %u marked %s", tunnel ? L"tunnel" : L"native",
-               static_cast<unsigned>(it->second.port),
-               suspect ? L"Suspect (kept; replaced only by a confirmed scan result)" : L"Good");
+bool LoadCachedPort(const NcmEndpoint& endpoint, uint16_t* outPort, uint16_t* outRsdPort) {
+    if (!endpoint.hasMac) return false; // no stable key to look up
+    std::string raw;
+    uint16_t port = 0, rsd = 0;
+    if (!ReadRegValue(FormatMacKey(endpoint.mac), &raw) || !ParsePortCacheValue(raw, &port, &rsd)) {
+        return false; // miss => caller runs a full port scan
     }
+    if (outPort) *outPort = port;
+    if (outRsdPort) *outRsdPort = rsd;
+    return true;
 }
 
-void SaveCachedPort(const NcmEndpoint& endpoint, uint16_t port, uint16_t rsdPort, bool tunnel) {
+void SaveCachedPort(const NcmEndpoint& endpoint, uint16_t port, uint16_t rsdPort) {
     if (!endpoint.hasMac) return; // nothing stable to key this entry on
     if (port == 0) return;         // never persist an empty/zero port
 
-    const std::string macKey = FormatMacKey(endpoint.mac);
-    const std::string key = MemKey(macKey, tunnel);
-
-    {
-        // Always remember it for this process.
-        std::lock_guard<std::mutex> lock(g_memMu);
-        MemPorts& m = MemCache()[key];
-        m.port = port;
-        m.rsd = rsdPort;
-        m.suspect = false; // a confirmed port is Good
-    }
-
-    // IPv4-tunnel cache stays in memory only (clears on process/driver restart).
-    if (tunnel) {
-        T2_LOG("discovery", L"SaveCachedPort: tunnel (IPv4) port %u cached in memory only",
-               static_cast<unsigned>(port));
-        return;
-    }
-
-    // Native IPv6: also persist to the registry so the port survives process restarts.
     std::string value = std::to_string(port);
     if (rsdPort != 0) value += "," + std::to_string(rsdPort);
     const std::wstring wvalue = Widen(value);
     const std::wstring path = PortCacheRegPath();
-    const std::wstring name = Widen(macKey);
+    const std::wstring name = Widen(FormatMacKey(endpoint.mac));
 
     HKEY hKey = nullptr;
     LSTATUS rc = RegCreateKeyExW(HKEY_LOCAL_MACHINE, path.c_str(), 0, nullptr,
@@ -258,8 +164,17 @@ void SaveCachedPort(const NcmEndpoint& endpoint, uint16_t port, uint16_t rsdPort
         return;
     }
     g_regFailureReported.store(false, std::memory_order_relaxed);
-    T2_LOG("discovery", L"SaveCachedPort: wrote %s\\%s = %s",
-           path.c_str(), name.c_str(), wvalue.c_str());
+    T2_LOG("discovery", L"SaveCachedPort: wrote %s\\%s = %s (%s)",
+           path.c_str(), name.c_str(), wvalue.c_str(),
+           t2::transport::IsTunnelModeActive() ? L"confirmed over IPv4 tunnel" : L"confirmed over native IPv6");
+}
+
+bool DeleteCachedPort(const NcmEndpoint& endpoint) {
+    if (!endpoint.hasMac) return false;
+    const std::wstring path = PortCacheRegPath();
+    const std::wstring name = Widen(FormatMacKey(endpoint.mac));
+    const LSTATUS rc = RegDeleteKeyValueW(HKEY_LOCAL_MACHINE, path.c_str(), name.c_str());
+    return rc == ERROR_SUCCESS || rc == ERROR_FILE_NOT_FOUND || rc == ERROR_PATH_NOT_FOUND;
 }
 
 } // namespace t2::discovery

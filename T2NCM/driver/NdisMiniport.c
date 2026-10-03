@@ -190,6 +190,53 @@ T2NcmDispatchDeviceControl(
     ExAcquireResourceSharedLite(&g_T2NcmDiagnosticLock, TRUE);
     context = g_T2NcmDiagnosticAdapter;
 
+    // Driver-global tunnel state: no adapter needed (a WUDFHost restarted
+    // while the adapter is being re-initialized must still be able to read
+    // the committed decision back).
+    switch (stack->Parameters.DeviceIoControl.IoControlCode)
+    {
+    case IOCTL_T2NCM_SET_TUNNEL_STICKY:
+    {
+        ULONG inLen = stack->Parameters.DeviceIoControl.InputBufferLength;
+        ULONG sticky;
+
+        if (inLen < sizeof(ULONG) || Irp->AssociatedIrp.SystemBuffer == NULL)
+        {
+            status = STATUS_INVALID_PARAMETER;
+            goto Complete;
+        }
+        RtlCopyMemory(&sticky, Irp->AssociatedIrp.SystemBuffer, sizeof(ULONG));
+        T2NcmTunnelSetSticky(sticky == 1ul);
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
+            "T2Ncm: sticky tunnel set via IOCTL -> %u (driver memory, cleared on reboot)\n",
+            (sticky == 1ul) ? 1u : 0u));
+        status = STATUS_SUCCESS;
+        goto Complete;
+    }
+
+    case IOCTL_T2NCM_GET_TUNNEL_STATE:
+    {
+        T2NCM_TUNNEL_STATE state;
+        ULONG outLen = stack->Parameters.DeviceIoControl.OutputBufferLength;
+
+        if (outLen < sizeof(state) || Irp->AssociatedIrp.SystemBuffer == NULL)
+        {
+            status = STATUS_BUFFER_TOO_SMALL;
+            goto Complete;
+        }
+        state.Version = T2NCM_TUNNEL_STATE_VERSION;
+        state.Sticky = T2NcmTunnelGetSticky() ? 1u : 0u;
+        state.Mode = T2NcmTunnelGetMode() ? 1u : 0u;
+        RtlCopyMemory(Irp->AssociatedIrp.SystemBuffer, &state, sizeof(state));
+        information = sizeof(state);
+        status = STATUS_SUCCESS;
+        goto Complete;
+    }
+
+    default:
+        break;
+    }
+
     if (context == NULL)
     {
         // No adapter initialized (halted, or mid-initialization). Say so

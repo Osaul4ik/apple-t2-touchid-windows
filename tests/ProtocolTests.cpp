@@ -7,6 +7,11 @@
 // assumed for this PoC tree; swap for a real framework (Catch2/GTest)
 // before this becomes a permanent CI suite.
 
+// Discovery/transport headers first: they pull in <winsock2.h>, which must
+// precede any <windows.h>.
+#include "../protocol/Discovery/PortScan.h"
+#include "../protocol/Discovery/PortCache.h"
+#include "../protocol/BridgeXpc/TransportMode.h"
 #include "../protocol/BridgeXpc/Frame.h"
 #include "../protocol/BridgeXpc/PlistPayload.h"
 #include "../protocol/BiometricKit/MatchResult.h"
@@ -387,6 +392,90 @@ static void TestStatisticsEventBody_DecodesTypeAndValue() {
 }
 
 
+
+
+// ---- Port scan order / port cache / path evidence (no hardware) ----------------
+
+static void TestPortOrder_PriorityBandsThenRest() {
+    const auto order = discovery::BuildPortOrder(49000, 65535, true, false);
+    CHECK(order.size() == 16536u);
+    CHECK(discovery::PriorityBandCount(49000, 65535) == 2001u);
+    bool bandsOk = order.size() >= 2001;
+    for (unsigned i = 0; bandsOk && i < 1001; ++i) bandsOk = order[i] == 59000 + i;
+    for (unsigned i = 0; bandsOk && i < 1000; ++i) bandsOk = order[1001 + i] == 49000 + i;
+    CHECK(bandsOk);
+    // Rest ascending, starting right after the 49xxx band.
+    CHECK(order.size() > 2001 && order[2001] == 50000);
+    CHECK(order.back() == 65535);
+    std::vector<unsigned char> seen(65536, 0);
+    bool noDupes = true;
+    for (uint16_t p : order) {
+        if (p < 49000 || seen[p]) noDupes = false;
+        seen[p] = 1;
+    }
+    CHECK(noDupes);
+}
+
+static void TestPortOrder_ClippedToRange() {
+    // A narrower range keeps only the overlapping part of each band.
+    const auto order = discovery::BuildPortOrder(49152, 65535, true, false);
+    CHECK(order.size() == 16384u);
+    CHECK(discovery::PriorityBandCount(49152, 65535) == 1001u + 848u);
+    CHECK(!order.empty() && order[0] == 59000);
+    CHECK(order.size() > 1001 && order[1001] == 49152);
+}
+
+static void TestPortCacheValue_Parse() {
+    uint16_t port = 0, rsd = 0;
+    CHECK(discovery::ParsePortCacheValue("12345", &port, &rsd) && port == 12345 && rsd == 0);
+    CHECK(discovery::ParsePortCacheValue("12345,6789", &port, &rsd) && port == 12345 && rsd == 6789);
+    CHECK(discovery::ParsePortCacheValue(" 49341 , 59602 ", &port, &rsd) && port == 49341 && rsd == 59602);
+    CHECK(discovery::ParsePortCacheValue("1,abc", &port, &rsd) && port == 1 && rsd == 0);
+    CHECK(!discovery::ParsePortCacheValue("", &port, &rsd));
+    CHECK(!discovery::ParsePortCacheValue("0", &port, &rsd));
+    CHECK(!discovery::ParsePortCacheValue("70000", &port, &rsd));
+    CHECK(!discovery::ParsePortCacheValue("abc", &port, &rsd));
+    CHECK(!discovery::ParsePortCacheValue("12a45", &port, &rsd));
+    CHECK(!discovery::ParsePortCacheValue(",6789", &port, &rsd));
+}
+
+static void TestPathEvidence_WfpBlockIsBlocked() {
+    CHECK(transport::ClassifyWsaError(WSAEACCES) == transport::PathEvidence::Blocked);
+    CHECK(transport::ClassifyWsaError(WSAECONNREFUSED) == transport::PathEvidence::Refused);
+    CHECK(transport::ClassifyWsaError(0) == transport::PathEvidence::Positive);
+    CHECK(transport::ClassifyWsaError(WSAETIMEDOUT) == transport::PathEvidence::Silent);
+    CHECK(transport::ClassifyWsaError(WSAENETUNREACH) == transport::PathEvidence::LocalError);
+}
+
+// Registry round trip. Only runs where the PortCache key already exists and is
+// writable (a machine set up by Set-T2NcmStaticIp.ps1, as administrator): it never
+// creates keys, so it leaves no trace on a machine without the T2 stack.
+static void TestPortCache_RegistryRoundTrip() {
+    HKEY key = nullptr;
+    const LSTATUS rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\T2TouchId\\Network\\PortCache",
+                                     0, KEY_SET_VALUE, &key);
+    if (rc != ERROR_SUCCESS) {
+        std::wcout << L"SKIP: PortCache registry round trip (key missing or not writable, err="
+                   << rc << L"; run as administrator on a configured machine)\n";
+        return;
+    }
+    RegCloseKey(key);
+    discovery::NcmEndpoint ep;
+    ep.hasMac = true;
+    const unsigned char testMac[6] = {0x02, 0x00, 0x5E, 0x00, 0x53, 0xFE}; // locally administered
+    std::memcpy(ep.mac, testMac, 6);
+    uint16_t port = 0, rsd = 0;
+    discovery::SaveCachedPort(ep, 49341, 59602);
+    CHECK(discovery::LoadCachedPort(ep, &port, &rsd) && port == 49341 && rsd == 59602);
+    discovery::SaveCachedPort(ep, 49999); // a confirmed port overwrites; rsd optional
+    CHECK(discovery::LoadCachedPort(ep, &port, &rsd) && port == 49999 && rsd == 0);
+    discovery::SaveCachedPort(ep, 0);     // rejected, entry untouched
+    CHECK(discovery::LoadCachedPort(ep, &port, &rsd) && port == 49999);
+    CHECK(discovery::DeleteCachedPort(ep));
+    CHECK(!discovery::LoadCachedPort(ep, &port, &rsd));
+    discovery::NcmEndpoint noMac; // no stable key => always a miss
+    CHECK(!discovery::LoadCachedPort(noMac, &port, &rsd));
+}
 int wmain() {
     TestFrameHeader_Valid();
     TestFrameHeader_Truncated();
@@ -416,6 +505,12 @@ int wmain() {
     TestStatusCodeNames_UnverifiedTable();
     TestStatisticsEventBody_DecodesTypeAndValue();
     TestLinuxIdentityCapacitiesAndGlobalCommand();
+
+    TestPortOrder_PriorityBandsThenRest();
+    TestPortOrder_ClippedToRange();
+    TestPortCacheValue_Parse();
+    TestPathEvidence_WfpBlockIsBlocked();
+    TestPortCache_RegistryRoundTrip();
 
     if (g_failures == 0) {
         std::wcout << L"All tests passed.\n";

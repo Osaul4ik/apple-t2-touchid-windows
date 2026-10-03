@@ -225,6 +225,35 @@ typedef struct _T2NCM_STATUS
 #define IOCTL_T2NCM_SET_TUNNEL_LOCAL \
     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x904, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 
+// Sticky IPv4-tunnel flag, owned by userspace (TransportMode.h): set once an
+// automatic switch to the tunnel SUCCEEDED, cleared only when auto-switch is
+// turned off or a native handshake works again. Kept in driver memory (a
+// driver global, independent of any adapter instance) so it survives a
+// WUDFHost restart, adapter re-init and sleep; a reboot / driver unload
+// clears it, so every cold boot starts on native IPv6. The driver never
+// acts on it itself - it is stored state, the live mode is still
+// IOCTL_T2NCM_SET_TRANSPORT_MODE. Input buffer: one ULONG, 0 or 1.
+// FILE_WRITE_ACCESS (not READ) on both of these so the UMDF host's
+// write-only handle (SDDL in NdisMiniport.c) can use them.
+#define IOCTL_T2NCM_SET_TUNNEL_STICKY \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x905, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+
+// Returns T2NCM_TUNNEL_STATE in the output buffer (METHOD_BUFFERED). Works
+// with no adapter present: it only reads driver globals.
+#define IOCTL_T2NCM_GET_TUNNEL_STATE \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x906, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+
+#define T2NCM_TUNNEL_STATE_VERSION 1u
+
+#pragma pack(push, 1)
+typedef struct _T2NCM_TUNNEL_STATE
+{
+    UINT32 Version;  // T2NCM_TUNNEL_STATE_VERSION
+    UINT32 Sticky;   // 1 = committed to the IPv4 tunnel until reboot
+    UINT32 Mode;     // driver-global transport mode: 0 native, 1 tunnel
+} T2NCM_TUNNEL_STATE, *PT2NCM_TUNNEL_STATE;
+#pragma pack(pop)
+
 // NT symbolic link the diagnostic device is reachable through. Created
 // by NdisMRegisterDeviceEx in NdisMiniport.c; open it with
 // CreateFile("\\\\.\\T2Ncm", ...).

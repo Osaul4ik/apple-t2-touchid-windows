@@ -32,11 +32,16 @@ struct ScanStats {
     unsigned tried = 0;          // probes finished during this call
     unsigned tcpHits = 0;
     unsigned http2Hits = 0;
+    unsigned refused = 0;        // RST (WSAECONNREFUSED): a packet came back, the path works
+    unsigned blocked = 0;        // WSAEACCES on connect: a local WFP block filter (VPN kill-switch)
     bool exhausted = false;      // reached the end of the (limited) order
+    bool silentAborted = false;  // stopped by ScanOptions::silentAbortAfter (path silent)
 };
 
 struct ScanOptions {
-    uint16_t portBegin = 49152;
+    // 49000, not 49152: the 49xxx priority band starts at 49000 and the
+    // Windows/T2 ephemeral range alone would silently skip 49000-49151.
+    uint16_t portBegin = 49000;
     uint16_t portEnd = 65535;
     unsigned concurrency = 256;
     // Linux default --probe-timeout 0.15 (150ms). Lowered here: observed
@@ -45,7 +50,7 @@ struct ScanOptions {
     // margin for VPN-induced jitter (see Adapter.cpp's neighbor-poll
     // comment) without reintroducing the old 150ms cost across 16384
     // ports.
-    unsigned connectTimeoutMs = 20;
+    unsigned connectTimeoutMs = 25;
     bool includeTcpOnly = true;
     // tried, total, tcpHits, http2Hits
     std::function<void(unsigned, unsigned, unsigned, unsigned)> onProgress;
@@ -80,8 +85,8 @@ struct ScanOptions {
     //
     //   priorityBands=true (default): hardware-tuned order observed on
     //   real T2 sessions —
-    //     1) 59xxx  (RemoteXPC often lands here, e.g. 59602)
-    //     2) 49xxx  (BridgeXPC / dense HTTP/2 decoys, e.g. 49341)
+    //     1) 59000-60000 (RemoteXPC often lands here, e.g. 59602)
+    //     2) 49000-49999 (BridgeXPC / dense HTTP/2 decoys, e.g. 49341)
     //     3) everything else in the range, ascending
     //   So a BiometricKit hit at 59xxx cancels long before the scan
     //   grinds through the middle of the ephemeral range.
@@ -104,13 +109,20 @@ struct ScanOptions {
     unsigned orderSkip = 0;
     unsigned orderLimit = 0;
     ScanStats* stats = nullptr;
+
+    // Path-silence early abort: once this many probes of THIS call have finished
+    // and not one of them got anything back (no SYN-ACK, no RST), stop claiming
+    // new ports and report stats->silentAborted. A dead/filtered path is then
+    // known after ~2 rounds of probes instead of a whole 16k-port pass.
+    // A WFP block (WSAEACCES) counts as "nothing back". 0 = disabled.
+    unsigned silentAbortAfter = 0;
 };
 
 // Dispatch order used by ScanHttp2Preface (see ScanOptions::priorityBands).
 std::vector<uint16_t> BuildPortOrder(uint16_t begin, uint16_t end,
                                      bool priorityBands, bool scanFromEnd);
 // Number of leading entries of the priority order that belong to the two priority
-// bands (59xxx, 49xxx) - i.e. "priority ranges only" is orderLimit = this.
+// bands (59000-60000, 49000-49999) - i.e. "priority ranges only" is orderLimit = this.
 unsigned PriorityBandCount(uint16_t begin, uint16_t end);
 
 std::vector<PortCandidate> ScanHttp2Preface(const NcmEndpoint& endpoint,

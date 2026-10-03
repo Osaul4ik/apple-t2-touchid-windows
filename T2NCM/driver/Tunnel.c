@@ -125,6 +125,25 @@ BOOLEAN T2NcmTunnelGetMode(VOID)
     return InterlockedCompareExchange(&g_T2NcmTunnelMode, 0, 0) != 0;
 }
 
+/*
+ * Sticky-tunnel flag: userspace's committed "switched to the IPv4 tunnel until
+ * reboot" decision. Same lifetime as g_T2NcmTunnelMode (driver image), kept
+ * separately because the live mode is flipped per probe phase while the
+ * committed decision is not. The driver only stores it, so a restarted
+ * WUDFHost can read it back with IOCTL_T2NCM_GET_TUNNEL_STATE.
+ */
+static volatile LONG g_T2NcmTunnelSticky = 0;
+
+VOID T2NcmTunnelSetSticky(_In_ BOOLEAN Sticky)
+{
+    InterlockedExchange(&g_T2NcmTunnelSticky, Sticky ? 1 : 0);
+}
+
+BOOLEAN T2NcmTunnelGetSticky(VOID)
+{
+    return InterlockedCompareExchange(&g_T2NcmTunnelSticky, 0, 0) != 0;
+}
+
 VOID T2NcmTunnelRefreshMode(_In_ PT2NCM_DEVICE_CONTEXT DeviceContext)
 {
     /* Re-seed the freshly created device context from driver memory.
