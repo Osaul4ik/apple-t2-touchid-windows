@@ -182,3 +182,4 @@ The project was used as a technical reference to understand the T2 Touch ID comm
 ## License
 
 GPL-2.0-only — see `LICENSE` and `NOTICE.md`.
+
