@@ -72,8 +72,8 @@ bool PickDefaultT2Endpoint(NcmEndpoint* outEndpoint, void* cancelEvent = nullptr
 // further one starts, so a cancelled CAPTURE_DATA does not keep the USB bulk pipe
 // busy. Cancel neither removes the saved port nor rolls back committed state.
 //
-// outScansExhausted (optional): set to true on failure ONLY when a full-chain
-// scan pass COMPLETED without finding BiometricKit on the transport that decides
+// outScansExhausted (optional): set to true on failure ONLY when 3 consecutive
+// full-chain scan passes COMPLETED without finding BiometricKit on the transport that decides
 // (the tunnel when IPv6 was blocked or the tunnel is sticky, otherwise native
 // IPv6). Everything else - cancel, a silent path, a cool-down, no peer/MAC yet -
 // leaves it false: "not yet", and the caller keeps retrying.
