@@ -124,13 +124,6 @@ void StoreScanState(const NcmEndpoint& ep, bool tunnel, const ScanState& st) {
     std::lock_guard<std::mutex> lock(g_scanMu);
     ScanStates()[ScanKey(ep, tunnel)] = st;
 }
-// How many consecutive EMPTY full-chain passes it takes before discovery reports the
-// scans as exhausted (=> the caller gives up). One empty pass is not a verdict on a
-// cold boot: the NCM link and the T2 TCP stack answer (RST) several seconds before
-// BiometricKit starts listening, so a single quick pass wrongly reads as "no
-// BiometricKit". Passes skipped by the cool-down do not count. The cool-down spaces
-// the passes (1 s, 2 s), so 3 passes span roughly 7-8 s.
-constexpr unsigned kEmptyPassesToGiveUp = 3;
 // Cool-down after an EMPTY full pass only (a cache miss always rescans at once):
 // 1 s, doubling, capped at 5 s, so a T2 whose services are not up yet does not
 // get 16k SYNs back to back from the retry ladder.
@@ -144,7 +137,7 @@ struct ScanOutcome {
     uint16_t servicePort = 0;
     uint16_t rsdPort = 0;
     bool ranScan = false;          // false: skipped by the cool-down
-    bool passCompletedEmpty = false; // kEmptyPassesToGiveUp consecutive full passes ended without BiometricKit
+    bool passCompletedEmpty = false; // a full pass reached its end without BiometricKit
     bool silent = false;           // aborted: no SYN-ACK and no RST (path dead/filtered)
     bool anyTcp = false;           // some SYN was answered (SYN-ACK) => the path works
     bool anyRefused = false;       // some RST came back => packets reach the T2
@@ -307,21 +300,20 @@ ScanOutcome RunScanAttempt(const NcmEndpoint& ep, bool tunnel, void* cancelEvent
         st.cursor = 0; // nothing learned; the next pass starts over
     } else if (stats.exhausted && fromCursor != 0 && !Cancelled(cancelEvent)) {
         // Only the TAIL of a pass that an earlier step (cancel / lock / budget) cut
-        // short was scanned now. The head was scanned earlier, possibly before the
-        // service opened its port, so this proves nothing: not an empty pass. Start
-        // over from port 0 on the next step (no cool-down: lastPassEnd is unchanged).
+        // short was scanned now. Its head was scanned earlier - possibly before the
+        // service opened its port - so this says nothing about "BiometricKit absent":
+        // not an empty pass. Next step rescans from port 0 (lastPassEnd is untouched,
+        // so no cool-down applies).
         st.cursor = 0;
-        T2_LOG("discovery", L"scan (%s): resumed tail finished (from %u) - not counted as an empty "
-               L"pass, next step rescans from the start", TransportName(tunnel), fromCursor);
+        T2_LOG("discovery", L"scan (%s): resumed tail finished (from %u) - not an empty pass, "
+               L"next step rescans from the start", TransportName(tunnel), fromCursor);
     } else if (stats.exhausted && !Cancelled(cancelEvent)) {
         ++st.emptyPasses;
         st.cursor = 0;
         st.lastPassEnd = GetTickCount64();
-        // Only the Nth consecutive empty pass is a verdict; earlier ones are "not yet".
-        out.passCompletedEmpty = st.emptyPasses >= kEmptyPassesToGiveUp;
-        T2_LOG("discovery", L"scan (%s): FULL pass complete without BiometricKit (empty passes=%u/%u)%s",
-               TransportName(tunnel), st.emptyPasses, kEmptyPassesToGiveUp,
-               out.passCompletedEmpty ? L" - exhausted" : L" - retrying");
+        out.passCompletedEmpty = true;
+        T2_LOG("discovery", L"scan (%s): FULL pass complete without BiometricKit (empty passes=%u)",
+               TransportName(tunnel), st.emptyPasses);
     }
     StoreScanState(ep, tunnel, st);
     return out;

@@ -313,32 +313,6 @@ std::mutex g_captureRequestCommitMu;
 // restart the SEP match under the same still-pending WBDI request.
 std::atomic<ULONGLONG> g_suspendGeneration{0};
 
-// T2 warm-up window. After a cold boot (SEP ready -> first connect attempt of this
-// process) and after a real Sx resume (PBT_APMRESUME* / EvtIoResume) the T2 answers
-// on the NCM link several seconds before BiometricKit listens. A discovery "gave up"
-// inside this window must not end the pending WBF CAPTURE_DATA: WBF does not re-arm
-// a capture that ended with DEVICE_FAILURE, so the fingerprint stays dead on the
-// lock screen until a PIN unlock + lock. The worker retries instead.
-std::atomic<ULONGLONG> g_lastResumeTick{0};      // 0 = no resume yet
-std::atomic<ULONGLONG> g_firstConnectTick{0};    // 0 = no connect attempt yet
-constexpr ULONGLONG kWarmupGaveUpGraceMs = 30000;
-
-static void NoteFirstConnectAttempt()
-{
-    ULONGLONG expected = 0;
-    g_firstConnectTick.compare_exchange_strong(expected, GetTickCount64(),
-                                               std::memory_order_acq_rel);
-}
-
-static bool InWarmupGrace()
-{
-    const ULONGLONG now = GetTickCount64();
-    const ULONGLONG resume = g_lastResumeTick.load(std::memory_order_acquire);
-    const ULONGLONG first = g_firstConnectTick.load(std::memory_order_acquire);
-    return (resume != 0 && (now - resume) < kWarmupGaveUpGraceMs) ||
-           (first != 0 && (now - first) < kWarmupGaveUpGraceMs);
-}
-
 // Sleep path only (not idle display-off while the PC stays awake):
 //  - g_sleepBarrier: set on PBT_APMSUSPEND, cleared on resume.
 //  - g_powerButtonGraceUntil: brief window after panel OFF so a power-button
@@ -755,7 +729,6 @@ ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_
         // above) is keyed off the SEP's own event sequence numbers, not off
         // when resume happened, so resume itself needs no bookkeeping beyond
         // what BeginCaptureSuspend/the generation counter already do.
-        g_lastResumeTick.store(GetTickCount64(), std::memory_order_release);
         HANDLE resumeEvent = GetSystemResumeEvent();
         if (resumeEvent) {
             SetEvent(resumeEvent);
@@ -1148,9 +1121,9 @@ HRESULT MapVerifyOutcomeToHresult(VerifyOutcome outcome)
 // `payload` (may be empty on a pure-error completion). Handles the same
 // grow-then-retry size probe as HandleGetAttributes/HandleGetSensorStatus,
 // scaled for CaptureData's variable-length tail.
-// alreadyLocked: the caller already holds g_captureRequestCommitMu (used by
-// HandleCaptureVerify to make "no suspend since the Match" + completion one
-// atomic step); std::mutex is not recursive, so it must not be taken again.
+// alreadyLocked: the caller already holds g_captureRequestCommitMu (HandleCaptureVerify
+// does, to make "no suspend since the Match" + completion one atomic step). std::mutex
+// is not recursive, so it must not be taken a second time.
 void CompleteCaptureData(_In_ WDFREQUEST Request, HRESULT winBioHresult,
                           WINBIO_SENSOR_STATUS sensorStatus, WINBIO_REJECT_DETAIL rejectDetail,
                           const std::vector<uint8_t>& payload, bool alreadyLocked = false)
@@ -1238,7 +1211,6 @@ bool ConnectForCapture(t2::bridgexpc::Connection* outConn, HANDLE cancelEvent,
                        bool* outScansExhausted)
 {
     *outScansExhausted = false;
-    NoteFirstConnectAttempt();   // starts the cold-start warm-up window (once per process)
     const ULONGLONG t0 = GetTickCount64();
 
     // After REAL Sx resume only (not WTS_SESSION_LOCK — that also bumps
@@ -1363,10 +1335,11 @@ bool ConnectForCapture(t2::bridgexpc::Connection* outConn, HANDLE cancelEvent,
 // own CancelIoEx (design doc 9.4), so an unreachable T2 is waited out the same
 // way: retry with backoff, cancel-aware. There is NO time limit (03.10.2026,
 // owner decision; was a 30 s window): the wait ends only when Windows cancels,
-// or when discovery reports that a full-chain scan COMPLETED without finding
-// BiometricKit (ConnectToBiometricKitBridge's outScansExhausted) - the only
-// "the T2 really has no BiometricKit for us" verdict. A missing adapter, no
-// peer yet, a silent path or a cancelled scan are all "not yet".
+// or when discovery reports that full-chain scans COMPLETED without finding
+// BiometricKit (ConnectToBiometricKitBridge's outScansExhausted) AND that persisted
+// past the warm-up grace (NoteEmptyPassAndCheckGiveUp) - the only "the T2 really has
+// no BiometricKit for us" verdict. A missing adapter, no peer yet, a silent path, a
+// cancelled scan or a T2 that is still warming up are all "not yet".
 // Hang guard for a caller without a cancel event only (nothing in-tree).
 constexpr ULONGLONG kConnectRetryNoCancelWindowMs = 30000;
 // Back-off before reconnecting a dropped BridgeXPC session (was 200 ms).
@@ -1379,6 +1352,99 @@ constexpr DWORD kConnectRetryMaxMs = 1000;   // was 2000: caps worst-case wait a
 
 enum class ConnectWait { Connected, Cancelled, GaveUp };
 
+// ---- When may "BiometricKit not found" end a pending CAPTURE_DATA? ------------
+//
+// Discovery's outScansExhausted means: the T2 answers on the network (a full port
+// pass finished) but no port advertises BiometricKit. Right after a cold boot, a
+// resume or a T2 re-enumeration that is the NORMAL state for several seconds - the
+// NCM link and the T2's TCP stack are up before BiometricKit listens. Completing the
+// CAPTURE_DATA with DEVICE_FAILURE then is fatal: WBF does not re-arm it, so the
+// fingerprint stays dead on the lock screen until a PIN unlock + lock opens a new
+// session. The verdict therefore only ends the CAPTURE when it PERSISTED: at least
+// kGiveUpMinEmptyPasses completed empty passes AND at least WarmupGraceMs since the
+// first of them. The clock starts at the first empty pass - the moment the T2 has
+// demonstrably answered - so a slow NCM bring-up cannot use the grace up. State is
+// scoped to the transport Generation (suspend/resume, NCM re-registration and a
+// changed T2 peer start a new epoch) and cleared by every successful connect.
+// Single policy point: ConnectForCaptureWithRetry, so verify AND enroll share it.
+constexpr unsigned kGiveUpMinEmptyPasses = 3;
+
+// HKLM\SOFTWARE\T2TouchIdBio\WarmupGraceMs (REG_DWORD, ms). Default 30000, max 600000;
+// 0 = no time condition (only the empty-pass count applies).
+DWORD LoadWarmupGraceMs()
+{
+    constexpr DWORD kDefaultMs = 30000;
+    constexpr DWORD kMaxMs = 600000;
+    DWORD v = kDefaultMs;
+    DWORD cb = sizeof(v);
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\T2TouchIdBio", L"WarmupGraceMs",
+                     RRF_RT_REG_DWORD, nullptr, &v, &cb) != ERROR_SUCCESS) {
+        return kDefaultMs;
+    }
+    return v > kMaxMs ? kMaxMs : v;
+}
+
+struct BridgeAvailability {
+    std::mutex mu;
+    ULONGLONG gen = 0;          // transport Generation this data belongs to
+    ULONGLONG emptySince = 0;   // tick of the first completed empty pass (0 = none)
+    unsigned emptyPasses = 0;   // completed empty passes since then
+    ULONGLONG bringUpTick = 0;  // when BridgeXPC last became reachable after being absent
+};
+BridgeAvailability g_bridgeAvail;
+
+// A connect succeeded: BiometricKit is reachable. Opens a bring-up window when this is
+// the first success of this Generation or the first one after an absent period.
+void NoteBridgeReachable()
+{
+    std::lock_guard<std::mutex> lock(g_bridgeAvail.mu);
+    const ULONGLONG gen = t2::transport::CurrentGeneration();
+    if (g_bridgeAvail.gen != gen || g_bridgeAvail.emptySince != 0 || g_bridgeAvail.bringUpTick == 0) {
+        g_bridgeAvail.bringUpTick = GetTickCount64();
+    }
+    g_bridgeAvail.gen = gen;
+    g_bridgeAvail.emptySince = 0;
+    g_bridgeAvail.emptyPasses = 0;
+}
+
+// Records one completed empty pass; true = the verdict may now end the CAPTURE.
+bool NoteEmptyPassAndCheckGiveUp(unsigned* outPasses, ULONGLONG* outSinceMs)
+{
+    std::lock_guard<std::mutex> lock(g_bridgeAvail.mu);
+    const ULONGLONG now = GetTickCount64();
+    const ULONGLONG gen = t2::transport::CurrentGeneration();
+    if (g_bridgeAvail.gen != gen || g_bridgeAvail.emptySince == 0) {
+        g_bridgeAvail.gen = gen;
+        g_bridgeAvail.emptySince = now;
+        g_bridgeAvail.emptyPasses = 0;
+    }
+    ++g_bridgeAvail.emptyPasses;
+    *outPasses = g_bridgeAvail.emptyPasses;
+    *outSinceMs = now - g_bridgeAvail.emptySince;
+    return g_bridgeAvail.emptyPasses >= kGiveUpMinEmptyPasses &&
+           *outSinceMs >= LoadWarmupGraceMs();
+}
+
+// True shortly after BridgeXPC (re)appeared: BiometricKit may still be initialising, so
+// device-side "not ready" answers (see IsDeviceNotReadyOutcome) are retried, not final.
+bool InBringUpWindow()
+{
+    std::lock_guard<std::mutex> lock(g_bridgeAvail.mu);
+    if (g_bridgeAvail.bringUpTick == 0 || g_bridgeAvail.gen != t2::transport::CurrentGeneration()) {
+        return false;
+    }
+    return (GetTickCount64() - g_bridgeAvail.bringUpTick) < LoadWarmupGraceMs();
+}
+
+// Outcomes that say "the device is not ready (yet)", not "the user's finger was wrong":
+// a setup command failed/timed out, the identity list was empty or unstable, StartMatch
+// was rejected. None of them carries a match, so retrying stays fail-closed.
+bool IsDeviceNotReadyOutcome(VerifyOutcome o)
+{
+    return o == VerifyOutcome::TransportError || o == VerifyOutcome::RejectedByDevice ||
+           o == VerifyOutcome::Malformed || o == VerifyOutcome::UnstableIdentityInventory;
+}
+
 ConnectWait ConnectForCaptureWithRetry(HANDLE cancelEvent, t2::bridgexpc::Connection* outConn)
 {
     const ULONGLONG start = GetTickCount64();
@@ -1386,6 +1452,7 @@ ConnectWait ConnectForCaptureWithRetry(HANDLE cancelEvent, t2::bridgexpc::Connec
     for (unsigned attempt = 1;; ++attempt) {
         bool scansExhausted = false;
         if (ConnectForCapture(outConn, cancelEvent, &scansExhausted)) {
+            NoteBridgeReachable();
             if (attempt > 1) {
                 T2BioLog("CAPTURE_DATA: BridgeXPC reachable after %u attempts (%llu ms) mode=%s",
                          attempt, static_cast<unsigned long long>(GetTickCount64() - start),
@@ -1398,9 +1465,20 @@ ConnectWait ConnectForCaptureWithRetry(HANDLE cancelEvent, t2::bridgexpc::Connec
         }
         const ULONGLONG waited = GetTickCount64() - start;
         if (scansExhausted) {
-            T2BioLog("CAPTURE_DATA: full-chain scan found no BiometricKit (attempt %u, %llu ms) - giving up",
-                     attempt, static_cast<unsigned long long>(waited));
-            return ConnectWait::GaveUp;
+            unsigned emptyPasses = 0;
+            ULONGLONG sinceMs = 0;
+            if (NoteEmptyPassAndCheckGiveUp(&emptyPasses, &sinceMs)) {
+                T2BioLog("CAPTURE_DATA: full-chain scan found no BiometricKit (attempt %u, %llu ms; "
+                         "%u empty passes over %llu ms) - giving up",
+                         attempt, static_cast<unsigned long long>(waited), emptyPasses,
+                         static_cast<unsigned long long>(sinceMs));
+                return ConnectWait::GaveUp;
+            }
+            // The T2 answers but BiometricKit is not listening (yet): stay pending.
+            T2BioLog("CAPTURE_DATA: T2 answers but BiometricKit is not listening yet (empty pass %u, "
+                     "%llu ms since the first; giving up needs %u passes and %lu ms) - CAPTURE stays pending",
+                     emptyPasses, static_cast<unsigned long long>(sinceMs), kGiveUpMinEmptyPasses,
+                     static_cast<unsigned long>(LoadWarmupGraceMs()));
         }
         if (!cancelEvent && waited >= kConnectRetryNoCancelWindowMs) {
             T2BioLog("CAPTURE_DATA: BridgeXPC still unreachable after %llu ms and no cancel event - giving up",
@@ -1645,16 +1723,15 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
     // A lost TCP session is retried only for genuine connection loss. Power
     // transitions restart the outer loop and do not consume this retry budget.
     constexpr int kMaxSessionAttempts = 3;
-    // Held (only for a Match) from the final "no suspend since this result"
-    // check until the request is completed, so PBT_APMSUSPEND - which takes the
-    // same mutex before bumping g_suspendGeneration - either runs entirely
-    // before the check (and the Match is discarded) or entirely after the
-    // completion (the Match was committed before suspend began).
+    // Held (for a Match only) from the final "no suspend since this result" check until
+    // the request is completed. PBT_APMSUSPEND takes the same mutex before it bumps
+    // g_suspendGeneration, so it runs either entirely before the check (the Match is
+    // discarded) or entirely after the completion (committed before suspend began).
     std::unique_lock<std::mutex> commitLock(g_captureRequestCommitMu, std::defer_lock);
     if (outcome != VerifyOutcome::Cancelled) {
         for (;;) {
             bool connectionRetryExhausted = true;
-            bool deferGaveUp = false;
+            bool gaveUp = false;
             for (int attempt = 1; attempt <= kMaxSessionAttempts; ++attempt) {
                 if (!WaitUntilDisplayAllowsScan(cancelScope, cancelEvent)) {
                     outcome = VerifyOutcome::Cancelled;
@@ -1669,16 +1746,12 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
                     break;
                 }
                 if (cw == ConnectWait::GaveUp) {
+                    // BiometricKit absent past the warm-up grace (see
+                    // NoteEmptyPassAndCheckGiveUp): this one DOES end the CAPTURE
+                    // (DEVICE_FAILURE below), unlike a dropped session.
+                    gaveUp = true;
                     outcome = VerifyOutcome::TransportError;
                     connectionRetryExhausted = false;
-                    if (InWarmupGrace()) {
-                        // Cold boot / just woke up: BiometricKit on the T2 may simply
-                        // not be listening yet. Do not fail the pending WBF request.
-                        deferGaveUp = true;
-                        break;
-                    }
-                    // Full-chain scan exhausted: this one DOES end the CAPTURE
-                    // (DEVICE_FAILURE below), unlike a dropped session.
                     break;
                 }
                 if (t2::bridgexpc::Connection::IsEventSignaled(cancelEvent)) {
@@ -1797,18 +1870,6 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
                 continue;
             }
 
-            if (deferGaveUp) {
-                T2BioLog("CAPTURE_DATA(verify): discovery gave up inside the %llu ms warm-up window (cold start / resume) - "
-                         "BiometricKit may not be listening yet; CAPTURE stays pending, "
-                         "retrying after %lu ms", static_cast<unsigned long long>(kWarmupGaveUpGraceMs),
-                         static_cast<unsigned long>(kSessionLostCooldownMs));
-                if (cancelEvent) {
-                    WaitForSingleObject(cancelEvent, kSessionLostCooldownMs);
-                } else {
-                    Sleep(kSessionLostCooldownMs);
-                }
-                continue; // cancel / power checks at the top of the next round apply
-            }
             if (outcome == VerifyOutcome::Cancelled) {
                 // A cancel with no intervening system suspend belongs to WBF
                 // (or a queue stop); do not silently restart the request.
@@ -1844,6 +1905,21 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
                          "verify under the same pending CAPTURE (hybrid)",
                          static_cast<long long>(kCaptureMatchWindow.count()));
                 continue;
+            }
+            if (!gaveUp && IsDeviceNotReadyOutcome(outcome) && InBringUpWindow()) {
+                // BridgeXPC just (re)appeared and BiometricKit answered "not ready" (setup
+                // command failed, empty/unstable identity list, StartMatch rejected). Same
+                // warm-up as above: ending the CAPTURE here would leave the lock screen
+                // without a fingerprint until the next session.
+                T2BioLog("CAPTURE_DATA(verify): device not ready (outcome=%d) inside the bring-up "
+                         "window - CAPTURE stays pending, retrying after %lu ms",
+                         static_cast<int>(outcome), static_cast<unsigned long>(kSessionLostCooldownMs));
+                if (cancelEvent) {
+                    WaitForSingleObject(cancelEvent, kSessionLostCooldownMs);
+                } else {
+                    Sleep(kSessionLostCooldownMs);
+                }
+                continue; // cancel / power checks at the top of the next round apply
             }
             // Match / Rejected / Unstable / Malformed / remaining: end CAPTURE.
             break;
@@ -2257,7 +2333,6 @@ extern "C" VOID T2BioEvtIoResume(_In_ WDFQUEUE Queue,
 {
     UNREFERENCED_PARAMETER(Queue);
     UNREFERENCED_PARAMETER(Request);
-    g_lastResumeTick.store(GetTickCount64(), std::memory_order_release);
     HANDLE resumeEvent = GetSystemResumeEvent();
     if (resumeEvent) SetEvent(resumeEvent);
     T2BioLog("EvtIoResume: D0 restored; pending CAPTURE_DATA worker may continue");
