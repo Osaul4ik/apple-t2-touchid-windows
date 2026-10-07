@@ -313,6 +313,20 @@ std::mutex g_captureRequestCommitMu;
 // restart the SEP match under the same still-pending WBDI request.
 std::atomic<ULONGLONG> g_suspendGeneration{0};
 
+// Tick of the last real Sx resume (PBT_APMRESUME* / EvtIoResume); 0 = none yet.
+// For a short while after wake the T2 may answer on the NCM link before
+// BiometricKit listens again, exactly like a cold boot. A discovery "gave up"
+// inside this window must not end the pending WBF CAPTURE_DATA (WBF may not
+// re-arm after a failed capture) - the worker retries instead.
+std::atomic<ULONGLONG> g_lastResumeTick{0};
+constexpr ULONGLONG kPostResumeGaveUpGraceMs = 30000;
+
+static bool InPostResumeGrace()
+{
+    const ULONGLONG t = g_lastResumeTick.load(std::memory_order_acquire);
+    return t != 0 && (GetTickCount64() - t) < kPostResumeGaveUpGraceMs;
+}
+
 // Sleep path only (not idle display-off while the PC stays awake):
 //  - g_sleepBarrier: set on PBT_APMSUSPEND, cleared on resume.
 //  - g_powerButtonGraceUntil: brief window after panel OFF so a power-button
@@ -729,6 +743,7 @@ ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_
         // above) is keyed off the SEP's own event sequence numbers, not off
         // when resume happened, so resume itself needs no bookkeeping beyond
         // what BeginCaptureSuspend/the generation counter already do.
+        g_lastResumeTick.store(GetTickCount64(), std::memory_order_release);
         HANDLE resumeEvent = GetSystemResumeEvent();
         if (resumeEvent) {
             SetEvent(resumeEvent);
@@ -1121,11 +1136,17 @@ HRESULT MapVerifyOutcomeToHresult(VerifyOutcome outcome)
 // `payload` (may be empty on a pure-error completion). Handles the same
 // grow-then-retry size probe as HandleGetAttributes/HandleGetSensorStatus,
 // scaled for CaptureData's variable-length tail.
+// alreadyLocked: the caller already holds g_captureRequestCommitMu (used by
+// HandleCaptureVerify to make "no suspend since the Match" + completion one
+// atomic step); std::mutex is not recursive, so it must not be taken again.
 void CompleteCaptureData(_In_ WDFREQUEST Request, HRESULT winBioHresult,
                           WINBIO_SENSOR_STATUS sensorStatus, WINBIO_REJECT_DETAIL rejectDetail,
-                          const std::vector<uint8_t>& payload)
+                          const std::vector<uint8_t>& payload, bool alreadyLocked = false)
 {
-    std::lock_guard<std::mutex> commitLock(g_captureRequestCommitMu);
+    std::unique_lock<std::mutex> commitLock(g_captureRequestCommitMu, std::defer_lock);
+    if (!alreadyLocked) {
+        commitLock.lock();
+    }
     const size_t headerBytes = offsetof(WINBIO_CAPTURE_DATA, CaptureData) +
                                offsetof(WINBIO_DATA, Data);
     const size_t needed = headerBytes + payload.size();
@@ -1611,9 +1632,16 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
     // A lost TCP session is retried only for genuine connection loss. Power
     // transitions restart the outer loop and do not consume this retry budget.
     constexpr int kMaxSessionAttempts = 3;
+    // Held (only for a Match) from the final "no suspend since this result"
+    // check until the request is completed, so PBT_APMSUSPEND - which takes the
+    // same mutex before bumping g_suspendGeneration - either runs entirely
+    // before the check (and the Match is discarded) or entirely after the
+    // completion (the Match was committed before suspend began).
+    std::unique_lock<std::mutex> commitLock(g_captureRequestCommitMu, std::defer_lock);
     if (outcome != VerifyOutcome::Cancelled) {
         for (;;) {
             bool connectionRetryExhausted = true;
+            bool deferGaveUp = false;
             for (int attempt = 1; attempt <= kMaxSessionAttempts; ++attempt) {
                 if (!WaitUntilDisplayAllowsScan(cancelScope, cancelEvent)) {
                     outcome = VerifyOutcome::Cancelled;
@@ -1628,10 +1656,16 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
                     break;
                 }
                 if (cw == ConnectWait::GaveUp) {
-                    // Full-chain scan exhausted: this one DOES end the CAPTURE
-                    // (DEVICE_FAILURE below), unlike a dropped session.
                     outcome = VerifyOutcome::TransportError;
                     connectionRetryExhausted = false;
+                    if (InPostResumeGrace()) {
+                        // Just woke up: BiometricKit on the T2 may simply not be
+                        // listening yet. Do not fail the pending WBF request.
+                        deferGaveUp = true;
+                        break;
+                    }
+                    // Full-chain scan exhausted: this one DOES end the CAPTURE
+                    // (DEVICE_FAILURE below), unlike a dropped session.
                     break;
                 }
                 if (t2::bridgexpc::Connection::IsEventSignaled(cancelEvent)) {
@@ -1705,6 +1739,9 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
                 break;
             }
 
+            if (outcome == VerifyOutcome::Match) {
+                commitLock.lock();
+            }
             const ULONGLONG currentGeneration =
                 g_suspendGeneration.load(std::memory_order_acquire);
             const HANDLE resumeEvent = GetSystemResumeEvent();
@@ -1713,6 +1750,9 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
             // Display-off or suspend: never deliver Match; keep CAPTURE pending.
             if (currentGeneration != handledSuspendGeneration || resumePending ||
                 DisplayBlocksSuccess()) {
+                if (commitLock.owns_lock()) {
+                    commitLock.unlock();   // never block below while holding it
+                }
                 ClearMatchReplay();
                 matchedUuid.reset();
                 T2BioLog("CAPTURE_DATA(verify): sleep path — Match not delivered; "
@@ -1744,6 +1784,18 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
                 continue;
             }
 
+            if (deferGaveUp) {
+                T2BioLog("CAPTURE_DATA(verify): discovery gave up within %llu ms of resume - "
+                         "BiometricKit may not be listening yet; CAPTURE stays pending, "
+                         "retrying after %lu ms", static_cast<unsigned long long>(kPostResumeGaveUpGraceMs),
+                         static_cast<unsigned long>(kSessionLostCooldownMs));
+                if (cancelEvent) {
+                    WaitForSingleObject(cancelEvent, kSessionLostCooldownMs);
+                } else {
+                    Sleep(kSessionLostCooldownMs);
+                }
+                continue; // cancel / power checks at the top of the next round apply
+            }
             if (outcome == VerifyOutcome::Cancelled) {
                 // A cancel with no intervening system suspend belongs to WBF
                 // (or a queue stop); do not silently restart the request.
@@ -1849,7 +1901,7 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
     } else {
         ClearMatchReplay();
     }
-    CompleteCaptureData(Request, hr, sensorStatus, 0, bir);
+    CompleteCaptureData(Request, hr, sensorStatus, 0, bir, commitLock.owns_lock());
 }
 
 // Everything CAPTURE_DATA does once the size probe and the SEP-ready gate have
@@ -2192,6 +2244,7 @@ extern "C" VOID T2BioEvtIoResume(_In_ WDFQUEUE Queue,
 {
     UNREFERENCED_PARAMETER(Queue);
     UNREFERENCED_PARAMETER(Request);
+    g_lastResumeTick.store(GetTickCount64(), std::memory_order_release);
     HANDLE resumeEvent = GetSystemResumeEvent();
     if (resumeEvent) SetEvent(resumeEvent);
     T2BioLog("EvtIoResume: D0 restored; pending CAPTURE_DATA worker may continue");
