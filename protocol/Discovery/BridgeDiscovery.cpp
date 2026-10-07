@@ -305,6 +305,14 @@ ScanOutcome RunScanAttempt(const NcmEndpoint& ep, bool tunnel, void* cancelEvent
     if (stats.silentAborted) {
         out.silent = true;
         st.cursor = 0; // nothing learned; the next pass starts over
+    } else if (stats.exhausted && fromCursor != 0 && !Cancelled(cancelEvent)) {
+        // Only the TAIL of a pass that an earlier step (cancel / lock / budget) cut
+        // short was scanned now. The head was scanned earlier, possibly before the
+        // service opened its port, so this proves nothing: not an empty pass. Start
+        // over from port 0 on the next step (no cool-down: lastPassEnd is unchanged).
+        st.cursor = 0;
+        T2_LOG("discovery", L"scan (%s): resumed tail finished (from %u) - not counted as an empty "
+               L"pass, next step rescans from the start", TransportName(tunnel), fromCursor);
     } else if (stats.exhausted && !Cancelled(cancelEvent)) {
         ++st.emptyPasses;
         st.cursor = 0;

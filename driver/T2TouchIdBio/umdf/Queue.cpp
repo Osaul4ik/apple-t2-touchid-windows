@@ -313,18 +313,30 @@ std::mutex g_captureRequestCommitMu;
 // restart the SEP match under the same still-pending WBDI request.
 std::atomic<ULONGLONG> g_suspendGeneration{0};
 
-// Tick of the last real Sx resume (PBT_APMRESUME* / EvtIoResume); 0 = none yet.
-// For a short while after wake the T2 may answer on the NCM link before
-// BiometricKit listens again, exactly like a cold boot. A discovery "gave up"
-// inside this window must not end the pending WBF CAPTURE_DATA (WBF may not
-// re-arm after a failed capture) - the worker retries instead.
-std::atomic<ULONGLONG> g_lastResumeTick{0};
-constexpr ULONGLONG kPostResumeGaveUpGraceMs = 30000;
+// T2 warm-up window. After a cold boot (SEP ready -> first connect attempt of this
+// process) and after a real Sx resume (PBT_APMRESUME* / EvtIoResume) the T2 answers
+// on the NCM link several seconds before BiometricKit listens. A discovery "gave up"
+// inside this window must not end the pending WBF CAPTURE_DATA: WBF does not re-arm
+// a capture that ended with DEVICE_FAILURE, so the fingerprint stays dead on the
+// lock screen until a PIN unlock + lock. The worker retries instead.
+std::atomic<ULONGLONG> g_lastResumeTick{0};      // 0 = no resume yet
+std::atomic<ULONGLONG> g_firstConnectTick{0};    // 0 = no connect attempt yet
+constexpr ULONGLONG kWarmupGaveUpGraceMs = 30000;
 
-static bool InPostResumeGrace()
+static void NoteFirstConnectAttempt()
 {
-    const ULONGLONG t = g_lastResumeTick.load(std::memory_order_acquire);
-    return t != 0 && (GetTickCount64() - t) < kPostResumeGaveUpGraceMs;
+    ULONGLONG expected = 0;
+    g_firstConnectTick.compare_exchange_strong(expected, GetTickCount64(),
+                                               std::memory_order_acq_rel);
+}
+
+static bool InWarmupGrace()
+{
+    const ULONGLONG now = GetTickCount64();
+    const ULONGLONG resume = g_lastResumeTick.load(std::memory_order_acquire);
+    const ULONGLONG first = g_firstConnectTick.load(std::memory_order_acquire);
+    return (resume != 0 && (now - resume) < kWarmupGaveUpGraceMs) ||
+           (first != 0 && (now - first) < kWarmupGaveUpGraceMs);
 }
 
 // Sleep path only (not idle display-off while the PC stays awake):
@@ -1226,6 +1238,7 @@ bool ConnectForCapture(t2::bridgexpc::Connection* outConn, HANDLE cancelEvent,
                        bool* outScansExhausted)
 {
     *outScansExhausted = false;
+    NoteFirstConnectAttempt();   // starts the cold-start warm-up window (once per process)
     const ULONGLONG t0 = GetTickCount64();
 
     // After REAL Sx resume only (not WTS_SESSION_LOCK — that also bumps
@@ -1658,9 +1671,9 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
                 if (cw == ConnectWait::GaveUp) {
                     outcome = VerifyOutcome::TransportError;
                     connectionRetryExhausted = false;
-                    if (InPostResumeGrace()) {
-                        // Just woke up: BiometricKit on the T2 may simply not be
-                        // listening yet. Do not fail the pending WBF request.
+                    if (InWarmupGrace()) {
+                        // Cold boot / just woke up: BiometricKit on the T2 may simply
+                        // not be listening yet. Do not fail the pending WBF request.
                         deferGaveUp = true;
                         break;
                     }
@@ -1785,9 +1798,9 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
             }
 
             if (deferGaveUp) {
-                T2BioLog("CAPTURE_DATA(verify): discovery gave up within %llu ms of resume - "
+                T2BioLog("CAPTURE_DATA(verify): discovery gave up inside the %llu ms warm-up window (cold start / resume) - "
                          "BiometricKit may not be listening yet; CAPTURE stays pending, "
-                         "retrying after %lu ms", static_cast<unsigned long long>(kPostResumeGaveUpGraceMs),
+                         "retrying after %lu ms", static_cast<unsigned long long>(kWarmupGaveUpGraceMs),
                          static_cast<unsigned long>(kSessionLostCooldownMs));
                 if (cancelEvent) {
                     WaitForSingleObject(cancelEvent, kSessionLostCooldownMs);
