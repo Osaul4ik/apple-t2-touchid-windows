@@ -1360,10 +1360,11 @@ enum class ConnectWait { Connected, Cancelled, GaveUp };
 // NCM link and the T2's TCP stack are up before BiometricKit listens. Completing the
 // CAPTURE_DATA with DEVICE_FAILURE then is fatal: WBF does not re-arm it, so the
 // fingerprint stays dead on the lock screen until a PIN unlock + lock opens a new
-// session. The verdict therefore only ends the CAPTURE when it PERSISTED: at least
-// kGiveUpMinEmptyPasses completed empty passes AND at least WarmupGraceMs since the
-// first of them. The clock starts at the first empty pass - the moment the T2 has
-// demonstrably answered - so a slow NCM bring-up cannot use the grace up. State is
+// session. The verdict therefore NEVER ends a CAPTURE that has a cancel event (only
+// Windows' CancelIoEx does); kGiveUpMinEmptyPasses/WarmupGraceMs now only decide when
+// the log says the grace is over, and when the no-cancel-event hang guard may give up
+// (cancel event creation failed). The clock starts at the first empty pass - the moment
+// the T2 has demonstrably answered. State is
 // scoped to the transport Generation (suspend/resume, NCM re-registration and a
 // changed T2 peer start a new epoch) and cleared by every successful connect.
 // Single policy point: ConnectForCaptureWithRetry, so verify AND enroll share it.
@@ -1467,18 +1468,25 @@ ConnectWait ConnectForCaptureWithRetry(HANDLE cancelEvent, t2::bridgexpc::Connec
         if (scansExhausted) {
             unsigned emptyPasses = 0;
             ULONGLONG sinceMs = 0;
-            if (NoteEmptyPassAndCheckGiveUp(&emptyPasses, &sinceMs)) {
+            const bool graceOver = NoteEmptyPassAndCheckGiveUp(&emptyPasses, &sinceMs);
+            if (graceOver && !cancelEvent) {
+                // No cancel event = nobody can end this wait: hang guard only.
                 T2BioLog("CAPTURE_DATA: full-chain scan found no BiometricKit (attempt %u, %llu ms; "
-                         "%u empty passes over %llu ms) - giving up",
+                         "%u empty passes over %llu ms) and no cancel event - giving up",
                          attempt, static_cast<unsigned long long>(waited), emptyPasses,
                          static_cast<unsigned long long>(sinceMs));
                 return ConnectWait::GaveUp;
             }
+            // With a cancel event the CAPTURE NEVER ends on "BiometricKit not found": WBF does
+            // not re-arm a CAPTURE that completed with DEVICE_FAILURE, so a T2 that is merely
+            // slow after a cold boot would leave the lock-screen fingerprint dead until a
+            // password unlock + lock. Only Windows' CancelIoEx ends the wait; the scan's
+            // own cool-down (1 s doubling to 5 s) keeps the retries cheap.
             // The T2 answers but BiometricKit is not listening (yet): stay pending.
             T2BioLog("CAPTURE_DATA: T2 answers but BiometricKit is not listening yet (empty pass %u, "
-                     "%llu ms since the first; giving up needs %u passes and %lu ms) - CAPTURE stays pending",
-                     emptyPasses, static_cast<unsigned long long>(sinceMs), kGiveUpMinEmptyPasses,
-                     static_cast<unsigned long>(LoadWarmupGraceMs()));
+                     "%llu ms since the first%s) - CAPTURE stays pending",
+                     emptyPasses, static_cast<unsigned long long>(sinceMs),
+                     graceOver ? "; warm-up grace over, only Windows' cancel ends this wait" : "");
         }
         if (!cancelEvent && waited >= kConnectRetryNoCancelWindowMs) {
             T2BioLog("CAPTURE_DATA: BridgeXPC still unreachable after %llu ms and no cancel event - giving up",
@@ -1746,9 +1754,9 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
                     break;
                 }
                 if (cw == ConnectWait::GaveUp) {
-                    // BiometricKit absent past the warm-up grace (see
-                    // NoteEmptyPassAndCheckGiveUp): this one DOES end the CAPTURE
-                    // (DEVICE_FAILURE below), unlike a dropped session.
+                    // Only reachable without a cancel event (CreateEventW failed): the
+                    // hang guard of ConnectForCaptureWithRetry. With a cancel event the
+                    // wait ends solely via Cancelled.
                     gaveUp = true;
                     outcome = VerifyOutcome::TransportError;
                     connectionRetryExhausted = false;

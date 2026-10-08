@@ -544,7 +544,11 @@ GateResult EnsureGate(NcmEndpoint* ep, void* cancelEvent) {
         return GateResult::Ready;
     }
     const GateResult g = RunReadinessGate(ep, cancelEvent);
-    if (g != GateResult::Cancelled) {
+    // Only a gate that actually PASSED is remembered. A TimedOut gate (link-local still
+    // Tentative after a slow cold boot) used to be cached too, so every later step
+    // skipped the wait and scanned a not-yet-usable IPv6 stack: silent scan -> "blocked"
+    // -> needless tunnel. Not caching it makes the next step wait for the address again.
+    if (g == GateResult::Ready) {
         g_gateIfIndex.store(ep->ifIndex, std::memory_order_relaxed);
         g_gateGeneration.store(tp::CurrentGeneration(), std::memory_order_release);
     }
@@ -574,7 +578,16 @@ bool ConnectToBiometricKitBridge(const NcmEndpoint& endpoint, t2::bridgexpc::Con
     NcmEndpoint ep = endpoint; // the step may refine the peer; the caller's copy is untouched
 
     // Step A - readiness gate. Preconditions only; no conclusion about transports.
-    if (EnsureGate(&ep, cancelEvent) == GateResult::Cancelled) return false;
+    const GateResult gate = EnsureGate(&ep, cancelEvent);
+    if (gate == GateResult::Cancelled) return false;
+    if (gate == GateResult::TimedOut) {
+        // The adapter's IPv6 address is not usable yet. That says nothing about the T2:
+        // no scan, no tunnel verdict - "not yet", the caller's ladder retries and the
+        // gate waits again.
+        T2_LOG("discovery", L"readiness gate timed out (link-local not usable yet) - not scanning, "
+               L"retrying on the next step");
+        return false;
+    }
     if (ep.peerSource == PeerSource::None) {
         T2_LOG("discovery", L"no T2 peer known (neighbor table empty, nothing persisted, ping got no "
                L"answer) - nothing to connect to yet");
