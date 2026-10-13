@@ -10,8 +10,10 @@
 // function exposes THREE memory BARs (confirmed via
 // docs/milestone-2-hardware-results.md), and the first one enumerated by
 // KMDF's translated resource list is not reliably BAR4. The old heuristic
-// is kept only as a last-resort fallback if GetBusData is ever
-// unavailable, and is clearly logged as unreliable when used.
+// has been REMOVED: there is deliberately NO fallback to "any" / "the first"
+// memory BAR. If BAR4 cannot be positively identified, PrepareHardware fails
+// closed (STATUS_DEVICE_CONFIGURATION_ERROR) instead of mapping and talking
+// to an arbitrary MMIO region of the T2.
 
 #include "driver.h"
 #include <wdmguid.h>   // GUID_BUS_INTERFACE_STANDARD
@@ -111,6 +113,14 @@ T2QueryBar4ViaPciConfig(_In_ WDFDEVICE Device, _Out_ PHYSICAL_ADDRESS *Bar4Base)
         Bar4Base->QuadPart = ((LONGLONG)bar5Raw << 32) | (LONGLONG)(bar4Raw & 0xFFFFFFF0u);
     } else {
         Bar4Base->QuadPart = (LONGLONG)(bar4Raw & 0xFFFFFFF0u);
+    }
+
+    if (Bar4Base->QuadPart == 0) {
+        // Unassigned BAR: nothing to match against, and 0 must never be
+        // allowed to match a bogus resource descriptor.
+        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "T2TouchIdTransport: PCI config space reports an unassigned BAR4 (base 0)\n"));
+        return STATUS_DEVICE_CONFIGURATION_ERROR;
     }
 
     T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
@@ -321,68 +331,67 @@ T2EvtDevicePrepareHardware(
     // against the assigned resource list instead of guessing.
     pciStatus = T2QueryBar4ViaPciConfig(Device, &bar4Base);
 
-    if (NT_SUCCESS(pciStatus)) {
-        // ResourcesRaw and ResourcesTranslated are parallel lists - index i
-        // in one always corresponds to the same underlying resource as
-        // index i in the other (WDF guarantee). Raw descriptors carry the
-        // bus-relative address that matches what's actually programmed
-        // into the PCI BAR register; translated descriptors carry the
-        // CPU-usable address MmMapIoSpaceEx needs. We match on raw, then
-        // map using translated.
+    if (!NT_SUCCESS(pciStatus)) {
+        // FAIL CLOSED. There is intentionally no "first memory resource" /
+        // "any BAR" fallback: that heuristic mapped the wrong BAR on real
+        // hardware, and writing SEP mailbox/OOL traffic into an arbitrary
+        // MMIO region of the T2 is not acceptable. No BAR4 identity == no
+        // device start.
+        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "T2TouchIdTransport: could not identify BAR4 via PCI config space (status=0x%x); "
+            "refusing to start - no fallback to any other BAR\n", pciStatus));
+        return STATUS_DEVICE_CONFIGURATION_ERROR;
+    }
+
+    // ResourcesRaw and ResourcesTranslated are parallel lists - index i
+    // in one always corresponds to the same underlying resource as
+    // index i in the other (WDF guarantee). Raw descriptors carry the
+    // bus-relative address that matches what's actually programmed
+    // into the PCI BAR register; translated descriptors carry the
+    // CPU-usable address MmMapIoSpaceEx needs. We match on raw, then
+    // map using translated. Exactly one memory resource may match.
+    {
         ULONG scanCount = (rawCount < count) ? rawCount : count;
+        ULONG matches = 0;
         for (ULONG i = 0; i < scanCount; i++) {
             PCM_PARTIAL_RESOURCE_DESCRIPTOR rawDesc = WdfCmResourceListGetDescriptor(ResourcesRaw, i);
             if (rawDesc->Type == CmResourceTypeMemory &&
                 rawDesc->u.Memory.Start.QuadPart == bar4Base.QuadPart) {
                 PCM_PARTIAL_RESOURCE_DESCRIPTOR desc = WdfCmResourceListGetDescriptor(ResourcesTranslated, i);
+                matches++;
+                if (matches > 1) {
+                    continue;   // ambiguous - rejected below
+                }
+                if (desc->Type != CmResourceTypeMemory) {
+                    // Parallel lists disagree about the resource type:
+                    // do not trust this entry.
+                    matches = 2;
+                    continue;
+                }
                 ctx->Bar4PhysicalAddress = desc->u.Memory.Start;
                 ctx->Bar4Length = desc->u.Memory.Length;
                 foundBar = TRUE;
                 T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                     "T2TouchIdTransport: BAR4 confirmed via PCI config space at resource index %u "
                     "(len=0x%x)\n", i, desc->u.Memory.Length));
-                break;
             }
         }
-        if (!foundBar) {
+        if (matches > 1) {
+            foundBar = FALSE;
+            ctx->Bar4PhysicalAddress.QuadPart = 0;
+            ctx->Bar4Length = 0;
+            T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                "T2TouchIdTransport: BAR4 base 0x%I64x matched %u resource descriptors - "
+                "ambiguous, refusing to start\n", bar4Base.QuadPart, matches));
+        } else if (!foundBar) {
             T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                 "T2TouchIdTransport: PCI config space reports BAR4 base 0x%I64x but no matching "
-                "memory resource was found in the assigned resource list\n", bar4Base.QuadPart));
-        }
-    } else {
-        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-            "T2TouchIdTransport: could not confirm BAR4 via PCI config space (status=0x%x); "
-            "falling back to first-memory-resource heuristic - THIS IS UNRELIABLE, do not "
-            "trust a successful mailbox read that follows this warning\n", pciStatus));
-    }
-
-    if (!foundBar) {
-        // Last-resort fallback only - kept so the driver doesn't outright
-        // refuse to load if GetBusData is ever unavailable on some target,
-        // but this is exactly the heuristic that mapped the wrong BAR on
-        // real hardware. Any warning below means BAR4 selection is still
-        // unconfirmed.
-        for (ULONG i = 0; i < count; i++) {
-            PCM_PARTIAL_RESOURCE_DESCRIPTOR desc = WdfCmResourceListGetDescriptor(ResourcesTranslated, i);
-
-            if (desc->Type == CmResourceTypeMemory) {
-                if (!foundBar) {
-                    ctx->Bar4PhysicalAddress = desc->u.Memory.Start;
-                    ctx->Bar4Length = desc->u.Memory.Length;
-                    foundBar = TRUE;
-                } else {
-                    T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                        "T2TouchIdTransport: unexpected second memory BAR "
-                        "(len=0x%x) - BAR4 selection logic needs review\n",
-                        desc->u.Memory.Length));
-                }
-            }
+                "memory resource was found in the assigned resource list - refusing to start\n",
+                bar4Base.QuadPart));
         }
     }
 
     if (!foundBar) {
-        T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-            "T2TouchIdTransport: no memory resource found (expected BAR4)\n"));
         return STATUS_DEVICE_CONFIGURATION_ERROR;
     }
 
