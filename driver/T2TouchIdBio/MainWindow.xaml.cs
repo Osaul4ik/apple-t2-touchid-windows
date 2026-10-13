@@ -865,46 +865,88 @@ namespace T2TouchId.SepVaultGui
             }
         }
 
+        // Bumped on every user change of the switch, so a late result of the background
+        // "live power plan" probe below can never overwrite what the user just chose.
+        private int _lockOnDisplayOffVersion;
+
+        private void ApplyLockOnDisplayOffText(bool on)
+        {
+            LockOnDisplayOffStatusText.Text = on
+                ? "On: power button = Turn off the display (all plans). Display-off also locks the PC."
+                : "Off: power button = Sleep (all plans). No lock on display-off.";
+            LockOnDisplayOffStatusText.Foreground = TextMuted;
+        }
+
         private void LoadLockOnDisplayOff()
         {
+            bool want;
             _lockOnDisplayOffLoading = true;
             try
             {
                 // Toggle is always available; it drives the power-button action itself.
                 LockOnDisplayOffCheck.IsEnabled = true;
-                bool want = ReadLockOnDisplayOff();
-                // Prefer registry, but if registry is off and the live plan is already
-                // display-off, still show the switch as on so the UI matches reality.
-                bool liveDisplayOff = IsPowerButtonDisplayOff();
-                LockOnDisplayOffCheck.IsChecked = want || liveDisplayOff;
-
-                if (LockOnDisplayOffCheck.IsChecked == true)
-                {
-                    LockOnDisplayOffStatusText.Text =
-                        "On: power button = Turn off the display (all plans). Display-off also locks the PC.";
-                }
-                else
-                {
-                    LockOnDisplayOffStatusText.Text =
-                        "Off: power button = Sleep (all plans). No lock on display-off.";
-                }
-                LockOnDisplayOffStatusText.Foreground = TextMuted;
+                want = ReadLockOnDisplayOff();
+                LockOnDisplayOffCheck.IsChecked = want;
+                ApplyLockOnDisplayOffText(want);
             }
             finally
             {
                 _lockOnDisplayOffLoading = false;
             }
+
+            // If the registry flag is off but the live plan is already display-off, the switch
+            // should still show "on" so the UI matches reality. That probe spawns powercfg.exe
+            // twice, so it runs off the UI thread (it used to block window construction) and
+            // only when the registry did not already answer.
+            if (want) return;
+            int version = _lockOnDisplayOffVersion;
+            _ = Task.Run(() =>
+            {
+                bool live;
+                try { live = IsPowerButtonDisplayOff(); }
+                catch { return; }
+                if (!live) return;
+                Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    if (version != _lockOnDisplayOffVersion) return;   // user already chose
+                    _lockOnDisplayOffLoading = true;
+                    try
+                    {
+                        LockOnDisplayOffCheck.IsChecked = true;
+                        ApplyLockOnDisplayOffText(true);
+                    }
+                    finally
+                    {
+                        _lockOnDisplayOffLoading = false;
+                    }
+                }));
+            });
         }
 
-        private void OnLockOnDisplayOffChanged(object sender, RoutedEventArgs e)
+        private async void OnLockOnDisplayOffChanged(object sender, RoutedEventArgs e)
         {
             if (_lockOnDisplayOffLoading) return;
+            _lockOnDisplayOffVersion++;
 
             bool enabled = LockOnDisplayOffCheck.IsChecked == true;
             int action = enabled ? PowerButtonDisplayOff : PowerButtonSleep;
 
-            bool powerOk = SetPowerButtonActionOnAllSchemes(action);
-            bool regOk = WriteLockOnDisplayOff(enabled);
+            // powercfg.exe is spawned several times per power plan; running that on the UI
+            // thread froze the window for the whole duration. Same calls, same order, just
+            // off the UI thread; the switch is disabled meanwhile so it cannot be re-entered.
+            LockOnDisplayOffCheck.IsEnabled = false;
+            LockOnDisplayOffStatusText.Text = "Applying power plan settings...";
+            LockOnDisplayOffStatusText.Foreground = TextMuted;
+            bool powerOk, regOk;
+            try
+            {
+                (powerOk, regOk) = await Task.Run(() =>
+                    (SetPowerButtonActionOnAllSchemes(action), WriteLockOnDisplayOff(enabled)));
+            }
+            finally
+            {
+                LockOnDisplayOffCheck.IsEnabled = true;
+            }
 
             if (!powerOk && !regOk)
             {
