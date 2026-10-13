@@ -52,7 +52,7 @@ Signature   = "$WINDOWS NT$"
 Class       = Net
 ClassGUID   = {4d36e972-e325-11ce-bfc1-08002be10318}
 Provider    = %ManufacturerName%
-DriverVer   = 09/15/2026,2.1.0.0
+DriverVer   = 10/13/2026,2.1.1.0
 CatalogFile = apple-t2-ncm.cat
 PnpLockdown = 1
 
@@ -87,7 +87,11 @@ T2Ncm.sys = 1
 [AppleT2Ncm_Install]
 CopyFiles           = T2Ncm.CopyDriverFiles
 
-Characteristics     = 0x84
+; 0x04 = NCF_PHYSICAL only. NCF_HAS_UI (0x80) is deliberately NOT set: it is what
+; makes Device Manager show the adapter's "Advanced" tab, and this adapter has
+; no user-configurable properties (no Ndi\params), so the tab was empty and
+; the property sheet crashed when it was opened.
+Characteristics     = 0x4
 BusType             = 15
 
 *IfType             = 6
@@ -150,7 +154,9 @@ HKR, Ndi\Interfaces, LowerRange, 0, "ethernet"
 ; line above only stops NEW installs from creating it; this DelReg also
 ; cleans it up on an already-installed adapter when the driver is updated.
 [AppleT2Ncm_DelReg]
-HKR, Ndi\params\NetworkAddress
+; Remove the whole (now empty / stale) Advanced-tab parameter tree on
+; already-installed adapters when the driver is updated.
+HKR, Ndi\params
 ; USB selective suspend is left at its default for this function. An
 ; earlier build forced it off (EnableSelectiveSuspend=0); that had no
 ; observable effect, so the override is removed here and cleaned up on
