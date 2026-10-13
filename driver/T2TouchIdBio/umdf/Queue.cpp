@@ -682,6 +682,25 @@ HANDLE GetSystemResumeEvent()
     return h;
 }
 
+// Wake-up for the "wait while ..." loops (WaitForSystemResume, WaitUntilDisplayAllowsScan,
+// WaitForSepBootstrap). They used to poll (Sleep(50) / 100 ms slices / Sleep(250)); now a
+// manual-reset event is signaled whenever display / sleep-barrier / shutdown / request-cancel
+// state changes. Waiters ResetEvent() BEFORE re-checking that state, so a change that lands
+// between the check and the wait leaves the event signaled (no lost wakeup). They still wait
+// with a bounded timeout (kStateWaitSafetyMs) as a safety net: a notification missed by some
+// future code path only costs latency, never a hang - the same worst case polling had.
+// Process-lifetime handle, never closed (like the cancel / resume events).
+HANDLE GetCaptureStateEvent()
+{
+    static HANDLE h = CreateEventW(nullptr, /*bManualReset=*/TRUE, /*initiallySignaled=*/FALSE, nullptr);
+    return h;
+}
+void NotifyCaptureStateChanged()
+{
+    if (HANDLE h = GetCaptureStateEvent()) SetEvent(h);
+}
+constexpr DWORD kStateWaitSafetyMs = 250;
+
 // Shared invalidation logic for both a real system suspend and a plain
 // screen lock (WTS_SESSION_LOCK) that happens without a suspend - see
 // BeginCaptureSessionLock's header comment below for why a screen lock
@@ -717,6 +736,7 @@ void InvalidateActiveCapture(_In_z_ const char* source, bool resetResumeEvent, b
 
     HANDLE cancelEvent = GetCaptureCancelEvent();
     if (cancelEvent) SetEvent(cancelEvent); // interrupts WaitForEvent if still blocked
+    NotifyCaptureStateChanged();
     T2BioLog("%s: invalidated active fingerprint result; aborting BiometricKit match "
              "(cmd 0x0c best-effort if session was live); keeping WBF CAPTURE_DATA pending",
              source);
@@ -812,6 +832,7 @@ ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_
         BeginCaptureSuspend("OnSuspendResume(PBT_APMSUSPEND)");
     } else if (Type == PBT_APMRESUMESUSPEND || Type == PBT_APMRESUMEAUTOMATIC) {
         g_sleepBarrier.store(false, std::memory_order_release);
+        NotifyCaptureStateChanged();   // lifts WaitUntilDisplayAllowsScan
         // Allow tunnel IOCTLs again only after resume. Sticky already cleared
         // below; Connect will rediscover once NCM is Running.
         t2::transport::SetTransportIoSuspended(false);
@@ -910,6 +931,7 @@ VOID EvtCaptureCancel(_In_ WDFREQUEST Request)
             }
         }
     }
+    NotifyCaptureStateChanged();   // cancelScope.IsCancelled() just changed
     if (owns) {
         // WdfRequestComplete here, not CompleteCaptureData: WBDI's own contract
         // for a cancelled request is STATUS_CANCELLED at the WDF layer, not a
@@ -941,6 +963,7 @@ void BeginCaptureShutdown(_In_z_ const char* source)
             }
         }
     }
+    NotifyCaptureStateChanged();   // g_systemShuttingDown / owner flags just changed
     std::lock_guard<std::mutex> commitLock(g_captureRequestCommitMu);
     for (WDFREQUEST req : toComplete) {
         T2BioLog("%s: force-completing pending CAPTURE_DATA with STATUS_CANCELLED "
@@ -1030,8 +1053,12 @@ bool WaitForSystemResume(_In_ CancelableScope& cancelScope,
     if (!resumeEvent) {
         return false;
     }
+    HANDLE stateEvent = GetCaptureStateEvent();
 
     for (;;) {
+        // Reset BEFORE re-checking (see GetCaptureStateEvent): a cancel / shutdown that
+        // lands after the checks below keeps the event signaled for the wait at the bottom.
+        if (stateEvent) ResetEvent(stateEvent);
         if (SystemIsShuttingDown() || cancelScope.IsCancelled()) {
             return false;
         }
@@ -1058,7 +1085,10 @@ bool WaitForSystemResume(_In_ CancelableScope& cancelScope,
         if (resumeState != WAIT_TIMEOUT) {
             return false;
         }
-        WaitForSingleObject(resumeEvent, 100);
+        // Wakes at once on resume (resumeEvent) or on cancel / shutdown (stateEvent)
+        // instead of re-checking every 100 ms.
+        HANDLE waitSet[2] = {resumeEvent, stateEvent};
+        WaitForMultipleObjects(stateEvent ? 2u : 1u, waitSet, FALSE, kStateWaitSafetyMs);
     }
 }
 
@@ -1078,11 +1108,32 @@ bool WaitUntilDisplayAllowsScan(_In_ CancelableScope& cancelScope,
         return !cancelScope.IsCancelled();
     }
     T2BioLog("CAPTURE_DATA(verify): sleep/power-button path — no SEP commands; CAPTURE stays pending");
-    while (DisplayBlocksSuccess()) {
+    HANDLE stateEvent = GetCaptureStateEvent();
+    for (;;) {
+        // Reset BEFORE re-checking (see GetCaptureStateEvent).
+        if (stateEvent) ResetEvent(stateEvent);
+        if (!DisplayBlocksSuccess()) {
+            break;
+        }
         if (SystemIsShuttingDown() || cancelScope.IsCancelled()) {
             return false;
         }
-        Sleep(50);
+        if (!stateEvent) {
+            Sleep(50);
+            continue;
+        }
+        // Wake on resume / display-on / cancel / shutdown. The power-button grace expires
+        // by the clock, so never wait past its deadline.
+        DWORD waitMs = kStateWaitSafetyMs;
+        const ULONGLONG until = g_powerButtonGraceUntil.load(std::memory_order_acquire);
+        if (until != 0) {
+            const ULONGLONG now = GetTickCount64();
+            const ULONGLONG left = (until > now) ? (until - now) : 0;
+            if (left + 1 < waitMs) {
+                waitMs = static_cast<DWORD>(left + 1);
+            }
+        }
+        WaitForSingleObject(stateEvent, waitMs);
     }
     if (cancelEvent) {
         ResetEvent(cancelEvent);
@@ -1111,11 +1162,16 @@ SepWait WaitForSepBootstrap(_In_ CancelableScope& cancelScope,
 {
     *outSensorStatus = WINBIO_SENSOR_READY;
     *outHresult = S_OK;
+    // The bootstrap service reports through the transport driver (IOCTL), not through an
+    // event this process can wait on, so the status itself is still polled - but the wait
+    // between polls is now cancel/shutdown-aware (stateEvent) instead of a blind Sleep.
     constexpr DWORD kPollMs = 250;
     const ULONGLONG t0 = GetTickCount64();
     ULONGLONG nextHintMs = 30000;
     bool logged = false;
+    HANDLE stateEvent = GetCaptureStateEvent();
     for (;;) {
+        if (stateEvent) ResetEvent(stateEvent);   // before re-checking
         if (SystemIsShuttingDown() || cancelScope.IsCancelled()) {
             return SepWait::Cancelled;
         }
@@ -1147,7 +1203,11 @@ SepWait WaitForSepBootstrap(_In_ CancelableScope& cancelScope,
                     static_cast<unsigned long long>(waitedMs / 1000));
             nextHintMs += 30000;
         }
-        Sleep(kPollMs);
+        if (stateEvent) {
+            WaitForSingleObject(stateEvent, kPollMs);
+        } else {
+            Sleep(kPollMs);
+        }
     }
 }
 
@@ -1364,17 +1424,23 @@ void CompleteCaptureData(_In_ WDFREQUEST Request, HRESULT winBioHresult,
 // already logged why) if the SEP/T2 side cannot be reached at all - the
 // caller maps that to WINBIO_E_DEVICE_FAILURE, never to a Match/NoMatch
 // verdict, because "couldn't ask the SEP" is not an answer from the SEP.
+// HKLM\SOFTWARE\T2TouchIdBio DWORDs read on the capture path (ShortVerify, BirVariant,
+// WarmupGraceMs, PostResumeSettleMs). They used to be opened/queried/closed on every
+// call - once or twice per CAPTURE_DATA, once per StartMatch attempt, and
+// WarmupGraceMs even while holding g_bridgeAvail.mu. They now go through the same
+// TTL cache IsAutoSwitchEnabled() uses (TransportMode.h): a registry edit (SepVault
+// GUI toggle) reaches the NEXT capture within kBioRegCacheTtlMs instead of at once.
+constexpr wchar_t kBioRegKey[] = L"SOFTWARE\\T2TouchIdBio";
+constexpr ULONGLONG kBioRegCacheTtlMs = 2000;
+
 // Post-Sx-resume settle before the first BridgeXPC connect (see ConnectForCapture).
 DWORD LoadPostResumeSettleMs()
 {
     constexpr DWORD kDefaultMs = 100;
     constexpr DWORD kMaxMs = 2000;
-    DWORD v = kDefaultMs;
-    DWORD cb = sizeof(v);
-    if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\T2TouchIdBio", L"PostResumeSettleMs",
-                     RRF_RT_REG_DWORD, nullptr, &v, &cb) != ERROR_SUCCESS) {
-        return kDefaultMs;
-    }
+    static t2::transport::CachedDword cache;
+    const DWORD v = t2::transport::ReadDwordCached(cache, kBioRegKey, L"PostResumeSettleMs",
+                                                   kDefaultMs, kBioRegCacheTtlMs);
     return v > kMaxMs ? kMaxMs : v;
 }
 
@@ -1551,12 +1617,9 @@ DWORD LoadWarmupGraceMs()
 {
     constexpr DWORD kDefaultMs = 30000;
     constexpr DWORD kMaxMs = 600000;
-    DWORD v = kDefaultMs;
-    DWORD cb = sizeof(v);
-    if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\T2TouchIdBio", L"WarmupGraceMs",
-                     RRF_RT_REG_DWORD, nullptr, &v, &cb) != ERROR_SUCCESS) {
-        return kDefaultMs;
-    }
+    static t2::transport::CachedDword cache;
+    const DWORD v = t2::transport::ReadDwordCached(cache, kBioRegKey, L"WarmupGraceMs",
+                                                   kDefaultMs, kBioRegCacheTtlMs);
     return v > kMaxMs ? kMaxMs : v;
 }
 
@@ -1710,12 +1773,9 @@ ConnectWait ConnectForCaptureWithRetry(HANDLE cancelEvent, t2::bridgexpc::Connec
 //     bit 1: include the placeholder ANSI-381 standard block
 t2::wbdi::BirOptions LoadBirOptions()
 {
-    DWORD variant = 3;
-    DWORD cb = sizeof(variant);
-    if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\T2TouchIdBio", L"BirVariant",
-                     RRF_RT_REG_DWORD, nullptr, &variant, &cb) != ERROR_SUCCESS) {
-        variant = 3;
-    }
+    static t2::transport::CachedDword cache;
+    const DWORD variant = t2::transport::ReadDwordCached(cache, kBioRegKey, L"BirVariant",
+                                                         3, kBioRegCacheTtlMs);
     T2BioLog("  BIR layout variant=%u (bit0=option-mask flag, bit1=ANSI-381 block)",
              static_cast<unsigned>(variant));
     return t2::wbdi::BirOptionsFromVariant(variant);
@@ -1738,13 +1798,10 @@ std::atomic<bool> g_forceLongVerify{false};
 //                  and the fail-closed 0x51 -> 0x42 -> 0x51 stability gate.
 bool LoadShortVerify()
 {
-    DWORD value = 0;
-    DWORD cb = sizeof(value);
-    if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\T2TouchIdBio", L"ShortVerify",
-                     RRF_RT_REG_DWORD, nullptr, &value, &cb) != ERROR_SUCCESS) {
-        return true; // default ON (fast verification)
-    }
-    return value != 0;
+    static t2::transport::CachedDword cache;
+    // default ON (fast verification) when the value is missing
+    return t2::transport::ReadDwordCached(cache, kBioRegKey, L"ShortVerify",
+                                          1, kBioRegCacheTtlMs) != 0;
 }
 
 // HKLM\SOFTWARE\T2TouchIdBio\LockOnDisplayOff (REG_DWORD, GUI writes 0/1)
@@ -2729,6 +2786,7 @@ void OnConsoleDisplayState(DWORD state)
         g_powerButtonGraceUntil.store(0, std::memory_order_release);
         T2BioLog("ConsoleDisplayState=%lu: grace cleared", static_cast<unsigned long>(state));
     }
+    NotifyCaptureStateChanged();   // grace set / cleared: re-evaluate DisplayBlocksSuccess()
 }
 
 LRESULT CALLBACK SessionLockWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)

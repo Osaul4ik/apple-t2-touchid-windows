@@ -4,6 +4,7 @@
 #include "../../driver/T2TouchIdTransport/public.h"
 #include <setupapi.h>
 #include <string>
+#include <mutex>
 #pragma comment(lib, "setupapi.lib")
 
 namespace t2::applekeystore {
@@ -34,18 +35,49 @@ static std::optional<std::wstring> FindDevicePath() {
     return result;
 }
 
+// The device-interface path of the transport device is stable for the life of the device
+// instance, but FindDevicePath() is a SetupDi enumeration (SetupDiGetClassDevs + enum +
+// detail) - far more expensive than the CreateFile it feeds. Callers open the device
+// repeatedly (e.g. the UMDF driver's SEP-ready poll every 250 ms while the bootstrap runs),
+// so the last good path is cached. It is dropped whenever CreateFile fails with it (device
+// removed / reinstalled / interface re-registered) and rediscovered once before giving up,
+// so a stale path costs one extra enumeration, never a false DeviceNotFound.
+static std::mutex g_devicePathMu;
+static std::wstring g_devicePath;   // empty = not cached
+
+static HANDLE OpenDevicePath(const std::wstring& path) {
+    return CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+        OPEN_EXISTING, 0, nullptr);
+}
+
 AksResult Client::Open() {
     // Milestone 2B §10: a repeated Open() call on an already-open Client
     // must not leak the previous handle - close it first so this is a
     // reconnect, not a leak.
     Close();
 
+    std::wstring cached;
+    {
+        std::lock_guard<std::mutex> lock(g_devicePathMu);
+        cached = g_devicePath;
+    }
+    if (!cached.empty()) {
+        handle_ = OpenDevicePath(cached);
+        if (handle_ != INVALID_HANDLE_VALUE) return AksResult::Ok;
+        std::lock_guard<std::mutex> lock(g_devicePathMu);
+        if (g_devicePath == cached) g_devicePath.clear();   // stale: rediscover below
+    }
+
     auto path = FindDevicePath();
     if (!path) return AksResult::DeviceNotFound;
 
-    handle_ = CreateFileW(path->c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
-        OPEN_EXISTING, 0, nullptr);
-    return (handle_ != INVALID_HANDLE_VALUE) ? AksResult::Ok : AksResult::DeviceNotFound;
+    handle_ = OpenDevicePath(*path);
+    if (handle_ == INVALID_HANDLE_VALUE) return AksResult::DeviceNotFound;
+    {
+        std::lock_guard<std::mutex> lock(g_devicePathMu);
+        g_devicePath = *path;
+    }
+    return AksResult::Ok;
 }
 
 void Client::Close() {

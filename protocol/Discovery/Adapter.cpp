@@ -14,20 +14,27 @@
 #pragma comment(lib, "Iphlpapi.lib")
 
 namespace t2::discovery {
+
+// Defined further down (also used by ProbePeerIcmpAlive); the multicast prompt needs it too.
+static bool QueryPreferredLinkLocal(unsigned long ifIndex, in6_addr* out);
+
 namespace {
 
 // Nudges the T2 to answer by sending one ICMPv6 echo to the all-nodes
-// multicast address on this interface — the exact manual workaround an
+// multicast address on this interface - the exact manual workaround an
 // operator has to reach for today ("try pinging ff02::1%<ifIndex>").
-// This shells out to the system ping.exe (rather than driving raw ICMPv6
-// via Icmp6SendEcho2, whose reply-capture semantics for a *multicast*
-// destination are the fragile part) — we don't need to parse *our* copy
-// of the reply, we only need Windows' own IPv6 stack to observe the T2's
-// unicast reply on the wire, which is what actually populates the
-// neighbor table entry FindNeighborPeer reads afterwards.
-bool PromptPeerViaMulticastPing(unsigned long ifIndex, unsigned timeoutMs) {
-    if (ifIndex == 0) return false;
-
+// We don't need to parse *our* copy of the reply, we only need Windows' own IPv6
+// stack to observe the T2's traffic on the wire (the T2's neighbor solicitation /
+// unicast reply), which is what actually populates the neighbor table entry
+// FindNeighborPeer reads afterwards.
+//
+// 13.10.2026: done in-process with Icmp6SendEcho2 (the API ProbePeerIcmpAlive already
+// uses) instead of spawning ping.exe first. A process spawn costs tens of ms (more
+// with AV/EDR) and runs a child inside the UMDF host. The reply capture of a
+// *multicast* echo is the fragile part of that API, but it is irrelevant here (see
+// above), so only "could not send at all" falls back to the old ping.exe path; a plain
+// timeout is a normal outcome (no T2 answered) and ping.exe would time out too.
+bool PromptPeerViaPingExe(unsigned long ifIndex, unsigned timeoutMs) {
     wchar_t cmd[128];
     _snwprintf_s(cmd, _TRUNCATE, L"ping.exe -6 -n 1 -w %u ff02::1%%%lu",
                  timeoutMs, ifIndex);
@@ -46,6 +53,39 @@ bool PromptPeerViaMulticastPing(unsigned long ifIndex, unsigned timeoutMs) {
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
     return true;
+}
+
+bool PromptPeerViaMulticastPing(unsigned long ifIndex, unsigned timeoutMs) {
+    if (ifIndex == 0) return false;
+
+    in6_addr localSrc{};
+    if (QueryPreferredLinkLocal(ifIndex, &localSrc)) {
+        HANDLE h = Icmp6CreateFile();
+        if (h != INVALID_HANDLE_VALUE) {
+            sockaddr_in6 src{};
+            src.sin6_family = AF_INET6;
+            src.sin6_addr = localSrc;
+            src.sin6_scope_id = ifIndex;
+            sockaddr_in6 dst{};
+            dst.sin6_family = AF_INET6;
+            dst.sin6_scope_id = ifIndex;
+            dst.sin6_addr.u.Word[0] = htons(0xFF02);   // ff02::1 (all nodes, link-local)
+            dst.sin6_addr.u.Word[7] = htons(0x0001);
+            char payload[4] = {'T', '2', 'P', 'G'};
+            alignas(8) unsigned char reply[512];
+            const DWORD n = Icmp6SendEcho2(h, nullptr, nullptr, nullptr, &src, &dst, payload,
+                                           static_cast<WORD>(sizeof(payload)), nullptr, reply,
+                                           static_cast<DWORD>(sizeof(reply)), timeoutMs);
+            const DWORD err = (n == 0) ? GetLastError() : ERROR_SUCCESS;
+            IcmpCloseHandle(h);
+            if (n > 0 || err == IP_REQ_TIMED_OUT) {
+                return true;
+            }
+            T2_LOG("discovery", L"multicast prompt: Icmp6SendEcho2 failed err=%lu - falling back to ping.exe",
+                   static_cast<unsigned long>(err));
+        }
+    }
+    return PromptPeerViaPingExe(ifIndex, timeoutMs);
 }
 
 bool LooksLikeT2Ncm(const std::wstring& description, const std::wstring& friendly) {

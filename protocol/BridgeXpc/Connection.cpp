@@ -988,7 +988,7 @@ Connection::WaitStep Connection::WaitForEventStep(std::vector<uint8_t>* outEvent
                    // before - this line must never be the thing that
                    // prints an enrolled identity UUID in the clear.
                    HexDump(env->payloadPlist, 512).c_str());
-            *outEventPayload = env->payloadPlist;
+            *outEventPayload = std::move(env->payloadPlist);   // env is local and not read again
             return WaitStep::Deliver;
         }
         // A stray reply to something we're not waiting on: ignore, keep looping.
