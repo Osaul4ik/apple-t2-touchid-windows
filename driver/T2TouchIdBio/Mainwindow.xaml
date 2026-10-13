@@ -607,7 +607,7 @@
                         </CheckBox>
                         <CheckBox x:Name="LogDiagEventCheck" Style="{StaticResource ToggleSwitch}" Margin="0,0,0,10"
                                   Checked="OnLogFlagChanged" Unchecked="OnLogFlagChanged">
-                            <TextBlock Text="...also write the diagnostics to the Windows Event Log (survives reboot; read with tools\Get-T2Diag.ps1)" TextWrapping="Wrap"/>
+                            <TextBlock Text="...also record them as an ETW trace (survives reboot; set up once with tools\Get-T2Diag.ps1 -Install)" TextWrapping="Wrap"/>
                         </CheckBox>
                         <CheckBox x:Name="LogPowerCheck" Style="{StaticResource ToggleSwitch}" Margin="0,0,0,10"
                                   Checked="OnLogFlagChanged" Unchecked="OnLogFlagChanged">

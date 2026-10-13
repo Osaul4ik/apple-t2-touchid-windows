@@ -611,7 +611,7 @@ namespace T2TouchId.SepVaultGui
             else
             {
                 LogStatusText.Text = LogDiagCheck.IsChecked == true
-                    ? "Saved. Cold-boot diagnostics turn ALL logs below on: user-mode parts within ~2 s, kernel drivers (SEP / T2NCM) at the next boot or driver reload. Reboot once, reproduce the problem, then run tools\\Get-T2Diag.ps1 (Event Log) - or use a DebugView boot log for the kernel part."
+                    ? "Saved. Cold-boot diagnostics turn ALL logs below on: user-mode parts within ~2 s, kernel drivers (SEP / T2NCM) at the next boot or driver reload. Reboot once, reproduce the problem, then read the trace with tools\\Get-T2Diag.ps1 (install it once with -Install, as Administrator) - or use a DebugView boot log for the kernel part."
                     : "Saved. User-mode parts (Bio, BridgeXPC, SEP bootstrap) pick it up within ~2 s; kernel drivers after the next sleep/resume or a driver reload.";
                 LogStatusText.Foreground = DotOk;
             }

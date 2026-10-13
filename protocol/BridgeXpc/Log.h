@@ -13,12 +13,14 @@
 //                (user-mode here; T2TouchIdTransport.sys and T2Ncm.sys read it too
 //                at DriverEntry / D0Entry) and enables the extra T2_DIAG lines
 //                (uptime-stamped, so they line up with a DebugView boot log).
-//   DiagEventLog — mirror the T2_DIAG lines (only those: curated, low volume) into the
-//                Windows Application event log, source "T2TouchIdDiag". This is what
-//                survives a cold boot when DebugView was not running yet, and it needs
-//                no file permissions (the UMDF host runs as LocalService and could not
-//                reliably create files under ProgramData - see PortCache.cpp).
-//                Read it with tools\Get-T2Diag.ps1.
+//   DiagEventLog — mirror the T2_DIAG lines (only those: curated, low volume) as ETW events
+//                (provider T2TouchIdDiag, kDiagProviderGuid below). A trace session records
+//                them across a cold boot when DebugView was not running yet; the session
+//                (an Autologger) is installed with tools\Get-T2Diag.ps1 -Install and read
+//                back with tools\Get-T2Diag.ps1. ETW, not the legacy Event Log: the UMDF
+//                driver build bans RegisterEventSource/ReportEvent (C28735 "Banned Crimson
+//                API"), and the UMDF host (LocalService) could not reliably create files
+//                under ProgramData either (see PortCache.cpp). The flag keeps its old name.
 //
 // Console echo is OFF by default; --verbose / T2TOUCHID_VERBOSE=1 enables it.
 #pragma once
@@ -26,6 +28,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <evntprov.h>      // ETW provider API (EventRegister / EventWriteString)
 #include <atomic>
 #include <string>
 #include <vector>
@@ -134,20 +137,29 @@ inline double UptimeSec() {
     return static_cast<double>(GetTickCount64()) / 1000.0;
 }
 
-// One line into the Application event log (source "T2TouchIdDiag", event id 3). An
-// unregistered source is accepted by RegisterEventSource and lands in Application; Event
-// Viewer wraps the text in a generic "description not found" notice but the insertion
-// string carries the full line (same trade-off as T2SepBootstrapService.cpp LogEvent).
-// The handle is opened once per process and kept - it is process-lifetime state.
+// ETW provider "T2TouchIdDiag" (manifest-free: every event is one Unicode string). Nothing is
+// stored unless a trace session listens - tools\Get-T2Diag.ps1 -Install creates an Autologger
+// that does, from early boot.
+inline constexpr GUID kDiagProviderGuid =
+    { 0x7b1d6f0e, 0x3c52, 0x4c7a, { 0x9a, 0x5e, 0x2f, 0x4d, 0x8e, 0x1b, 0x6a, 0x93 } };
+
+// One line as an ETW event (level 4 = informational). The registration is opened once per
+// process and kept for the process lifetime; a failed registration just disables the mirror.
 inline void WriteDiagEventLog(const wchar_t* line) {
-    static HANDLE h = RegisterEventSourceW(nullptr, L"T2TouchIdDiag");
-    if (!h) return;
-    const wchar_t* strings[1] = { line };
-    ReportEventW(h, EVENTLOG_INFORMATION_TYPE, 0, 3, nullptr, 1, 0, strings, nullptr);
+    static const REGHANDLE h = [] {
+        REGHANDLE r = 0;
+        if (EventRegister(&kDiagProviderGuid, nullptr, nullptr, &r) != ERROR_SUCCESS) {
+            r = 0;
+        }
+        return r;
+    }();
+    if (h != 0) {
+        EventWriteString(h, 4, 0, line);
+    }
 }
 
 // Diagnostic line (cold-boot investigation). Only when the master Diag switch is on.
-// DebugView + (if DiagEventLog is on) the Application event log. Prefix:
+// DebugView + (if DiagEventLog is on) the ETW provider above. Prefix:
 //   "T2TouchIdDiag: [pid:tid up=<s since boot>][tag] msg"
 inline void Diagf(const wchar_t* tag, const wchar_t* fmt, ...) {
     if (!DiagEnabled()) {
