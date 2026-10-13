@@ -216,7 +216,7 @@ inline void Shutdown() {
     if (!s.enabled.exchange(false, std::memory_order_acq_rel)) return;
     s.stop.store(true, std::memory_order_release);
     SetEvent(s.wake);
-    if (WaitForSingleObject(s.thread, 3000) == WAIT_OBJECT_0) {
+    if (WaitForSingleObject(s.thread, 3000) == 0) {   // 0 == WAIT_OBJECT_0 (macro needs STATUS_WAIT_0, undeclared under UMDF_USING_NTSTATUS)
         CloseHandle(s.thread);
         s.thread = nullptr;
         CloseHandle(s.wake);
