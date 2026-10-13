@@ -53,14 +53,15 @@ bool PickDefaultT2Endpoint(NcmEndpoint* outEndpoint, void* cancelEvent = nullptr
 //   C. IPv4 tunnel      - only when IPv6 is blocked (WSAEACCES, or no SYN-ACK and
 //                         no RST at all) or the tunnel is already sticky: HELO on the
 //                         same registry port, else a full-chain tunnel scan. A
-//                         tunnel handshake commits the sticky tunnel until reboot.
+//                         tunnel handshake commits the sticky tunnel (until reboot, or
+//                         until the one native re-check after a real unlock succeeds).
 //   D. nothing          - returns false.
 //
 // Every driver-mode flip happens inside a TransportPhase (cross-process mutex +
 // RAII scope), so on return the driver mode equals the committed mode on every path.
 //
 // Peer: uses endpoint.peerLinkLocal when known; when endpoint.peerSource is None
-// the gate resolves it (neighbor table -> persisted -> ping). Returns false if there
+// the gate resolves it (neighbor table -> ping -> persisted). Returns false if there
 // is still no peer.
 //
 // On success: outConn is connected and HELO-verified; *outServicePort (if non-null)

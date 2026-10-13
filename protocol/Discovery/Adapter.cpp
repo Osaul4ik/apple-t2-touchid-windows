@@ -3,6 +3,7 @@
 #include "../BridgeXpc/TransportMode.h"
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
+#include <icmpapi.h>
 #include <netioapi.h>
 #include <windows.h>
 #include <cstring>
@@ -180,23 +181,19 @@ bool ResolveT2Peer(NcmEndpoint* out, bool allowPing) {
         return true;
     }
     // Neighbor table has no T2 entry (cold boot, resume, or a VPN/WFP dropping ND).
-    //  1. last-known peer persisted from a good session - free, and right unless
-    //     the machine was paired with another T2 or the T2 changed address. Trusted
-    //     in native AND tunnel mode until two silent attempts in a row distrust it
-    //     (TransportMode.h NotePathSilent); the old code trusted it forever in
-    //     tunnel mode;
-    //  2. multicast ping + neighbor-table poll (~550 ms worst case, spawns
-    //     ping.exe) - whenever 1 gave nothing, regardless of the tunnel flag;
-    //  3. the persisted peer even if distrusted: ND/ICMPv6 is dropped, so a stale
-    //     guess still beats no target for the IPv4-tunnel attempt.
-    const bool trustPersisted = !t2::transport::ConsumePersistedPeerDistrust();
-    in6_addr saved{};
-    const bool haveSaved = t2::transport::ReadPersistedPeer(&saved, nullptr, nullptr);
-    if (haveSaved && trustPersisted) {
-        out->peerLinkLocal = saved;
-        out->peerSource = PeerSource::LastKnown;
-        return true;
-    }
+    // Fixed order (owner spec 03.10.2026): the ping ALWAYS comes before the persisted
+    // peer, so a stale last-known address can never shadow a peer the T2 would reveal
+    // right now (T2 re-addressed, another T2 paired, empty table after resume):
+    //  1. multicast ping + neighbor-table poll (~550 ms worst case, spawns ping.exe) -
+    //     only when `allowPing` (IPv6 usable on the adapter), in native and tunnel
+    //     mode alike;
+    //  2. last-known peer persisted from a good session - the LAST resort: when ND/ICMPv6
+    //     is dropped (VPN/WFP) or IPv6 is unbound, a possibly stale guess still beats
+    //     no target for the IPv4-tunnel attempt.
+    // The "distrusted" flag (TransportMode.h NotePathSilent / DistrustPersistedPeer) used
+    // to make step 2 wait for step 1; step 1 is now unconditional, so the flag has no
+    // further effect on the order. It is still consumed here so it cannot linger.
+    const bool wasDistrusted = t2::transport::ConsumePersistedPeerDistrust();
     if (allowPing) {
         // The ping still gets its full timeout; only the wait for the neighbor
         // table is responsive (10 ms polling instead of a blind sleep).
@@ -215,9 +212,13 @@ bool ResolveT2Peer(NcmEndpoint* out, bool allowPing) {
             Sleep(kPeerPollIntervalMs);
         }
     }
-    if (haveSaved) {
+    in6_addr saved{};
+    if (t2::transport::ReadPersistedPeer(&saved, nullptr, nullptr)) {
         out->peerLinkLocal = saved;
         out->peerSource = PeerSource::LastKnown;
+        T2_LOG("discovery", L"ResolveT2Peer: no neighbor%s - using the persisted last-known peer%s",
+               allowPing ? L" even after the ff02::1 ping" : L" (ping not allowed: no usable IPv6)",
+               wasDistrusted ? L" (it was distrusted)" : L"");
         return true;
     }
     return false;
@@ -248,6 +249,56 @@ bool RecoverPeerViaMulticastPing(NcmEndpoint* ep, unsigned timeoutMs) {
     T2_LOG("discovery", L"RecoverPeerViaMulticastPing: no neighbor after ff02::1 ping "
            L"(timeoutMs=%u) - treating as IPv6 path dead for this attempt", timeoutMs);
     return false;
+}
+
+// The adapter's CURRENT Preferred (or Deprecated) link-local address, straight from the IP
+// stack. NcmEndpoint::localLinkLocal is not good enough as an echo source: it is a snapshot
+// taken when the endpoint was enumerated (possibly Tentative) and, when the adapter had no
+// link-local yet, even a MAC-derived guess - not an address Windows would send from.
+static bool QueryPreferredLinkLocal(unsigned long ifIndex, in6_addr* out) {
+    PMIB_UNICASTIPADDRESS_TABLE table = nullptr;
+    if (GetUnicastIpAddressTable(AF_INET6, &table) != NO_ERROR || !table) return false;
+    bool found = false;
+    for (ULONG i = 0; i < table->NumEntries; ++i) {
+        const auto& row = table->Table[i];
+        if (row.InterfaceIndex != ifIndex || row.Address.si_family != AF_INET6) continue;
+        if (!IsLinkLocal(row.Address.Ipv6.sin6_addr)) continue;
+        if (row.DadState != IpDadStatePreferred && row.DadState != IpDadStateDeprecated) continue;
+        *out = row.Address.Ipv6.sin6_addr;
+        found = true;
+        break;
+    }
+    FreeMibTable(table);
+    return found;
+}
+
+bool ProbePeerIcmpAlive(const NcmEndpoint& ep, unsigned timeoutMs) {
+    if (ep.ifIndex == 0 || ep.peerSource == PeerSource::None) return false;
+    in6_addr localSrc{};
+    if (!QueryPreferredLinkLocal(ep.ifIndex, &localSrc)) localSrc = ep.localLinkLocal;
+    HANDLE h = Icmp6CreateFile();
+    if (h == INVALID_HANDLE_VALUE) return false;
+    sockaddr_in6 src{};
+    src.sin6_family = AF_INET6;
+    src.sin6_addr = localSrc;
+    src.sin6_scope_id = ep.ifIndex;
+    sockaddr_in6 dst{};
+    dst.sin6_family = AF_INET6;
+    dst.sin6_addr = ep.peerLinkLocal;
+    dst.sin6_scope_id = ep.ifIndex;
+    char payload[4] = {'T', '2', 'P', 'G'};
+    // Reply buffer: at least sizeof(ICMPV6_ECHO_REPLY) + payload + 8 + IO_STATUS_BLOCK.
+    alignas(8) unsigned char reply[512];
+    const DWORD n = Icmp6SendEcho2(h, nullptr, nullptr, nullptr, &src, &dst, payload,
+                                   static_cast<WORD>(sizeof(payload)), nullptr, reply,
+                                   static_cast<DWORD>(sizeof(reply)), timeoutMs);
+    bool alive = false;
+    if (n > 0) {
+        const auto* r = reinterpret_cast<const ICMPV6_ECHO_REPLY*>(reply);
+        alive = (r->Status == IP_SUCCESS);
+    }
+    IcmpCloseHandle(h);
+    return alive;
 }
 
 bool FindNeighborPeer(unsigned long ifIndex, in6_addr* out,

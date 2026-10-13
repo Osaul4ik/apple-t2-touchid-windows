@@ -79,6 +79,7 @@
     <ClInclude Include="BridgeXpc\PlistPayload.h" />
     <ClInclude Include="BridgeXpc\Winsock.h" />
     <ClInclude Include="Discovery\Adapter.h" />
+    <ClInclude Include="Discovery\NativeVerdict.h" />
     <ClInclude Include="Discovery\PortCache.h" />
     <ClInclude Include="Discovery\PortScan.h" />
     <ClInclude Include="Discovery\RemoteXpc.h" />

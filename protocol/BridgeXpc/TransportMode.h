@@ -60,15 +60,20 @@ inline constexpr wchar_t kPeerMacValue[] = L"PeerMac";
 //       - if that single recovery attempt fails → fall to the IPv4 tunnel;
 //       - when off, only Native IPv6 is used.
 //
-//  2. STICKY TUNNEL (until reboot): set only when a switch to the tunnel SUCCEEDED
+//  2. STICKY TUNNEL (until reboot or a successful native re-check): set only when a
+//     switch to the tunnel SUCCEEDED
 //     (a tunnel handshake worked), never on a mere native failure. The source of
 //     truth is T2Ncm.sys MEMORY (IOCTL_T2NCM_SET_TUNNEL_STICKY / GET_TUNNEL_STATE,
 //     a driver global): it survives a WUDFHost restart, an adapter re-init and
 //     sleep, and a reboot (or driver unload) clears it. Each process seeds its
 //     in-process copy from the driver once (EnsureStickySeededFromDriver) and
-//     pushes every change back. No registry. After it is set there is NO way back
-//     to native IPv6 until reboot. The next cold boot starts from Native IPv6 again
-//     and switches to the tunnel only if IPv6 is blocked.
+//     pushes every change back. No registry. The way back to native IPv6 is ONE
+//     re-check per real unlock (RequestNativeRevalidate): the next connect after the
+//     unlock - which has no live session - tries the cached port on native IPv6 once; a
+//     native HELO clears the sticky flag, anything else keeps the tunnel until the next
+//     unlock (no timers, no check on resume). A reboot also clears it: the next cold
+//     boot starts from Native IPv6 again and switches to the tunnel only if IPv6 is
+//     blocked.
 //     An older T2Ncm.sys without those IOCTLs: the in-process flag alone (the
 //     pre-IOCTL behaviour), logged once.
 //
@@ -141,9 +146,11 @@ inline ULONGLONG BumpGeneration(const wchar_t* why) {
 }
 
 // Committed auto-tunnel: in-process copy of the driver's sticky flag (see 2.).
-// Sticky-until-reboot: once the automatic switch to the IPv4 tunnel happened, it stays.
-// It is NOT tied to the Generation (resume / NCM re-enumeration / peer change do not
-// undo it) and there is no way back to native IPv6 until reboot.
+// The automatic switch to the IPv4 tunnel stays through resume / NCM re-enumeration /
+// peer change (it is NOT tied to the Generation) and a reboot clears it (driver memory).
+// The one way back to native IPv6 is a native-revalidation (RequestNativeRevalidate
+// below): one fresh native check after a real unlock, run by the connect flow when no
+// BridgeXPC session is live; a native HELO then clears the sticky flag.
 inline std::atomic<bool> g_autoTunnel{false};
 inline std::atomic<ULONGLONG> g_autoTunnelGen{0};
 
@@ -217,9 +224,24 @@ inline PathEvidence ClassifyWsaError(int wsa) {
     }
 }
 
-// Unlock / resume: a stale "IPv6 unavailable" verdict must not survive it. There is no
-// return from the sticky tunnel to native IPv6 (until reboot), so nothing else to do.
-inline void RequestNativeReprobe() { ClearV6Unavailable(); }
+// One-shot "re-check native IPv6 once" request for a COMMITTED tunnel. Set on a real
+// unlock (RequestNativeReprobe); consumed by the NEXT connect (ConnectToBiometricKitBridge),
+// which by definition runs with no live BridgeXPC session - the driver's transport mode is
+// global, so a native check must never run under a live tunnel session. In-process only:
+// a restarted WUDFHost waits for the next unlock. Cleared whenever the question is moot
+// (tunnel freshly committed, native just worked).
+inline std::atomic<bool> g_nativeRevalidate{false};
+inline void RequestNativeRevalidate() { g_nativeRevalidate.store(true, std::memory_order_relaxed); }
+inline bool ConsumeNativeRevalidate() { return g_nativeRevalidate.exchange(false, std::memory_order_relaxed); }
+
+// Unlock: a stale "IPv6 unavailable" verdict must not survive it, and a committed tunnel
+// gets exactly one fresh native check on the next connect (return to native IPv6 once the
+// VPN is gone). NOT called on resume: a VPN that persists across sleep would turn every
+// wake into a failed native probe.
+inline void RequestNativeReprobe() {
+    ClearV6Unavailable();
+    RequestNativeRevalidate();
+}
 
 // ---- adaptive native connect budget -------------------------------------
 // A healthy T2 link-local peer answers a SYN in single-digit ms (field logs:
@@ -248,22 +270,28 @@ inline void RecordNativeSuccess(ULONGLONG tcpMs) {
         PushTunnelStickyToDriver(false);
     }
     ClearV6Unavailable(); // a native handshake just worked
+    g_nativeRevalidate.store(false, std::memory_order_relaxed); // nothing left to re-check
 }
-// Tunnel handshake completed after native failed: sticky until reboot (driver
-// memory + in-process copy). Independent of Generation. on=false only when
+// Tunnel handshake completed after native failed: sticky until reboot or until a native
+// re-check after an unlock succeeds (driver memory + in-process copy). Independent of Generation. on=false only when
 // auto-switch was turned off.
 inline void CommitAutoTunnel(bool on) {
     EnsureStickySeededFromDriver();
     const bool was = g_autoTunnel.exchange(on, std::memory_order_relaxed);
-    if (on) g_autoTunnelGen.store(CurrentGeneration(), std::memory_order_relaxed);
+    if (on) {
+        g_autoTunnelGen.store(CurrentGeneration(), std::memory_order_relaxed);
+        // Native was just found dead: an older unlock's re-check request is stale.
+        g_nativeRevalidate.store(false, std::memory_order_relaxed);
+    }
     if (was != on) PushTunnelStickyToDriver(on);
 }
 
 // ---- persisted-peer trust -----------------------------------------------
-// Adapter.cpp uses the last-known T2 peer straight away when the neighbor
-// table is empty (skipping the ~550 ms ping + poll). If a connect to that
-// guessed peer then fails, this flag makes the NEXT discovery do the full
-// ping-based lookup once instead of trusting it again.
+// Adapter.cpp ResolveT2Peer always tries the neighbor table and then the ~550 ms ping +
+// poll BEFORE it falls back to the last-known T2 peer, so this flag no longer changes
+// the order (it used to make the NEXT discovery skip a persisted peer that had just
+// failed). It is still set by DistrustPersistedPeer/NotePathSilent and consumed by the
+// next ResolveT2Peer, which only uses it to log that the fallback peer was distrusted.
 inline std::atomic<bool> g_persistedPeerDistrusted{false};
 inline void DistrustPersistedPeer() { g_persistedPeerDistrusted.store(true, std::memory_order_relaxed); }
 inline bool ConsumePersistedPeerDistrust() { return g_persistedPeerDistrusted.exchange(false, std::memory_order_relaxed); }
@@ -1017,9 +1045,9 @@ inline TunnelPrep PrepareTunnelPeer(unsigned long ifIndex, const in6_addr& peer6
 
 // ---- Path-silence streak -> distrust of the persisted peer (section 9) -----
 // Two consecutive attempts that produced only Silent evidence (on either
-// transport) make the persisted last-known peer suspect: the next peer
-// resolution skips it and does the full neighbor/ping lookup. This applies in
-// tunnel mode too (the old code trusted the persisted peer forever there).
+// transport) make the persisted last-known peer suspect. The next peer resolution
+// does the full neighbor/ping lookup first anyway (ResolveT2Peer's order is fixed:
+// table -> ping -> persisted), so this only flags the fallback peer in the log.
 inline std::atomic<int>& PathSilentStreak() {
     static std::atomic<int> s{0};
     return s;

@@ -4,7 +4,7 @@
 #include "../WbdiBir.h"
 // Transport policy (Native IPv6 <-> IPv4 tunnel auto-switch): see the header
 // comment in TransportMode.h. This file only feeds it events
-// (RequestNativeReprobe on unlock / resume).
+// (RequestNativeReprobe on unlock).
 #include "BridgeXpc/TransportMode.h"
 // FindT2NcmEndpoints() - peer IPv6 link-local + interface index for the probe.
 #include "Discovery/Adapter.h"
@@ -699,12 +699,12 @@ ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_
         // Connect/LockRefresh/warmup must not arm tunnel while miniport is paused.
         t2::transport::SetTransportIoSuspended(true);
         t2::transport::BumpRealSuspendGeneration();
-        // Do not RequestNativeReprobe() here: VPN up/down is already covered by
-        // NotifyIpInterfaceChange -> RequestNativeReprobe(). Re-probing on every
-        // Sx under a persistent VPN causes a failed native probe + TunnelMode
-        // flip and can leave the next CAPTURE in MatchingCancelled. Unlock
-        // (WTS_SESSION_UNLOCK) and interface-change still restore Native IPv6
-        // when the VPN actually goes away.
+        // Do not RequestNativeReprobe() here: re-probing on every Sx under a
+        // persistent VPN causes a failed native probe + TunnelMode flip and can
+        // leave the next CAPTURE in MatchingCancelled. Unlock (WTS_SESSION_UNLOCK)
+        // asks for ONE native re-check of a committed tunnel; the next connect runs
+        // it. (There is no NotifyIpInterfaceChange registration: VPN up/down is not
+        // observed directly, only through a failed/successful connect.)
         std::lock_guard<std::mutex> commitLock(g_captureRequestCommitMu);
         BeginCaptureSuspend("OnSuspendResume(PBT_APMSUSPEND)");
     } else if (Type == PBT_APMRESUMESUSPEND || Type == PBT_APMRESUMEAUTOMATIC) {
@@ -2534,8 +2534,8 @@ LRESULT CALLBACK SessionLockWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             std::lock_guard<std::mutex> commitLock(g_captureRequestCommitMu);
             BeginCaptureSessionLock("SessionLockNotify(WTS_SESSION_LOCK)");
         } else if (wParam == WTS_SESSION_UNLOCK) {
-            // Only drops a stale "IPv6 unavailable" verdict. A tunnel switched to
-            // automatically stays until reboot (no return to Native IPv6).
+            // Drops a stale "IPv6 unavailable" verdict and asks for ONE native-IPv6
+            // re-check of a committed tunnel; the next connect (no live session) runs it.
             t2::transport::RequestNativeReprobe();
         }
         // Every other WM_WTSSESSION_CHANGE type is intentionally ignored.

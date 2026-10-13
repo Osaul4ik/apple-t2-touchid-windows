@@ -20,12 +20,14 @@
 //                         -> one ff02::1 recovery ping (unless WFP) -> IPv4 tunnel:
 //                         HELO on the SAME registry port, else a full-chain tunnel
 //                         scan. A tunnel handshake commits the sticky tunnel (driver
-//                         memory) until reboot; the next cold boot starts on IPv6.
+//                         memory) until reboot or until the one native re-check after
+//                         a real unlock succeeds (step B'); a cold boot starts on IPv6.
 //   D. nothing          - return false; *outScansExhausted says whether that was
 //                         a COMPLETED full pass with no BiometricKit on every
 //                         transport that applies (the caller then gives up), or
 //                         just "not yet" (cancel, silent path, cool-down, no peer).
 #include "BridgeDiscovery.h"
+#include "NativeVerdict.h"
 #include "PortCache.h"
 #include "PortScan.h"
 #include "RemoteXpc.h"
@@ -432,6 +434,43 @@ void ScanAndConnect(const NcmEndpoint& ep, Connection* conn, bool tunnel, void* 
     sr->fullPassEmpty = so.passCompletedEmpty;
 }
 
+// ---- "silent native" bookkeeping (NativeVerdict.h) -----------------------------
+// How long the T2 has been "alive over ICMPv6 but silent over TCP" (no SYN-ACK, no RST,
+// no WFP block, yet it answers an echo) in this Generation. Starts at the first such
+// observation and is cleared by any sign of life on native AND by an unanswered echo, so
+// the hold is a bounded grace for a T2 whose service is still coming up - measured from
+// when its IPv6 stack came up, not from an earlier stretch of total silence - and never a
+// permanent excuse. In-process only: a new process or a new Generation starts it over.
+constexpr unsigned kSilenceEchoTimeoutMs = 300;
+struct SilentTracker {
+    std::mutex mu;
+    ULONGLONG gen = 0;
+    ULONGLONG first = 0; // GetTickCount64() of the first "alive but silent" verdict, 0 = none
+};
+SilentTracker g_silent;
+ULONGLONG NoteNativeSilentMs() {
+    std::lock_guard<std::mutex> lock(g_silent.mu);
+    const ULONGLONG now = GetTickCount64();
+    const ULONGLONG gen = tp::CurrentGeneration();
+    if (g_silent.first == 0 || g_silent.gen != gen) {
+        g_silent.first = now;
+        g_silent.gen = gen;
+    }
+    return now - g_silent.first;
+}
+void ClearNativeSilent() {
+    std::lock_guard<std::mutex> lock(g_silent.mu);
+    g_silent.first = 0;
+}
+// HKLM\SOFTWARE\T2TouchId\Network\NativeSilenceGraceMs (REG_DWORD, ms). Default 15000
+// (the T2's BridgeXPC has been seen ~7 s behind its NCM link), max 120000; 0 = never hold
+// (silent native is "blocked" at once, the behavior before this change).
+DWORD LoadSilenceGraceMs() {
+    static tp::CachedDword c;
+    const DWORD v = tp::ReadDwordCached(c, tp::kNetworkRegPath, L"NativeSilenceGraceMs", 15000, 1000);
+    return v > 120000 ? 120000 : v;
+}
+
 // ---- Step B: native IPv6 -----------------------------------------------------
 StepResult NativeStep(const NcmEndpoint& ep, Connection* conn, void* cancelEvent, bool autoSwitch) {
     StepResult sr;
@@ -442,6 +481,7 @@ StepResult NativeStep(const NcmEndpoint& ep, Connection* conn, void* cancelEvent
     CacheTry ct = TryCachedBridgePort(ep, conn, false);
     if (ct.ok) {
         tp::RecordNativeSuccess(ct.tcpMs); // native works
+        ClearNativeSilent();
         sr.ok = true;
         sr.servicePort = ct.port;
         sr.rsdPort = ct.rsd;
@@ -463,15 +503,76 @@ StepResult NativeStep(const NcmEndpoint& ep, Connection* conn, void* cancelEvent
     // B.3: no cache or no HELO => full-chain native rescan right away.
     ScanOutcome so;
     ScanAndConnect(ep, conn, false, cancelEvent, &sr, &so);
-    if (sr.ok) return sr;
+    if (sr.ok) {
+        ClearNativeSilent();
+        return sr;
+    }
     if (ct.ev == PathEvidence::Positive || ct.ev == PathEvidence::Refused) sr.pathAlive = true;
+    if (sr.pathAlive) ClearNativeSilent();
     if (!sr.pathAlive && so.ranScan && (so.silent || so.anyBlocked)) {
+        // A local WFP block (WSAEACCES) is a definitive verdict. A plain SILENT path may
+        // also be a T2 whose service is not up yet: tell them apart with one ICMPv6 echo
+        // before the verdict can send the next step to the tunnel (NativeVerdict.h).
+        if (!so.anyBlocked && autoSwitch) {
+            NativeSilenceEvidence ev;
+            ev.wfpBlocked = false;
+            ev.icmpAlive = ProbePeerIcmpAlive(ep, kSilenceEchoTimeoutMs);
+            if (ev.icmpAlive) {
+                ev.silentForMs = NoteNativeSilentMs();
+            } else {
+                ClearNativeSilent(); // an unanswered echo breaks the "alive but silent" streak
+                ev.silentForMs = 0;
+            }
+            ev.graceMs = LoadSilenceGraceMs();
+            if (JudgeNativeSilence(ev) == NativeSilenceVerdict::HoldNative) {
+                T2_LOG("discovery", L"native IPv6 silent for %llu ms but the T2 answers ICMPv6 echo - "
+                       L"its BridgeXPC is not up yet: holding native (grace %lu ms), no tunnel",
+                       static_cast<unsigned long long>(ev.silentForMs),
+                       static_cast<unsigned long>(ev.graceMs));
+                return sr; // not blocked, and not counted towards peer distrust: "not yet"
+            }
+            T2_LOG("discovery", L"native IPv6 silent and %s - judged blocked",
+                   !ev.icmpAlive ? L"the T2 does not answer ICMPv6 echo"
+                   : ev.graceMs == 0 ? L"the silence hold is disabled (NativeSilenceGraceMs=0)"
+                                     : L"the hold grace is over");
+        }
         sr.blocked = true;
         sr.wfpBlocked = so.anyBlocked;
         sr.sawSilent = !so.anyBlocked;
         T2_LOG("discovery", L"native IPv6 path %s: no SYN-ACK and no RST from the T2",
                so.anyBlocked ? L"blocked by a local WFP filter" : L"silent");
     }
+    return sr;
+}
+
+// ---- Step B': return from a committed tunnel --------------------------------
+// After a real unlock the connect flow gets ONE fresh native check while the sticky
+// tunnel is committed (TransportMode.h RequestNativeRevalidate): the VPN that forced the
+// tunnel may be gone. It runs inside the connect flow, i.e. with no live BridgeXPC
+// session (the driver's transport mode is global), and costs one cached-port HELO bounded
+// by the adaptive native budget (150 ms before anything was measured; Path B only when the
+// path answered). A native HELO clears the sticky flag (RecordNativeSuccess) and the
+// connection is used as is; anything else leaves the committed tunnel untouched - the
+// phase scope puts the driver back on it - until the next unlock.
+StepResult NativeRevalidateStep(const NcmEndpoint& ep, Connection* conn, void* cancelEvent) {
+    StepResult sr;
+    tp::TransportPhase phase(static_cast<HANDLE>(cancelEvent));
+    phase.mode.Enter(tp::TransportMode::NativeIpv6);
+    CacheTry ct = TryCachedBridgePort(ep, conn, false);
+    if (ct.ok) {
+        tp::RecordNativeSuccess(ct.tcpMs); // clears the sticky tunnel + tells the driver
+        ClearNativeSilent();
+        sr.ok = true;
+        sr.servicePort = ct.port;
+        sr.rsdPort = ct.rsd;
+        sr.pathAlive = true;
+        T2_LOG("discovery", L"native IPv6 re-check after unlock succeeded - leaving the IPv4 tunnel");
+        return sr;
+    }
+    T2_LOG("discovery", L"native IPv6 re-check after unlock failed (%s, evidence=%d) - staying on the "
+           L"IPv4 tunnel until the next unlock",
+           ct.hadCache ? L"cached port did not answer" : L"no cached port to test",
+           static_cast<int>(ct.ev));
     return sr;
 }
 
@@ -600,9 +701,22 @@ bool ConnectToBiometricKitBridge(const NcmEndpoint& endpoint, t2::bridgexpc::Con
     }
 
     // Native IPv6 is the default; skipped only when the sticky tunnel is committed
-    // (T2Ncm memory, until reboot) or IPv6 is unusable on the adapter.
+    // (T2Ncm memory; left again by the one re-check after an unlock, step B') or IPv6 is
+    // unusable on the adapter.
     const bool sticky = autoSwitch && tp::IsAutoTunnelCommitted();
     const bool v6Unavailable = autoSwitch && tp::IsV6Unavailable();
+
+    // Return from the sticky tunnel: at most one native re-check per unlock (step B').
+    // Skipped while IPv6 is unusable on the adapter (the flag then stays for later).
+    if (sticky && !v6Unavailable && !Cancelled(cancelEvent) && tp::ConsumeNativeRevalidate()) {
+        const StepResult rv = NativeRevalidateStep(ep, outConn, cancelEvent);
+        if (rv.ok) {
+            tp::NotePathAlive();
+            if (outServicePort) *outServicePort = rv.servicePort;
+            if (outRsdPort) *outRsdPort = rv.rsdPort;
+            return true;
+        }
+    }
     const bool tryNative = !sticky && !v6Unavailable;
 
     StepResult native;

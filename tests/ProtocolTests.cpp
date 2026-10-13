@@ -11,6 +11,7 @@
 // precede any <windows.h>.
 #include "../protocol/Discovery/PortScan.h"
 #include "../protocol/Discovery/PortCache.h"
+#include "../protocol/Discovery/NativeVerdict.h"
 #include "../protocol/BridgeXpc/TransportMode.h"
 #include "../protocol/BridgeXpc/Frame.h"
 #include "../protocol/BridgeXpc/PlistPayload.h"
@@ -447,6 +448,53 @@ static void TestPathEvidence_WfpBlockIsBlocked() {
     CHECK(transport::ClassifyWsaError(WSAENETUNREACH) == transport::PathEvidence::LocalError);
 }
 
+// NativeVerdict.h: when a SILENT native attempt may be called "IPv6 blocked".
+static void TestNativeSilence_WfpBlockIsAlwaysBlocked() {
+    discovery::NativeSilenceEvidence e;
+    e.wfpBlocked = true; e.icmpAlive = true; e.silentForMs = 0; e.graceMs = 15000;
+    CHECK(discovery::JudgeNativeSilence(e) == discovery::NativeSilenceVerdict::Blocked);
+}
+
+static void TestNativeSilence_NoIcmpAnswerIsBlocked() {
+    // The T2 does not even answer an ICMPv6 echo: the IPv6 path looks dead (VPN filter).
+    discovery::NativeSilenceEvidence e;
+    e.icmpAlive = false; e.silentForMs = 0; e.graceMs = 15000;
+    CHECK(discovery::JudgeNativeSilence(e) == discovery::NativeSilenceVerdict::Blocked);
+}
+
+static void TestNativeSilence_AliveButSilentIsHeldThenGraceExpires() {
+    discovery::NativeSilenceEvidence e;
+    e.icmpAlive = true; e.graceMs = 15000;
+    e.silentForMs = 0;
+    CHECK(discovery::JudgeNativeSilence(e) == discovery::NativeSilenceVerdict::HoldNative);
+    e.silentForMs = 14999;
+    CHECK(discovery::JudgeNativeSilence(e) == discovery::NativeSilenceVerdict::HoldNative);
+    e.silentForMs = 15000; // grace over: a filter that drops TCP but passes ICMPv6 still reaches the tunnel
+    CHECK(discovery::JudgeNativeSilence(e) == discovery::NativeSilenceVerdict::Blocked);
+    e.silentForMs = 60000;
+    CHECK(discovery::JudgeNativeSilence(e) == discovery::NativeSilenceVerdict::Blocked);
+}
+
+static void TestNativeSilence_ZeroGraceIsTheOldBehavior() {
+    discovery::NativeSilenceEvidence e;
+    e.icmpAlive = true; e.silentForMs = 0; e.graceMs = 0;
+    CHECK(discovery::JudgeNativeSilence(e) == discovery::NativeSilenceVerdict::Blocked);
+}
+
+// One-shot native re-check request for a committed tunnel (TransportMode.h): an unlock
+// asks for it, exactly one connect consumes it. Pure atomics - no driver access.
+static void TestNativeRevalidate_UnlockRequestsExactlyOneCheck() {
+    transport::ConsumeNativeRevalidate();            // start from a known state
+    CHECK(!transport::ConsumeNativeRevalidate());    // nothing pending
+    transport::RequestNativeReprobe();               // what WTS_SESSION_UNLOCK calls
+    CHECK(transport::ConsumeNativeRevalidate());     // the next connect gets the check ...
+    CHECK(!transport::ConsumeNativeRevalidate());    // ... and only one
+    transport::RequestNativeReprobe();
+    transport::RequestNativeReprobe();               // two unlocks before a connect: still one check
+    CHECK(transport::ConsumeNativeRevalidate());
+    CHECK(!transport::ConsumeNativeRevalidate());
+}
+
 // Registry round trip. Only runs where the PortCache key already exists and is
 // writable (a machine set up by Set-T2NcmStaticIp.ps1, as administrator): it never
 // creates keys, so it leaves no trace on a machine without the T2 stack.
@@ -510,6 +558,11 @@ int wmain() {
     TestPortOrder_ClippedToRange();
     TestPortCacheValue_Parse();
     TestPathEvidence_WfpBlockIsBlocked();
+    TestNativeSilence_WfpBlockIsAlwaysBlocked();
+    TestNativeSilence_NoIcmpAnswerIsBlocked();
+    TestNativeSilence_AliveButSilentIsHeldThenGraceExpires();
+    TestNativeSilence_ZeroGraceIsTheOldBehavior();
+    TestNativeRevalidate_UnlockRequestsExactlyOneCheck();
     TestPortCache_RegistryRoundTrip();
 
     if (g_failures == 0) {

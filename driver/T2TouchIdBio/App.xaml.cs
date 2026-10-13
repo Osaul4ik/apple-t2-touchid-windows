@@ -10,7 +10,7 @@ namespace T2TouchId.SepVaultGui
         // cmd examples:
         //   SepVaultGui.exe --auto | --no-auto   (persistent IPv6->IPv4 auto-switch, default on)
         //   SepVaultGui.exe --no-auto --quit
-        // There is no way to force IPv4: the switch is automatic and lasts until reboot.
+        // There is no way to force IPv4: the switch is automatic and lasts until reboot (or until a native re-check after an unlock succeeds).
         protected override void OnStartup(StartupEventArgs e)
         {
             base.OnStartup(e);

@@ -131,8 +131,9 @@ namespace T2TouchId.SepVaultGui
         // ---- Network transport (automatic only) ----
         // Auto-switch (persistent): HKLM\SOFTWARE\T2TouchId\Network\AutoSwitch, DWORD, missing == ON.
         // Native IPv6 first; if IPv6 is blocked the connection switches to the IPv4 tunnel and
-        // stays there until reboot. That sticky flag lives in T2Ncm.sys memory (cleared on
-        // reboot) and is read here with IOCTL_T2NCM_GET_TUNNEL_STATE.
+        // stays there until reboot or until the one native IPv6 re-check after a real unlock
+        // succeeds. That sticky flag lives in T2Ncm.sys memory (cleared on reboot) and is
+        // read here with IOCTL_T2NCM_GET_TUNNEL_STATE.
         // There is no manual "force IPv4".
         private const string NetworkRegPath = @"SOFTWARE\T2TouchId\Network";
         private const string AutoSwitchValue = "AutoSwitch";

@@ -67,10 +67,11 @@ enum class GateResult {
 // the transport Generation. On return *ep has the peer resolved when one exists.
 GateResult RunReadinessGate(NcmEndpoint* ep, void* cancelEvent, unsigned maxMs = 3000);
 
-// Peer resolution order: neighbor table -> persisted last-known peer (unless
-// distrusted) -> multicast ping + poll (only when `allowPing`) -> persisted peer
-// even if distrusted. The ping runs whenever the table AND the persisted peer give
-// nothing, in native and tunnel mode alike. Updates ep->peerLinkLocal/peerSource.
+// Peer resolution order (fixed): neighbor table -> multicast ping + poll (only when
+// `allowPing`) -> persisted last-known peer. The ping ALWAYS runs before the persisted
+// peer when the table is empty, in native and tunnel mode alike; the persisted peer is
+// the last resort (ND/ICMPv6 dropped by a VPN, or no usable IPv6) and may be stale.
+// Updates ep->peerLinkLocal/peerSource.
 bool ResolveT2Peer(NcmEndpoint* ep, bool allowPing = true);
 
 // One recovery attempt after a native TCP-level failure: multicast ICMPv6 echo
@@ -80,6 +81,13 @@ bool ResolveT2Peer(NcmEndpoint* ep, bool allowPing = true);
 // in the table; false when the ping did not produce a usable neighbor entry.
 // Used by auto-switch: one failed recovery → fall to IPv4 until reboot.
 bool RecoverPeerViaMulticastPing(NcmEndpoint* ep, unsigned timeoutMs = 300);
+
+// One ICMPv6 echo to the T2's unicast link-local address, answered or not within
+// timeoutMs (blocking, bounded). An answer proves the IPv6 path to the T2 works in both
+// directions RIGHT NOW (unlike a Stale neighbor-table entry, which proves nothing).
+// Used only to tell "T2 service not up yet" from "IPv6 filtered" (NativeVerdict.h).
+// Any failure (no peer, no usable source address, API error, no reply) returns false.
+bool ProbePeerIcmpAlive(const NcmEndpoint& ep, unsigned timeoutMs = 300);
 
 bool ParseIpv6(const char* text, in6_addr* out);
 
