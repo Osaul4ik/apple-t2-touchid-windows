@@ -75,6 +75,13 @@ void Log(const wchar_t* msg) {
     if (!t2::log::TransportEnabled()) {
         return;
     }
+    // Cold-boot diagnostics (master Diag switch): the same line, but uptime-stamped so it
+    // lines up with the kernel boot log, and mirrored into the Application event log when
+    // DiagEventLog is on (DebugView is usually not running yet at boot). One line only.
+    if (t2::log::DiagEnabled()) {
+        t2::log::Diagf(L"bootstrap", L"%ls", msg);
+        return;
+    }
     wchar_t line[1100];
     _snwprintf_s(line, _TRUNCATE, L"T2TouchIdBootstrap: [%lu:%lu] %ls\n",
                  GetCurrentProcessId(), GetCurrentThreadId(), msg);

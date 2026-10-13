@@ -9,6 +9,16 @@
 //   Ncm        — T2Ncm.sys + T2NcmCtrl.sys (kernel DbgPrint; see driver)
 //   BridgeXpc  — this file / Connection.cpp (connect, HELO, frames)
 //   Power      — sleep / resume / shutdown / D0 traces (Bio + user-mode)
+//   Diag       — MASTER switch "cold-boot diagnostics": turns ALL of the above on
+//                (user-mode here; T2TouchIdTransport.sys and T2Ncm.sys read it too
+//                at DriverEntry / D0Entry) and enables the extra T2_DIAG lines
+//                (uptime-stamped, so they line up with a DebugView boot log).
+//   DiagEventLog — mirror the T2_DIAG lines (only those: curated, low volume) into the
+//                Windows Application event log, source "T2TouchIdDiag". This is what
+//                survives a cold boot when DebugView was not running yet, and it needs
+//                no file permissions (the UMDF host runs as LocalService and could not
+//                reliably create files under ProgramData - see PortCache.cpp).
+//                Read it with tools\Get-T2Diag.ps1.
 //
 // Console echo is OFF by default; --verbose / T2TOUCHID_VERBOSE=1 enables it.
 #pragma once
@@ -92,11 +102,15 @@ inline bool CachedRegistryFlag(CachedFlag& cache, const wchar_t* valueName) {
     return v;
 }
 
-inline bool BridgeXpcEnabled() { static CachedFlag c; return CachedRegistryFlag(c, L"BridgeXpc"); }
-inline bool BioEnabled() { static CachedFlag c; return CachedRegistryFlag(c, L"Bio"); }
-inline bool PowerEnabled() { static CachedFlag c; return CachedRegistryFlag(c, L"Power"); }
-inline bool TransportEnabled() { static CachedFlag c; return CachedRegistryFlag(c, L"Transport"); }
-inline bool NcmEnabled() { static CachedFlag c; return CachedRegistryFlag(c, L"Ncm"); }
+// Master switch (see header). Every per-category gate below is "its own flag OR Diag".
+inline bool DiagEnabled() { static CachedFlag c; return CachedRegistryFlag(c, L"Diag"); }
+inline bool DiagEventLogEnabled() { static CachedFlag c; return CachedRegistryFlag(c, L"DiagEventLog"); }
+
+inline bool BridgeXpcEnabled() { static CachedFlag c; return DiagEnabled() || CachedRegistryFlag(c, L"BridgeXpc"); }
+inline bool BioEnabled() { static CachedFlag c; return DiagEnabled() || CachedRegistryFlag(c, L"Bio"); }
+inline bool PowerEnabled() { static CachedFlag c; return DiagEnabled() || CachedRegistryFlag(c, L"Power"); }
+inline bool TransportEnabled() { static CachedFlag c; return DiagEnabled() || CachedRegistryFlag(c, L"Transport"); }
+inline bool NcmEnabled() { static CachedFlag c; return DiagEnabled() || CachedRegistryFlag(c, L"Ncm"); }
 
 inline int64_t ElapsedMs() {
     static const auto start = std::chrono::steady_clock::now();
@@ -109,6 +123,48 @@ inline void EmitLine(const wchar_t* line) {
     OutputDebugStringW(line);
     if (ConsoleEnabled()) {
         std::wcerr << line;
+    }
+}
+
+// Seconds since Windows booted. Deliberately NOT process-relative: the kernel DebugView
+// boot log counts seconds from boot too, so a T2_DIAG line "up=8.412s" sits at the same
+// place on that timeline (e.g. "T2SepBootstrap finished at 8.5 s, CAPTURE_DATA arrived
+// at 7.9 s").
+inline double UptimeSec() {
+    return static_cast<double>(GetTickCount64()) / 1000.0;
+}
+
+// One line into the Application event log (source "T2TouchIdDiag", event id 3). An
+// unregistered source is accepted by RegisterEventSource and lands in Application; Event
+// Viewer wraps the text in a generic "description not found" notice but the insertion
+// string carries the full line (same trade-off as T2SepBootstrapService.cpp LogEvent).
+// The handle is opened once per process and kept - it is process-lifetime state.
+inline void WriteDiagEventLog(const wchar_t* line) {
+    static HANDLE h = RegisterEventSourceW(nullptr, L"T2TouchIdDiag");
+    if (!h) return;
+    const wchar_t* strings[1] = { line };
+    ReportEventW(h, EVENTLOG_INFORMATION_TYPE, 0, 3, nullptr, 1, 0, strings, nullptr);
+}
+
+// Diagnostic line (cold-boot investigation). Only when the master Diag switch is on.
+// DebugView + (if DiagEventLog is on) the Application event log. Prefix:
+//   "T2TouchIdDiag: [pid:tid up=<s since boot>][tag] msg"
+inline void Diagf(const wchar_t* tag, const wchar_t* fmt, ...) {
+    if (!DiagEnabled()) {
+        return;
+    }
+    wchar_t msg[1024];
+    va_list args;
+    va_start(args, fmt);
+    _vsnwprintf_s(msg, _TRUNCATE, fmt, args);
+    va_end(args);
+
+    wchar_t line[1200];
+    _snwprintf_s(line, _TRUNCATE, L"T2TouchIdDiag: [%lu:%lu up=%.3fs][%s] %s\n",
+                 GetCurrentProcessId(), GetCurrentThreadId(), UptimeSec(), tag, msg);
+    EmitLine(line);
+    if (DiagEventLogEnabled()) {
+        WriteDiagEventLog(line);
     }
 }
 
@@ -171,3 +227,7 @@ inline std::wstring Widen(const std::string& s) {
 // Logf() keeps its own check for the direct ::t2::log::Logf() callers.
 #define T2_LOG(tag, ...) \
     do { if (::t2::log::BridgeXpcEnabled()) ::t2::log::Logf(L##tag, __VA_ARGS__); } while (0)
+
+// Cold-boot diagnostics (master Diag switch). Same eager-argument rule as T2_LOG.
+#define T2_DIAG(tag, ...) \
+    do { if (::t2::log::DiagEnabled()) ::t2::log::Diagf(L##tag, __VA_ARGS__); } while (0)

@@ -601,6 +601,14 @@
                         <TextBlock Style="{StaticResource FieldLabel}" Text="Logging (DebugView)"/>
                         <TextBlock Style="{StaticResource CardHint}" Margin="0,0,0,12"
                                    Text="Flags are written to HKLM\SOFTWARE\T2TouchId\Logging. In DebugView enable Capture Global Win32 and Capture Kernel. Administrator rights are required to save."/>
+                        <CheckBox x:Name="LogDiagCheck" Style="{StaticResource ToggleSwitch}" Margin="0,0,0,10"
+                                  Checked="OnLogFlagChanged" Unchecked="OnLogFlagChanged">
+                            <TextBlock Text="Cold-boot diagnostics (everything below + lock/unlock, SEP readiness, transport state, uptime-stamped)" TextWrapping="Wrap"/>
+                        </CheckBox>
+                        <CheckBox x:Name="LogDiagEventCheck" Style="{StaticResource ToggleSwitch}" Margin="0,0,0,10"
+                                  Checked="OnLogFlagChanged" Unchecked="OnLogFlagChanged">
+                            <TextBlock Text="...also write the diagnostics to the Windows Event Log (survives reboot; read with tools\Get-T2Diag.ps1)" TextWrapping="Wrap"/>
+                        </CheckBox>
                         <CheckBox x:Name="LogPowerCheck" Style="{StaticResource ToggleSwitch}" Margin="0,0,0,10"
                                   Checked="OnLogFlagChanged" Unchecked="OnLogFlagChanged">
                             <TextBlock Text="Power / sleep / resume / shutdown (recommended)" TextWrapping="Wrap"/>

@@ -7,24 +7,33 @@ volatile LONG g_T2LogEnabled = 0;
 
 // Re-reads the logging switch. PASSIVE_LEVEL only (Zw registry calls); a
 // missing key/value, a wrong type or any failure leaves logging OFF.
+// Logging is ON when either "Transport" (the GUI "SEP" switch) or the master "Diag"
+// switch (GUI "Cold-boot diagnostics") is a non-zero DWORD.
 VOID
 T2LogRefresh(VOID)
 {
     UNICODE_STRING keyName = RTL_CONSTANT_STRING(L"\\Registry\\Machine\\SOFTWARE\\T2TouchId\\Logging");
-    UNICODE_STRING valueName = RTL_CONSTANT_STRING(L"Transport");
+    UNICODE_STRING valueNames[2] = {
+        RTL_CONSTANT_STRING(L"Transport"),
+        RTL_CONSTANT_STRING(L"Diag"),
+    };
     OBJECT_ATTRIBUTES attrs;
     HANDLE key = NULL;
     ULONG buf[(sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(ULONG) + sizeof(ULONG) - 1) / sizeof(ULONG)];
     PKEY_VALUE_PARTIAL_INFORMATION info = (PKEY_VALUE_PARTIAL_INFORMATION)buf;
     ULONG resultLength = 0;
     LONG enabled = 0;
+    ULONG i;
 
     InitializeObjectAttributes(&attrs, &keyName, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
     if (NT_SUCCESS(ZwOpenKey(&key, KEY_QUERY_VALUE, &attrs))) {
-        if (NT_SUCCESS(ZwQueryValueKey(key, &valueName, KeyValuePartialInformation,
-                                       info, sizeof(buf), &resultLength)) &&
-            info->Type == REG_DWORD && info->DataLength == sizeof(ULONG)) {
-            enabled = (*(PULONG)info->Data != 0) ? 1 : 0;
+        for (i = 0; i < RTL_NUMBER_OF(valueNames); i++) {
+            if (NT_SUCCESS(ZwQueryValueKey(key, &valueNames[i], KeyValuePartialInformation,
+                                           info, sizeof(buf), &resultLength)) &&
+                info->Type == REG_DWORD && info->DataLength == sizeof(ULONG) &&
+                *(PULONG)info->Data != 0) {
+                enabled = 1;
+            }
         }
         ZwClose(key);
     }

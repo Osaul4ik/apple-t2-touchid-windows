@@ -19,7 +19,13 @@ static __inline LONG
 T2NcmReadLogSwitch(VOID)
 {
     UNICODE_STRING keyName = RTL_CONSTANT_STRING(L"\\Registry\\Machine\\SOFTWARE\\T2TouchId\\Logging");
-    UNICODE_STRING valueName = RTL_CONSTANT_STRING(L"Ncm");
+    // On when "Ncm" (GUI "T2NCM" switch) or the master "Diag" switch (GUI "Cold-boot
+    // diagnostics") is a non-zero DWORD.
+    UNICODE_STRING valueNames[2] = {
+        RTL_CONSTANT_STRING(L"Ncm"),
+        RTL_CONSTANT_STRING(L"Diag"),
+    };
+    ULONG i;
     OBJECT_ATTRIBUTES attrs;
     HANDLE key = NULL;
     ULONG buf[(sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(ULONG) + sizeof(ULONG) - 1) / sizeof(ULONG)];
@@ -30,11 +36,15 @@ T2NcmReadLogSwitch(VOID)
     InitializeObjectAttributes(&attrs, &keyName, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
     if (NT_SUCCESS(ZwOpenKey(&key, KEY_QUERY_VALUE, &attrs)))
     {
-        if (NT_SUCCESS(ZwQueryValueKey(key, &valueName, KeyValuePartialInformation,
-                                       info, sizeof(buf), &resultLength)) &&
-            info->Type == REG_DWORD && info->DataLength == sizeof(ULONG))
+        for (i = 0; i < RTL_NUMBER_OF(valueNames); i++)
         {
-            enabled = (*(PULONG)info->Data != 0) ? 1 : 0;
+            if (NT_SUCCESS(ZwQueryValueKey(key, &valueNames[i], KeyValuePartialInformation,
+                                           info, sizeof(buf), &resultLength)) &&
+                info->Type == REG_DWORD && info->DataLength == sizeof(ULONG) &&
+                *(PULONG)info->Data != 0)
+            {
+                enabled = 1;
+            }
         }
         ZwClose(key);
     }

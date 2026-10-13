@@ -142,6 +142,8 @@ inline ULONGLONG BumpGeneration(const wchar_t* why) {
     const ULONGLONG n = GenerationCounter().fetch_add(1, std::memory_order_acq_rel) + 1;
     T2_LOG("transport", L"Generation -> %llu (%s)", static_cast<unsigned long long>(n),
            why ? why : L"?");
+    T2_DIAG("state", L"Generation -> %llu (%s) - committed tunnel keeps, V6Unavailable/scan progress reset",
+            static_cast<unsigned long long>(n), why ? why : L"?");
     return n;
 }
 
@@ -184,8 +186,17 @@ inline bool IsTunnelModeActive() {
 // IPv6 unusable on the T2 adapter for this Generation (unbound, or no
 // link-local address 1.5 s after the link came up). Native is not attempted.
 inline std::atomic<ULONGLONG> g_v6UnavailableGen{0};
-inline void MarkV6Unavailable() { g_v6UnavailableGen.store(CurrentGeneration(), std::memory_order_relaxed); }
-inline void ClearV6Unavailable() { g_v6UnavailableGen.store(0, std::memory_order_relaxed); }
+// `why` is for the diagnostic log only (Log.h T2_DIAG): who decided "IPv6 unusable" / who dropped it.
+inline void MarkV6Unavailable(const wchar_t* why = L"?") {
+    g_v6UnavailableGen.store(CurrentGeneration(), std::memory_order_relaxed);
+    T2_DIAG("state", L"V6Unavailable SET gen=%llu reason=%s",
+            static_cast<unsigned long long>(CurrentGeneration()), why ? why : L"?");
+}
+inline void ClearV6Unavailable(const wchar_t* why = L"?") {
+    if (g_v6UnavailableGen.exchange(0, std::memory_order_relaxed) != 0) {
+        T2_DIAG("state", L"V6Unavailable CLEARED reason=%s", why ? why : L"?");
+    }
+}
 inline bool IsV6Unavailable() {
     return g_v6UnavailableGen.load(std::memory_order_relaxed) == CurrentGeneration();
 }
@@ -231,15 +242,23 @@ inline PathEvidence ClassifyWsaError(int wsa) {
 // a restarted WUDFHost waits for the next unlock. Cleared whenever the question is moot
 // (tunnel freshly committed, native just worked).
 inline std::atomic<bool> g_nativeRevalidate{false};
-inline void RequestNativeRevalidate() { g_nativeRevalidate.store(true, std::memory_order_relaxed); }
-inline bool ConsumeNativeRevalidate() { return g_nativeRevalidate.exchange(false, std::memory_order_relaxed); }
+inline void RequestNativeRevalidate() {
+    g_nativeRevalidate.store(true, std::memory_order_relaxed);
+    T2_DIAG("state", L"native re-check requested (sticky tunnel=%d)",
+            g_autoTunnel.load(std::memory_order_relaxed) ? 1 : 0);
+}
+inline bool ConsumeNativeRevalidate() {
+    const bool had = g_nativeRevalidate.exchange(false, std::memory_order_relaxed);
+    if (had) T2_DIAG("state", L"native re-check consumed by this connect");
+    return had;
+}
 
 // Unlock: a stale "IPv6 unavailable" verdict must not survive it, and a committed tunnel
 // gets exactly one fresh native check on the next connect (return to native IPv6 once the
 // VPN is gone). NOT called on resume: a VPN that persists across sleep would turn every
 // wake into a failed native probe.
 inline void RequestNativeReprobe() {
-    ClearV6Unavailable();
+    ClearV6Unavailable(L"unlock (RequestNativeReprobe)");
     RequestNativeRevalidate();
 }
 
@@ -267,9 +286,11 @@ inline void RecordNativeSuccess(ULONGLONG tcpMs) {
     g_nativeEmaMs.store(next, std::memory_order_relaxed);
     EnsureStickySeededFromDriver();
     if (g_autoTunnel.exchange(false, std::memory_order_relaxed)) {
+        T2_DIAG("state", L"sticky tunnel CLEARED: native handshake worked (tcp %llu ms)",
+                static_cast<unsigned long long>(tcpMs));
         PushTunnelStickyToDriver(false);
     }
-    ClearV6Unavailable(); // a native handshake just worked
+    ClearV6Unavailable(L"native handshake worked"); // a native handshake just worked
     g_nativeRevalidate.store(false, std::memory_order_relaxed); // nothing left to re-check
 }
 // Tunnel handshake completed after native failed: sticky until reboot or until a native
@@ -278,6 +299,12 @@ inline void RecordNativeSuccess(ULONGLONG tcpMs) {
 inline void CommitAutoTunnel(bool on) {
     EnsureStickySeededFromDriver();
     const bool was = g_autoTunnel.exchange(on, std::memory_order_relaxed);
+    if (was != on) {
+        T2_DIAG("state", L"sticky tunnel %s (gen=%llu, v6Unavailable=%d)",
+                on ? L"COMMITTED" : L"DROPPED (auto-switch off)",
+                static_cast<unsigned long long>(CurrentGeneration()),
+                g_v6UnavailableGen.load(std::memory_order_relaxed) == CurrentGeneration() ? 1 : 0);
+    }
     if (on) {
         g_autoTunnelGen.store(CurrentGeneration(), std::memory_order_relaxed);
         // Native was just found dead: an older unlock's re-check request is stale.
@@ -811,6 +838,8 @@ inline void EnsureStickySeededFromDriver() {
         }
         T2_LOG("transport", L"sticky tunnel seeded from T2Ncm memory: sticky=%lu mode=%lu",
                st.Sticky, st.Mode);
+        T2_DIAG("state", L"sticky tunnel seeded from T2Ncm memory: sticky=%lu mode=%lu",
+                st.Sticky, st.Mode);
         StickySeedState().store(1, std::memory_order_release);
         return;
     }
@@ -1058,11 +1087,39 @@ inline bool NotePathSilent() { // true when the peer was just distrusted
         DistrustPersistedPeer();
         InvalidateTunnelPrepCache();
         T2_LOG("tunnel", L"2 silent attempts in a row - persisted peer distrusted, next resolve does a full lookup");
+        T2_DIAG("state", L"2 silent attempts in a row - persisted peer distrusted");
         return true;
     }
     return false;
 }
 inline void NotePathAlive() { PathSilentStreak().store(0, std::memory_order_relaxed); }
+
+// ---- Cold-boot diagnostics: one line with EVERY piece of transport state that can make a
+// lock-screen CAPTURE fail or hang and that sleep/resume and unlock treat differently.
+// Read-only: it never does an IOCTL (no EnsureStickySeededFromDriver), so it is safe to call
+// from anywhere, including right before a suspend. `why` says which event asked for it.
+inline void DiagTransportSnapshot(const wchar_t* why) {
+    if (!::t2::log::DiagEnabled()) return;
+    const ULONGLONG gen = CurrentGeneration();
+    const ULONGLONG v6gen = g_v6UnavailableGen.load(std::memory_order_relaxed);
+    const int ov = TransportOverride().load(std::memory_order_relaxed);
+    T2_DIAG("snapshot",
+            L"%s: gen=%llu v6Unavailable=%d(setGen=%llu) stickyTunnel=%d(commitGen=%llu seed=%d) "
+            L"override=%d nativeRevalidatePending=%d autoSwitch=%d silentStreak=%d "
+            L"peerDistrusted=%d ioSuspended=%d nativeEmaMs=%lu",
+            why ? why : L"?",
+            static_cast<unsigned long long>(gen),
+            v6gen == gen ? 1 : 0, static_cast<unsigned long long>(v6gen),
+            g_autoTunnel.load(std::memory_order_relaxed) ? 1 : 0,
+            static_cast<unsigned long long>(g_autoTunnelGen.load(std::memory_order_relaxed)),
+            static_cast<int>(StickySeedState().load(std::memory_order_relaxed)),
+            ov, g_nativeRevalidate.load(std::memory_order_relaxed) ? 1 : 0,
+            IsAutoSwitchEnabled() ? 1 : 0,
+            PathSilentStreak().load(std::memory_order_relaxed),
+            g_persistedPeerDistrusted.load(std::memory_order_relaxed) ? 1 : 0,
+            IsTransportIoSuspended() ? 1 : 0,
+            static_cast<unsigned long>(g_nativeEmaMs.load(std::memory_order_relaxed)));
+}
 
 // ---- Cross-process transport lock + mode scope (sections 11, 12) ------------
 // Named mutex shared by the UMDF host, the CLI and the GUI. Held for one

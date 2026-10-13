@@ -570,6 +570,9 @@ namespace T2TouchId.SepVaultGui
             _logFlagsLoading = true;
             try
             {
+                LogDiagCheck.IsChecked = ReadLogFlag("Diag");
+                LogDiagEventCheck.IsChecked = ReadLogFlag("DiagEventLog");
+                LogDiagEventCheck.IsEnabled = LogDiagCheck.IsChecked == true;
                 LogPowerCheck.IsChecked = ReadLogFlag("Power");
                 LogBioCheck.IsChecked = ReadLogFlag("Bio");
                 LogBridgeCheck.IsChecked = ReadLogFlag("BridgeXpc");
@@ -588,7 +591,12 @@ namespace T2TouchId.SepVaultGui
         {
             if (_logFlagsLoading) return;
 
+            // The Event Log mirror only does something while the master switch is on.
+            LogDiagEventCheck.IsEnabled = LogDiagCheck.IsChecked == true;
+
             bool ok =
+                WriteLogFlag("Diag", LogDiagCheck.IsChecked == true) &
+                WriteLogFlag("DiagEventLog", LogDiagEventCheck.IsChecked == true) &
                 WriteLogFlag("Power", LogPowerCheck.IsChecked == true) &
                 WriteLogFlag("Bio", LogBioCheck.IsChecked == true) &
                 WriteLogFlag("BridgeXpc", LogBridgeCheck.IsChecked == true) &
@@ -602,7 +610,9 @@ namespace T2TouchId.SepVaultGui
             }
             else
             {
-                LogStatusText.Text = "Saved. User-mode parts (Bio, BridgeXPC, SEP bootstrap) pick it up within ~2 s; kernel drivers after the next sleep/resume or a driver reload.";
+                LogStatusText.Text = LogDiagCheck.IsChecked == true
+                    ? "Saved. Cold-boot diagnostics turn ALL logs below on: user-mode parts within ~2 s, kernel drivers (SEP / T2NCM) at the next boot or driver reload. Reboot once, reproduce the problem, then run tools\\Get-T2Diag.ps1 (Event Log) - or use a DebugView boot log for the kernel part."
+                    : "Saved. User-mode parts (Bio, BridgeXPC, SEP bootstrap) pick it up within ~2 s; kernel drivers after the next sleep/resume or a driver reload.";
                 LogStatusText.Foreground = DotOk;
             }
         }

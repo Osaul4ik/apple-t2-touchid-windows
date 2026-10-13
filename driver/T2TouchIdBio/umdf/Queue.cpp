@@ -115,6 +115,43 @@ Payload* RetrieveProbedPayload(_In_ WDFREQUEST Request, _Out_ bool* fitsFully)
 // reported yet, or reported an actual failure - returns false with a
 // WBDI-meaningful status filled in, so callers can complete the IOCTL
 // without a hardcoded WINBIO_SENSOR_READY that got ahead of reality.
+// Cold-boot diagnostics: when the CURRENT CAPTURE_DATA reached the driver (0 = none in
+// flight), so a completion / cancellation can say how long it was pending.
+std::atomic<ULONGLONG> g_diagCaptureArrivedTick{0};
+const wchar_t* DiagOutcomeName(t2::biometrickit::VerifyOutcome o)
+{
+    switch (o) {
+    case t2::biometrickit::VerifyOutcome::Match: return L"Match";
+    case t2::biometrickit::VerifyOutcome::NoMatch: return L"NoMatch";
+    case t2::biometrickit::VerifyOutcome::Timeout: return L"Timeout";
+    case t2::biometrickit::VerifyOutcome::TransportError: return L"TransportError";
+    case t2::biometrickit::VerifyOutcome::RejectedByDevice: return L"RejectedByDevice";
+    case t2::biometrickit::VerifyOutcome::Malformed: return L"Malformed";
+    case t2::biometrickit::VerifyOutcome::Busy: return L"Busy";
+    case t2::biometrickit::VerifyOutcome::Cancelled: return L"Cancelled";
+    case t2::biometrickit::VerifyOutcome::UnstableIdentityInventory: return L"UnstableIdentityInventory";
+    default: return L"other";
+    }
+}
+ULONGLONG DiagCapturePendingMs()
+{
+    const ULONGLONG t = g_diagCaptureArrivedTick.load(std::memory_order_relaxed);
+    return t == 0 ? 0 : GetTickCount64() - t;
+}
+
+// Cold-boot diagnostics: a line only when the bootstrap status CHANGES (this is polled every
+// 250 ms while a CAPTURE waits for the bootstrap). Key: -2 = transport device missing,
+// -3 = status IOCTL failed, otherwise reason/step/sepStatus. Never reset: the first call
+// of a process always logs.
+std::atomic<long> g_diagLastSepKey{-1};
+void DiagSepStatus(long key, const wchar_t* what, int reason, int step, int sepStatus)
+{
+    if (g_diagLastSepKey.exchange(key) != key) {
+        T2_DIAG("sep", L"bootstrap status changed: %s reason=%d (0=unknown/not-reported-yet 1=ok) step=%d sepStatus=%d",
+                what, reason, step, sepStatus);
+    }
+}
+
 bool CheckSepReady(_Out_ WINBIO_SENSOR_STATUS* outSensorStatus, _Out_ HRESULT* outHresult)
 {
     using t2::applekeystore::AksResult;
@@ -124,6 +161,7 @@ bool CheckSepReady(_Out_ WINBIO_SENSOR_STATUS* outSensorStatus, _Out_ HRESULT* o
     if (client.Open() != AksResult::Ok) {
         // Driver not loaded / device not present at all - nothing to poll,
         // nothing to capture from.
+        DiagSepStatus(-2, L"T2TouchIdTransport device interface cannot be opened", -1, -1, 0);
         T2BioLog("  SEP readiness: T2TouchIdTransport device not found -> FAILURE");
         *outSensorStatus = WINBIO_SENSOR_FAILURE;
         *outHresult = WINBIO_E_DEVICE_FAILURE;
@@ -132,11 +170,17 @@ bool CheckSepReady(_Out_ WINBIO_SENSOR_STATUS* outSensorStatus, _Out_ HRESULT* o
 
     T2_BOOTSTRAP_STATUS status{};
     if (client.GetBootstrapStatus(&status) != AksResult::Ok) {
+        DiagSepStatus(-3, L"GetBootstrapStatus IOCTL failed", -1, -1, 0);
         T2BioLog("  SEP readiness: GetBootstrapStatus IOCTL failed -> FAILURE");
         *outSensorStatus = WINBIO_SENSOR_FAILURE;
         *outHresult = WINBIO_E_DEVICE_FAILURE;
         return false;
     }
+
+    DiagSepStatus(static_cast<long>(status.Reason) * 10000 + static_cast<long>(status.Step) * 100 +
+                      (static_cast<long>(status.SepStatus) & 0x7f),
+                  L"reported by T2SepBootstrap", static_cast<int>(status.Reason),
+                  static_cast<int>(status.Step), static_cast<int>(status.SepStatus));
 
     switch (status.Reason) {
     case T2SepReasonOk:
@@ -692,6 +736,9 @@ ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_
 {
     UNREFERENCED_PARAMETER(Context);
     UNREFERENCED_PARAMETER(Setting);
+    T2_DIAG("power", L"PowerBroadcast type=0x%lx (4=APMSUSPEND 7=RESUMESUSPEND 18=RESUMEAUTOMATIC)",
+            static_cast<unsigned long>(Type));
+    t2::transport::DiagTransportSnapshot(L"power event (before handling)");
     if (Type == PBT_APMSUSPEND) {
         g_sleepBarrier.store(true, std::memory_order_release);
         g_powerButtonGraceUntil.store(0, std::memory_order_release); // suspend owns the barrier
@@ -780,6 +827,8 @@ std::vector<std::pair<WDFREQUEST, CancelTrack*>> g_cancelTracks;
 VOID EvtCaptureCancel(_In_ WDFREQUEST Request)
 {
     T2BioLog("CAPTURE_DATA: EvtCaptureCancel fired (Windows called CancelIoEx)");
+    T2_DIAG("capture", L"Windows CANCELLED the pending CAPTURE_DATA (CancelIoEx) after %llu ms",
+            static_cast<unsigned long long>(DiagCapturePendingMs()));
     // Same ordering as suspend: cmd 0x0c on the live socket first, then wake.
     t2::biometrickit::BestEffortCancelActiveMatch();
     HANDLE cancelEvent = GetCaptureCancelEvent();
@@ -1017,15 +1066,21 @@ SepWait WaitForSepBootstrap(_In_ CancelableScope& cancelScope,
             if (logged) {
                 T2BioLog("CAPTURE_DATA(verify): SEP bootstrap finished after %llu ms of waiting - continuing",
                          static_cast<unsigned long long>(GetTickCount64() - t0));
+                T2_DIAG("capture", L"SEP bootstrap finished after %llu ms of waiting - CAPTURE continues",
+                        static_cast<unsigned long long>(GetTickCount64() - t0));
             }
             return SepWait::Ready;
         }
         if (*outHresult != WINBIO_E_DEVICE_BUSY) {
+            T2_DIAG("capture", L"SEP bootstrap reported a REAL failure after %llu ms: hr=0x%08x sensorStatus=%d",
+                    static_cast<unsigned long long>(GetTickCount64() - t0),
+                    static_cast<unsigned>(*outHresult), static_cast<int>(*outSensorStatus));
             return SepWait::Failed;      // a real bootstrap failure, not "not yet"
         }
         if (!logged) {
             T2BioLog("CAPTURE_DATA(verify): SEP bootstrap not finished yet (cold boot) - "
                      "CAPTURE stays pending until it reports");
+            T2_DIAG("capture", L"verify CAPTURE is WAITING for the SEP bootstrap (status BUSY / not reported yet)");
             logged = true;
         }
         Sleep(kPollMs);
@@ -1186,6 +1241,12 @@ void CompleteCaptureData(_In_ WDFREQUEST Request, HRESULT winBioHresult,
     T2BioLog("  CAPTURE_DATA complete: winBioHresult=0x%08x sensorStatus=%d reject=%d payload=%llu",
              static_cast<unsigned>(winBioHresult), static_cast<int>(sensorStatus),
              static_cast<int>(rejectDetail), static_cast<unsigned long long>(payload.size()));
+    T2_DIAG("capture", L"CAPTURE_DATA COMPLETED hr=0x%08x sensorStatus=%d reject=%d payload=%llu after %llu ms pending "
+            L"(a non-success hr other than cancel here means WBF will NOT re-arm this CAPTURE)",
+            static_cast<unsigned>(winBioHresult), static_cast<int>(sensorStatus),
+            static_cast<int>(rejectDetail), static_cast<unsigned long long>(payload.size()),
+            static_cast<unsigned long long>(DiagCapturePendingMs()));
+    g_diagCaptureArrivedTick.store(0, std::memory_order_relaxed);
 
     PWINBIO_CAPTURE_DATA out = nullptr;
     size_t outLen = 0;
@@ -1501,6 +1562,9 @@ ConnectWait ConnectForCaptureWithRetry(HANDLE cancelEvent, t2::bridgexpc::Connec
         bool scansExhausted = false;
         if (ConnectForCapture(outConn, cancelEvent, &scansExhausted)) {
             NoteBridgeReachable();
+            T2_DIAG("capture", L"BridgeXPC connected on attempt %u after %llu ms mode=%s", attempt,
+                    static_cast<unsigned long long>(GetTickCount64() - start),
+                    t2::transport::IsTunnelModeActive() ? L"Ipv4Tunnel" : L"NativeIpv6");
             if (attempt > 1) {
                 T2BioLog("CAPTURE_DATA: BridgeXPC reachable after %u attempts (%llu ms) mode=%s",
                          attempt, static_cast<unsigned long long>(GetTickCount64() - start),
@@ -1522,7 +1586,10 @@ ConnectWait ConnectForCaptureWithRetry(HANDLE cancelEvent, t2::bridgexpc::Connec
                          "%u empty passes over %llu ms) and no cancel event - giving up",
                          attempt, static_cast<unsigned long long>(waited), emptyPasses,
                          static_cast<unsigned long long>(sinceMs));
-                return ConnectWait::GaveUp;
+                T2_DIAG("capture", L"connect GAVE UP (attempt %u, %llu ms) - the CAPTURE will be completed with a failure",
+                    attempt, static_cast<unsigned long long>(waited));
+            t2::transport::DiagTransportSnapshot(L"connect gave up");
+            return ConnectWait::GaveUp;
             }
             // With a cancel event the CAPTURE NEVER ends on "BiometricKit not found": WBF does
             // not re-arm a CAPTURE that completed with DEVICE_FAILURE, so a T2 that is merely
@@ -1538,12 +1605,24 @@ ConnectWait ConnectForCaptureWithRetry(HANDLE cancelEvent, t2::bridgexpc::Connec
         if (!cancelEvent && waited >= kConnectRetryNoCancelWindowMs) {
             T2BioLog("CAPTURE_DATA: BridgeXPC still unreachable after %llu ms and no cancel event - giving up",
                      static_cast<unsigned long long>(waited));
+            T2_DIAG("capture", L"connect GAVE UP (attempt %u, %llu ms) - the CAPTURE will be completed with a failure",
+                    attempt, static_cast<unsigned long long>(waited));
+            t2::transport::DiagTransportSnapshot(L"connect gave up");
             return ConnectWait::GaveUp;
         }
         // Not reachable YET (no adapter/peer, silent path, scan interrupted or in
         // cool-down): back off and retry - only Windows' cancel ends this wait.
         T2BioLog("CAPTURE_DATA: BridgeXPC not reachable yet (attempt %u, %llu ms) - retrying in %lu ms",
                  attempt, static_cast<unsigned long long>(waited), static_cast<unsigned long>(backoffMs));
+        // First failures and then every ~10th: a CAPTURE that waits minutes must not flood the log.
+        if (attempt <= 3 || (attempt % 10) == 0) {
+            T2_DIAG("capture", L"BridgeXPC not reachable (attempt %u, %llu ms, scansExhausted=%d) - retry in %lu ms",
+                    attempt, static_cast<unsigned long long>(waited), scansExhausted ? 1 : 0,
+                    static_cast<unsigned long>(backoffMs));
+            if (attempt == 3 || (attempt % 10) == 0) {
+                t2::transport::DiagTransportSnapshot(L"BridgeXPC still unreachable");
+            }
+        }
         if (cancelEvent) {
             if (WaitForSingleObject(cancelEvent, backoffMs) == WAIT_OBJECT_0) {
                 return ConnectWait::Cancelled;
@@ -1855,6 +1934,9 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
                 matchedUuid.reset();
                 uint64_t highestOrdinalSeen = 0;
                 outcome = engine.Verify(&conn, &matchedUuid, cancelEvent, &highestOrdinalSeen);
+                T2_DIAG("verify", L"engine.Verify returned %s (%d) connectionLost=%d shortVerify=%d (attempt %d)",
+                        DiagOutcomeName(outcome), static_cast<int>(outcome), conn.ConnectionLost() ? 1 : 0,
+                        shortVerify ? 1 : 0, attempt);
                 // Last verdict decides whether the NEXT session must be Long:
                 // a wrong finger forces it; a match or a quiet window clears it.
                 if (outcome == VerifyOutcome::NoMatch) {
@@ -1991,6 +2073,8 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
                 continue; // cancel / power checks at the top of the next round apply
             }
             // Match / Rejected / Unstable / Malformed / remaining: end CAPTURE.
+            T2_DIAG("verify", L"verify loop ENDS the CAPTURE with outcome=%s (gaveUp=%d inBringUpWindow=%d)",
+                    DiagOutcomeName(outcome), gaveUp ? 1 : 0, InBringUpWindow() ? 1 : 0);
             break;
         }
     }
@@ -2204,6 +2288,11 @@ void HandleCaptureData(_In_ WDFREQUEST Request)
         }
     }
 
+    g_diagCaptureArrivedTick.store(GetTickCount64(), std::memory_order_relaxed);
+    T2_DIAG("capture", L"CAPTURE_DATA ARRIVED purpose=0x%02x flags=0x%02x (WBF asks for a touch)",
+            static_cast<unsigned>(key.Purpose), static_cast<unsigned>(key.Flags));
+    t2::transport::DiagTransportSnapshot(L"CAPTURE_DATA arrived");
+
     // Gate: never touch the SEP - no ConnectForCapture, no busy-slot, no
     // actual fingerprint read - until T2SepBootstrap has reported the SEP
     // fully unlocked this boot. Checked after the size-probe reply above
@@ -2266,6 +2355,9 @@ extern "C" VOID T2BioEvtIoDeviceControl(_In_ WDFQUEUE Queue,
     T2BioLog("IOCTL %s (0x%08x) in=%llu out=%llu", IoctlName(IoControlCode), IoControlCode,
              static_cast<unsigned long long>(InputBufferLength),
              static_cast<unsigned long long>(OutputBufferLength));
+    T2_DIAG("ioctl", L"%hs (0x%08x) in=%llu out=%llu", IoctlName(IoControlCode), IoControlCode,
+            static_cast<unsigned long long>(InputBufferLength),
+            static_cast<unsigned long long>(OutputBufferLength));
 
     switch (IoControlCode) {
     case IOCTL_BIOMETRIC_GET_ATTRIBUTES:
@@ -2540,6 +2632,7 @@ void RequestWorkstationLock()
 
 void OnConsoleDisplayState(DWORD state)
 {
+    T2_DIAG("power", L"console display state -> %lu (0=off 1=on 2=dim)", static_cast<unsigned long>(state));
     if (state == 0) {
         // Idle dim vs power-button: we cannot tell yet. Arm a short grace so a
         // power-button finger cannot unlock before APMSUSPEND; if sleep never
@@ -2601,6 +2694,27 @@ LRESULT CALLBACK SessionLockWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         return TRUE;
     }
     if (msg == WM_WTSSESSION_CHANGE) {
+        {
+            const wchar_t* name = L"other";
+            switch (wParam) {
+            case WTS_CONSOLE_CONNECT:     name = L"CONSOLE_CONNECT"; break;
+            case WTS_CONSOLE_DISCONNECT:  name = L"CONSOLE_DISCONNECT"; break;
+            case WTS_REMOTE_CONNECT:      name = L"REMOTE_CONNECT"; break;
+            case WTS_REMOTE_DISCONNECT:   name = L"REMOTE_DISCONNECT"; break;
+            case WTS_SESSION_LOGON:       name = L"SESSION_LOGON"; break;
+            case WTS_SESSION_LOGOFF:      name = L"SESSION_LOGOFF"; break;
+            case WTS_SESSION_LOCK:        name = L"SESSION_LOCK"; break;
+            case WTS_SESSION_UNLOCK:      name = L"SESSION_UNLOCK"; break;
+            case WTS_SESSION_REMOTE_CONTROL: name = L"SESSION_REMOTE_CONTROL"; break;
+            default: break;
+            }
+            T2_DIAG("session", L"WTS session change %s (wParam=%llu) session=%lu - %s", name,
+                    static_cast<unsigned long long>(wParam), static_cast<unsigned long>(lParam),
+                    (wParam == WTS_SESSION_UNLOCK) ? L"UNLOCK drops V6Unavailable and requests ONE native re-check"
+                    : (wParam == WTS_SESSION_LOCK) ? L"LOCK starts a new capture generation"
+                                                    : L"no driver action");
+            t2::transport::DiagTransportSnapshot(L"session change (before handling)");
+        }
         if (wParam == WTS_SESSION_LOCK) {
             std::lock_guard<std::mutex> commitLock(g_captureRequestCommitMu);
             BeginCaptureSessionLock("SessionLockNotify(WTS_SESSION_LOCK)");

@@ -79,6 +79,7 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject,
                                 _In_ PUNICODE_STRING RegistryPath)
 {
     T2BioLog("DriverEntry (UMDF %d.%d)", UMDF_VERSION_MAJOR, UMDF_VERSION_MINOR);
+    T2_DIAG("driver", L"DriverEntry: WUDFHost loaded T2TouchIdBio (UMDF %d.%d)", UMDF_VERSION_MAJOR, UMDF_VERSION_MINOR);
 
     WDF_DRIVER_CONFIG config;
     WDF_DRIVER_CONFIG_INIT(&config, T2BioEvtDeviceAdd);
@@ -122,6 +123,7 @@ extern "C" NTSTATUS T2BioEvtDeviceAdd(_In_ WDFDRIVER Driver,
 {
     UNREFERENCED_PARAMETER(Driver);
     T2BioLog("EvtDeviceAdd");
+    T2_DIAG("driver", L"EvtDeviceAdd: biometric device being created");
 
     WDFDEVICE device = nullptr;
     NTSTATUS status = WdfDeviceCreate(&DeviceInit, WDF_NO_OBJECT_ATTRIBUTES, &device);

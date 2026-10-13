@@ -670,9 +670,11 @@ bool PickDefaultT2Endpoint(NcmEndpoint* outEndpoint, void* cancelEvent) {
     return true;
 }
 
-bool ConnectToBiometricKitBridge(const NcmEndpoint& endpoint, t2::bridgexpc::Connection* outConn,
-                                  uint16_t* outServicePort, uint16_t* outRsdPort,
-                                  void* cancelEvent, bool* outScansExhausted) {
+// The real connect flow. The public ConnectToBiometricKitBridge() below only wraps it with the
+// cold-boot diagnostics (start / end / duration / state snapshot) - see Log.h T2_DIAG.
+static bool ConnectToBiometricKitBridgeImpl(const NcmEndpoint& endpoint, t2::bridgexpc::Connection* outConn,
+                                            uint16_t* outServicePort, uint16_t* outRsdPort,
+                                            void* cancelEvent, bool* outScansExhausted) {
     if (outScansExhausted) *outScansExhausted = false;
     if (outConn == nullptr) return false;
     if (Cancelled(cancelEvent)) return false;
@@ -718,12 +720,18 @@ bool ConnectToBiometricKitBridge(const NcmEndpoint& endpoint, t2::bridgexpc::Con
         }
     }
     const bool tryNative = !sticky && !v6Unavailable;
+    T2_DIAG("connect", L"decision: autoSwitch=%d sticky=%d v6Unavailable=%d -> tryNative=%d "
+            L"(sticky/v6Unavailable skip native and go straight to the IPv4 tunnel)",
+            autoSwitch ? 1 : 0, sticky ? 1 : 0, v6Unavailable ? 1 : 0, tryNative ? 1 : 0);
 
     StepResult native;
     bool sawSilent = false;
     if (tryNative) {
         native = NativeStep(ep, outConn, cancelEvent, autoSwitch);
         sawSilent = native.sawSilent;
+        T2_DIAG("connect", L"native step: ok=%d blocked=%d wfpBlocked=%d silent=%d pathAlive=%d fullPassEmpty=%d",
+                native.ok ? 1 : 0, native.blocked ? 1 : 0, native.wfpBlocked ? 1 : 0,
+                native.sawSilent ? 1 : 0, native.pathAlive ? 1 : 0, native.fullPassEmpty ? 1 : 0);
         if (native.ok) {
             tp::NotePathAlive();
             if (outServicePort) *outServicePort = native.servicePort;
@@ -761,6 +769,9 @@ bool ConnectToBiometricKitBridge(const NcmEndpoint& endpoint, t2::bridgexpc::Con
                native.wfpBlocked ? L" (WFP)" : L"");
         tunnel = TunnelStep(&ep, outConn, cancelEvent);
         sawSilent = sawSilent || tunnel.sawSilent;
+        T2_DIAG("connect", L"tunnel step: ok=%d localError=%d silent=%d pathAlive=%d fullPassEmpty=%d",
+                tunnel.ok ? 1 : 0, tunnel.localError ? 1 : 0, tunnel.sawSilent ? 1 : 0,
+                tunnel.pathAlive ? 1 : 0, tunnel.fullPassEmpty ? 1 : 0);
         if (tunnel.ok) {
             tp::NotePathAlive();
             if (outServicePort) *outServicePort = tunnel.servicePort;
@@ -791,6 +802,30 @@ bool ConnectToBiometricKitBridge(const NcmEndpoint& endpoint, t2::bridgexpc::Con
         }
     }
     return false;
+}
+
+bool ConnectToBiometricKitBridge(const NcmEndpoint& endpoint, t2::bridgexpc::Connection* outConn,
+                                  uint16_t* outServicePort, uint16_t* outRsdPort,
+                                  void* cancelEvent, bool* outScansExhausted) {
+    const ULONGLONG t0 = GetTickCount64();
+    T2_DIAG("connect", L"connect START ifIndex=%lu peerSource=%d", static_cast<unsigned long>(endpoint.ifIndex),
+            static_cast<int>(endpoint.peerSource));
+    tp::DiagTransportSnapshot(L"connect START");
+    uint16_t servicePort = 0, rsdPort = 0;
+    bool exhausted = false;
+    const bool ok = ConnectToBiometricKitBridgeImpl(endpoint, outConn, &servicePort, &rsdPort,
+                                                    cancelEvent, &exhausted);
+    if (outServicePort) *outServicePort = servicePort;
+    if (outRsdPort) *outRsdPort = rsdPort;
+    if (outScansExhausted) *outScansExhausted = exhausted;
+    T2_DIAG("connect", L"connect END ok=%d port=%u rsd=%u scansExhausted=%d cancelled=%d mode=%s in %llu ms",
+            ok ? 1 : 0, static_cast<unsigned>(servicePort), static_cast<unsigned>(rsdPort), exhausted ? 1 : 0,
+            Cancelled(cancelEvent) ? 1 : 0, tp::IsTunnelModeActive() ? L"Ipv4Tunnel" : L"NativeIpv6",
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+    if (!ok) {
+        tp::DiagTransportSnapshot(L"connect FAILED");
+    }
+    return ok;
 }
 
 } // namespace t2::discovery

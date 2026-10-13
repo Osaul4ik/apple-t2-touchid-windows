@@ -216,6 +216,9 @@ bool ResolveT2Peer(NcmEndpoint* out, bool allowPing) {
     if (t2::transport::ReadPersistedPeer(&saved, nullptr, nullptr)) {
         out->peerLinkLocal = saved;
         out->peerSource = PeerSource::LastKnown;
+        T2_DIAG("peer", L"ResolveT2Peer: neighbor table empty%s - using the persisted last-known peer%s",
+                allowPing ? L" even after the ff02::1 ping" : L" (ping not allowed)",
+                wasDistrusted ? L" (distrusted)" : L"");
         T2_LOG("discovery", L"ResolveT2Peer: no neighbor%s - using the persisted last-known peer%s",
                allowPing ? L" even after the ff02::1 ping" : L" (ping not allowed: no usable IPv6)",
                wasDistrusted ? L" (it was distrusted)" : L"");
@@ -436,8 +439,17 @@ void NotePeerIdentity(const NcmEndpoint& ep) {
 } // namespace
 
 GateResult RunReadinessGate(NcmEndpoint* ep, void* cancelEvent, unsigned maxMs) {
-    if (!ep || ep->ifIndex == 0) return GateResult::TimedOut;
+    if (!ep || ep->ifIndex == 0) {
+        T2_DIAG("gate", L"readiness gate: no T2 NCM adapter (ifIndex=0) -> TimedOut");
+        return GateResult::TimedOut;
+    }
     NoteAdapterIdentity(*ep);
+    T2_DIAG("gate", L"readiness gate START ifIndex=%lu ipv6Bound=%d operUp=%d linkLocal=%d peerSource=%d "
+            L"v6Unavailable=%d gen=%llu",
+            static_cast<unsigned long>(ep->ifIndex), ep->ipv6Bound ? 1 : 0,
+            IsInterfaceOperUp(ep->ifIndex) ? 1 : 0, static_cast<int>(QueryLinkLocalState(ep->ifIndex)),
+            static_cast<int>(ep->peerSource), t2::transport::IsV6Unavailable() ? 1 : 0,
+            static_cast<unsigned long long>(t2::transport::CurrentGeneration()));
 
     const ULONGLONG t0 = GetTickCount64();
     GateResult result = GateResult::Ready;
@@ -450,13 +462,13 @@ GateResult RunReadinessGate(NcmEndpoint* ep, void* cancelEvent, unsigned maxMs) 
     // of staying pinned to "no v6" until something else resets the Generation.
     if (ep->ipv6Bound && t2::transport::IsV6Unavailable() &&
         QueryLinkLocalState(ep->ifIndex) != LinkLocalState::None) {
-        t2::transport::ClearV6Unavailable();
+        t2::transport::ClearV6Unavailable(L"readiness gate: link-local present again");
         T2_LOG("discovery", L"readiness gate: link-local IPv6 present again - V6Unavailable cleared");
     }
 
     if (!ep->ipv6Bound) {
         // IPv6 component unbound on the adapter: nothing to wait for, native is impossible.
-        t2::transport::MarkV6Unavailable();
+        t2::transport::MarkV6Unavailable(L"IPv6 not bound on the T2 NCM adapter");
         result = GateResult::V6Unavailable;
     } else if (!t2::transport::IsV6Unavailable()) {
         // (When V6Unavailable is already set for this Generation the wait is not repeated.)
@@ -469,7 +481,7 @@ GateResult RunReadinessGate(NcmEndpoint* ep, void* cancelEvent, unsigned maxMs) 
             const ULONGLONG waited = GetTickCount64() - t0;
             if (st == LinkLocalState::Preferred) break;
             if (st == LinkLocalState::None && waited >= kNoAddressMs && IsInterfaceOperUp(ep->ifIndex)) {
-                t2::transport::MarkV6Unavailable();
+                t2::transport::MarkV6Unavailable(L"no link-local address 1.5 s after link up");
                 result = GateResult::V6Unavailable;
                 T2_LOG("discovery", L"readiness gate: no link-local IPv6 %llu ms after link up - "
                        L"V6Unavailable for this Generation (native skipped)",
@@ -501,6 +513,14 @@ GateResult RunReadinessGate(NcmEndpoint* ep, void* cancelEvent, unsigned maxMs) 
            static_cast<unsigned long long>(GetTickCount64() - t0),
            static_cast<int>(ep->peerSource),
            static_cast<unsigned long long>(t2::transport::CurrentGeneration()));
+    T2_DIAG("gate", L"readiness gate END %s in %llu ms ifIndex=%lu linkLocal=%d peerSource=%d "
+            L"(0=none) v6Unavailable=%d gen=%llu",
+            result == GateResult::Ready ? L"READY"
+                : result == GateResult::V6Unavailable ? L"V6UNAVAILABLE" : L"TIMED-OUT",
+            static_cast<unsigned long long>(GetTickCount64() - t0),
+            static_cast<unsigned long>(ep->ifIndex), static_cast<int>(QueryLinkLocalState(ep->ifIndex)),
+            static_cast<int>(ep->peerSource), t2::transport::IsV6Unavailable() ? 1 : 0,
+            static_cast<unsigned long long>(t2::transport::CurrentGeneration()));
     return result;
 }
 
