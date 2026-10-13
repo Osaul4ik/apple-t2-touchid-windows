@@ -165,13 +165,19 @@ void DiagSepStatus(long key, const wchar_t* what, int reason, int step, int sepS
 // one IOCTL already tells us both "is the transport up" and "did the SEP
 // actually unlock", with a specific reason attached when it didn't.
 //
-// Returns true (leaves outSensorStatus/outHresult untouched) only when the
+// Returns true (outSensorStatus/outHresult = WINBIO_SENSOR_READY / S_OK) only when the
 // SEP has fully unlocked this boot (T2SepReasonOk). Every other case - not
 // reported yet, or reported an actual failure - returns false with a
 // WBDI-meaningful status filled in, so callers can complete the IOCTL
 // without a hardcoded WINBIO_SENSOR_READY that got ahead of reality.
 bool CheckSepReady(_Out_ WINBIO_SENSOR_STATUS* outSensorStatus, _Out_ HRESULT* outHresult)
 {
+    // Defined on every path (incl. the two `return true` ones) - fixes C6101
+    // ("returning uninitialized memory" for an _Out_ parameter). All failure/busy
+    // branches below overwrite both values.
+    *outSensorStatus = WINBIO_SENSOR_READY;
+    *outHresult = S_OK;
+
     using t2::applekeystore::AksResult;
     using t2::applekeystore::Client;
 
