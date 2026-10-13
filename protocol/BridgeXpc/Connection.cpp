@@ -49,6 +49,7 @@ void Connection::Close() {
         T2_LOG("connect", L"disconnect: already closed (pendingEvents=%zu)",
                pendingEvents_.size());
     }
+    ResetRx();   // buffered bytes belong to the socket just closed
     // Defensive only: this class is one-connection-per-verification-attempt
     // (see the class comment) and is expected to be discarded after Close(),
     // never reused, so there should be no queued events left to leak into a
@@ -320,6 +321,8 @@ ConnectResult Connection::ConnectOnce(bool tunnel, const in6_addr& linkLocalAddr
     TuneEstablishedSocket(socket_);
     SetSocketTimeout(socket_, SO_RCVTIMEO, heloTimeout);
     SetSocketTimeout(socket_, SO_SNDTIMEO, heloTimeout);
+    ResetRx();   // new stream: no buffered bytes
+    rcvTimeoutMs_ = static_cast<DWORD>(heloTimeout.count());   // what was just set
     T2_LOG("connect", L"TCP connected (%s): ifIndex=%lu port=%u, %llu ms (waiting for peer HELO)",
            tunnel ? L"IPv4 tunnel" : L"Native IPv6", interfaceIndex,
            static_cast<unsigned>(port), static_cast<unsigned long long>(*outTcpMs));
@@ -1025,70 +1028,113 @@ bool Connection::AcknowledgeEvent(const std::string& requestId) {
 // parsed body bytes as a frame header).
 static constexpr std::chrono::milliseconds kFrameTailTimeout{3000};
 
+void Connection::SetRcvTimeoutCached(std::chrono::milliseconds timeout) {
+    const DWORD ms = static_cast<DWORD>(timeout.count());
+    if (ms == rcvTimeoutMs_) return;
+    rcvTimeoutMs_ = SetSocketTimeout(socket_, SO_RCVTIMEO, timeout) ? ms : 0xFFFFFFFFu;
+}
+
+// Smallest read issued against the socket. A frame header + typical event body is
+// 150-400 B, so one chunk usually holds several back-to-back frames.
+static constexpr size_t kRxChunkBytes = 8192;
+static constexpr size_t kRxFrameHeaderBytes = 16;
+// Buffer capacity kept between frames; a rare multi-KB match_result frame grows it
+// temporarily, anything above this is released once drained.
+static constexpr size_t kRxKeepBytes = 65536;
+
 bool Connection::ReadFrame(RawFrame* out, std::chrono::milliseconds timeout,
                             ReadFailure* why, bool quietIdleTimeout) {
     if (why) *why = ReadFailure::None;
-    SetSocketTimeout(socket_, SO_RCVTIMEO, timeout);
 
-    uint8_t headerBuf[16];
-    size_t got = 0;
-    bool tailTimeoutSet = false;
-    while (got < sizeof(headerBuf)) {
-        int n = recv(socket_, reinterpret_cast<char*>(headerBuf) + got,
-                      static_cast<int>(sizeof(headerBuf) - got), 0);
-        if (n <= 0) {
-            const int wsaErr = (n < 0) ? WSAGetLastError() : 0;
-            const bool timedOut = (n < 0) && (wsaErr == WSAETIMEDOUT || wsaErr == WSAEWOULDBLOCK);
-            if (timedOut && got == 0) {
-                // Nothing of a new frame arrived: the stream is still in sync.
-                if (why) *why = ReadFailure::IdleTimeout;
-                if (!quietIdleTimeout) {
+    FrameHeader hdr{};
+    bool haveHeader = false;
+
+    // Reads from the socket until at least `need` bytes of the current frame are
+    // buffered. Failure semantics are those of the old two-recv() loop: a timeout with
+    // ZERO bytes of a new frame buffered is IdleTimeout (stream still in sync); anything
+    // else - reset, EOF, or a frame torn mid-way - fails closed.
+    auto fill = [&](size_t need) -> bool {
+        while (rxLen_ - rxPos_ < need) {
+            if (rxPos_ != 0) {   // keep the unread tail at the front
+                if (rxPos_ == rxLen_) {
+                    rxPos_ = rxLen_ = 0;
+                } else {
+                    std::memmove(rxBuf_.data(), rxBuf_.data() + rxPos_, rxLen_ - rxPos_);
+                    rxLen_ -= rxPos_;
+                    rxPos_ = 0;
+                }
+            }
+            const size_t want = need > kRxChunkBytes ? need : kRxChunkBytes;
+            if (rxBuf_.size() < want) rxBuf_.resize(want);
+
+            // Once the FIRST byte of a frame is here the rest is already in flight, so
+            // the remaining recv()s get at least kFrameTailTimeout no matter how short
+            // the caller's slice was (see kFrameTailTimeout).
+            const bool midFrame = rxLen_ != rxPos_;
+            SetRcvTimeoutCached(midFrame && timeout < kFrameTailTimeout ? kFrameTailTimeout : timeout);
+
+            const int n = recv(socket_, reinterpret_cast<char*>(rxBuf_.data()) + rxLen_,
+                               static_cast<int>(rxBuf_.size() - rxLen_), 0);
+            if (n <= 0) {
+                const int wsaErr = (n < 0) ? WSAGetLastError() : 0;
+                const bool timedOut = (n < 0) && (wsaErr == WSAETIMEDOUT || wsaErr == WSAEWOULDBLOCK);
+                const size_t have = rxLen_ - rxPos_;
+                if (timedOut && !midFrame) {
+                    // Nothing of a new frame arrived: the stream is still in sync.
+                    if (why) *why = ReadFailure::IdleTimeout;
+                    if (!quietIdleTimeout) {
+                        T2_LOG("readFrame", L"header recv failed after %zu/%zuB, n=%d, "
+                               "WSAGetLastError=%d (0=timeout/closed cleanly)",
+                               have, kRxFrameHeaderBytes, n, wsaErr);
+                    }
+                    return false;
+                }
+                if (!haveHeader) {
                     T2_LOG("readFrame", L"header recv failed after %zu/%zuB, n=%d, "
                            "WSAGetLastError=%d (0=timeout/closed cleanly)",
-                           got, sizeof(headerBuf), n, wsaErr);
+                           have, kRxFrameHeaderBytes, n, wsaErr);
+                } else {
+                    T2_LOG("readFrame", L"body recv failed after %zu/%lluB, n=%d, "
+                           "WSAGetLastError=%d (frameType=%u)",
+                           have - kRxFrameHeaderBytes, static_cast<unsigned long long>(hdr.bodyLength),
+                           n, wsaErr, hdr.frameType);
                 }
+                if (why) *why = (n == 0) ? ReadFailure::Closed : ReadFailure::Error;
                 return false;
             }
-            T2_LOG("readFrame", L"header recv failed after %zu/%zuB, n=%d, "
-                   "WSAGetLastError=%d (0=timeout/closed cleanly)",
-                   got, sizeof(headerBuf), n, wsaErr);
-            if (why) *why = (n == 0) ? ReadFailure::Closed : ReadFailure::Error;
-            return false; // reset, EOF, or a frame torn mid-header: fail closed
+            rxLen_ += static_cast<size_t>(n);
         }
-        got += static_cast<size_t>(n);
-        if (!tailTimeoutSet) {
-            tailTimeoutSet = true;
-            SetSocketTimeout(socket_, SO_RCVTIMEO,
-                             timeout < kFrameTailTimeout ? kFrameTailTimeout : timeout);
-        }
-    }
+        return true;
+    };
 
-    FrameHeader hdr;
-    ParseResult pr = ParseFrameHeader(headerBuf, sizeof(headerBuf), &hdr);
+    if (!fill(kRxFrameHeaderBytes)) return false;
+
+    ParseResult pr = ParseFrameHeader(rxBuf_.data() + rxPos_, kRxFrameHeaderBytes, &hdr);
     if (pr != ParseResult::Ok) {
         T2_LOG("readFrame", L"ParseFrameHeader failed, result=%d, header=%s",
-               static_cast<int>(pr), HexDump(headerBuf, sizeof(headerBuf), sizeof(headerBuf)).c_str());
+               static_cast<int>(pr),
+               HexDump(rxBuf_.data() + rxPos_, kRxFrameHeaderBytes, kRxFrameHeaderBytes).c_str());
+        rxPos_ = rxLen_ = 0;   // stream is desynchronized; nothing buffered can be trusted
         if (why) *why = ReadFailure::Error;
         return false;
     }
+    haveHeader = true;
 
-    out->body.resize(static_cast<size_t>(hdr.bodyLength));
-    size_t bodyGot = 0;
-    while (bodyGot < out->body.size()) {
-        int n = recv(socket_, reinterpret_cast<char*>(out->body.data()) + bodyGot,
-                      static_cast<int>(out->body.size() - bodyGot), 0);
-        if (n <= 0) {
-            T2_LOG("readFrame", L"body recv failed after %zu/%lluB, n=%d, "
-                   "WSAGetLastError=%d (frameType=%u)",
-                   bodyGot, static_cast<unsigned long long>(hdr.bodyLength), n,
-                   (n < 0) ? WSAGetLastError() : 0, hdr.frameType);
-            if (why) *why = (n == 0) ? ReadFailure::Closed : ReadFailure::Error;
-            return false;
-        }
-        bodyGot += static_cast<size_t>(n);
-    }
+    const size_t bodyLen = static_cast<size_t>(hdr.bodyLength);
+    if (!fill(kRxFrameHeaderBytes + bodyLen)) return false;
 
+    const uint8_t* body = rxBuf_.data() + rxPos_ + kRxFrameHeaderBytes;
+    out->body.assign(body, body + bodyLen);
     out->type = static_cast<FrameType>(hdr.frameType);
+
+    rxPos_ += kRxFrameHeaderBytes + bodyLen;
+    if (rxPos_ == rxLen_) {
+        rxPos_ = rxLen_ = 0;
+        if (rxBuf_.size() > kRxKeepBytes) {   // a huge frame grew the buffer: release it
+            rxBuf_.clear();
+            rxBuf_.shrink_to_fit();
+        }
+    }
     return true;
 }
 

@@ -71,13 +71,18 @@ void T2BioLog(_In_z_ const char* fmt, ...)
                                    prefix,
                                    static_cast<unsigned long>(GetCurrentProcessId()),
                                    static_cast<unsigned long>(GetCurrentThreadId()), buf))) {
-        OutputDebugStringA(line);
+        // Async when enabled in DriverEntry (see t2::log::EnableAsync): keeps the
+        // debugger handshake off the CAPTURE/verify threads. Order is preserved.
+        t2::log::EmitLineA(line);
     }
 }
 
 extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject,
                                 _In_ PUNICODE_STRING RegistryPath)
 {
+    // First: every later T2BioLog / T2_LOG / T2_DIAG line of this process goes through
+    // the background writer. Paired with t2::log::Shutdown() in T2BioEvtDriverUnload.
+    (void)t2::log::EnableAsync();
     T2BioLog("DriverEntry (UMDF %d.%d)", UMDF_VERSION_MAJOR, UMDF_VERSION_MINOR);
     T2_DIAG("driver", L"DriverEntry: WUDFHost loaded T2TouchIdBio (UMDF %d.%d)", UMDF_VERSION_MAJOR, UMDF_VERSION_MINOR);
 
@@ -116,6 +121,9 @@ extern "C" VOID T2BioEvtDriverUnload(_In_ WDFDRIVER Driver)
     T2BioUnregisterSessionLockNotification();
     T2BioUnregisterSuspendResumeNotification();
     T2BioLog("EvtDriverUnload ok");
+    // Last: flush the queued lines and end the writer thread (it executes code from
+    // this DLL, same constraint as the capture workers drained above).
+    t2::log::Shutdown();
 }
 
 extern "C" NTSTATUS T2BioEvtDeviceAdd(_In_ WDFDRIVER Driver,

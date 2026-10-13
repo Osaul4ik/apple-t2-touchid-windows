@@ -9,6 +9,7 @@
 #include <string>
 #include <chrono>
 #include <deque>
+#include <vector>
 #include <mutex>
 #include <atomic>
 
@@ -187,6 +188,19 @@ private:
     // sensor sat waiting for a finger).
     bool ReadFrame(RawFrame* out, std::chrono::milliseconds timeout,
                    ReadFailure* why = nullptr, bool quietIdleTimeout = false);
+    // ---- receive buffering (hot path) ----
+    // ReadFrame() used to cost 2 recv() + up to 2 setsockopt(SO_RCVTIMEO) per frame, and a
+    // match session delivers ~25 small events back to back. Frames are now parsed out of
+    // this per-connection buffer, filled by ONE recv() per wakeup (frames that arrived
+    // together cost no syscall at all), and SO_RCVTIMEO is only re-armed when the value
+    // actually changes. Same serialization as the socket itself (ioMu_, or the single
+    // connecting thread before the connection is published).
+    std::vector<uint8_t> rxBuf_;
+    size_t rxPos_ = 0;                       // first unread byte
+    size_t rxLen_ = 0;                       // one past the last valid byte
+    DWORD rcvTimeoutMs_ = 0xFFFFFFFFu;       // SO_RCVTIMEO last set on socket_; sentinel = unknown
+    void ResetRx() { rxPos_ = rxLen_ = 0; rcvTimeoutMs_ = 0xFFFFFFFFu; }
+    void SetRcvTimeoutCached(std::chrono::milliseconds timeout);
     bool WriteFrame(FrameType type, const std::vector<uint8_t>& body);
     bool AcknowledgeEvent(const std::string& requestId);
     // Same event-before-reply loop as SendBiometricCommand/GetFdr:

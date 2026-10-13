@@ -9,6 +9,9 @@
 //   Ncm        — T2Ncm.sys + T2NcmCtrl.sys (kernel DbgPrint; see driver)
 //   BridgeXpc  — this file / Connection.cpp (connect, HELO, frames)
 //   Power      — sleep / resume / shutdown / D0 traces (Bio + user-mode)
+//   SyncEmit   — force the old synchronous OutputDebugString per line. The UMDF driver
+//                emits through a background writer by default (EnableAsync below); set
+//                SyncEmit=1 when chasing a crash so the last lines cannot be lost.
 //   Diag       — MASTER switch "cold-boot diagnostics": turns ALL of the above on
 //                (user-mode here; T2TouchIdTransport.sys and T2Ncm.sys read it too
 //                at DriverEntry / D0Entry) and enables the extra T2_DIAG lines
@@ -30,6 +33,8 @@
 #include <windows.h>
 #include <evntprov.h>      // ETW provider API (EventRegister / EventWriteString)
 #include <atomic>
+#include <deque>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <cstdint>
@@ -114,19 +119,154 @@ inline bool BioEnabled() { static CachedFlag c; return DiagEnabled() || CachedRe
 inline bool PowerEnabled() { static CachedFlag c; return DiagEnabled() || CachedRegistryFlag(c, L"Power"); }
 inline bool TransportEnabled() { static CachedFlag c; return DiagEnabled() || CachedRegistryFlag(c, L"Transport"); }
 inline bool NcmEnabled() { static CachedFlag c; return DiagEnabled() || CachedRegistryFlag(c, L"Ncm"); }
+inline bool SyncEmitForced() { static CachedFlag c; return CachedRegistryFlag(c, L"SyncEmit"); }
 
-inline int64_t ElapsedMs() {
+inline int64_t ElapsedUs() {
     static const auto start = std::chrono::steady_clock::now();
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
+    return std::chrono::duration_cast<std::chrono::microseconds>(
                std::chrono::steady_clock::now() - start)
         .count();
 }
+inline int64_t ElapsedMs() { return ElapsedUs() / 1000; }
+
+// ---- asynchronous emit ------------------------------------------------------
+// OutputDebugString is a synchronous handshake with the debugger (DBWIN mutex + shared
+// buffer). With DebugView attached one call costs ~1-4 ms (field log: ~4 ms per line,
+// and a 224 ms stall between two consecutive lines of one thread with no I/O between
+// them), and it was paid on the verify thread between acking one bridge event and
+// reading the next. A host that opts in with EnableAsync() gets its lines copied into a
+// bounded queue (microseconds) and written, in order, by one low-priority writer thread.
+// Hosts that do not opt in (CLI, bootstrap service, engine adapter) keep the synchronous
+// path unchanged, and so does everything while SyncEmit=1 or the console echo is on.
+// The writer holds a reference on its own module until Shutdown(), so a DLL cannot be
+// unloaded under it; the host must call Shutdown() from its unload callback.
+inline constexpr size_t kAsyncMaxLines = 8192;
+
+struct AsyncSink {
+    std::mutex mu;
+    std::deque<std::wstring> q;
+    size_t dropped = 0;
+    HANDLE wake = nullptr;       // auto-reset: queue became non-empty / stop requested
+    HANDLE thread = nullptr;
+    HMODULE module = nullptr;    // reference held by the writer thread
+    std::atomic<bool> enabled{false};
+    std::atomic<bool> stop{false};
+};
+inline AsyncSink& Sink() { static AsyncSink s; return s; }
+
+inline DWORD WINAPI AsyncWriterMain(LPVOID) {
+    AsyncSink& s = Sink();
+    std::deque<std::wstring> batch;
+    for (;;) {
+        WaitForSingleObject(s.wake, INFINITE);
+        size_t dropped = 0;
+        {
+            std::lock_guard<std::mutex> lock(s.mu);
+            batch.swap(s.q);
+            dropped = s.dropped;
+            s.dropped = 0;
+        }
+        for (const std::wstring& l : batch) {
+            OutputDebugStringW(l.c_str());
+        }
+        batch.clear();
+        if (dropped != 0) {
+            wchar_t msg[96];
+            _snwprintf_s(msg, _TRUNCATE, L"T2TouchIdLog: dropped %zu line(s), async queue full\n", dropped);
+            OutputDebugStringW(msg);
+        }
+        if (s.stop.load(std::memory_order_acquire)) {
+            std::lock_guard<std::mutex> lock(s.mu);
+            if (s.q.empty()) break;
+        }
+    }
+    FreeLibraryAndExitThread(s.module, 0);
+}
+
+// Call once, early (DriverEntry). Returns false (and stays synchronous) on any failure.
+inline bool EnableAsync() {
+    AsyncSink& s = Sink();
+    if (s.enabled.load(std::memory_order_acquire)) return true;
+    s.stop.store(false, std::memory_order_relaxed);
+    s.wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!s.wake) return false;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                            reinterpret_cast<LPCWSTR>(&AsyncWriterMain), &s.module)) {
+        CloseHandle(s.wake);
+        s.wake = nullptr;
+        return false;
+    }
+    s.thread = CreateThread(nullptr, 0, AsyncWriterMain, nullptr, 0, nullptr);
+    if (!s.thread) {
+        FreeLibrary(s.module);
+        s.module = nullptr;
+        CloseHandle(s.wake);
+        s.wake = nullptr;
+        return false;
+    }
+    SetThreadPriority(s.thread, THREAD_PRIORITY_BELOW_NORMAL);
+    s.enabled.store(true, std::memory_order_release);
+    return true;
+}
+
+// Flushes the queue and ends the writer thread; lines emitted afterwards are synchronous.
+// Call from the unload callback BEFORE the host may unload the module.
+inline void Shutdown() {
+    AsyncSink& s = Sink();
+    if (!s.enabled.exchange(false, std::memory_order_acq_rel)) return;
+    s.stop.store(true, std::memory_order_release);
+    SetEvent(s.wake);
+    if (WaitForSingleObject(s.thread, 3000) == WAIT_OBJECT_0) {
+        CloseHandle(s.thread);
+        s.thread = nullptr;
+        CloseHandle(s.wake);
+        s.wake = nullptr;
+    }   // else: writer stuck in OutputDebugString - leak the handles rather than race it
+}
+
+inline bool AsyncActive() {
+    return Sink().enabled.load(std::memory_order_acquire) && !ConsoleEnabled() && !SyncEmitForced();
+}
+
+inline void AsyncEnqueue(const wchar_t* line) {
+    AsyncSink& s = Sink();
+    bool wasEmpty = false;
+    {
+        std::lock_guard<std::mutex> lock(s.mu);
+        if (s.q.size() >= kAsyncMaxLines) {
+            ++s.dropped;                 // reported by the writer on its next pass
+            return;
+        }
+        wasEmpty = s.q.empty();
+        s.q.emplace_back(line);
+    }
+    if (wasEmpty) SetEvent(s.wake);
+}
 
 inline void EmitLine(const wchar_t* line) {
+    if (AsyncActive()) {
+        AsyncEnqueue(line);
+        return;
+    }
     OutputDebugStringW(line);
     if (ConsoleEnabled()) {
         std::wcerr << line;
     }
+}
+
+// Narrow-line variant for callers that format in ANSI (T2BioLog). Lines are ASCII.
+inline void EmitLineA(const char* line) {
+    if (AsyncActive()) {
+        wchar_t w[512];
+        size_t n = 0;
+        for (; line[n] != '\0' && n < ARRAYSIZE(w) - 1; ++n) {
+            w[n] = static_cast<unsigned char>(line[n]);
+        }
+        w[n] = L'\0';
+        AsyncEnqueue(w);
+        return;
+    }
+    OutputDebugStringA(line);
 }
 
 // Seconds since Windows booted. Deliberately NOT process-relative: the kernel DebugView
@@ -194,9 +334,11 @@ inline void Logf(const wchar_t* tag, const wchar_t* fmt, ...) {
     // Same shape as every other component: "<prefix>: [pid:tid] msg"
     // (T2TouchIdBio / T2TouchIdEngine / T2TouchIdBootstrap), so one DebugView
     // filter - T2TouchId* - catches all user-mode output.
-    _snwprintf_s(line, _TRUNCATE, L"T2TouchIdBridge: [%lu:%lu +%lldms][%s] %s\n",
+    // +<ms>.<us>: sub-millisecond stamp, taken BEFORE the line is emitted.
+    const int64_t us = ElapsedUs();
+    _snwprintf_s(line, _TRUNCATE, L"T2TouchIdBridge: [%lu:%lu +%lld.%03lldms][%s] %s\n",
                  GetCurrentProcessId(), GetCurrentThreadId(),
-                 static_cast<long long>(ElapsedMs()), tag, msg);
+                 static_cast<long long>(us / 1000), static_cast<long long>(us % 1000), tag, msg);
     EmitLine(line);
 }
 

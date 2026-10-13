@@ -293,6 +293,31 @@ inline void RecordNativeSuccess(ULONGLONG tcpMs) {
     ClearV6Unavailable(L"native handshake worked"); // a native handshake just worked
     g_nativeRevalidate.store(false, std::memory_order_relaxed); // nothing left to re-check
 }
+// ---- adaptive tunnel connect budget -------------------------------------
+// Same idea as the native budget above, for the committed IPv4 tunnel. Field logs: the
+// tunnel TCP handshake completes in 0 ms and connect+HELO in ~15 ms, yet a DEAD cached
+// port (stale after a T2 reboot / port change) used to cost the fixed 2000 ms before the
+// scan even started - over the tunnel an RST from the T2 does not make it back (the miss
+// shows up as WSA 10060, not 10061), so a dead port can only be told apart by waiting.
+// The wait is 8x the smoothed successful handshake + 150 ms, clamped to [200, 500] ms;
+// 500 ms before anything has been measured (first connect after boot). It only bounds the
+// TCP handshake; HELO keeps the caller's full timeout.
+inline std::atomic<DWORD> g_tunnelEmaMs{0};
+inline std::chrono::milliseconds TunnelConnectBudget(std::chrono::milliseconds cap) {
+    const DWORD ema = g_tunnelEmaMs.load(std::memory_order_relaxed);
+    long long ms = (ema == 0) ? 500 : static_cast<long long>(ema) * 8 + 150;
+    if (ms < 200) ms = 200;
+    if (ms > 500) ms = 500;
+    if (cap.count() < ms) ms = cap.count();
+    return std::chrono::milliseconds(ms);
+}
+// Tunnel TCP handshake completed (cached port or scan-confirmed port).
+inline void RecordTunnelSuccess(ULONGLONG tcpMs) {
+    const DWORD old = g_tunnelEmaMs.load(std::memory_order_relaxed);
+    DWORD next = (old == 0) ? static_cast<DWORD>(tcpMs) : static_cast<DWORD>((old * 3 + tcpMs) / 4);
+    if (next == 0) next = 1;
+    g_tunnelEmaMs.store(next, std::memory_order_relaxed);
+}
 // Tunnel handshake completed after native failed: sticky until reboot or until a native
 // re-check after an unlock succeeds (driver memory + in-process copy). Independent of Generation. on=false only when
 // auto-switch was turned off.

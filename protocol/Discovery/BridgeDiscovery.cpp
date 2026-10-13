@@ -333,9 +333,10 @@ struct CacheTry {
 
 // Path A: HELO on the registry port. Path B: RSD replay through the cached
 // RemoteXPC port. On ONE explicit transport (the port is the same on both). The
-// budget is short on native (a healthy T2 answers in single-digit ms) and longer
-// on the tunnel. A failure never deletes the entry; only a scan-confirmed port
-// overwrites it.
+// TCP budget is adaptive on both (a healthy T2 answers in single-digit ms; see
+// NativeConnectBudget / TunnelConnectBudget), so a dead cached port is given up on
+// quickly and the scan starts. A failure never deletes the entry; only a
+// scan-confirmed port overwrites it.
 CacheTry TryCachedBridgePort(const NcmEndpoint& ep, Connection* conn, bool tunnel) {
     CacheTry r;
     uint16_t svcPort = 0, rsdPort = 0;
@@ -347,7 +348,7 @@ CacheTry TryCachedBridgePort(const NcmEndpoint& ep, Connection* conn, bool tunne
     r.port = svcPort;
     r.rsd = rsdPort;
 
-    const std::chrono::milliseconds tcp = tunnel ? std::chrono::milliseconds(2000)
+    const std::chrono::milliseconds tcp = tunnel ? tp::TunnelConnectBudget(std::chrono::milliseconds(2000))
                                                  : tp::NativeConnectBudget(std::chrono::milliseconds(250));
     const std::chrono::milliseconds helo = tunnel ? std::chrono::milliseconds(2000)
                                                   : std::chrono::milliseconds(500);
@@ -356,6 +357,7 @@ CacheTry TryCachedBridgePort(const NcmEndpoint& ep, Connection* conn, bool tunne
     if (crA == ConnectResult::Ok) {
         T2_LOG("discovery", L"cached port %u answered with HELO (%s) - no scan needed",
                static_cast<unsigned>(svcPort), TransportName(tunnel));
+        if (tunnel) tp::RecordTunnelSuccess(r.tcpMs);
         r.ok = true;
         return r;
     }
@@ -394,6 +396,7 @@ bool ConnectFoundPort(const NcmEndpoint& ep, Connection* conn, bool tunnel, uint
                static_cast<unsigned>(port), static_cast<int>(cr), static_cast<int>(ev));
         return false;
     }
+    if (tunnel && outTcpMs) tp::RecordTunnelSuccess(*outTcpMs);
     return true;
 }
 
