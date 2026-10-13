@@ -102,19 +102,6 @@ Payload* RetrieveProbedPayload(_In_ WDFREQUEST Request, _Out_ bool* fitsFully)
     return out;
 }
 
-// Real readiness logic (formerly a TODO comment in HandleGetSensorStatus):
-// reads the driver-held bootstrap status T2SepBootstrapService reports via
-// IOCTL_T2_SET_BOOTSTRAP_STATUS (public.h T2_BOOTSTRAP_STATUS) instead of
-// the two separate checks ("open GUID_DEVINTERFACE_T2TOUCHID_TRANSPORT,
-// IOCTL_T2_GET_STATUS, and Global\T2SepReady") originally sketched there -
-// one IOCTL already tells us both "is the transport up" and "did the SEP
-// actually unlock", with a specific reason attached when it didn't.
-//
-// Returns true (leaves outSensorStatus/outHresult untouched) only when the
-// SEP has fully unlocked this boot (T2SepReasonOk). Every other case - not
-// reported yet, or reported an actual failure - returns false with a
-// WBDI-meaningful status filled in, so callers can complete the IOCTL
-// without a hardcoded WINBIO_SENSOR_READY that got ahead of reality.
 // Cold-boot diagnostics: when the CURRENT CAPTURE_DATA reached the driver (0 = none in
 // flight), so a completion / cancellation can say how long it was pending.
 std::atomic<ULONGLONG> g_diagCaptureArrivedTick{0};
@@ -139,6 +126,24 @@ ULONGLONG DiagCapturePendingMs()
     return t == 0 ? 0 : GetTickCount64() - t;
 }
 
+// Cache of "T2SepBootstrap reported Ok". CheckSepReady opens the transport device and issues an
+// IOCTL on every call (GET_SENSOR_STATUS, every CAPTURE gate, and 4x per second while a CAPTURE
+// waits for the bootstrap); once the SEP is unlocked that answer does not change by itself, so it
+// is remembered. Only "Ok" is cached - never BUSY / failure, those must be re-read to notice the
+// bootstrap finishing. The cache is dropped (InvalidateSepReadyCache) on anything that could mean
+// the unlock no longer holds: suspend / resume (the bootstrap may run again), a capture that
+// failed with a device / transport error, and, as a safety net, after kSepReadyCacheMs. A
+// restart of the UMDF host clears it with the process.
+constexpr ULONGLONG kSepReadyCacheMs = 10ull * 60ull * 1000ull;
+std::atomic<ULONGLONG> g_sepReadyUntilTick{0};   // GetTickCount64() deadline; 0 = not cached
+
+void InvalidateSepReadyCache(const wchar_t* why)
+{
+    if (g_sepReadyUntilTick.exchange(0, std::memory_order_relaxed) != 0) {
+        T2_DIAG("sep", L"SEP-ready cache dropped: %s (next check asks the transport driver again)", why);
+    }
+}
+
 // Cold-boot diagnostics: a line only when the bootstrap status CHANGES (this is polled every
 // 250 ms while a CAPTURE waits for the bootstrap). Key: -2 = transport device missing,
 // -3 = status IOCTL failed, otherwise reason/step/sepStatus. Never reset: the first call
@@ -152,10 +157,28 @@ void DiagSepStatus(long key, const wchar_t* what, int reason, int step, int sepS
     }
 }
 
+// Real readiness logic (formerly a TODO comment in HandleGetSensorStatus):
+// reads the driver-held bootstrap status T2SepBootstrapService reports via
+// IOCTL_T2_SET_BOOTSTRAP_STATUS (public.h T2_BOOTSTRAP_STATUS) instead of
+// the two separate checks ("open GUID_DEVINTERFACE_T2TOUCHID_TRANSPORT,
+// IOCTL_T2_GET_STATUS, and Global\T2SepReady") originally sketched there -
+// one IOCTL already tells us both "is the transport up" and "did the SEP
+// actually unlock", with a specific reason attached when it didn't.
+//
+// Returns true (leaves outSensorStatus/outHresult untouched) only when the
+// SEP has fully unlocked this boot (T2SepReasonOk). Every other case - not
+// reported yet, or reported an actual failure - returns false with a
+// WBDI-meaningful status filled in, so callers can complete the IOCTL
+// without a hardcoded WINBIO_SENSOR_READY that got ahead of reality.
 bool CheckSepReady(_Out_ WINBIO_SENSOR_STATUS* outSensorStatus, _Out_ HRESULT* outHresult)
 {
     using t2::applekeystore::AksResult;
     using t2::applekeystore::Client;
+
+    // Cached "Ok" (see InvalidateSepReadyCache): no device open, no IOCTL.
+    if (GetTickCount64() < g_sepReadyUntilTick.load(std::memory_order_relaxed)) {
+        return true;
+    }
 
     Client client;
     if (client.Open() != AksResult::Ok) {
@@ -184,6 +207,7 @@ bool CheckSepReady(_Out_ WINBIO_SENSOR_STATUS* outSensorStatus, _Out_ HRESULT* o
 
     switch (status.Reason) {
     case T2SepReasonOk:
+        g_sepReadyUntilTick.store(GetTickCount64() + kSepReadyCacheMs, std::memory_order_relaxed);
         return true;
 
     case T2SepReasonUnknown:
@@ -739,6 +763,9 @@ ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_
     T2_DIAG("power", L"PowerBroadcast type=0x%lx (4=APMSUSPEND 7=RESUMESUSPEND 18=RESUMEAUTOMATIC)",
             static_cast<unsigned long>(Type));
     t2::transport::DiagTransportSnapshot(L"power event (before handling)");
+    if (Type == PBT_APMSUSPEND || Type == PBT_APMRESUMESUSPEND || Type == PBT_APMRESUMEAUTOMATIC) {
+        InvalidateSepReadyCache(Type == PBT_APMSUSPEND ? L"system suspend" : L"system resume");
+    }
     if (Type == PBT_APMSUSPEND) {
         g_sleepBarrier.store(true, std::memory_order_release);
         g_powerButtonGraceUntil.store(0, std::memory_order_release); // suspend owns the barrier
@@ -1057,6 +1084,7 @@ SepWait WaitForSepBootstrap(_In_ CancelableScope& cancelScope,
     *outHresult = S_OK;
     constexpr DWORD kPollMs = 250;
     const ULONGLONG t0 = GetTickCount64();
+    ULONGLONG nextHintMs = 30000;
     bool logged = false;
     for (;;) {
         if (SystemIsShuttingDown() || cancelScope.IsCancelled()) {
@@ -1082,6 +1110,13 @@ SepWait WaitForSepBootstrap(_In_ CancelableScope& cancelScope,
                      "CAPTURE stays pending until it reports");
             T2_DIAG("capture", L"verify CAPTURE is WAITING for the SEP bootstrap (status BUSY / not reported yet)");
             logged = true;
+        }
+        const ULONGLONG waitedMs = GetTickCount64() - t0;
+        if (waitedMs >= nextHintMs) {
+            T2_DIAG("capture", L"still waiting for the SEP bootstrap after %llu s - is the T2SepBootstrap service "
+                    L"running? (Unknown = it never reported; a real failure would be reported as such)",
+                    static_cast<unsigned long long>(waitedMs / 1000));
+            nextHintMs += 30000;
         }
         Sleep(kPollMs);
     }
@@ -1247,6 +1282,9 @@ void CompleteCaptureData(_In_ WDFREQUEST Request, HRESULT winBioHresult,
             static_cast<int>(rejectDetail), static_cast<unsigned long long>(payload.size()),
             static_cast<unsigned long long>(DiagCapturePendingMs()));
     g_diagCaptureArrivedTick.store(0, std::memory_order_relaxed);
+    if (winBioHresult == WINBIO_E_DEVICE_FAILURE || winBioHresult == E_FAIL) {
+        InvalidateSepReadyCache(L"CAPTURE_DATA completed with a device/transport failure");
+    }
 
     PWINBIO_CAPTURE_DATA out = nullptr;
     size_t outLen = 0;
@@ -1587,9 +1625,9 @@ ConnectWait ConnectForCaptureWithRetry(HANDLE cancelEvent, t2::bridgexpc::Connec
                          attempt, static_cast<unsigned long long>(waited), emptyPasses,
                          static_cast<unsigned long long>(sinceMs));
                 T2_DIAG("capture", L"connect GAVE UP (attempt %u, %llu ms) - the CAPTURE will be completed with a failure",
-                    attempt, static_cast<unsigned long long>(waited));
-            t2::transport::DiagTransportSnapshot(L"connect gave up");
-            return ConnectWait::GaveUp;
+                        attempt, static_cast<unsigned long long>(waited));
+                t2::transport::DiagTransportSnapshot(L"connect gave up");
+                return ConnectWait::GaveUp;
             }
             // With a cancel event the CAPTURE NEVER ends on "BiometricKit not found": WBF does
             // not re-arm a CAPTURE that completed with DEVICE_FAILURE, so a T2 that is merely

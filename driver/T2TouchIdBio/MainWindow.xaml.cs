@@ -591,7 +591,7 @@ namespace T2TouchId.SepVaultGui
         {
             if (_logFlagsLoading) return;
 
-            // The Event Log mirror only does something while the master switch is on.
+            // The ETW mirror only does something while the master switch is on.
             LogDiagEventCheck.IsEnabled = LogDiagCheck.IsChecked == true;
 
             bool ok =

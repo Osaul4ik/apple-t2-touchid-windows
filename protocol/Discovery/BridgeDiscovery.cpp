@@ -811,15 +811,14 @@ bool ConnectToBiometricKitBridge(const NcmEndpoint& endpoint, t2::bridgexpc::Con
     T2_DIAG("connect", L"connect START ifIndex=%lu peerSource=%d", static_cast<unsigned long>(endpoint.ifIndex),
             static_cast<int>(endpoint.peerSource));
     tp::DiagTransportSnapshot(L"connect START");
-    uint16_t servicePort = 0, rsdPort = 0;
-    bool exhausted = false;
-    const bool ok = ConnectToBiometricKitBridgeImpl(endpoint, outConn, &servicePort, &rsdPort,
-                                                    cancelEvent, &exhausted);
-    if (outServicePort) *outServicePort = servicePort;
-    if (outRsdPort) *outRsdPort = rsdPort;
-    if (outScansExhausted) *outScansExhausted = exhausted;
+    // The caller's out-pointers go straight through: the wrapper must not change what a failed
+    // connect leaves in them. Values are only read back for the log, and only when ok.
+    const bool ok = ConnectToBiometricKitBridgeImpl(endpoint, outConn, outServicePort, outRsdPort,
+                                                    cancelEvent, outScansExhausted);
     T2_DIAG("connect", L"connect END ok=%d port=%u rsd=%u scansExhausted=%d cancelled=%d mode=%s in %llu ms",
-            ok ? 1 : 0, static_cast<unsigned>(servicePort), static_cast<unsigned>(rsdPort), exhausted ? 1 : 0,
+            ok ? 1 : 0, (ok && outServicePort) ? static_cast<unsigned>(*outServicePort) : 0u,
+            (ok && outRsdPort) ? static_cast<unsigned>(*outRsdPort) : 0u,
+            (outScansExhausted && *outScansExhausted) ? 1 : 0,
             Cancelled(cancelEvent) ? 1 : 0, tp::IsTunnelModeActive() ? L"Ipv4Tunnel" : L"NativeIpv6",
             static_cast<unsigned long long>(GetTickCount64() - t0));
     if (!ok) {
