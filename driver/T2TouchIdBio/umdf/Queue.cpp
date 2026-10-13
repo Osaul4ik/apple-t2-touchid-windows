@@ -985,6 +985,53 @@ bool WaitUntilDisplayAllowsScan(_In_ CancelableScope& cancelScope,
     return !SystemIsShuttingDown() && !cancelScope.IsCancelled();
 }
 
+// 13.10.2026: cold-boot race between WBF and T2SepBootstrap. Hardware kernel log of a
+// cold boot: the transport device is up at ~1.9 s, but the T2SepBootstrap service only
+// starts its sequence at ~8.0 s (register-ool) and finishes the last unlock at ~8.5 s.
+// A lock-screen CAPTURE_DATA that reaches the driver before that moment saw
+// bootstrap status "Unknown" (CheckSepReady -> BUSY) and was COMPLETED at once with
+// DEVICE_BUSY. WBF does not re-arm such a CAPTURE, so the fingerprint stayed dead on the
+// lock screen - also across sleep/resume, because the logon UI keeps the same dead
+// session - until a PIN unlock + lock opened a new one (hypothesis from the code paths +
+// the kernel boot log; confirm with a user-mode log of a failing boot: look for the line
+// "SEP not ready yet ... refusing capture"). A verify CAPTURE must stay pending
+// instead (same rule as an unreachable T2, see ConnectForCaptureWithRetry): wait here,
+// cancel-aware, until the bootstrap reports. Only a REAL bootstrap failure (vault missing,
+// DPAPI, SEP rejected / hung, driver missing) ends the request, with its own HRESULT.
+enum class SepWait { Ready, Cancelled, Failed };
+
+SepWait WaitForSepBootstrap(_In_ CancelableScope& cancelScope,
+                            _Out_ WINBIO_SENSOR_STATUS* outSensorStatus,
+                            _Out_ HRESULT* outHresult)
+{
+    *outSensorStatus = WINBIO_SENSOR_READY;
+    *outHresult = S_OK;
+    constexpr DWORD kPollMs = 250;
+    const ULONGLONG t0 = GetTickCount64();
+    bool logged = false;
+    for (;;) {
+        if (SystemIsShuttingDown() || cancelScope.IsCancelled()) {
+            return SepWait::Cancelled;
+        }
+        if (CheckSepReady(outSensorStatus, outHresult)) {
+            if (logged) {
+                T2BioLog("CAPTURE_DATA(verify): SEP bootstrap finished after %llu ms of waiting - continuing",
+                         static_cast<unsigned long long>(GetTickCount64() - t0));
+            }
+            return SepWait::Ready;
+        }
+        if (*outHresult != WINBIO_E_DEVICE_BUSY) {
+            return SepWait::Failed;      // a real bootstrap failure, not "not yet"
+        }
+        if (!logged) {
+            T2BioLog("CAPTURE_DATA(verify): SEP bootstrap not finished yet (cold boot) - "
+                     "CAPTURE stays pending until it reports");
+            logged = true;
+        }
+        Sleep(kPollMs);
+    }
+}
+
 enum class SlotWait { Acquired, StillBusy, RequestCancelled };
 
 // Upper bound for how long a NEW CAPTURE_DATA waits for a CANCELLED
@@ -1696,6 +1743,20 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
     CancelableScope cancelScope(Request);
     cancelScope.Arm();
 
+    // Cold boot: the SEP bootstrap may still be running (see WaitForSepBootstrap).
+    WINBIO_SENSOR_STATUS sepWaitStatus = WINBIO_SENSOR_READY;
+    HRESULT sepWaitHr = S_OK;
+    const SepWait sepWait = WaitForSepBootstrap(cancelScope, &sepWaitStatus, &sepWaitHr);
+    if (sepWait == SepWait::Failed) {
+        T2BioLog("CAPTURE_DATA(verify): SEP bootstrap failed -> sensorStatus=%d hr=0x%08x",
+                 static_cast<int>(sepWaitStatus), static_cast<unsigned>(sepWaitHr));
+        if (!cancelScope.Release()) {
+            return;                      // cancelled meanwhile: Request already completed
+        }
+        CompleteCaptureData(Request, sepWaitHr, sepWaitStatus, 0, {});
+        return;
+    }
+
     VerifyConfig cfg;
     cfg.macosUserId = kDefaultMacosUserId;
     cfg.matchWindow = kCaptureMatchWindow;
@@ -1713,7 +1774,7 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
 
     // Keep the WBF request pending across system sleep / display-off.
     // Never open SEP while the panel is off (power-button path).
-    if (!WaitUntilDisplayAllowsScan(cancelScope, cancelEvent)) {
+    if (sepWait == SepWait::Cancelled || !WaitUntilDisplayAllowsScan(cancelScope, cancelEvent)) {
         outcome = VerifyOutcome::Cancelled;
     } else if (!WaitForSystemResume(cancelScope, cancelEvent, &handledSuspendGeneration)) {
         outcome = VerifyOutcome::Cancelled;
@@ -2153,10 +2214,20 @@ void HandleCaptureData(_In_ WDFREQUEST Request)
         WINBIO_SENSOR_STATUS sensorStatus = WINBIO_SENSOR_READY;
         HRESULT hr = S_OK;
         if (!CheckSepReady(&sensorStatus, &hr)) {
-            T2BioLog("CAPTURE_DATA: SEP not ready yet -> sensorStatus=%d hr=0x%08x, refusing capture",
-                     static_cast<int>(sensorStatus), static_cast<unsigned>(hr));
-            CompleteCaptureData(Request, hr, sensorStatus, 0, {});
-            return;
+            // Verify/identify: "bootstrap still running" (BUSY) is NOT a reason to complete the
+            // request - WBF does not re-arm it and the lock-screen fingerprint stays dead until
+            // a PIN unlock + lock. The worker waits for the bootstrap (WaitForSepBootstrap).
+            // Enroll keeps the old refusal; any real bootstrap failure is refused for all.
+            const bool verifyPurpose = key.Purpose == WINBIO_PURPOSE_VERIFY ||
+                                       key.Purpose == WINBIO_PURPOSE_IDENTIFY;
+            if (!(verifyPurpose && hr == WINBIO_E_DEVICE_BUSY)) {
+                T2BioLog("CAPTURE_DATA: SEP not ready yet -> sensorStatus=%d hr=0x%08x, refusing capture",
+                         static_cast<int>(sensorStatus), static_cast<unsigned>(hr));
+                CompleteCaptureData(Request, hr, sensorStatus, 0, {});
+                return;
+            }
+            T2BioLog("CAPTURE_DATA: SEP bootstrap still running (BUSY) - verify CAPTURE accepted, "
+                     "the worker waits for it instead of refusing");
         }
     }
 
