@@ -23,7 +23,7 @@ rem ============================================================
 rem Enable Windows Test Mode (required for unsigned drivers)
 rem ============================================================
 
-echo [0/6] Enabling Test Mode (bcdedit testsigning)...
+echo [0/7] Enabling Test Mode (bcdedit testsigning)...
 echo.
 
 rem Detect whether testsigning is already configured (localized Yes/No - don't parse value).
@@ -72,7 +72,7 @@ rem ============================================================
 rem 1. Install certificate
 rem ============================================================
 
-echo [1/6] Installing certificates...
+echo [1/7] Installing certificates...
 echo.
 
 if not exist "%ROOT%Inst\InstallCert.bat" (
@@ -101,7 +101,7 @@ rem ============================================================
 rem 2. Install SEP T2TouchIdTransport
 rem ============================================================
 
-echo [2/6] Installing SEP T2TouchIdTransport...
+echo [2/7] Installing SEP T2TouchIdTransport...
 echo.
 
 if not exist "%ROOT%SEP\T2TouchIdTransport.inf" (
@@ -130,7 +130,7 @@ rem ============================================================
 rem 3. Install NCM composite and refresh device list
 rem ============================================================
 
-echo [3/6] Installing Apple T2 composite...
+echo [3/7] Installing Apple T2 composite...
 echo.
 
 if not exist "%ROOT%NCM\apple-t2-composite.inf" (
@@ -173,7 +173,7 @@ rem ============================================================
 rem 4. Install NCM drivers
 rem ============================================================
 
-echo [4/6] Installing Apple T2 NCM drivers...
+echo [4/7] Installing Apple T2 NCM drivers...
 echo.
 
 if not exist "%ROOT%NCM\apple-t2-ncm.inf" (
@@ -232,7 +232,7 @@ rem header comment for the full rationale. Best-effort: a failure here
 rem (e.g. Mac not plugged in yet, adapter not enumerated within 30s) does
 rem not abort the install - the script itself logs what to do instead.
 
-echo [5/6] Assigning static IPv4 to Apple T2 NCM adapter...
+echo [5/7] Assigning static IPv4 to Apple T2 NCM adapter...
 echo.
 
 if not exist "%ROOT%Inst\Set-T2NcmStaticIp.ps1" (
@@ -249,7 +249,7 @@ rem ============================================================
 rem 6. Install T2 Touch ID Bio driver
 rem ============================================================
 
-echo [6/6] Installing T2 Touch ID biometric driver...
+echo [6/7] Installing T2 Touch ID biometric driver...
 echo.
 
 if not exist "%ROOT%Inst\Install-T2TouchIdBio.ps1" (
@@ -271,6 +271,32 @@ if errorlevel 1 (
     exit /b 1
 )
 
+
+rem ============================================================
+rem 7. First-boot ordering: WbioSrvc waits for T2SepBootstrap
+rem ============================================================
+rem T2SepBootstrap only reports Running after the SEP unlock sequence has
+rem finished. Making Windows Biometric Service depend on it stops WBF from
+rem creating the Touch ID unit before the SEP is ready, which is what made
+rem the first fingerprint scan after a restart get no reaction. The script
+rem keeps the existing dependency list, writes a rollback JSON and is
+rem idempotent. Best-effort: a failure does not abort the install (the
+rem sensor then simply behaves as before). Undone by remove-t2-drivers.bat.
+
+echo [7/7] Ordering Windows Biometric Service after T2SepBootstrap...
+echo.
+
+if not exist "%ROOT%Inst\Set-T2TouchIdWbioStartupDependency.ps1" (
+    echo [WARNING] Inst\Set-T2TouchIdWbioStartupDependency.ps1 not found - skipping.
+    echo.
+) else (
+    powershell.exe -NoProfile -ExecutionPolicy Bypass ^
+        -File "%ROOT%Inst\Set-T2TouchIdWbioStartupDependency.ps1"
+    if errorlevel 1 (
+        echo [WARNING] Could not set the WbioSrvc startup dependency - continuing without it.
+    )
+    echo.
+)
 
 rem ============================================================
 rem Refresh devices

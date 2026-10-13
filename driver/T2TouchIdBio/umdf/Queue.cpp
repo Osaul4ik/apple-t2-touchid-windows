@@ -30,6 +30,11 @@ using T2BioSensorAttributes = WINBIO_SENSOR_ATTRIBUTES;   // out of GET_ATTRIBUT
 // the WINBIO_DATA tail, so PayloadSize has to be sizeof(WINBIO_DIAGNOSTICS).
 using T2BioDiagnostics = WINBIO_DIAGNOSTICS;
 
+// This WBDI device does not expose a private sensor-type blob. The optional
+// IOCTL still needs a well-formed success response so WBF can distinguish
+// "no private type data" from a failed sensor request.
+using T2BioPrivateSensorTypeInfo = WINBIO_PRIVATE_SENSOR_TYPE_INFO;
+
 namespace {
 
 // Placeholder identity strings shown by WinBio / Settings.
@@ -290,6 +295,24 @@ void HandleGetSensorStatus(_In_ WDFREQUEST Request)
     out->SensorStatus  = WINBIO_SENSOR_READY;
     out->VendorDiagnostics.Size = 0;
     T2BioLog("  GET_SENSOR_STATUS ok sensorStatus=%d (READY)", static_cast<int>(out->SensorStatus));
+    WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, out->PayloadSize);
+}
+
+void HandleGetPrivateSensorType(_In_ WDFREQUEST Request)
+{
+    bool fits = false;
+    T2BioPrivateSensorTypeInfo* out = RetrieveProbedPayload<T2BioPrivateSensorTypeInfo>(Request, &fits);
+    if (!fits) {
+        return;
+    }
+
+    RtlZeroMemory(out, sizeof(*out));
+    out->PayloadSize = sizeof(*out);
+    out->WinBioHresult = S_OK;
+    out->PrivateSensorTypeInfo.Size = 0;
+
+    T2BioLog("  GET_PRIVATE_SENSOR_TYPE ok (no private data) payload=%lu",
+             static_cast<unsigned long>(out->PayloadSize));
     WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, out->PayloadSize);
 }
 
@@ -2410,6 +2433,10 @@ extern "C" VOID T2BioEvtIoDeviceControl(_In_ WDFQUEUE Queue,
 
     case IOCTL_BIOMETRIC_GET_SENSOR_STATUS:
         HandleGetSensorStatus(Request);
+        return;
+
+    case IOCTL_BIOMETRIC_GET_PRIVATE_SENSOR_TYPE:
+        HandleGetPrivateSensorType(Request);
         return;
 
     case IOCTL_BIOMETRIC_RESET: {

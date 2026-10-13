@@ -983,6 +983,9 @@ jobs:
         # Apple T2 NCM adapter - InstallDriver.bat's new step 5/6 calls this
         # from Inst\, same layout as Install-T2TouchIdBio.ps1 above.
         Copy-Item -Path "tools\Set-T2NcmStaticIp.ps1" -Destination "$inst\Set-T2NcmStaticIp.ps1" -Force
+        # WbioSrvc -> T2SepBootstrap start ordering (InstallDriver.bat step 7/7) + evidence collector.
+        Copy-Item -Path "tools\Set-T2TouchIdWbioStartupDependency.ps1" -Destination "$inst\Set-T2TouchIdWbioStartupDependency.ps1" -Force
+        Copy-Item -Path "tools\Collect-T2TouchIdFirstBootEvidence.ps1" -Destination "$inst\Collect-T2TouchIdFirstBootEvidence.ps1" -Force
         Write-Host "OK: InstallDriver.bat + remove-t2-drivers.bat in package root; InstallCert.bat + Install-T2TouchIdBio.ps1 + Set-T2NcmStaticIp.ps1 in Inst\."
       shell: pwsh
 
@@ -1065,6 +1068,8 @@ jobs:
           "Inst\InstallCert.bat",
           "Inst\Install-T2TouchIdBio.ps1",
           "Inst\Set-T2NcmStaticIp.ps1",
+          "Inst\Set-T2TouchIdWbioStartupDependency.ps1",
+          "Inst\Collect-T2TouchIdFirstBootEvidence.ps1",
           "SEP\$env:SEP_DRIVER_NAME.inf",
           "NCM\apple-t2-ncm.inf", "NCM\apple-t2-ncm-ctrl-stub.inf", "NCM\apple-t2-composite.inf",
           "Bio\$env:BIO_UMDF_NAME.inf",

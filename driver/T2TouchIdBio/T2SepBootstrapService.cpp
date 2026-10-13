@@ -629,6 +629,68 @@ DWORD WINAPI LockWatcherThread(LPVOID)
     return 0;
 }
 
+// WbioSrvc depends on this service (tools/Set-T2TouchIdWbioStartupDependency.ps1),
+// so the SCM waits for SERVICE_RUNNING before starting WbioSrvc. RunBootstrapSequence
+// can legitimately take longer than the SCM's default 30 s start timeout (up to
+// 60 s transport wait + several SEP exchanges). Without periodic START_PENDING
+// checkpoints the SCM would fail this service (event 7009) and, through the
+// dependency, WbioSrvc itself (event 7001/1068) - taking Windows Hello offline.
+// This pump keeps the start "making progress" for a bounded time only: after
+// kStartPendingBudgetMs it stops, so a truly hung sequence still fails instead
+// of holding the boot forever.
+constexpr DWORD kStartPendingBudgetMs = 150000;
+constexpr DWORD kStartPendingPeriodMs = 3000;
+constexpr DWORD kStartPendingWaitHintMs = 10000;
+
+struct StartPendingPump {
+    HANDLE stopEvent = nullptr;
+    HANDLE thread = nullptr;
+};
+
+DWORD WINAPI StartPendingPumpThread(LPVOID param) {
+    auto* pump = static_cast<StartPendingPump*>(param);
+    DWORD elapsed = 0;
+    while (elapsed < kStartPendingBudgetMs) {
+        if (WaitForSingleObject(pump->stopEvent, kStartPendingPeriodMs) == WAIT_OBJECT_0) {
+            return 0;
+        }
+        elapsed += kStartPendingPeriodMs;
+        if (gStatus.dwCurrentState != SERVICE_START_PENDING) {
+            return 0;
+        }
+        gStatus.dwCheckPoint++;
+        gStatus.dwWaitHint = kStartPendingWaitHintMs;
+        SetServiceStatus(gStatusHandle, &gStatus);
+    }
+    Log(L"bootstrap: START_PENDING checkpoint budget exhausted - no more progress reports");
+    return 0;
+}
+
+void StartStartPendingPump(StartPendingPump& pump) {
+    pump.stopEvent = CreateEventW(nullptr, /*manualReset=*/TRUE, /*initialState=*/FALSE, nullptr);
+    if (!pump.stopEvent) return;
+    pump.thread = CreateThread(nullptr, 0, StartPendingPumpThread, &pump, 0, nullptr);
+    if (!pump.thread) {
+        CloseHandle(pump.stopEvent);
+        pump.stopEvent = nullptr;
+    }
+}
+
+// Must complete before the caller sets SERVICE_RUNNING so the two threads
+// never race on gStatus.
+void StopStartPendingPump(StartPendingPump& pump) {
+    if (pump.stopEvent) SetEvent(pump.stopEvent);
+    if (pump.thread) {
+        WaitForSingleObject(pump.thread, INFINITE);
+        CloseHandle(pump.thread);
+        pump.thread = nullptr;
+    }
+    if (pump.stopEvent) {
+        CloseHandle(pump.stopEvent);
+        pump.stopEvent = nullptr;
+    }
+}
+
 DWORD WINAPI ServiceCtrlHandler(DWORD ctrl, DWORD, LPVOID, LPVOID) {
     switch (ctrl) {
         case SERVICE_CONTROL_STOP:
@@ -682,7 +744,10 @@ VOID WINAPI ServiceMain(DWORD, LPWSTR*) {
         // would only cost an IOCTL round-trip for no new information.
         Log(L"bootstrap: Global\\T2SepReady already signaled this session — skipping (SEP already unlocked)");
     } else {
+        StartPendingPump pump;
+        StartStartPendingPump(pump);
         RunBootstrapSequence(readyEvent);
+        StopStartPendingPump(pump);
         // Deliberately does not retry or loop on failure here (file header
         // comment) — a failed bootstrap leaves the event unsignaled, WinBio
         // sees the sensor as not ready, and the design doc's own fallback
@@ -702,6 +767,8 @@ VOID WINAPI ServiceMain(DWORD, LPWSTR*) {
     }
 
     gStatus.dwCurrentState = SERVICE_RUNNING;
+    gStatus.dwCheckPoint = 0;
+    gStatus.dwWaitHint = 0;
     SetServiceStatus(gStatusHandle, &gStatus);
 
     // Stay resident: one-shot bootstrap is done; lock watcher handles

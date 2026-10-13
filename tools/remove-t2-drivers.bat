@@ -40,6 +40,13 @@ echo  Apple T2 driver removal
 echo ============================================================
 echo.
 
+rem Undo the WbioSrvc -> T2SepBootstrap startup dependency (added by
+rem InstallDriver.bat step 7/7) before the drivers go away, so Windows
+rem Biometric Service never waits on a service that no longer does its job.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$k='HKLM:\SYSTEM\CurrentControlSet\Services\WbioSrvc'; $v=(Get-Item -LiteralPath $k).GetValue('DependOnService',$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames); if($v -and ($v -contains 'T2SepBootstrap')){ $n=[string[]]@($v | Where-Object { $_ -ne 'T2SepBootstrap' }); if($n.Count -gt 0){ Set-ItemProperty -LiteralPath $k -Name DependOnService -Type MultiString -Value $n } else { Remove-ItemProperty -LiteralPath $k -Name DependOnService }; Write-Host 'Removed T2SepBootstrap from WbioSrvc dependencies.' } else { Write-Host 'WbioSrvc has no T2SepBootstrap dependency - nothing to undo.' }"
+echo.
+
 call :REMOVE_INF "apple-t2-ncm-ctrl-stub.inf" "Apple T2 USB NCM Control Interface"
 call :REMOVE_INF "apple-t2-ncm.inf"           "Apple T2 USB NCM Network Adapter"
 call :REMOVE_INF "T2TouchIdBio.inf"           "Apple T2 Touch ID (Windows Hello sensor)"
