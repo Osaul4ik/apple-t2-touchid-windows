@@ -5,6 +5,10 @@
 #define T2NCM_ETH_TYPE_IPV6  0x86DDu
 #define T2NCM_IPPROTO_TCP    6u
 #define T2NCM_IPPROTO_UDP    17u
+// Largest MSS let through a tunneled SYN: 1500 - 20 (IPv4 hdr) - 20 (TCP hdr)
+// - 20 (the IPv6/IPv4 header growth) = 1440, so a full segment still fits a
+// 1514-byte frame after the 20-byte expansion.
+#define T2NCM_TUNNEL_MAX_MSS 1440u
 
 static USHORT T2NcmReadBe16(_In_reads_bytes_(2) const UCHAR* p)
 {
@@ -50,14 +54,15 @@ static ULONG T2NcmSumBuffer(_In_reads_bytes_(Len) const UCHAR* Buf, ULONG Len)
 static USHORT T2NcmTcpChecksumV4(
     _In_reads_bytes_(20) const UCHAR* IpHdr,
     _In_reads_bytes_(TcpLen) const UCHAR* Tcp,
-    ULONG TcpLen)
+    ULONG TcpLen,
+    UCHAR Proto)
 {
     ULONG sum = 0;
     sum += ((ULONG)IpHdr[12] << 8) | IpHdr[13];
     sum += ((ULONG)IpHdr[14] << 8) | IpHdr[15];
     sum += ((ULONG)IpHdr[16] << 8) | IpHdr[17];
     sum += ((ULONG)IpHdr[18] << 8) | IpHdr[19];
-    sum += T2NCM_IPPROTO_TCP;
+    sum += Proto;
     sum += TcpLen & 0xFFFF;
     sum += T2NcmSumBuffer(Tcp, TcpLen);
     return (USHORT)~T2NcmChecksumFold(sum);
@@ -67,7 +72,8 @@ static USHORT T2NcmTcpChecksumV6(
     _In_reads_bytes_(16) const UCHAR* Src,
     _In_reads_bytes_(16) const UCHAR* Dst,
     _In_reads_bytes_(TcpLen) const UCHAR* Tcp,
-    ULONG TcpLen)
+    ULONG TcpLen,
+    UCHAR Proto)
 {
     ULONG sum = 0;
     ULONG i;
@@ -77,7 +83,7 @@ static USHORT T2NcmTcpChecksumV6(
         sum += ((ULONG)Dst[i] << 8) | Dst[i + 1];
     sum += (TcpLen >> 16) & 0xFFFF;
     sum += TcpLen & 0xFFFF;
-    sum += T2NCM_IPPROTO_TCP;
+    sum += Proto;
     sum += T2NcmSumBuffer(Tcp, TcpLen);
     return (USHORT)~T2NcmChecksumFold(sum);
 }
@@ -173,6 +179,11 @@ VOID T2NcmTunnelNotePeerFromIpv6Frame(
         return;
 
     newPeer = Frame + 14 + 8;
+    // The peer is a link-local unicast address. Without this, a DAD
+    // Neighbor Solicitation (source ::) or any multicast source replaced the
+    // real peer and every tunneled packet went to the wrong destination.
+    if (newPeer[0] != 0xFE || (newPeer[1] & 0xC0) != 0x80)
+        return;
     wasValid = DeviceContext->TunnelPeerIpv6Valid;
 
     // Log only on first learn or on an actual change (T2 re-addressed,
@@ -192,8 +203,13 @@ VOID T2NcmTunnelNotePeerFromIpv6Frame(
         DeviceContext->TunnelTxPeerUnknownLogged = FALSE; // give the next outage its own log line
     }
 
-    RtlCopyMemory(DeviceContext->TunnelPeerIpv6, newPeer, 16);
-    DeviceContext->TunnelPeerIpv6Valid = TRUE;
+    if (!wasValid || !RtlEqualMemory(DeviceContext->TunnelPeerIpv6, newPeer, 16)) {
+        KIRQL irql;
+        KeAcquireSpinLock(&DeviceContext->TunnelPeerLock, &irql);
+        RtlCopyMemory(DeviceContext->TunnelPeerIpv6, newPeer, 16);
+        DeviceContext->TunnelPeerIpv6Valid = TRUE;
+        KeReleaseSpinLock(&DeviceContext->TunnelPeerLock, irql);
+    }
 }
 
 VOID T2NcmTunnelNoteLocalFromIpv6Frame(
@@ -335,11 +351,23 @@ BOOLEAN T2NcmTunnelRewriteTxIpv4ToIpv6(
         return TRUE;
 
     payloadLen = fl - 14 - ipHdrLen;
+    {
+        // Trust the IPv4 Total Length over the frame length: anything after
+        // it is Ethernet padding and must not enter the IPv6 payload.
+        ULONG totalLen = ((ULONG)Frame[14 + 2] << 8) | Frame[14 + 3];
+        if (totalLen >= ipHdrLen + 8 && 14 + totalLen <= fl)
+            payloadLen = totalLen - ipHdrLen;
+    }
     newFl = 14 + 40 + payloadLen;
     if (newFl > BufferCapacity)
         return FALSE;
 
-    RtlCopyMemory(dst6, DeviceContext->TunnelPeerIpv6, 16);
+    {
+        KIRQL peerIrql;
+        KeAcquireSpinLock(&DeviceContext->TunnelPeerLock, &peerIrql);
+        RtlCopyMemory(dst6, DeviceContext->TunnelPeerIpv6, 16);
+        KeReleaseSpinLock(&DeviceContext->TunnelPeerLock, peerIrql);
+    }
     if (DeviceContext->TunnelLocalIpv6Valid) {
         // Real address Windows actually has bound to this adapter (learned
         // from a native outbound v6 frame). Modern Windows randomizes the
@@ -390,11 +418,44 @@ BOOLEAN T2NcmTunnelRewriteTxIpv4ToIpv6(
             // pseudo-header+segment checksum over up to 60 bytes twice per
             // TX'd TCP frame was pure wasted CPU on the tunnel's hot path;
             // this now does it once.
+            if (tcp[13] & 0x02) { // SYN: keep the tunneled segment inside 1514
+                ULONG o = 20;
+                while (o + 1 < tcpHdrLen) {
+                    UCHAR kind = tcp[o];
+                    ULONG olen;
+                    if (kind == 0)
+                        break;
+                    if (kind == 1) {
+                        o++;
+                        continue;
+                    }
+                    olen = tcp[o + 1];
+                    if (olen < 2 || o + olen > tcpHdrLen)
+                        break;
+                    if (kind == 2 && olen == 4 &&
+                        T2NcmReadBe16(tcp + o + 2) > T2NCM_TUNNEL_MAX_MSS)
+                        T2NcmWriteBe16(tcp + o + 2, T2NCM_TUNNEL_MAX_MSS);
+                    o += olen;
+                }
+            }
             tcp[16] = 0;
             tcp[17] = 0;
-            oldCheck = T2NcmTcpChecksumV6(src6, dst6, tcp, payloadLen);
+            oldCheck = T2NcmTcpChecksumV6(src6, dst6, tcp, payloadLen, T2NCM_IPPROTO_TCP);
             T2NcmWriteBe16(tcp + 16, oldCheck);
         }
+    }
+
+    if (proto == T2NCM_IPPROTO_UDP && payloadLen >= 8) {
+        // IPv6 makes the UDP checksum mandatory and its pseudo-header differs
+        // from IPv4's, so the one the host computed is wrong on the wire.
+        UCHAR* udp = Frame + 14 + 40;
+        USHORT udpCheck;
+        udp[6] = 0;
+        udp[7] = 0;
+        udpCheck = T2NcmTcpChecksumV6(src6, dst6, udp, payloadLen, T2NCM_IPPROTO_UDP);
+        if (udpCheck == 0)
+            udpCheck = 0xFFFF;
+        T2NcmWriteBe16(udp + 6, udpCheck);
     }
 
     // No per-packet T2NCM_LOG here: this runs on every TX'd TCP/UDP frame,
@@ -488,8 +549,19 @@ BOOLEAN T2NcmTunnelRewriteRxIpv6ToIpv4(
         tcp = Frame + 14 + 20;
         tcp[16] = 0;
         tcp[17] = 0;
-        csum = T2NcmTcpChecksumV4(Frame + 14, tcp, payloadLen);
+        csum = T2NcmTcpChecksumV4(Frame + 14, tcp, payloadLen, T2NCM_IPPROTO_TCP);
         T2NcmWriteBe16(tcp + 16, csum);
+    }
+
+    if (nextHdr == T2NCM_IPPROTO_UDP && payloadLen >= 8) {
+        // Checksum was computed over the IPv6 pseudo-header; redo it for IPv4.
+        UCHAR* udp = Frame + 14 + 20;
+        udp[6] = 0;
+        udp[7] = 0;
+        csum = T2NcmTcpChecksumV4(Frame + 14, udp, payloadLen, T2NCM_IPPROTO_UDP);
+        if (csum == 0)
+            csum = 0xFFFF;
+        T2NcmWriteBe16(udp + 6, csum);
     }
 
     // Same reasoning as the TX side above: no per-packet log.

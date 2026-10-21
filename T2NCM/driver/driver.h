@@ -466,6 +466,21 @@ typedef struct _T2NCM_DEVICE_CONTEXT
     // this once NDIS calls into TX" case the previous revision flagged.
     volatile LONG        TxSequence;
 
+    // Bulk-IN read slots retired by a failed read since the last RxStart.
+    // Non-zero asks MiniportCheckForHangEx for a reset (RX recovery).
+    volatile LONG        RxFailedSlots;
+
+    // Serializes SET_ETHERNET_PACKET_FILTER against alt-setting changes
+    // (KMUTEX: does not raise IRQL, control transfers need PASSIVE).
+    KMUTEX               PacketFilterMutex;
+
+    // Shared by users of BulkIn/BulkOutPipe outside the data path (diagnostic
+    // IOCTL); exclusive around SelectSetting, which destroys the pipe objects.
+    ERESOURCE            PipeLock;
+
+    // Guards TunnelPeerIpv6 (written by RX slots / IOCTL, read by TX).
+    KSPIN_LOCK           TunnelPeerLock;
+
     LONG64               TxNtbsSent;
     LONG64               TxFramesSent;
     LONG64               TxFramesRejected;

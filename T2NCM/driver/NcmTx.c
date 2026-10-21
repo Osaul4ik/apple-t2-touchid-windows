@@ -425,8 +425,14 @@ T2NcmTxSubmitNetBuffer(
     frameLength = NET_BUFFER_DATA_LENGTH(NetBuffer);
 
     // +20 headroom so IPv4→IPv6 tunnel rewrite can expand the datagram.
-    status = T2NcmTxComputeLayout(DeviceContext, frameLength + 20,
-        &ndpOffset, &ndpLength, &datagramOffset, &blockLength);
+    // Headroom only when the tunnel is on: in native mode it just put 20
+    // zero bytes into every NTB's wBlockLength.
+    status = STATUS_INVALID_PARAMETER;
+    if (DeviceContext->TunnelModeEnabled)
+    {
+        status = T2NcmTxComputeLayout(DeviceContext, frameLength + 20,
+            &ndpOffset, &ndpLength, &datagramOffset, &blockLength);
+    }
     if (!NT_SUCCESS(status))
     {
         status = T2NcmTxComputeLayout(DeviceContext, frameLength,
@@ -647,8 +653,9 @@ T2NcmTxSendNetBufferLists(
 // Synchronous diagnostic path (IOCTL_T2NCM_SEND_TEST_FRAME)
 // ---------------------------------------------------------------------
 
+static
 NTSTATUS
-T2NcmTxSendFrame(
+T2NcmTxSendFrameLocked(
     _In_ PT2NCM_DEVICE_CONTEXT DeviceContext,
     _In_reads_bytes_(FrameLength) const UCHAR* Frame,
     _In_ ULONG FrameLength
@@ -742,6 +749,27 @@ T2NcmTxSendFrame(
         sequence, blockLength, FrameLength));
 
     return STATUS_SUCCESS;
+}
+
+// Holds PipeLock shared for the whole write: Activate/Deactivate take it
+// exclusive around SelectSetting, so BulkOutPipe cannot be NULLed or
+// destroyed under this synchronous write.
+NTSTATUS
+T2NcmTxSendFrame(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext,
+    _In_reads_bytes_(FrameLength) const UCHAR* Frame,
+    _In_ ULONG FrameLength
+    )
+{
+    NTSTATUS status;
+
+    KeEnterCriticalRegion();
+    ExAcquireResourceSharedLite(&DeviceContext->PipeLock, TRUE);
+    status = T2NcmTxSendFrameLocked(DeviceContext, Frame, FrameLength);
+    ExReleaseResourceLite(&DeviceContext->PipeLock);
+    KeLeaveCriticalRegion();
+
+    return status;
 }
 
 // ---------------------------------------------------------------------

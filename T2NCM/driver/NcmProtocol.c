@@ -122,6 +122,31 @@ T2NcmValidateNdpGeometry(
     return TRUE;
 }
 
+// Control transfers are synchronous and run inside InitializeEx, the D0
+// OID and MiniportRestart: a T2 that never answers must not be able to
+// hang NDIS (resume -> bugcheck 0x9F). Bounded like the bulk-OUT writes.
+#define T2NCM_CONTROL_TIMEOUT_MS  3000
+
+static
+NTSTATUS
+T2NcmControlTransfer(
+    _In_ WDFUSBDEVICE UsbDevice,
+    _In_ PWDF_USB_CONTROL_SETUP_PACKET SetupPacket,
+    _In_opt_ PWDF_MEMORY_DESCRIPTOR MemoryDescriptor,
+    _Out_opt_ PULONG BytesTransferred
+    )
+{
+    WDF_REQUEST_SEND_OPTIONS options;
+
+    WDF_REQUEST_SEND_OPTIONS_INIT(&options, WDF_REQUEST_SEND_OPTION_TIMEOUT);
+    WDF_REQUEST_SEND_OPTIONS_SET_TIMEOUT(&options,
+        WDF_REL_TIMEOUT_IN_MS(T2NCM_CONTROL_TIMEOUT_MS));
+
+    return WdfUsbTargetDeviceSendControlTransferSynchronously(
+        UsbDevice, WDF_NO_HANDLE, &options, SetupPacket,
+        MemoryDescriptor, BytesTransferred);
+}
+
 NTSTATUS
 T2NcmGetNtbParameters(
     _In_  PT2NCM_DEVICE_CONTEXT DeviceContext,
@@ -147,13 +172,7 @@ T2NcmGetNtbParameters(
 
     WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&memDesc, &wire, (ULONG)sizeof(wire));
 
-    status = WdfUsbTargetDeviceSendControlTransferSynchronously(
-        DeviceContext->UsbDevice,
-        WDF_NO_HANDLE,
-        NULL,
-        &setupPacket,
-        &memDesc,
-        &bytesReturned);
+    status = T2NcmControlTransfer(DeviceContext->UsbDevice, &setupPacket, &memDesc, &bytesReturned);
 
     if (!NT_SUCCESS(status))
     {
@@ -274,13 +293,7 @@ T2NcmNegotiateNtbFormat(
         (USHORT)T2NCM_NTB_FORMAT_16,
         (USHORT)T2NCM_CONTROL_IFACE_NUM);
 
-    status = WdfUsbTargetDeviceSendControlTransferSynchronously(
-        DeviceContext->UsbDevice,
-        WDF_NO_HANDLE,
-        NULL,
-        &setupPacket,
-        NULL,
-        NULL);
+    status = T2NcmControlTransfer(DeviceContext->UsbDevice, &setupPacket, NULL, NULL);
 
     if (!NT_SUCCESS(status))
     {
@@ -339,13 +352,7 @@ T2NcmSetNtbInputSize(
 
     WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&memDesc, &dwNtbInputSize, (ULONG)sizeof(dwNtbInputSize));
 
-    status = WdfUsbTargetDeviceSendControlTransferSynchronously(
-        DeviceContext->UsbDevice,
-        WDF_NO_HANDLE,
-        NULL,
-        &setupPacket,
-        &memDesc,
-        NULL);
+    status = T2NcmControlTransfer(DeviceContext->UsbDevice, &setupPacket, &memDesc, NULL);
 
     if (!NT_SUCCESS(status))
     {
@@ -616,13 +623,7 @@ T2NcmSetEthernetPacketFilter(
         CdcFilter,
         (USHORT)T2NCM_CONTROL_IFACE_NUM);
 
-    status = WdfUsbTargetDeviceSendControlTransferSynchronously(
-        DeviceContext->UsbDevice,
-        WDF_NO_HANDLE,
-        NULL,
-        &setupPacket,
-        NULL,   // no data stage
-        NULL);
+    status = T2NcmControlTransfer(DeviceContext->UsbDevice, &setupPacket, NULL, NULL);
 
     if (!NT_SUCCESS(status))
     {
@@ -650,23 +651,52 @@ T2NcmApplyPacketFilter(
     _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
     )
 {
-    USHORT desired = T2NcmNdisFilterToCdcFilter(
-        T2NcmReadPacketFilter(DeviceContext),
-        DeviceContext->MacAddressIsPermanent);
+    NTSTATUS status;
 
-    // Skip the control transfer when the device already holds exactly
-    // this filter. CdcPacketFilterApplied is cleared by
-    // T2NcmUsbActivateDataInterface on every SET_INTERFACE (the device
-    // drops its filter then), so a TRUE flag here means the value in
-    // CdcPacketFilter is what the device is really holding. Removes the
-    // 4-5 identical back-to-back requests seen right after arm/restart.
-    if (DeviceContext->CdcPacketFilterApplied &&
-        DeviceContext->CdcPacketFilter == desired)
+    // Control transfers are PASSIVE-only; the mutex below also waits.
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL)
     {
-        return STATUS_SUCCESS;
+        return STATUS_INVALID_DEVICE_STATE;
     }
 
-    return T2NcmSetEthernetPacketFilter(DeviceContext, desired);
+    // Serialized against Activate/Deactivate (UsbTransport.c). The check and
+    // the transfer are one unit: a filter sent while the interface is parked
+    // or the device is in Dx would be recorded as applied and then wiped by
+    // the next SET_INTERFACE, which T2NcmApplyPacketFilter would never redo.
+    (VOID)KeWaitForSingleObject(&DeviceContext->PacketFilterMutex,
+        Executive, KernelMode, FALSE, NULL);
+
+    if (DeviceContext->PowerState != NdisDeviceStateD0 ||
+        DeviceContext->UsbDevice == NULL ||
+        DeviceContext->BulkInPipe == NULL)
+    {
+        // Not an error: PowerArmHardware / MiniportRestart re-apply the
+        // current NDIS filter right after alt 1 is selected.
+        status = STATUS_INVALID_DEVICE_STATE;
+    }
+    else
+    {
+        USHORT desired = T2NcmNdisFilterToCdcFilter(
+            T2NcmReadPacketFilter(DeviceContext),
+            DeviceContext->MacAddressIsPermanent);
+
+        // CdcPacketFilterApplied is cleared on every SET_INTERFACE
+        // (Activate and Deactivate), so TRUE means the device really holds
+        // CdcPacketFilter.
+        if (DeviceContext->CdcPacketFilterApplied &&
+            DeviceContext->CdcPacketFilter == desired)
+        {
+            status = STATUS_SUCCESS;
+        }
+        else
+        {
+            status = T2NcmSetEthernetPacketFilter(DeviceContext, desired);
+        }
+    }
+
+    (VOID)KeReleaseMutex(&DeviceContext->PacketFilterMutex, FALSE);
+
+    return status;
 }
 
 EVT_WDF_WORKITEM T2NcmEvtPacketFilterWorkItem;

@@ -191,6 +191,8 @@ T2NcmDeviceCreate(
 
     KeInitializeEvent(&context->QuiesceEvent, NotificationEvent, FALSE);
     KeInitializeSpinLock(&context->MulticastLock);
+    KeInitializeSpinLock(&context->TunnelPeerLock);
+    KeInitializeMutex(&context->PacketFilterMutex, 0);
 
     // BUGFIX (memory leak): WDF_NO_OBJECT_ATTRIBUTES here means "no
     // explicit parent", and per KMDF's documented default, an object
@@ -266,6 +268,10 @@ T2NcmDeviceCreate(
             context->RecoveryWorkItem = NULL;
         }
     }
+
+    // Last on purpose: every failure path above returns before this exists.
+    // Deleted in MiniportHaltEx / the MiniportInitializeEx Fail path.
+    (VOID)ExInitializeResourceLite(&context->PipeLock);
 
     *Device = device;
     *DeviceContext = context;

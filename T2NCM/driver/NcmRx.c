@@ -859,6 +859,14 @@ T2NcmEvtRxReadComplete(
         T2NcmRxHandleRead(deviceContext, readContext,
             Params->Parameters.Usb.Completion->Parameters.PipeRead.Length);
 
+        // RX is alive; a reset triggered by RX must not count towards the
+        // TX-stuck escalation (device restart) while TX itself is healthy.
+        if (deviceContext->TxConsecutiveResets != 0 &&
+            deviceContext->TxConsecutiveFailures == 0)
+        {
+            InterlockedExchange(&deviceContext->TxConsecutiveResets, 0);
+        }
+
         if (deviceContext->RxReadsRunning != 0)
         {
             WDF_REQUEST_REUSE_PARAMS reuse;
@@ -893,6 +901,8 @@ T2NcmEvtRxReadComplete(
             "T2Ncm: RX bulk-IN read failed (status=0x%08X) - slot retired, "
             "not re-armed until the adapter is restarted\n", status));
         InterlockedIncrement64(&deviceContext->InErrors);
+        // Nothing re-arms this slot; ask CheckForHang for a reset.
+        InterlockedIncrement(&deviceContext->RxFailedSlots);
     }
     // else: a stop is in progress and this is the cancelled read coming
     // back. AppleUSBVHCI reports that as 0xC0000001, which is expected
@@ -1098,6 +1108,8 @@ T2NcmRxStart(
         readContext->DeviceContext = DeviceContext;
         readContext->Memory        = memory;
     }
+
+    InterlockedExchange(&DeviceContext->RxFailedSlots, 0);
 
     // Open the gate before the first send: a completion can arrive before
     // the loop below has submitted every slot.

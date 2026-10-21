@@ -283,8 +283,13 @@ T2NcmDispatchDeviceControl(
             status = STATUS_INVALID_PARAMETER;
             break;
         }
-        RtlCopyMemory(context->TunnelPeerIpv6, Irp->AssociatedIrp.SystemBuffer, 16);
-        context->TunnelPeerIpv6Valid = TRUE;
+        {
+            KIRQL peerIrql;
+            KeAcquireSpinLock(&context->TunnelPeerLock, &peerIrql);
+            RtlCopyMemory(context->TunnelPeerIpv6, Irp->AssociatedIrp.SystemBuffer, 16);
+            context->TunnelPeerIpv6Valid = TRUE;
+            KeReleaseSpinLock(&context->TunnelPeerLock, peerIrql);
+        }
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
             "T2Ncm: TunnelPeerIpv6 set via IOCTL (tunnel rewrite armed)\n"));
         status = STATUS_SUCCESS;
@@ -813,6 +818,7 @@ Fail:
         T2NcmUsbDeactivateDataInterface(context);
         T2NcmRxFreeResources(context);
         T2NcmUsbReleaseHardware(context);
+        ExDeleteResourceLite(&context->PipeLock);
         WdfSpinLockAcquire(context->StateLock);
         context->State = T2NcmStateReleased;
         WdfSpinLockRelease(context->StateLock);
@@ -852,6 +858,10 @@ T2NcmMiniportHaltEx(
     {
         WdfWorkItemFlush(context->RecoveryWorkItem);
     }
+    if (context->PacketFilterWorkItem != NULL)
+    {
+        WdfWorkItemFlush(context->PacketFilterWorkItem);
+    }
     T2NcmRxStop(context);
     T2NcmTxCancelOutstanding(context);
     T2NcmWaitForDrain(context);
@@ -864,6 +874,7 @@ T2NcmMiniportHaltEx(
     T2NcmUsbDeactivateDataInterface(context);
     T2NcmRxFreeResources(context);
     T2NcmUsbReleaseHardware(context);
+    ExDeleteResourceLite(&context->PipeLock);
 
     T2NcmForceSetState(context, T2NcmStateReleased);
 
@@ -908,6 +919,10 @@ T2NcmMiniportPause(
     if (context->RecoveryWorkItem != NULL)
     {
         WdfWorkItemFlush(context->RecoveryWorkItem);
+    }
+    if (context->PacketFilterWorkItem != NULL)
+    {
+        WdfWorkItemFlush(context->PacketFilterWorkItem);
     }
 
     (VOID)T2NcmTrySetState(context, T2NcmStateRunning, T2NcmStateStopping);
@@ -1001,6 +1016,12 @@ T2NcmMiniportRestart(
     {
         return NDIS_STATUS_FAILURE;
     }
+
+    // Failure bookkeeping from before the pause must not survive it, or
+    // CheckForHang fires a reset right after every resume.
+    InterlockedExchange(&context->TxConsecutiveFailures, 0);
+    InterlockedExchange(&context->TxConsecutiveResets, 0);
+    InterlockedExchange(&context->TxHangLastCompleted, context->TxCompletedCount);
 
     // Open the gate BEFORE arming the reader: a read completion that
     // lands between WdfIoTargetStart and the flag being set would
@@ -1156,6 +1177,25 @@ T2NcmOidQueryCopy(
     return NDIS_STATUS_SUCCESS;
 }
 
+// OID_GEN_XMIT_OK / OID_GEN_RCV_OK: 8 bytes when the caller has room, the
+// low 32 bits when it only offers 4 (NDIS 5-style callers).
+static
+NDIS_STATUS
+T2NcmOidQueryCounter(
+    _In_ PNDIS_OID_REQUEST Request,
+    _In_ ULONG64 Value
+    )
+{
+    ULONG available = Request->DATA.QUERY_INFORMATION.InformationBufferLength;
+
+    if (available >= sizeof(ULONG) && available < sizeof(ULONG64))
+    {
+        ULONG value32 = (ULONG)Value;
+        return T2NcmOidQueryCopy(Request, &value32, sizeof(value32));
+    }
+    return T2NcmOidQueryCopy(Request, &Value, sizeof(Value));
+}
+
 static
 NDIS_STATUS
 T2NcmOidQuery(
@@ -1279,12 +1319,12 @@ T2NcmOidQuery(
     case OID_GEN_XMIT_OK:
         genericUlong64 = (ULONG64)(DeviceContext->OutUcastPkts +
             DeviceContext->OutMulticastPkts + DeviceContext->OutBroadcastPkts);
-        return T2NcmOidQueryCopy(Request, &genericUlong64, sizeof(genericUlong64));
+        return T2NcmOidQueryCounter(Request, genericUlong64);
 
     case OID_GEN_RCV_OK:
         genericUlong64 = (ULONG64)(DeviceContext->InUcastPkts +
             DeviceContext->InMulticastPkts + DeviceContext->InBroadcastPkts);
-        return T2NcmOidQueryCopy(Request, &genericUlong64, sizeof(genericUlong64));
+        return T2NcmOidQueryCounter(Request, genericUlong64);
 
     case OID_GEN_STATISTICS:
     {
@@ -1575,8 +1615,10 @@ T2NcmMiniportDevicePnPEventNotify(
         // further USB I/O is started against a device that is gone,
         // since every one of those would now fail and be counted as a
         // transmit error.
+        // Gate only: this notification can arrive at IRQL <= DISPATCH_LEVEL
+        // and T2NcmRxStop needs PASSIVE (stops targets, sleeps). The real
+        // teardown is MiniportHaltEx.
         InterlockedExchange(&context->DataPathRunning, 0);
-        T2NcmRxStop(context);
         break;
 
     case NdisDevicePnPEventPowerProfileChanged:
@@ -1618,6 +1660,14 @@ T2NcmMiniportCheckForHangEx(
     if (context->DataPathRunning == 0)
     {
         return FALSE;
+    }
+
+    if (context->RxFailedSlots != 0)
+    {
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+            "T2Ncm: CheckForHang - %ld bulk-IN read slot(s) retired by errors, "
+            "requesting reset\n", context->RxFailedSlots));
+        return TRUE;
     }
 
     if (context->OutstandingTxRequests != 0 && completed == previous)
@@ -1714,6 +1764,16 @@ T2NcmEvtRecoveryWorkItem(
             }
 
             T2NcmRxStop(context);
+
+            // Clears a halted/stalled bulk-IN endpoint and its data toggle.
+            if (context->BulkInPipe != NULL)
+            {
+                NTSTATUS inStatus = WdfUsbTargetPipeResetSynchronously(
+                    context->BulkInPipe, NULL, NULL);
+                T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
+                    "T2Ncm: bulk-IN pipe reset -> 0x%08X\n", inStatus));
+            }
+
             if (context->DataPathRunning != 0)
             {
                 status = T2NcmRxStart(context);
@@ -1737,7 +1797,9 @@ T2NcmEvtRecoveryWorkItem(
     if (restartDevice)
     {
         InterlockedExchange(&context->TxConsecutiveResets, 0);
-        WdfDeviceSetFailed(context->WdfDevice, WdfDeviceFailedAttemptRestart);
+        // NOT WdfDeviceSetFailed: the WDFDEVICE is miniport-mode and only a
+        // short whitelist of device methods is legal on it.
+        NdisMRemoveMiniport(context->MiniportAdapterHandle);
     }
 }
 

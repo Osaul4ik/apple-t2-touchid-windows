@@ -158,8 +158,9 @@ T2NcmUsbSelectDataAltSetting(
         DeviceContext->DataInterface, WDF_NO_OBJECT_ATTRIBUTES, &params);
 }
 
+static
 NTSTATUS
-T2NcmUsbActivateDataInterface(
+T2NcmUsbActivateDataInterfaceLocked(
     _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
     )
 {
@@ -179,6 +180,12 @@ T2NcmUsbActivateDataInterface(
             T2NCM_DATA_ALT_ACTIVE, status));
         return status;
     }
+
+    // SET_INTERFACE made the device drop its Ethernet packet filter. Clear
+    // the cached copy HERE, not only on deactivate: a filter pushed while
+    // the interface was parked would otherwise read as still applied and
+    // T2NcmApplyPacketFilter would skip the request (silent RX).
+    DeviceContext->CdcPacketFilterApplied = FALSE;
 
     // T2NcmUsbSelectDataAltSetting above already made alt 1 the
     // interface's current setting, so the pipe queries below reflect it.
@@ -275,8 +282,48 @@ Unwind:
 
     return status;
 }
+static
 VOID
-T2NcmUsbDeactivateDataInterface(
+T2NcmUsbLockPipes(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
+    )
+{
+    // Lock order: PipeLock, then PacketFilterMutex. T2NcmApplyPacketFilter
+    // only ever takes the mutex.
+    KeEnterCriticalRegion();
+    ExAcquireResourceExclusiveLite(&DeviceContext->PipeLock, TRUE);
+    (VOID)KeWaitForSingleObject(&DeviceContext->PacketFilterMutex,
+        Executive, KernelMode, FALSE, NULL);
+}
+
+static
+VOID
+T2NcmUsbUnlockPipes(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
+    )
+{
+    (VOID)KeReleaseMutex(&DeviceContext->PacketFilterMutex, FALSE);
+    ExReleaseResourceLite(&DeviceContext->PipeLock);
+    KeLeaveCriticalRegion();
+}
+
+NTSTATUS
+T2NcmUsbActivateDataInterface(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
+    )
+{
+    NTSTATUS status;
+
+    T2NcmUsbLockPipes(DeviceContext);
+    status = T2NcmUsbActivateDataInterfaceLocked(DeviceContext);
+    T2NcmUsbUnlockPipes(DeviceContext);
+
+    return status;
+}
+
+static
+VOID
+T2NcmUsbDeactivateDataInterfaceLocked(
     _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
     )
 {
@@ -320,4 +367,14 @@ T2NcmUsbDeactivateDataInterface(
 
     T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_TRACE_LEVEL,
         "T2Ncm: MI_01 parked on alt %u\n", T2NCM_DATA_ALT_IDLE));
+}
+
+VOID
+T2NcmUsbDeactivateDataInterface(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
+    )
+{
+    T2NcmUsbLockPipes(DeviceContext);
+    T2NcmUsbDeactivateDataInterfaceLocked(DeviceContext);
+    T2NcmUsbUnlockPipes(DeviceContext);
 }
