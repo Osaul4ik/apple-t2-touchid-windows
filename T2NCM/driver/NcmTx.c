@@ -321,6 +321,22 @@ T2NcmTxCompleteNetBuffer(
     }
 }
 
+// Asks the recovery work item to reset the bulk-OUT pipe. Callable at
+// DISPATCH_LEVEL. Coalesces: the flag is consumed by the work item.
+VOID
+T2NcmTxRequestPipeRecovery(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
+    )
+{
+    if (DeviceContext->RecoveryWorkItem == NULL)
+    {
+        return;
+    }
+
+    InterlockedExchange(&DeviceContext->TxRecoverPending, 1);
+    WdfWorkItemEnqueue(DeviceContext->RecoveryWorkItem);
+}
+
 EVT_WDF_REQUEST_COMPLETION_ROUTINE T2NcmEvtTxWriteComplete;
 
 VOID
@@ -366,6 +382,19 @@ T2NcmEvtTxWriteComplete(
             requestContext->DatagramOffset,
             requestContext->FrameLength);
         ndisStatus = NDIS_STATUS_SUCCESS;
+    }
+
+    InterlockedIncrement(&deviceContext->TxCompletedCount);
+
+    // A write that failed or timed out while the data path is meant to be
+    // running may have left the bulk-OUT endpoint halted or wedged, and
+    // every later write would then fail or hang the same way. Reset the
+    // pipe (PASSIVE_LEVEL, so from the work item). Failures caused by
+    // MiniportPause cancelling writes are excluded: the gate is already
+    // closed then.
+    if (ndisStatus != NDIS_STATUS_SUCCESS && deviceContext->DataPathRunning != 0)
+    {
+        T2NcmTxRequestPipeRecovery(deviceContext);
     }
 
     T2NcmTxCompleteNetBuffer(deviceContext, requestContext->NetBufferList, ndisStatus);
@@ -774,5 +803,53 @@ T2NcmTxResume(
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
             "T2Ncm: WdfIoTargetStart(BulkOutPipe) failed (0x%08X)\n", status));
     }
+    return status;
+}
+
+// Microsoft's recovery sequence for a bulk pipe whose transfers failed or
+// timed out: stop the target and cancel everything sent to it, reset the
+// pipe (clears a halt/stall condition and the host-side data toggle), and
+// start the target again. PASSIVE_LEVEL only.
+NTSTATUS
+T2NcmTxRecoverPipe(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
+    )
+{
+    WDFUSBPIPE pipe = DeviceContext->BulkOutPipe;
+    NTSTATUS status;
+
+    NT_ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
+
+    if (pipe == NULL)
+    {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
+    WdfIoTargetStop(WdfUsbTargetPipeGetIoTarget(pipe), WdfIoTargetCancelSentIo);
+
+    status = WdfUsbTargetPipeResetSynchronously(pipe, NULL, NULL);
+    InterlockedIncrement(&DeviceContext->TxPipeResetCount);
+
+    T2NCM_LOG((T2NCM_DPFLTR_ID,
+        NT_SUCCESS(status) ? DPFLTR_WARNING_LEVEL : DPFLTR_ERROR_LEVEL,
+        "T2Ncm: bulk-OUT pipe reset -> 0x%08X (resets so far: %ld)\n",
+        status, DeviceContext->TxPipeResetCount));
+
+    // Start regardless: leaving the target stopped would fail every
+    // later send until the next Pause/Restart cycle.
+    {
+        NTSTATUS startStatus = WdfIoTargetStart(WdfUsbTargetPipeGetIoTarget(pipe));
+        if (!NT_SUCCESS(startStatus))
+        {
+            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+                "T2Ncm: WdfIoTargetStart(BulkOutPipe) after reset failed 0x%08X\n",
+                startStatus));
+            if (NT_SUCCESS(status))
+            {
+                status = startStatus;
+            }
+        }
+    }
+
     return status;
 }

@@ -245,6 +245,28 @@ T2NcmDeviceCreate(
         }
     }
 
+    // Work item that runs the PASSIVE_LEVEL half of TX recovery (bulk-OUT
+    // pipe reset) and of MiniportResetEx. Non-fatal if it cannot be
+    // created: pipe recovery is then skipped and ResetEx fails.
+    {
+        WDF_WORKITEM_CONFIG workItemConfig;
+        WDF_OBJECT_ATTRIBUTES workItemAttributes;
+
+        WDF_WORKITEM_CONFIG_INIT(&workItemConfig, T2NcmEvtRecoveryWorkItem);
+        WDF_OBJECT_ATTRIBUTES_INIT(&workItemAttributes);
+        workItemAttributes.ParentObject = device;
+
+        status = WdfWorkItemCreate(&workItemConfig, &workItemAttributes,
+            &context->RecoveryWorkItem);
+        if (!NT_SUCCESS(status))
+        {
+            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
+                "T2Ncm: WdfWorkItemCreate (recovery) failed 0x%08X - TX pipe "
+                "recovery and MiniportResetEx are unavailable\n", status));
+            context->RecoveryWorkItem = NULL;
+        }
+    }
+
     *Device = device;
     *DeviceContext = context;
 

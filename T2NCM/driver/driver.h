@@ -358,6 +358,19 @@ typedef struct _T2NCM_DEVICE_CONTEXT
     volatile LONG        DrainTimeoutCount;
     KEVENT               QuiesceEvent;
 
+    // ---- TX hang detection / recovery ----
+    // TxCompletedCount advances on every bulk-OUT completion (any
+    // status). MiniportCheckForHangEx declares a hang when writes are
+    // outstanding and this has not moved since the previous check.
+    volatile LONG        TxCompletedCount;
+    volatile LONG        TxHangLastCompleted;
+    // Requests for the recovery work item (PASSIVE_LEVEL work that
+    // cannot run in a completion routine or in MiniportResetEx).
+    volatile LONG        TxRecoverPending;   // reset the bulk-OUT pipe
+    volatile LONG        ResetPending;       // MiniportResetEx awaiting NdisMResetComplete
+    volatile LONG        TxPipeResetCount;   // diagnostic
+    WDFWORKITEM          RecoveryWorkItem;
+
     // Current D-state as told to us by OID_PNP_SET_POWER. NDIS owns
     // this value; the driver only reacts to it (Power.c).
     NDIS_DEVICE_POWER_STATE PowerState;
@@ -466,6 +479,8 @@ typedef struct _T2NCM_DEVICE_CONTEXT
 } T2NCM_DEVICE_CONTEXT, *PT2NCM_DEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(T2NCM_DEVICE_CONTEXT, T2NcmGetDeviceContext)
+
+EVT_WDF_WORKITEM T2NcmEvtRecoveryWorkItem;
 
 // Atomic accessors for PacketFilter (volatile LONG). Keep all call sites
 // on these helpers so Interlocked always sees LONG volatile * — matching

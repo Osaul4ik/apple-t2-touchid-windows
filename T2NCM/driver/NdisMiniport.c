@@ -633,10 +633,11 @@ T2NcmMiniportInitializeEx(
         NDIS_MINIPORT_ATTRIBUTES_NDIS_WDM |
         NDIS_MINIPORT_ATTRIBUTES_NO_HALT_ON_SUSPEND;
 
-    // 0 = no CheckForHangEx polling. There is no hardware watchdog to
-    // implement it against: a wedged NCM endpoint looks exactly like an
-    // idle one from here, so a hang check could only ever guess.
-    registrationAttributes.CheckForHangTimeInSeconds = 0;
+    // CheckForHangEx polling for stuck transmits. Interval is longer than
+    // the per-write timeout (T2NCM_TX_WRITE_TIMEOUT_MS), so a hang is
+    // only ever reported when the timeout itself failed to free the
+    // writes. NDIS then calls MiniportResetEx.
+    registrationAttributes.CheckForHangTimeInSeconds = 4;
     registrationAttributes.InterfaceType = NdisInterfacePNPBus;
 
     ndisStatus = NdisMSetMiniportAttributes(NdisMiniportHandle,
@@ -847,7 +848,12 @@ T2NcmMiniportHaltEx(
     // surprise removal can reach halt through paths where that is less
     // obvious; all of these are idempotent.
     InterlockedExchange(&context->DataPathRunning, 0);
+    if (context->RecoveryWorkItem != NULL)
+    {
+        WdfWorkItemFlush(context->RecoveryWorkItem);
+    }
     T2NcmRxStop(context);
+    T2NcmTxCancelOutstanding(context);
     T2NcmWaitForDrain(context);
 
     // Deregister first so no new IRPs arrive, then withdraw the pointer:
@@ -896,6 +902,13 @@ T2NcmMiniportPause(
     // flight. Doing it the other way round leaves a window where the
     // reader has stopped but an in-flight completion still indicates.
     InterlockedExchange(&context->DataPathRunning, 0);
+
+    // Let a running recovery/reset work item finish before tearing down
+    // underneath it. With the gate closed no new recovery is requested.
+    if (context->RecoveryWorkItem != NULL)
+    {
+        WdfWorkItemFlush(context->RecoveryWorkItem);
+    }
 
     (VOID)T2NcmTrySetState(context, T2NcmStateRunning, T2NcmStateStopping);
 
@@ -1577,8 +1590,41 @@ T2NcmMiniportDevicePnPEventNotify(
     }
 }
 
+MINIPORT_CHECK_FOR_HANG T2NcmMiniportCheckForHangEx;
+
+// Called by NDIS every CheckForHangTimeInSeconds at IRQL <= DISPATCH_LEVEL.
+// TRUE makes NDIS call MiniportResetEx. A hang is: the data path is
+// running, bulk-OUT writes are outstanding, and not one write completed
+// (successfully or not) since the previous check.
+BOOLEAN
+T2NcmMiniportCheckForHangEx(
+    _In_ NDIS_HANDLE MiniportAdapterContext
+    )
+{
+    PT2NCM_DEVICE_CONTEXT context = (PT2NCM_DEVICE_CONTEXT)MiniportAdapterContext;
+    LONG completed = context->TxCompletedCount;
+    LONG previous = InterlockedExchange(&context->TxHangLastCompleted, completed);
+
+    if (context->DataPathRunning != 0 &&
+        context->OutstandingTxRequests != 0 &&
+        completed == previous)
+    {
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+            "T2Ncm: CheckForHang - %ld TX write(s) outstanding with no "
+            "completion since the last check, requesting reset\n",
+            context->OutstandingTxRequests));
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
 MINIPORT_RESET T2NcmMiniportResetEx;
 
+// MiniportResetEx runs at IRQL <= DISPATCH_LEVEL and must not block, but
+// recovery needs PASSIVE_LEVEL work (stopping I/O targets, a pipe reset,
+// restarting the reader). So: queue the work item, return
+// NDIS_STATUS_PENDING, and finish with NdisMResetComplete from the item.
 NDIS_STATUS
 T2NcmMiniportResetEx(
     _In_  NDIS_HANDLE MiniportAdapterContext,
@@ -1586,7 +1632,6 @@ T2NcmMiniportResetEx(
     )
 {
     PT2NCM_DEVICE_CONTEXT context = (PT2NCM_DEVICE_CONTEXT)MiniportAdapterContext;
-    NTSTATUS status;
 
     // FALSE: the station address, packet filter and multicast list are
     // all held in software here and survive a reset untouched, so NDIS
@@ -1594,27 +1639,66 @@ T2NcmMiniportResetEx(
     *AddressingReset = FALSE;
 
     T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
-        "T2Ncm: MiniportResetEx - restarting the RX engine\n"));
+        "T2Ncm: MiniportResetEx - deferring to the recovery work item\n"));
 
-    T2NcmRxStop(context);
-
-    if (context->DataPathRunning == 0)
+    if (context->RecoveryWorkItem == NULL)
     {
-        // Reset while paused: nothing to bring back up, and starting the
-        // reader here would be the driver deciding on its own that
-        // frames may flow again. MiniportRestart will do it.
-        return NDIS_STATUS_SUCCESS;
-    }
-
-    status = T2NcmRxStart(context);
-    if (!NT_SUCCESS(status))
-    {
-        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2Ncm: RX engine did not come back after reset (0x%08X)\n", status));
         return NDIS_STATUS_FAILURE;
     }
 
-    return NDIS_STATUS_SUCCESS;
+    InterlockedExchange(&context->ResetPending, 1);
+    WdfWorkItemEnqueue(context->RecoveryWorkItem);
+    return NDIS_STATUS_PENDING;
+}
+
+// PASSIVE_LEVEL half of TX pipe recovery and of MiniportResetEx.
+VOID
+T2NcmEvtRecoveryWorkItem(
+    _In_ WDFWORKITEM WorkItem
+    )
+{
+    PT2NCM_DEVICE_CONTEXT context =
+        T2NcmGetDeviceContext(WdfWorkItemGetParentObject(WorkItem));
+    BOOLEAN reset = (InterlockedExchange(&context->ResetPending, 0) != 0);
+    BOOLEAN recover = (InterlockedExchange(&context->TxRecoverPending, 0) != 0);
+    NDIS_STATUS resetStatus = NDIS_STATUS_SUCCESS;
+
+    if (!reset && !recover)
+    {
+        return;
+    }
+
+    // Paused/halting: nothing to recover, MiniportRestart rebuilds the
+    // data path. A pending reset is still completed below.
+    if (context->DataPathRunning != 0)
+    {
+        NTSTATUS status = T2NcmTxRecoverPipe(context);
+        if (!NT_SUCCESS(status))
+        {
+            resetStatus = NDIS_STATUS_FAILURE;
+        }
+
+        if (reset)
+        {
+            T2NcmRxStop(context);
+            if (context->DataPathRunning != 0)
+            {
+                status = T2NcmRxStart(context);
+                if (!NT_SUCCESS(status))
+                {
+                    T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+                        "T2Ncm: RX engine did not come back after reset (0x%08X)\n",
+                        status));
+                    resetStatus = NDIS_STATUS_FAILURE;
+                }
+            }
+        }
+    }
+
+    if (reset)
+    {
+        NdisMResetComplete(context->MiniportAdapterHandle, resetStatus, FALSE);
+    }
 }
 
 MINIPORT_SHUTDOWN T2NcmMiniportShutdownEx;
@@ -1710,10 +1794,9 @@ T2NcmNdisRegisterDriver(
     characteristics.CancelSendHandler            = T2NcmMiniportCancelSend;
     characteristics.DevicePnPEventNotifyHandler  = T2NcmMiniportDevicePnPEventNotify;
     characteristics.ResetHandlerEx               = T2NcmMiniportResetEx;
+    characteristics.CheckForHangHandlerEx        = T2NcmMiniportCheckForHangEx;
     characteristics.ShutdownHandlerEx            = T2NcmMiniportShutdownEx;
 
-    // CheckForHangHandlerEx deliberately left NULL — see the
-    // CheckForHangTimeInSeconds comment in MiniportInitializeEx.
 
     return NdisMRegisterMiniportDriver(
         DriverObject,

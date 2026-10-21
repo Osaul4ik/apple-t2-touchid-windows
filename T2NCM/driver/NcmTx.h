@@ -70,3 +70,16 @@ NTSTATUS
 T2NcmTxResume(
     _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
     );
+
+// Requests a bulk-OUT pipe reset from the recovery work item. Callable at
+// DISPATCH_LEVEL (used from the write completion routine).
+VOID
+T2NcmTxRequestPipeRecovery(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
+    );
+
+// Stop+cancel, WdfUsbTargetPipeResetSynchronously, start. PASSIVE_LEVEL.
+NTSTATUS
+T2NcmTxRecoverPipe(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
+    );
