@@ -1074,6 +1074,54 @@ inline bool PushTransportModeToDriver(TransportMode mode, bool force = false) {
 // the T2 is ready - the caller re-resolves the peer instead of counting a failure.
 enum class TunnelPrep { Ok, NoMac, NoPeer, Suspended };
 
+// IPv4 MTU the stack must use while the IPv4-over-IPv6 tunnel is armed:
+// T2NCM_TUNNEL_MTU in T2NCM/driver/driver.h (1500 - 20). T2Ncm.sys can only
+// advertise it as the adapter's L2 MTU at MiniportInitializeEx, so an adapter
+// that was initialized before the tunnel was armed (every boot: the driver
+// global starts native) keeps L2 MTU 1500 until a disable/enable - a sleep/
+// resume only runs MiniportRestart and never changes it. The tunnel rewrite
+// grows every IPv4 frame by 20 bytes, so a full 1500-byte IP packet no longer
+// fits the 1514-byte frame limit (NcmTx.c refuses the +20 layout, the rewrite
+// is skipped and the T2 drops the bare IPv4 frame). TCP is protected by the SYN
+// MSS clamp; UDP/ICMP are not. Capping the IPv4 interface MTU here closes that gap
+// without re-initializing the adapter.
+//
+// Idempotent and self-healing: it reads the live value and only writes when it
+// is above the cap, so it needs no cache (a re-initialized adapter comes back
+// at 1500 and is capped again on the next call). Active store only - nothing
+// persistent to go stale. Best effort: failure is logged, never fatal.
+inline constexpr ULONG kTunnelIpv4Mtu = 1480;
+inline bool ApplyTunnelIpv4Mtu(unsigned long ifIndex) {
+    if (ifIndex == 0 || IsTransportIoSuspended()) {
+        return false;
+    }
+    MIB_IPINTERFACE_ROW row;
+    InitializeIpInterfaceEntry(&row);
+    row.Family = AF_INET;
+    row.InterfaceIndex = ifIndex;
+    DWORD rc = GetIpInterfaceEntry(&row);
+    if (rc != NO_ERROR) {
+        T2_LOG("tunnel", L"ApplyTunnelIpv4Mtu: GetIpInterfaceEntry(ifIndex=%lu) failed rc=%lu",
+               ifIndex, rc);
+        return false;
+    }
+    if (row.NlMtu <= kTunnelIpv4Mtu) {
+        return true; // already capped (or lower)
+    }
+    const ULONG before = row.NlMtu;
+    row.SitePrefixLength = 0; // documented requirement for Get-then-Set on IPv4 rows
+    row.NlMtu = kTunnelIpv4Mtu;
+    rc = SetIpInterfaceEntry(&row);
+    if (rc != NO_ERROR) {
+        T2_LOG("tunnel", L"ApplyTunnelIpv4Mtu: SetIpInterfaceEntry(ifIndex=%lu, %lu->%lu) failed rc=%lu",
+               ifIndex, before, kTunnelIpv4Mtu, rc);
+        return false;
+    }
+    T2_LOG("tunnel", L"ApplyTunnelIpv4Mtu: ifIndex=%lu IPv4 MTU %lu -> %lu",
+           ifIndex, before, kTunnelIpv4Mtu);
+    return true;
+}
+
 // Call before AF_INET connect in tunnel mode.
 inline TunnelPrep PrepareTunnelPeer(unsigned long ifIndex, const in6_addr& peer6) {
     if (IsTransportIoSuspended()) {
@@ -1093,7 +1141,14 @@ inline TunnelPrep PrepareTunnelPeer(unsigned long ifIndex, const in6_addr& peer6
     // driver still native" cannot happen - e.g. cold-discovery's provisional
     // tunnel (CommitAutoTunnel only flips a flag in this process) scanning into
     // a void. Deduped by LastPushedModeFlag, so it is a no-op when already armed.
-    PushTransportModeToDriver(TransportMode::Ipv4Tunnel);
+    const bool tunnelArmed = PushTransportModeToDriver(TransportMode::Ipv4Tunnel);
+    // Only once the driver confirmed tunnel mode (true also covers the deduped
+    // "already armed" case): then the IPv4 interface must not hand the tunnel
+    // packets it cannot carry (see ApplyTunnelIpv4Mtu). Runs before the fast
+    // path so a resume that reuses the cached peer still re-checks the MTU.
+    if (tunnelArmed) {
+        ApplyTunnelIpv4Mtu(ifIndex);
+    }
     // Fast path: same peer as last time we successfully prepared it, and
     // nothing has invalidated that since (see InvalidateTunnelPrepCache).
     // Skips the neighbor-table walk and the ARP create/set syscalls -

@@ -324,10 +324,8 @@ T2NcmPowerSetDeviceState(
             // NTB parameters) - try the more common Prepared case first
             // and only fall back if it didn't match, same reasoning as
             // MiniportRestart's NdisRegistered/NcmReady pair.
-            if (!T2NcmTrySetState(DeviceContext, T2NcmStatePrepared, T2NcmStateNcmReady))
-            {
-                (void)T2NcmTrySetState(DeviceContext, T2NcmStateUsbReady, T2NcmStateNcmReady);
-            }
+            (void)T2NcmTrySetStateFromEither(DeviceContext,
+                T2NcmStatePrepared, T2NcmStateUsbReady, T2NcmStateNcmReady);
         }
         else
         {

@@ -54,6 +54,43 @@ T2NcmTrySetState(
     return ok;
 }
 
+BOOLEAN
+T2NcmTrySetStateFromEither(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext,
+    _In_ T2NCM_LIFECYCLE_STATE ExpectedA,
+    _In_ T2NCM_LIFECYCLE_STATE ExpectedB,
+    _In_ T2NCM_LIFECYCLE_STATE NewState
+    )
+{
+    T2NCM_LIFECYCLE_STATE previous;
+    BOOLEAN ok = FALSE;
+
+    WdfSpinLockAcquire(DeviceContext->StateLock);
+    previous = DeviceContext->State;
+    if (previous == ExpectedA || previous == ExpectedB)
+    {
+        DeviceContext->State = NewState;
+        ok = TRUE;
+    }
+    WdfSpinLockRelease(DeviceContext->StateLock);
+
+    if (ok)
+    {
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_TRACE_LEVEL,
+            "T2Ncm: state %s -> %s\n",
+            T2NcmStateName(previous), T2NcmStateName(NewState)));
+    }
+    else
+    {
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
+            "T2Ncm: transition to %s not taken: state is %s, expected %s or %s\n",
+            T2NcmStateName(NewState), T2NcmStateName(previous),
+            T2NcmStateName(ExpectedA), T2NcmStateName(ExpectedB)));
+    }
+
+    return ok;
+}
+
 // Unconditional variant of T2NcmTrySetState, for the two transitions that
 // are deliberately allowed from ANY current state: MiniportHaltEx must be
 // able to tear down from a partially-initialized or error state, not just

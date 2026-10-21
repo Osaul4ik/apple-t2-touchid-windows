@@ -1081,17 +1081,20 @@ T2NcmMiniportRestart(
         return NDIS_STATUS_FAILURE;
     }
 
-    // Restart can be reached with the lifecycle state sitting at either
-    // NdisRegistered (the normal path) or NcmReady (a fast re-arm on
-    // resume that never passed back through NdisRegistered) - try the
-    // common case first and only fall back to the other predecessor if
-    // it didn't match. Trying both unconditionally meant the second call
-    // was a guaranteed no-op every single time the first one succeeded,
-    // logging a spurious "not taken" trace line on every normal restart.
-    if (!T2NcmTrySetState(context, T2NcmStateNdisRegistered, T2NcmStateRunning))
-    {
-        (VOID)T2NcmTrySetState(context, T2NcmStateNcmReady, T2NcmStateRunning);
-    }
+    // Restart is reached from one of two predecessors, and which one is
+    // decided by what happened before, not by chance:
+    //   NdisRegistered - first start after MiniportInitializeEx, or a plain
+    //                    NDIS pause/restart with the device kept in D0
+    //                    (MiniportPause ends in NdisRegistered).
+    //   NcmReady       - the NORMAL path after every system sleep: Dx quiesce
+    //                    drops the state to Prepared, the D0 OID re-arms the
+    //                    hardware (Prepared -> NcmReady), and NDIS only then
+    //                    calls Restart. NdisRegistered is never revisited.
+    // Both are legitimate, so test them together under one lock and one
+    // trace line; a miss now means a real state mismatch and is logged as
+    // a WARNING that names the observed state.
+    (VOID)T2NcmTrySetStateFromEither(context,
+        T2NcmStateNdisRegistered, T2NcmStateNcmReady, T2NcmStateRunning);
 
     return NDIS_STATUS_SUCCESS;
 }

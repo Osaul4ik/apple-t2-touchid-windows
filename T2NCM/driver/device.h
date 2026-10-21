@@ -46,6 +46,22 @@ T2NcmTrySetState(
     _In_ T2NCM_LIFECYCLE_STATE NewState
     );
 
+// Two-predecessor variant: moves to NewState if the current state is
+// EITHER ExpectedA or ExpectedB, under a single lock acquisition and with a
+// single trace line (success: "state X -> Y"; failure: one WARNING naming the
+// state actually observed). Use it where the lifecycle legitimately reaches
+// a point from two different predecessors (e.g. MiniportRestart after a
+// first start vs. after a Dx resume) instead of chaining two
+// T2NcmTrySetState calls, whose first call logs a spurious "not taken" line
+// whenever the second predecessor is the real one.
+BOOLEAN
+T2NcmTrySetStateFromEither(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext,
+    _In_ T2NCM_LIFECYCLE_STATE ExpectedA,
+    _In_ T2NCM_LIFECYCLE_STATE ExpectedB,
+    _In_ T2NCM_LIFECYCLE_STATE NewState
+    );
+
 // Unconditional variant — sets NewState regardless of current state.
 // Only for transitions that are genuinely allowed from anywhere (see
 // Device.c). Do not reach for this instead of fixing an ExpectedCurrent
