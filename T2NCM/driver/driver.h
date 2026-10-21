@@ -179,6 +179,11 @@ VOID T2NcmLogRefresh(VOID);
 #define T2NCM_MAC_LENGTH            6u
 #define T2NCM_ETHERNET_HEADER_SIZE  14u
 #define T2NCM_MTU                   1500u
+// MTU reported to NDIS while the IPv4-over-IPv6 tunnel is on: the tunnel turns a
+// 20-byte IPv4 header into a 40-byte IPv6 one, so an IP packet above 1480 bytes
+// no longer fits the T2's 1514-byte Ethernet frame. NDIS cannot change the L2 MTU
+// of a running adapter, so this is chosen once, in MiniportInitializeEx.
+#define T2NCM_TUNNEL_MTU            (T2NCM_MTU - 20u)
 #define T2NCM_MAX_FRAME_SIZE        (T2NCM_ETHERNET_HEADER_SIZE + T2NCM_MTU)  // 1514
 
 // Upper bound on concurrently outstanding bulk-IN read requests. The RX
@@ -261,6 +266,10 @@ typedef struct _T2NCM_DEVICE_CONTEXT
     // TunnelModeEnabled is a per-device cached copy of the driver-global mode (Tunnel.c).
     // PeerIpv6 is learned from the first inbound IPv6 frame source.
     BOOLEAN              TunnelModeEnabled;
+    // L2 MTU handed to NDIS at MiniportInitializeEx (T2NCM_MTU, or
+    // T2NCM_TUNNEL_MTU when the tunnel was on at that moment). Fixed for the
+    // life of the adapter; NDIS has no way to change it afterwards.
+    ULONG                L2Mtu;
     BOOLEAN              TunnelPeerIpv6Valid;
     UCHAR                TunnelPeerIpv6[16];
     // Set the first time a TX frame is dropped (not rewritten) because
@@ -433,18 +442,12 @@ typedef struct _T2NCM_DEVICE_CONTEXT
     WDFUSBPIPE           RxPipe;
     ULONG                RxReadBufferSize;
 
-    // One WDFREQUEST (with a request-parented WDFMEMORY) per pending read.
-    // Created in T2NcmRxStart against RxPipe's I/O target, deleted in
-    // T2NcmRxStop once RxReadsOutstanding has drained to zero.
-    WDFREQUEST           RxReadRequests[T2NCM_RX_MAX_READ_SLOTS];
-
-    // 1 while a completed read may be re-sent; T2NcmRxStop clears it
-    // before stopping the target.
-    volatile LONG        RxReadsRunning;
-
-    // Requests currently owned by the USB stack or by a completion
-    // routine. T2NcmRxStop waits for 0 before deleting anything.
-    volatile LONG        RxReadsOutstanding;
+    // The current read run (NcmRx.c T2NCM_RX_RUN): the requests, the gate
+    // and the in-flight accounting. Deliberately a separate nonpaged
+    // allocation with its requests parented to the WDFDRIVER, so that a
+    // stop that times out can orphan it instead of leaving in-flight
+    // requests tied to this context's lifetime. NULL while stopped.
+    struct _T2NCM_RX_RUN* RxRun;
 
     // LEGACY: only meaningful for the old continuous reader. Nothing reads
     // it any more; it stays so Power.c and UsbTransport.c, which still

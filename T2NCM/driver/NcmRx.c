@@ -60,6 +60,11 @@ typedef struct _T2NCM_WIRE_NDP16
 #define T2NCM_NTH16_HEADER_LENGTH   12u
 #define T2NCM_NDP16_HEADER_LENGTH   8u
 #define T2NCM_ETHERNET_HEADER_LEN   14u  // dest(6) + src(6) + ethertype(2)
+#define T2NCM_VLAN_TAG_LENGTH       4u   // one 802.1Q tag
+// Largest datagram accepted from the device: a full-size frame carrying one
+// 802.1Q tag is 1518 bytes and is legal at a 1500-byte MTU; capping at 1514
+// silently dropped every such frame.
+#define T2NCM_RX_MAX_FRAME_SIZE     (T2NCM_MAX_FRAME_SIZE + T2NCM_VLAN_TAG_LENGTH)
 
 // Number of concurrently outstanding bulk-IN reads (must not exceed
 // T2NCM_RX_MAX_READ_SLOTS in driver.h). Enough depth that
@@ -440,6 +445,99 @@ T2NcmRxReadNdp(
     return TRUE;
 }
 
+// Counts the datagrams an NTB claims to carry, WITHOUT indicating or
+// logging anything. Used only when a whole NTB is discarded (data path
+// paused) so InDiscards is counted per frame, which is what
+// ifInDiscards means, instead of once per NTB. Same bounds discipline as
+// T2NcmRxParseNtb: nothing the device says is trusted beyond what USB
+// delivered. Never returns 0 - an NTB that cannot be walked still
+// discarded at least one frame's worth of data.
+static
+ULONG
+T2NcmRxCountDatagrams(
+    _In_reads_bytes_(Length) const UCHAR* Buffer,
+    _In_ size_t Length
+    )
+{
+    T2NCM_WIRE_NTH16 nth;
+    T2NCM_WIRE_NDP16 ndp;
+    ULONG blockLength;
+    ULONG ndpOffset;
+    ULONG count = 0;
+
+    if (Length < sizeof(T2NCM_WIRE_NTH16))
+    {
+        return 1;
+    }
+
+    RtlCopyMemory(&nth, Buffer, sizeof(nth));
+    if (nth.dwSignature != T2NCM_NTH16_SIGNATURE ||
+        nth.wHeaderLength != T2NCM_NTH16_HEADER_LENGTH)
+    {
+        return 1;
+    }
+
+    blockLength = nth.wBlockLength;
+    if (blockLength < sizeof(T2NCM_WIRE_NTH16) || blockLength > Length)
+    {
+        return 1;
+    }
+
+    ndpOffset = nth.wNdpIndex;
+
+    for (ULONG ndpCount = 0; ndpCount < T2NCM_RX_MAX_NDPS; ndpCount++)
+    {
+        ULONG ndpLength;
+        ULONG entryCount;
+
+        if (ndpOffset < sizeof(T2NCM_WIRE_NTH16) ||
+            ndpOffset + T2NCM_NDP16_HEADER_LENGTH > blockLength)
+        {
+            break;
+        }
+
+        RtlCopyMemory(&ndp, Buffer + ndpOffset, sizeof(ndp));
+        if (ndp.dwSignature != T2NCM_NDP16_SIGNATURE_NOCRC)
+        {
+            break;
+        }
+
+        ndpLength = ndp.wLength;
+        if (ndpLength < T2NCM_NDP16_HEADER_LENGTH ||
+            ndpOffset + ndpLength > blockLength ||
+            ((ndpLength - T2NCM_NDP16_HEADER_LENGTH) % sizeof(T2NCM_WIRE_NDP16_ENTRY)) != 0)
+        {
+            break;
+        }
+
+        entryCount = (ULONG)((ndpLength - T2NCM_NDP16_HEADER_LENGTH) /
+                             sizeof(T2NCM_WIRE_NDP16_ENTRY));
+
+        for (ULONG i = 0; i < entryCount; i++)
+        {
+            T2NCM_WIRE_NDP16_ENTRY entry;
+            ULONG entryOffset = (ULONG)(ndpOffset + T2NCM_NDP16_HEADER_LENGTH +
+                                 (i * sizeof(T2NCM_WIRE_NDP16_ENTRY)));
+
+            RtlCopyMemory(&entry, Buffer + entryOffset, sizeof(entry));
+            if (entry.wDatagramIndex == 0 && entry.wDatagramLength == 0)
+            {
+                break; // terminator
+            }
+            count++;
+        }
+
+        if (ndp.wNextNdpIndex <= ndpOffset)
+        {
+            break; // 0 = last NDP16; anything not moving forward is malformed
+        }
+
+        ndpOffset = ndp.wNextNdpIndex;
+    }
+
+    return (count != 0) ? count : 1;
+}
+
 static
 VOID
 T2NcmRxParseNtb(
@@ -554,13 +652,13 @@ T2NcmRxParseNtb(
             }
 
             if (entry.wDatagramLength < T2NCM_ETHERNET_HEADER_LEN ||
-                entry.wDatagramLength > T2NCM_MAX_FRAME_SIZE)
+                entry.wDatagramLength > T2NCM_RX_MAX_FRAME_SIZE)
             {
                 T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
                     "T2Ncm: RX datagram entry %u length %u outside [%u,%u] - "
                     "skipping this datagram only\n",
                     i, entry.wDatagramLength, T2NCM_ETHERNET_HEADER_LEN,
-                    T2NCM_MAX_FRAME_SIZE));
+                    T2NCM_RX_MAX_FRAME_SIZE));
                 InterlockedIncrement64(&DeviceContext->RxFramesRejected);
                 InterlockedIncrement64(&DeviceContext->InErrors);
                 continue;
@@ -569,7 +667,7 @@ T2NcmRxParseNtb(
             {
                 const UCHAR* frame = Buffer + entry.wDatagramIndex;
                 PNET_BUFFER_LIST nbl;
-                UCHAR tunFrame[T2NCM_MAX_FRAME_SIZE];
+                UCHAR tunFrame[T2NCM_RX_MAX_FRAME_SIZE];
                 ULONG tunLen = entry.wDatagramLength;
                 const UCHAR* deliver = frame;
 
@@ -719,48 +817,115 @@ T2NcmRxParseNtb(
 // with an error is simply not re-sent, and the only cancel a request ever
 // sees is the single one WdfIoTargetStop issues from T2NcmRxStop.
 //
-// Ownership rules:
-//   * RxReadRequests[] holds T2NCM_RX_PENDING_READS WDFREQUESTs, created
-//     against the CURRENT bulk-IN pipe's I/O target in T2NcmRxStart and
-//     deleted in T2NcmRxStop. A request never outlives the pipe object it
-//     was created for (alt-setting re-selection replaces the pipe).
-//   * RxReadsRunning is the gate: a completion re-sends its request only
-//     while it is 1. T2NcmRxStop clears it before stopping the target.
-//   * RxReadsOutstanding counts requests owned by the USB stack or by a
-//     completion routine. A resend takes its own count BEFORE the
-//     completing routine drops the old one, so the count never touches 0
-//     while the loop is alive; T2NcmRxStop waits for 0 before deleting.
+// Ownership rules (see T2NCM_RX_RUN below):
+//   * Everything the completion routine shares with the stop path lives in
+//     a T2NCM_RX_RUN, a separate nonpaged allocation made by T2NcmRxStart.
+//     It is NOT part of the WDFDEVICE context, and its requests are
+//     parented to the WDFDRIVER, not to the WDFDEVICE.
+//   * Refs counts the owner (the device context, 1) plus every read owned
+//     by the USB stack or by a completion routine. Whoever drops it to 0
+//     deletes the requests and frees the run.
+//   * Running is the gate: a completion re-sends its request only while it
+//     is 1. T2NcmRxStop clears it before stopping the target.
+//   * A normal stop waits for Refs to fall back to 1, deletes the
+//     requests and releases the owner reference.
+//   * A stop that times out ORPHANS the run instead of leaking it onto the
+//     device context: the run is detached, MiniportHaltEx may delete the
+//     WDFDEVICE, T2NcmRxStart may build a fresh run, and when the stuck
+//     reads finally complete the last one deletes the requests and frees
+//     the run. A completion of an orphaned run never touches the device
+//     context (see InCompletion/Orphaned).
 // ---------------------------------------------------------------------
 
 #define T2NCM_RX_STOP_DRAIN_POLL_MS     10u
 #define T2NCM_RX_STOP_DRAIN_TIMEOUT_MS  5000u
 
+// Upper bound on orphaned runs alive at once. Each one is a set of reads
+// the USB stack has failed to hand back for longer than the stop timeout;
+// past this many the bus is not coming back and T2NcmRxStart refuses.
+#define T2NCM_RX_MAX_ORPHANED_RUNS      4
+
 C_ASSERT(T2NCM_RX_PENDING_READS <= T2NCM_RX_MAX_READ_SLOTS);
+
+typedef struct _T2NCM_RX_RUN
+{
+    PT2NCM_DEVICE_CONTEXT DeviceContext;  // valid only while !Orphaned
+    WDFUSBPIPE            Pipe;           // pipe the requests were created for
+    volatile LONG         Running;        // gate for re-sending a read
+    volatile LONG         Refs;           // 1 (owner) + reads in flight
+    volatile LONG         InCompletion;   // completion routines executing now
+    volatile LONG         Orphaned;       // owner gave up; device may be gone
+    WDFREQUEST            Requests[T2NCM_RX_MAX_READ_SLOTS];
+} T2NCM_RX_RUN, *PT2NCM_RX_RUN;
 
 typedef struct _T2NCM_RX_READ_CONTEXT
 {
-    PT2NCM_DEVICE_CONTEXT DeviceContext;
-    WDFMEMORY             Memory;   // parented to the request
+    PT2NCM_RX_RUN Run;
+    WDFMEMORY     Memory;   // parented to the request
 } T2NCM_RX_READ_CONTEXT, *PT2NCM_RX_READ_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(T2NCM_RX_READ_CONTEXT, T2NcmGetRxReadContext)
 
 EVT_WDF_REQUEST_COMPLETION_ROUTINE T2NcmEvtRxReadComplete;
 
+// Orphaned runs still waiting for their stuck reads (bounded, see above).
+static volatile LONG g_T2NcmRxOrphanedRuns = 0;
+
+// Deletes every request of the run and frees it. Called only by whoever
+// dropped Refs to 0, so no read is in flight. DISPATCH_LEVEL safe: the
+// requests have no cleanup callbacks.
+static
+VOID
+T2NcmRxRunDestroy(
+    _In_ PT2NCM_RX_RUN Run
+    )
+{
+    ULONG i;
+
+    if (Run->Orphaned != 0)
+    {
+        InterlockedDecrement(&g_T2NcmRxOrphanedRuns);
+    }
+
+    for (i = 0; i < T2NCM_RX_MAX_READ_SLOTS; i++)
+    {
+        if (Run->Requests[i] != NULL)
+        {
+            // Also releases the parented WDFMEMORY.
+            WdfObjectDelete(Run->Requests[i]);
+            Run->Requests[i] = NULL;
+        }
+    }
+
+    ExFreePoolWithTag(Run, T2NCM_RX_POOL_TAG);
+}
+
+static
+VOID
+T2NcmRxRunRelease(
+    _In_ PT2NCM_RX_RUN Run
+    )
+{
+    if (InterlockedDecrement(&Run->Refs) == 0)
+    {
+        T2NcmRxRunDestroy(Run);
+    }
+}
+
 // Formats and sends one read. On FALSE the request is NOT in flight and
-// no outstanding count is held for it.
+// no reference is held for it.
 static
 BOOLEAN
 T2NcmRxSubmitRead(
-    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext,
-    _In_ WDFREQUEST            Request
+    _In_ PT2NCM_RX_RUN Run,
+    _In_ WDFREQUEST    Request
     )
 {
     PT2NCM_RX_READ_CONTEXT readContext = T2NcmGetRxReadContext(Request);
     NTSTATUS status;
 
     status = WdfUsbTargetPipeFormatRequestForRead(
-        DeviceContext->RxPipe, Request, readContext->Memory, NULL);
+        Run->Pipe, Request, readContext->Memory, NULL);
     if (!NT_SUCCESS(status))
     {
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
@@ -770,20 +935,24 @@ T2NcmRxSubmitRead(
 
     WdfRequestSetCompletionRoutine(Request, T2NcmEvtRxReadComplete, readContext);
 
-    // Count BEFORE sending: the completion can run before WdfRequestSend
-    // returns, and T2NcmRxStop must never see 0 while a read is in flight.
-    InterlockedIncrement(&DeviceContext->RxReadsOutstanding);
+    // Take the reference BEFORE sending: the completion can run before
+    // WdfRequestSend returns, and the run must never see its count fall
+    // to 0 (or the stop path see it at 1) while a read is in flight.
+    InterlockedIncrement(&Run->Refs);
 
     if (!WdfRequestSend(Request,
-            WdfUsbTargetPipeGetIoTarget(DeviceContext->RxPipe),
+            WdfUsbTargetPipeGetIoTarget(Run->Pipe),
             WDF_NO_SEND_OPTIONS))
     {
         status = WdfRequestGetStatus(Request);
-        InterlockedDecrement(&DeviceContext->RxReadsOutstanding);
+
+        // The caller still holds a reference (the owner's, or the
+        // completion routine's), so this cannot reach 0.
+        InterlockedDecrement(&Run->Refs);
 
         // A resend racing T2NcmRxStop lands on a stopped target and fails
         // here; that is the expected, quiet way for the loop to end.
-        if (DeviceContext->RxReadsRunning != 0)
+        if (Run->Running != 0)
         {
             T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
                 "T2Ncm: RX WdfRequestSend failed (0x%08X) - read not re-armed\n",
@@ -820,14 +989,19 @@ T2NcmRxHandleRead(
     // hand NDIS a frame on a paused adapter, which is exactly what
     // pause means it must not receive. Cheap volatile read, checked on
     // every completion rather than assumed from the stop ordering.
+    buffer = (const UCHAR*)WdfMemoryGetBuffer(ReadContext->Memory, NULL);
+
     if (DeviceContext->DataPathRunning == 0)
     {
+        // Counted per datagram, not per NTB: ifInDiscards counts frames.
         InterlockedIncrement64(&DeviceContext->RxNtbsReceived);
-        InterlockedIncrement64(&DeviceContext->InDiscards);
+        InterlockedAdd64(&DeviceContext->InDiscards,
+            (buffer != NULL)
+                ? (LONG64)T2NcmRxCountDatagrams(buffer, NumBytesTransferred)
+                : 1);
         return;
     }
 
-    buffer = (const UCHAR*)WdfMemoryGetBuffer(ReadContext->Memory, NULL);
     if (buffer == NULL)
     {
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
@@ -849,10 +1023,27 @@ T2NcmEvtRxReadComplete(
     )
 {
     PT2NCM_RX_READ_CONTEXT readContext = (PT2NCM_RX_READ_CONTEXT)Context;
-    PT2NCM_DEVICE_CONTEXT deviceContext = readContext->DeviceContext;
+    PT2NCM_RX_RUN run = readContext->Run;
+    PT2NCM_DEVICE_CONTEXT deviceContext = NULL;
     NTSTATUS status = Params->IoStatus.Status;
 
     UNREFERENCED_PARAMETER(Target);
+
+    // Announce this completion BEFORE looking at Orphaned. The orphaning
+    // side sets Orphaned and then waits for InCompletion to reach 0, and
+    // both sides use full-barrier interlocked operations, so either this
+    // routine sees Orphaned == 1 (and stays away from the device context)
+    // or the orphaning side sees InCompletion != 0 (and waits for us).
+    InterlockedIncrement(&run->InCompletion);
+
+    if (run->Orphaned != 0)
+    {
+        // The owner gave up on this run and MiniportHaltEx may already
+        // have freed the device context. Touch nothing but the run.
+        goto Done;
+    }
+
+    deviceContext = run->DeviceContext;
 
     if (NT_SUCCESS(status))
     {
@@ -867,7 +1058,7 @@ T2NcmEvtRxReadComplete(
             InterlockedExchange(&deviceContext->TxConsecutiveResets, 0);
         }
 
-        if (deviceContext->RxReadsRunning != 0)
+        if (run->Running != 0 && run->Orphaned == 0)
         {
             WDF_REQUEST_REUSE_PARAMS reuse;
 
@@ -877,10 +1068,9 @@ T2NcmEvtRxReadComplete(
             status = WdfRequestReuse(Request, &reuse);
             if (NT_SUCCESS(status))
             {
-                // Takes its own outstanding count before ours is dropped
-                // below. Failure is logged inside and simply retires
-                // this slot.
-                (VOID)T2NcmRxSubmitRead(deviceContext, Request);
+                // Takes its own reference before ours is dropped below.
+                // Failure is logged inside and simply retires this slot.
+                (VOID)T2NcmRxSubmitRead(run, Request);
             }
             else
             {
@@ -890,7 +1080,7 @@ T2NcmEvtRxReadComplete(
             }
         }
     }
-    else if (deviceContext->RxReadsRunning != 0)
+    else if (run->Running != 0)
     {
         // A genuine failure while the loop is supposed to be running. The
         // slot is retired (no resend); the other slots keep running, and
@@ -908,68 +1098,85 @@ T2NcmEvtRxReadComplete(
     // back. AppleUSBVHCI reports that as 0xC0000001, which is expected
     // here and deliberately neither logged nor counted.
 
-    InterlockedDecrement(&deviceContext->RxReadsOutstanding);
-}
+Done:
+    InterlockedDecrement(&run->InCompletion);
 
-static
-VOID
-T2NcmRxDeleteReadRequests(
-    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
-    )
-{
-    ULONG i;
-
-    for (i = 0; i < T2NCM_RX_MAX_READ_SLOTS; i++)
-    {
-        if (DeviceContext->RxReadRequests[i] != NULL)
-        {
-            // Also releases the parented WDFMEMORY.
-            WdfObjectDelete(DeviceContext->RxReadRequests[i]);
-            DeviceContext->RxReadRequests[i] = NULL;
-        }
-    }
+    // Last thing this routine does: after this the run (and, for the very
+    // last reference, this request) may be gone.
+    T2NcmRxRunRelease(run);
 }
 
 // Shared by T2NcmRxStop and the failure path of T2NcmRxStart. PASSIVE_LEVEL
 // only (WdfIoTargetStop with CancelSentIo, and a sleeping drain wait).
+// Always detaches DeviceContext->RxRun on return.
 static
 VOID
 T2NcmRxTeardownReads(
     _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
     )
 {
+    PT2NCM_RX_RUN run = DeviceContext->RxRun;
     ULONG waitedMs = 0;
 
     NT_ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
 
+    if (run == NULL)
+    {
+        return;
+    }
+
     // Close the gate first so a completion racing the stop does not queue
     // a fresh read; one that slips through anyway fails on the stopped
     // target inside T2NcmRxSubmitRead.
-    InterlockedExchange(&DeviceContext->RxReadsRunning, 0);
+    InterlockedExchange(&run->Running, 0);
 
-    if (DeviceContext->RxPipe != NULL)
-    {
-        // The ONLY cancel this engine ever issues.
-        WdfIoTargetStop(
-            WdfUsbTargetPipeGetIoTarget(DeviceContext->RxPipe),
-            WdfIoTargetCancelSentIo);
-    }
+    // The ONLY cancel this engine ever issues.
+    WdfIoTargetStop(
+        WdfUsbTargetPipeGetIoTarget(run->Pipe),
+        WdfIoTargetCancelSentIo);
 
-    // Wait until no request is owned by the USB stack or a completion
-    // routine. Deleting a request that is still in flight is a bugcheck,
-    // so on timeout the requests are leaked instead (T2NcmRxStart refuses
-    // to run over a non-zero count).
-    while (InterlockedCompareExchange(
-               (LONG volatile *)&DeviceContext->RxReadsOutstanding, 0, 0) != 0)
+    // Wait until no read is owned by the USB stack or a completion
+    // routine (only the owner's reference left).
+    while (InterlockedCompareExchange((LONG volatile *)&run->Refs, 1, 1) != 1)
     {
         LARGE_INTEGER delay;
 
         if (waitedMs >= T2NCM_RX_STOP_DRAIN_TIMEOUT_MS)
         {
+            LONG stuck = run->Refs - 1;
+
+            if (InterlockedIncrement(&g_T2NcmRxOrphanedRuns) >
+                T2NCM_RX_MAX_ORPHANED_RUNS)
+            {
+                T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+                    "T2Ncm: RX stop timed out again - %ld orphaned run(s) "
+                    "already pending\n", g_T2NcmRxOrphanedRuns));
+            }
+
             T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
                 "T2Ncm: RX stop timed out with %ld read(s) still outstanding - "
-                "leaking the read requests rather than deleting them in flight\n",
-                DeviceContext->RxReadsOutstanding));
+                "orphaning the run (requests are freed when they complete)\n",
+                stuck));
+
+            // Detach. Set the flag first, then wait out any completion
+            // routine that already got past its own Orphaned check: those
+            // are bounded CPU-only work, not USB waits, so the wait ends.
+            InterlockedExchange(&run->Orphaned, 1);
+            while (InterlockedCompareExchange(
+                       (LONG volatile *)&run->InCompletion, 0, 0) != 0)
+            {
+                LARGE_INTEGER shortDelay;
+
+                shortDelay.QuadPart = -((LONGLONG)T2NCM_RX_STOP_DRAIN_POLL_MS * 10000);
+                KeDelayExecutionThread(KernelMode, FALSE, &shortDelay);
+            }
+
+            DeviceContext->RxRun = NULL;
+            DeviceContext->RxPipe = NULL;
+
+            // Drop the owner's reference. If the stuck reads completed in
+            // the meantime this frees the run right here.
+            T2NcmRxRunRelease(run);
             return;
         }
 
@@ -978,8 +1185,12 @@ T2NcmRxTeardownReads(
         waitedMs += T2NCM_RX_STOP_DRAIN_POLL_MS;
     }
 
-    T2NcmRxDeleteReadRequests(DeviceContext);
+    DeviceContext->RxRun = NULL;
     DeviceContext->RxPipe = NULL;
+
+    // Refs == 1: nothing in flight. Dropping the owner's reference
+    // deletes the requests and frees the run.
+    T2NcmRxRunRelease(run);
 }
 
 NTSTATUS
@@ -992,6 +1203,7 @@ T2NcmRxStart(
     ULONG readBufferSize;
     ULONG i;
     NTSTATUS status;
+    PT2NCM_RX_RUN run;
 
     if (DeviceContext->RxStarted)
     {
@@ -1014,20 +1226,21 @@ T2NcmRxStart(
         return STATUS_INVALID_DEVICE_STATE;
     }
 
-    // A previous stop that timed out left requests in flight; starting a
-    // second set on top of them would orphan them.
-    if (InterlockedCompareExchange(
-            (LONG volatile *)&DeviceContext->RxReadsOutstanding, 0, 0) != 0)
+    // Earlier stops that timed out left their reads with the USB stack.
+    // They no longer block a restart (each lives in its own orphaned run
+    // that cleans up after itself), but a bus that keeps swallowing reads
+    // is not recoverable by starting more of them.
+    if (g_T2NcmRxOrphanedRuns >= T2NCM_RX_MAX_ORPHANED_RUNS)
     {
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-            "T2Ncm: T2NcmRxStart refused - %ld read(s) from a previous "
-            "run are still outstanding\n", DeviceContext->RxReadsOutstanding));
+            "T2Ncm: T2NcmRxStart refused - %ld orphaned run(s) still have "
+            "reads stuck in the USB stack\n", g_T2NcmRxOrphanedRuns));
         return STATUS_DEVICE_BUSY;
     }
 
-    // Idle leftovers (a stop that finished draining always deletes them,
-    // but be explicit that nothing stale is ever reused).
-    T2NcmRxDeleteReadRequests(DeviceContext);
+    // A previous run that was not stopped (should not happen: stop and
+    // the failure path both detach it) is torn down rather than reused.
+    T2NcmRxTeardownReads(DeviceContext);
 
     // The read buffer must be a multiple of the pipe's MaximumPacketSize
     // (WdfUsbTargetPipeFormatRequestForRead rejects it otherwise -
@@ -1054,17 +1267,32 @@ T2NcmRxStart(
     readBufferSize =
         ((DeviceContext->NtbInMaxSize + maxPacketSize - 1) / maxPacketSize) * maxPacketSize;
 
-    DeviceContext->RxPipe = DeviceContext->BulkInPipe;
+    run = (PT2NCM_RX_RUN)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED, sizeof(*run), T2NCM_RX_POOL_TAG);
+    if (run == NULL)
+    {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    run->DeviceContext = DeviceContext;
+    run->Pipe          = DeviceContext->BulkInPipe;
+    run->Refs          = 1;   // the owner's reference
+
+    DeviceContext->RxRun = run;
+    DeviceContext->RxPipe = run->Pipe;
     DeviceContext->RxReadBufferSize = readBufferSize;
 
     // Pipe I/O targets are stopped after a stop and must be started
     // again; a fresh pipe object after an alt-setting switch needs it too.
-    status = WdfIoTargetStart(WdfUsbTargetPipeGetIoTarget(DeviceContext->RxPipe));
+    status = WdfIoTargetStart(WdfUsbTargetPipeGetIoTarget(run->Pipe));
     if (!NT_SUCCESS(status))
     {
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
             "T2Ncm: WdfIoTargetStart(BulkInPipe) failed (0x%08X)\n", status));
+        // Nothing was created or sent yet: detach and free directly.
+        DeviceContext->RxRun  = NULL;
         DeviceContext->RxPipe = NULL;
+        ExFreePoolWithTag(run, T2NCM_RX_POOL_TAG);
         return status;
     }
 
@@ -1076,10 +1304,13 @@ T2NcmRxStart(
         PT2NCM_RX_READ_CONTEXT readContext;
 
         WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, T2NCM_RX_READ_CONTEXT);
-        attributes.ParentObject = DeviceContext->WdfDevice;
+
+        // Parented to the DRIVER, not the device: a read that outlives an
+        // orphaned stop must survive MiniportHaltEx deleting the WDFDEVICE.
+        attributes.ParentObject = WdfGetDriver();
 
         status = WdfRequestCreate(&attributes,
-            WdfUsbTargetPipeGetIoTarget(DeviceContext->RxPipe), &request);
+            WdfUsbTargetPipeGetIoTarget(run->Pipe), &request);
         if (!NT_SUCCESS(status))
         {
             T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
@@ -1089,7 +1320,7 @@ T2NcmRxStart(
         }
 
         // Stored before anything else can fail, so Fail: deletes it.
-        DeviceContext->RxReadRequests[i] = request;
+        run->Requests[i] = request;
 
         WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
         attributes.ParentObject = request;
@@ -1105,19 +1336,19 @@ T2NcmRxStart(
         }
 
         readContext = T2NcmGetRxReadContext(request);
-        readContext->DeviceContext = DeviceContext;
-        readContext->Memory        = memory;
+        readContext->Run    = run;
+        readContext->Memory = memory;
     }
 
     InterlockedExchange(&DeviceContext->RxFailedSlots, 0);
 
     // Open the gate before the first send: a completion can arrive before
     // the loop below has submitted every slot.
-    InterlockedExchange(&DeviceContext->RxReadsRunning, 1);
+    InterlockedExchange(&run->Running, 1);
 
     for (i = 0; i < T2NCM_RX_PENDING_READS; i++)
     {
-        if (!T2NcmRxSubmitRead(DeviceContext, DeviceContext->RxReadRequests[i]))
+        if (!T2NcmRxSubmitRead(run, run->Requests[i]))
         {
             status = STATUS_UNSUCCESSFUL;
             goto Fail;
@@ -1135,7 +1366,8 @@ T2NcmRxStart(
     return STATUS_SUCCESS;
 
 Fail:
-    // Cancels whatever did get sent, waits for it, deletes every slot.
+    // Cancels whatever did get sent, waits for it, deletes every slot
+    // (or orphans the run if the stack will not give the reads back).
     T2NcmRxTeardownReads(DeviceContext);
     return status;
 }
@@ -1152,8 +1384,8 @@ T2NcmRxStop(
 
     // Cancels outstanding reads (once - nothing else cancels them), waits
     // for every completion routine to finish, and only then deletes the
-    // requests, so nothing races the pipe teardown that follows on a halt
-    // path.
+    // requests - or, if the USB stack never hands them back, orphans the
+    // run so the halt path and a later restart are not held hostage.
     T2NcmRxTeardownReads(DeviceContext);
 
     DeviceContext->RxStarted = FALSE;

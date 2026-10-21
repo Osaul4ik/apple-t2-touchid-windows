@@ -12,7 +12,7 @@
 #include "Power.h"
 #include "Tunnel.h"
 
-#define T2NCM_VENDOR_DRIVER_VERSION  0x00020000  // 2.0
+#define T2NCM_VENDOR_DRIVER_VERSION  0x00020001  // 2.1 (matches the INF's DriverVer 2.1.x.x)
 #define T2NCM_NDIS_MAJOR_VERSION     6
 #define T2NCM_NDIS_MINOR_VERSION     30
 
@@ -345,6 +345,21 @@ T2NcmDispatchDeviceControl(
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
             "T2Ncm: TunnelModeEnabled set live via IOCTL -> %u\n",
             context->TunnelModeEnabled ? 1u : 0u));
+
+        // NDIS cannot change the L2 MTU of a running adapter, so a flip
+        // across the 1500/1480 boundary only reaches the stack at the next
+        // MiniportInitializeEx (disable/enable or replug). Until then the
+        // TX path still tunnels via its +20 headroom and the MSS clamp
+        // keeps TCP inside the frame; userspace that needs UDP/ICMP to fit
+        // immediately can set the IP interface MTU itself.
+        if (context->L2Mtu != (context->TunnelModeEnabled ? T2NCM_TUNNEL_MTU : T2NCM_MTU))
+        {
+            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
+                "T2Ncm: adapter L2 MTU is %lu but the new mode wants %lu - takes "
+                "effect at the next adapter initialize\n",
+                context->L2Mtu,
+                context->TunnelModeEnabled ? T2NCM_TUNNEL_MTU : T2NCM_MTU));
+        }
         status = STATUS_SUCCESS;
         break;
     }
@@ -683,7 +698,14 @@ T2NcmMiniportInitializeEx(
 
     generalAttributes.MediaType               = NdisMedium802_3;
     generalAttributes.PhysicalMediumType      = NdisPhysicalMediumUnspecified;
-    generalAttributes.MtuSize                 = T2NCM_MTU;
+    // Seed the tunnel flag first: the L2 MTU below is fixed for the life of
+    // the adapter (NDIS cannot change it), so it has to reflect the mode that
+    // is active NOW. With the tunnel on, 1500-byte IPv4 packets would grow to
+    // 1520 bytes on the wire; advertising 1480 makes the stack size UDP/ICMP
+    // (and TCP) so they fit, not only the TCP SYNs the MSS clamp covers.
+    T2NcmTunnelRefreshMode(context);
+    context->L2Mtu = context->TunnelModeEnabled ? T2NCM_TUNNEL_MTU : T2NCM_MTU;
+    generalAttributes.MtuSize                 = context->L2Mtu;
     generalAttributes.MaxXmitLinkSpeed        = T2NCM_LINK_SPEED_BPS;
     generalAttributes.MaxRcvLinkSpeed         = T2NCM_LINK_SPEED_BPS;
     generalAttributes.XmitLinkSpeed           = T2NCM_LINK_SPEED_BPS;
@@ -1231,10 +1253,13 @@ T2NcmOidQuery(
         return T2NcmOidQueryCopy(Request, &genericUlong, sizeof(genericUlong));
 
     case OID_GEN_MAXIMUM_FRAME_SIZE:
-        genericUlong = T2NCM_MTU;
+        genericUlong = DeviceContext->L2Mtu;
         return T2NcmOidQueryCopy(Request, &genericUlong, sizeof(genericUlong));
 
     case OID_GEN_MAXIMUM_TOTAL_SIZE:
+        genericUlong = DeviceContext->L2Mtu + T2NCM_ETHERNET_HEADER_SIZE;
+        return T2NcmOidQueryCopy(Request, &genericUlong, sizeof(genericUlong));
+
     case OID_GEN_TRANSMIT_BLOCK_SIZE:
     case OID_GEN_RECEIVE_BLOCK_SIZE:
         genericUlong = T2NCM_MAX_FRAME_SIZE;
@@ -1881,7 +1906,7 @@ T2NcmNdisRegisterDriver(
     characteristics.MajorNdisVersion   = T2NCM_NDIS_MAJOR_VERSION;
     characteristics.MinorNdisVersion   = T2NCM_NDIS_MINOR_VERSION;
     characteristics.MajorDriverVersion = 2;
-    characteristics.MinorDriverVersion = 0;
+    characteristics.MinorDriverVersion = 1;
 
     characteristics.SetOptionsHandler            = T2NcmMiniportSetOptions;
     characteristics.InitializeHandlerEx          = T2NcmMiniportInitializeEx;
