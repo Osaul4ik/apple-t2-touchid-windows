@@ -117,6 +117,35 @@ T2DmaAllocateOolBuffers(_In_ PT2_DEVICE_CONTEXT Ctx)
     return STATUS_SUCCESS;
 }
 
+// Keeps SEP-visible DMA memory alive for the rest of the boot.
+//
+// SEP retains the logical address of OOL_IN/OOL_OUT after SET_OOL_* and there
+// is no deregistration opcode. T2DmaFreeOolBuffers already refuses to free
+// them, but the DmaEnabler is parented to the WDFDEVICE (default parent) and
+// the common buffers to the enabler: when the device object is deleted
+// (Disable/Enable in Device Manager, uninstall, surprise removal) the
+// framework deletes that whole tree and releases the DMA memory even though
+// SEP still owns the addresses. An extra reference on each object holds it
+// past that deletion; the references are deliberately never dropped.
+// Idempotent. The enabler is pinned together with the first buffer because a
+// common buffer needs its enabler (and the DMA adapter behind it) alive.
+static VOID
+T2DmaPinForSep(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ BOOLEAN PinIn, _In_ BOOLEAN PinOut)
+{
+    if (Ctx->DmaEnabler != NULL && !Ctx->DmaEnablerPinned) {
+        WdfObjectReference(Ctx->DmaEnabler);
+        Ctx->DmaEnablerPinned = TRUE;
+    }
+    if (PinIn && Ctx->OolInBuffer != NULL && !Ctx->OolInPinned) {
+        WdfObjectReference(Ctx->OolInBuffer);
+        Ctx->OolInPinned = TRUE;
+    }
+    if (PinOut && Ctx->OolOutBuffer != NULL && !Ctx->OolOutPinned) {
+        WdfObjectReference(Ctx->OolOutBuffer);
+        Ctx->OolOutPinned = TRUE;
+    }
+}
+
 NTSTATUS
 T2DmaRegisterOolBuffers(_In_ PT2_DEVICE_CONTEXT Ctx)
 {
@@ -146,6 +175,7 @@ T2DmaRegisterOolBuffers(_In_ PT2_DEVICE_CONTEXT Ctx)
         // doorbell rang; SEP may already have the address even if the
         // status check right below says this call "failed".
         Ctx->OolSepMayKnowAddress = TRUE;
+        T2DmaPinForSep(Ctx, TRUE, FALSE);
     }
     if (!NT_SUCCESS(status)) {
         T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
@@ -165,6 +195,7 @@ T2DmaRegisterOolBuffers(_In_ PT2_DEVICE_CONTEXT Ctx)
     status = T2SepControl(Ctx, T2_SEP_CMSG_SET_OOL_OUT, 2, Ctx->OolOutPa, T2_SEP_OOL_SIZE, &sentOut);
     if (sentOut) {
         Ctx->OolSepMayKnowAddress = TRUE;
+        T2DmaPinForSep(Ctx, FALSE, TRUE);
     }
     if (!NT_SUCCESS(status)) {
         T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,

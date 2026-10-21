@@ -321,22 +321,6 @@ T2NcmTxCompleteNetBuffer(
     }
 }
 
-// Asks the recovery work item to reset the bulk-OUT pipe. Callable at
-// DISPATCH_LEVEL. Coalesces: the flag is consumed by the work item.
-VOID
-T2NcmTxRequestPipeRecovery(
-    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
-    )
-{
-    if (DeviceContext->RecoveryWorkItem == NULL)
-    {
-        return;
-    }
-
-    InterlockedExchange(&DeviceContext->TxRecoverPending, 1);
-    WdfWorkItemEnqueue(DeviceContext->RecoveryWorkItem);
-}
-
 EVT_WDF_REQUEST_COMPLETION_ROUTINE T2NcmEvtTxWriteComplete;
 
 VOID
@@ -386,15 +370,21 @@ T2NcmEvtTxWriteComplete(
 
     InterlockedIncrement(&deviceContext->TxCompletedCount);
 
-    // A write that failed or timed out while the data path is meant to be
-    // running may have left the bulk-OUT endpoint halted or wedged, and
-    // every later write would then fail or hang the same way. Reset the
-    // pipe (PASSIVE_LEVEL, so from the work item). Failures caused by
-    // MiniportPause cancelling writes are excluded: the gate is already
-    // closed then.
-    if (ndisStatus != NDIS_STATUS_SUCCESS && deviceContext->DataPathRunning != 0)
+    // Recovery is NOT started from here. A completion routine runs at
+    // DISPATCH_LEVEL, and the writes cancelled by recovery itself complete
+    // through this same routine, so triggering from here re-entered
+    // recovery. This only counts; MiniportCheckForHangEx (called by NDIS at
+    // its own interval) reads the count and asks NDIS for MiniportResetEx.
+    // Failures while the gate is closed (MiniportPause cancelling writes)
+    // are expected and not counted.
+    if (ndisStatus == NDIS_STATUS_SUCCESS)
     {
-        T2NcmTxRequestPipeRecovery(deviceContext);
+        InterlockedExchange(&deviceContext->TxConsecutiveFailures, 0);
+        InterlockedExchange(&deviceContext->TxConsecutiveResets, 0);
+    }
+    else if (deviceContext->DataPathRunning != 0)
+    {
+        InterlockedIncrement(&deviceContext->TxConsecutiveFailures);
     }
 
     T2NcmTxCompleteNetBuffer(deviceContext, requestContext->NetBufferList, ndisStatus);

@@ -276,6 +276,12 @@ typedef struct _T2_DEVICE_CONTEXT
     WDFDMAENABLER        DmaEnabler;
     WDFCOMMONBUFFER      OolInBuffer;
     WDFCOMMONBUFFER      OolOutBuffer;
+    // Extra WDF references taken once SEP may know a buffer's address (see
+    // T2DmaPinForSep in dma.c). Never released: SEP retains the address until
+    // reboot, so the memory must outlive this WDFDEVICE too.
+    BOOLEAN              DmaEnablerPinned;
+    BOOLEAN              OolInPinned;
+    BOOLEAN              OolOutPinned;
     PVOID                OolInVa;   // VA from common buffer
     PVOID                OolOutVa;
     PHYSICAL_ADDRESS     OolInPa;   // logical/bus address for SEP

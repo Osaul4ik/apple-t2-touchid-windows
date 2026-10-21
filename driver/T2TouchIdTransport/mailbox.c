@@ -15,33 +15,63 @@ static ULONGLONG T2NowUs(VOID)
     return KeQueryInterruptTime() / 10;
 }
 
-static VOID T2StallMicroseconds(_In_ ULONG MinUs, _In_ ULONG MaxUs)
+// Fine-grained monotonic clock for the mailbox poll loops. KeQueryInterruptTime
+// only advances once per system timer tick (0.5-15.6 ms), so it cannot
+// measure the first few hundred microseconds of a poll. Split division keeps
+// the counter*1e6 product from overflowing on long uptimes.
+static ULONGLONG T2PerfUs(VOID)
 {
-    // PASSIVE_LEVEL under ExchangeLock (WDFWAITLOCK) — never in a DPC.
-    // Prefer a real sleep over KeStallExecutionProcessor busy-wait so a
-    // multi-second SEP timeout does not pin a CPU core for the full
-    // T2_SEP_TIMEOUT_US / T2_SEP_TRANSACTION_DEADLINE_US window (which also
-    // delays D0Exit/ReleaseHardware that serialize on the same lock).
-    // Interval is relative (negative) in 100 ns units.
-    UNREFERENCED_PARAMETER(MaxUs);
-    LARGE_INTEGER interval;
-    ULONG us = (MinUs > 0) ? MinUs : 1;
-    interval.QuadPart = -((LONGLONG)us * 10);
-    (VOID)KeDelayExecutionThread(KernelMode, FALSE, &interval);
+    LARGE_INTEGER freq;
+    LARGE_INTEGER cnt = KeQueryPerformanceCounter(&freq);
+    ULONGLONG f = (ULONGLONG)freq.QuadPart;
+    ULONGLONG c = (ULONGLONG)cnt.QuadPart;
+    if (f == 0) {
+        return KeQueryInterruptTime() / 10;
+    }
+    return (c / f) * 1000000ULL + ((c % f) * 1000000ULL) / f;
+}
+
+// A SEP reply normally lands within a few hundred microseconds. Poll that
+// first window with short busy-waits (a sleep is rounded UP to a whole
+// timer tick, i.e. >= 0.5 ms and up to 15.6 ms, which is where most of the
+// reply latency used to go); after it, sleep so a silent SEP never pins a
+// core. The spin window is bounded and only exists inside a transaction -
+// nothing here runs while the transport is idle.
+#define T2_SEP_SPIN_WINDOW_US   300u
+#define T2_SEP_SPIN_STEP_US     10u
+
+// PASSIVE_LEVEL under ExchangeLock (WDFWAITLOCK) - never in a DPC.
+// ElapsedUs is REAL elapsed time (T2PerfUs), not an iteration count: a
+// KeDelayExecutionThread(100us) really sleeps one full timer tick, so
+// counting iterations made the "5 s" timeouts last minutes while holding
+// ExchangeLock (blocking D0Exit and RegisterOol behind them).
+static VOID T2PollPause(_In_ ULONGLONG ElapsedUs)
+{
+    if (ElapsedUs < T2_SEP_SPIN_WINDOW_US) {
+        KeStallExecutionProcessor(T2_SEP_SPIN_STEP_US);
+    } else {
+        LARGE_INTEGER interval;
+        interval.QuadPart = -((LONGLONG)T2_SEP_POLL_MIN_US * 10);
+        (VOID)KeDelayExecutionThread(KernelMode, FALSE, &interval);
+    }
 }
 
 NTSTATUS
 T2MailboxWaitOutbox(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ ULONG TimeoutUs)
 {
-    ULONG waited = 0;
+    ULONGLONG startUs = T2PerfUs();
 
-    while (waited < TimeoutUs) {
+    for (;;) {
+        ULONGLONG elapsedUs;
         ULONG status = READ_REGISTER_ULONG((PULONG)(Ctx->Bar4VirtualAddress + T2_SEP_OUTBOX_STATUS));
         if (!(status & T2_SEP_OUTBOX_FULL_BIT)) {
             return STATUS_SUCCESS;
         }
-        T2StallMicroseconds(T2_SEP_POLL_MIN_US, T2_SEP_POLL_MAX_US);
-        waited += T2_SEP_POLL_MIN_US;
+        elapsedUs = T2PerfUs() - startUs;
+        if (elapsedUs >= TimeoutUs) {
+            break;
+        }
+        T2PollPause(elapsedUs);
     }
     T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
         "T2TouchIdTransport: timed out waiting for SEP outbox to drain (%u us)\n", TimeoutUs));
@@ -106,13 +136,16 @@ T2MailboxSend(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ const T2_SEP_MESSAGE *Message)
 NTSTATUS
 T2MailboxReceive(_In_ PT2_DEVICE_CONTEXT Ctx, _Out_ T2_SEP_MESSAGE *Message, _In_ ULONG TimeoutUs)
 {
-    ULONG waited = 0;
+    ULONGLONG startUs = T2PerfUs();
+    ULONGLONG nextHeartbeatUs = 1000000ULL;
+    ULONG waited = 0;   // REAL elapsed microseconds (see T2PollPause)
 
-    while (waited < TimeoutUs) {
+    for (;;) {
         ULONG status = READ_REGISTER_ULONG((PULONG)(Ctx->Bar4VirtualAddress + T2_SEP_INBOX_STATUS));
         // Heartbeat every 1s so we can see whether inbox/outbox bits move at all
         // during an EP7 timeout (proves SEP is alive but silent vs frozen).
-        if (waited > 0 && (waited % 1000000) < T2_SEP_POLL_MIN_US) {
+        if ((ULONGLONG)waited >= nextHeartbeatUs) {
+            nextHeartbeatUs += 1000000ULL;
             ULONG ob = READ_REGISTER_ULONG((PULONG)(Ctx->Bar4VirtualAddress + T2_SEP_OUTBOX_STATUS));
             T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                 "T2TouchIdTransport: MMIO WAIT %u ms inbox=0x%x empty=%d outbox=0x%x full=%d seq=0x%x\n",
@@ -132,11 +165,18 @@ T2MailboxReceive(_In_ PT2_DEVICE_CONTEXT Ctx, _Out_ T2_SEP_MESSAGE *Message, _In
             // place that will show the raw bytes it wrongly rejected.
             T2_LOG((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                 "T2TouchIdTransport: SEP receive word0=0x%08x word1=0x%08x word2=0x%08x waited=%u us\n",
-                Message->Word[0], Message->Word[1], Message->Word[2], waited));
+                Message->Word[0], Message->Word[1], Message->Word[2],
+                (ULONG)(T2PerfUs() - startUs)));
             return STATUS_SUCCESS;
         }
-        T2StallMicroseconds(T2_SEP_POLL_MIN_US, T2_SEP_POLL_MAX_US);
-        waited += T2_SEP_POLL_MIN_US;
+        {
+            ULONGLONG elapsedUs = T2PerfUs() - startUs;
+            if (elapsedUs >= TimeoutUs) {
+                break;
+            }
+            waited = (ULONG)elapsedUs;
+            T2PollPause(elapsedUs);
+        }
     }
     // DIAGNOSTIC: on a real timeout, capture a final inbox/outbox snapshot.
     // This distinguishes "SEP never touched the mailbox again" (outbox

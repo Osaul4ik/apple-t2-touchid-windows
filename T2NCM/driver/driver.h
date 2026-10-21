@@ -366,9 +366,17 @@ typedef struct _T2NCM_DEVICE_CONTEXT
     volatile LONG        TxHangLastCompleted;
     // Requests for the recovery work item (PASSIVE_LEVEL work that
     // cannot run in a completion routine or in MiniportResetEx).
-    volatile LONG        TxRecoverPending;   // reset the bulk-OUT pipe
     volatile LONG        ResetPending;       // MiniportResetEx awaiting NdisMResetComplete
     volatile LONG        TxPipeResetCount;   // diagnostic
+    // Write-failure bookkeeping that drives MiniportCheckForHangEx (the ONLY
+    // trigger for TX recovery - the completion routine just counts).
+    // TxConsecutiveFailures: failed writes since the last successful write
+    //   or the last recovery (cleared by both).
+    // TxConsecutiveResets: recoveries run since the last successful write;
+    //   at T2NCM_TX_MAX_RESETS the pipe reset is judged not to help and the
+    //   device is restarted via WdfDeviceSetFailed.
+    volatile LONG        TxConsecutiveFailures;
+    volatile LONG        TxConsecutiveResets;
     WDFWORKITEM          RecoveryWorkItem;
 
     // Current D-state as told to us by OID_PNP_SET_POWER. NDIS owns

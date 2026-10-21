@@ -1592,10 +1592,19 @@ T2NcmMiniportDevicePnPEventNotify(
 
 MINIPORT_CHECK_FOR_HANG T2NcmMiniportCheckForHangEx;
 
+// TX failures in a row (no successful write between them) that count as a
+// stuck endpoint even though writes still complete (as failures/timeouts).
+#define T2NCM_TX_FAIL_THRESHOLD   3
+// Pipe resets in a row (no successful write between them) after which a
+// further reset is judged useless and the device is restarted instead.
+#define T2NCM_TX_MAX_RESETS       2
+
 // Called by NDIS every CheckForHangTimeInSeconds at IRQL <= DISPATCH_LEVEL.
-// TRUE makes NDIS call MiniportResetEx. A hang is: the data path is
-// running, bulk-OUT writes are outstanding, and not one write completed
-// (successfully or not) since the previous check.
+// TRUE makes NDIS call MiniportResetEx. The data path must be running and
+// either (a) bulk-OUT writes are outstanding and not one completed
+// (successfully or not) since the previous check, or (b) at least
+// T2NCM_TX_FAIL_THRESHOLD writes in a row failed. This is the single entry
+// into TX recovery.
 BOOLEAN
 T2NcmMiniportCheckForHangEx(
     _In_ NDIS_HANDLE MiniportAdapterContext
@@ -1604,15 +1613,27 @@ T2NcmMiniportCheckForHangEx(
     PT2NCM_DEVICE_CONTEXT context = (PT2NCM_DEVICE_CONTEXT)MiniportAdapterContext;
     LONG completed = context->TxCompletedCount;
     LONG previous = InterlockedExchange(&context->TxHangLastCompleted, completed);
+    LONG failures = context->TxConsecutiveFailures;
 
-    if (context->DataPathRunning != 0 &&
-        context->OutstandingTxRequests != 0 &&
-        completed == previous)
+    if (context->DataPathRunning == 0)
+    {
+        return FALSE;
+    }
+
+    if (context->OutstandingTxRequests != 0 && completed == previous)
     {
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
             "T2Ncm: CheckForHang - %ld TX write(s) outstanding with no "
             "completion since the last check, requesting reset\n",
             context->OutstandingTxRequests));
+        return TRUE;
+    }
+
+    if (failures >= T2NCM_TX_FAIL_THRESHOLD)
+    {
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+            "T2Ncm: CheckForHang - %ld TX writes failed in a row, "
+            "requesting reset\n", failures));
         return TRUE;
     }
 
@@ -1651,7 +1672,7 @@ T2NcmMiniportResetEx(
     return NDIS_STATUS_PENDING;
 }
 
-// PASSIVE_LEVEL half of TX pipe recovery and of MiniportResetEx.
+// PASSIVE_LEVEL half of MiniportResetEx (the only TX recovery path).
 VOID
 T2NcmEvtRecoveryWorkItem(
     _In_ WDFWORKITEM WorkItem
@@ -1659,27 +1680,39 @@ T2NcmEvtRecoveryWorkItem(
 {
     PT2NCM_DEVICE_CONTEXT context =
         T2NcmGetDeviceContext(WdfWorkItemGetParentObject(WorkItem));
-    BOOLEAN reset = (InterlockedExchange(&context->ResetPending, 0) != 0);
-    BOOLEAN recover = (InterlockedExchange(&context->TxRecoverPending, 0) != 0);
     NDIS_STATUS resetStatus = NDIS_STATUS_SUCCESS;
+    BOOLEAN restartDevice = FALSE;
 
-    if (!reset && !recover)
+    if (InterlockedExchange(&context->ResetPending, 0) == 0)
     {
         return;
     }
 
     // Paused/halting: nothing to recover, MiniportRestart rebuilds the
-    // data path. A pending reset is still completed below.
+    // data path. The pending reset is still completed below.
     if (context->DataPathRunning != 0)
     {
-        NTSTATUS status = T2NcmTxRecoverPipe(context);
-        if (!NT_SUCCESS(status))
-        {
-            resetStatus = NDIS_STATUS_FAILURE;
-        }
+        NTSTATUS status;
 
-        if (reset)
+        // A reset that follows T2NCM_TX_MAX_RESETS earlier ones with no
+        // successful write in between means resetting the pipe does not
+        // help: fail the reset and have PnP restart the device instead.
+        if (InterlockedIncrement(&context->TxConsecutiveResets) > T2NCM_TX_MAX_RESETS)
         {
+            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+                "T2Ncm: pipe reset did not restore TX after %d attempts - "
+                "restarting the device\n", T2NCM_TX_MAX_RESETS));
+            resetStatus = NDIS_STATUS_FAILURE;
+            restartDevice = TRUE;
+        }
+        else
+        {
+            status = T2NcmTxRecoverPipe(context);
+            if (!NT_SUCCESS(status))
+            {
+                resetStatus = NDIS_STATUS_FAILURE;
+            }
+
             T2NcmRxStop(context);
             if (context->DataPathRunning != 0)
             {
@@ -1692,12 +1725,19 @@ T2NcmEvtRecoveryWorkItem(
                     resetStatus = NDIS_STATUS_FAILURE;
                 }
             }
+
+            // Writes cancelled by the stop above already completed; start
+            // counting from zero so they cannot immediately re-trigger.
+            InterlockedExchange(&context->TxConsecutiveFailures, 0);
         }
     }
 
-    if (reset)
+    NdisMResetComplete(context->MiniportAdapterHandle, resetStatus, FALSE);
+
+    if (restartDevice)
     {
-        NdisMResetComplete(context->MiniportAdapterHandle, resetStatus, FALSE);
+        InterlockedExchange(&context->TxConsecutiveResets, 0);
+        WdfDeviceSetFailed(context->WdfDevice, WdfDeviceFailedAttemptRestart);
     }
 }
 
