@@ -179,11 +179,6 @@ VOID T2NcmLogRefresh(VOID);
 #define T2NCM_MAC_LENGTH            6u
 #define T2NCM_ETHERNET_HEADER_SIZE  14u
 #define T2NCM_MTU                   1500u
-// MTU reported to NDIS while the IPv4-over-IPv6 tunnel is on: the tunnel turns a
-// 20-byte IPv4 header into a 40-byte IPv6 one, so an IP packet above 1480 bytes
-// no longer fits the T2's 1514-byte Ethernet frame. NDIS cannot change the L2 MTU
-// of a running adapter, so this is chosen once, in MiniportInitializeEx.
-#define T2NCM_TUNNEL_MTU            (T2NCM_MTU - 20u)
 #define T2NCM_MAX_FRAME_SIZE        (T2NCM_ETHERNET_HEADER_SIZE + T2NCM_MTU)  // 1514
 
 // Upper bound on concurrently outstanding bulk-IN read requests. The RX
@@ -266,9 +261,7 @@ typedef struct _T2NCM_DEVICE_CONTEXT
     // TunnelModeEnabled is a per-device cached copy of the driver-global mode (Tunnel.c).
     // PeerIpv6 is learned from the first inbound IPv6 frame source.
     BOOLEAN              TunnelModeEnabled;
-    // L2 MTU handed to NDIS at MiniportInitializeEx (T2NCM_MTU, or
-    // T2NCM_TUNNEL_MTU when the tunnel was on at that moment). Fixed for the
-    // life of the adapter; NDIS has no way to change it afterwards.
+    // L2 MTU handed to NDIS at MiniportInitializeEx (always T2NCM_MTU).
     ULONG                L2Mtu;
     BOOLEAN              TunnelPeerIpv6Valid;
     UCHAR                TunnelPeerIpv6[16];

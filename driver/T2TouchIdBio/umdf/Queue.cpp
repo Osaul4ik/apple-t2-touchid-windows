@@ -2808,6 +2808,17 @@ LRESULT CALLBACK SessionLockWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         if (wParam) { // TRUE = session is ending
             T2BioLog("SessionLockWndProc: WM_ENDSESSION (ending) — abort CAPTURE");
             BeginCaptureShutdown("WM_ENDSESSION");
+        } else {
+            // WM_QUERYENDSESSION armed the shutdown state, but another app vetoed
+            // the shutdown/logoff. Nothing else ever clears these flags, so without
+            // this every later CAPTURE_DATA would be refused until the host restarts.
+            // A real suspend still owns g_sleepBarrier until its resume callback.
+            T2BioLog("SessionLockWndProc: WM_ENDSESSION (cancelled) — re-enabling CAPTURE");
+            g_systemShuttingDown.store(false, std::memory_order_release);
+            if (!t2::transport::IsTransportIoSuspended()) {
+                g_sleepBarrier.store(false, std::memory_order_release);
+            }
+            NotifyCaptureStateChanged();
         }
         return 0;
     }

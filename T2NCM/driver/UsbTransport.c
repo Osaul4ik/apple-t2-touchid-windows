@@ -141,6 +141,9 @@ T2NcmUsbReleaseHardware(
     DeviceContext->DataInterface = NULL;
     DeviceContext->UsbDevice = NULL;
     DeviceContext->RxReaderConfigured = FALSE;
+    // The cached NTB parameters describe the device as it was configured by the
+    // previous Prepare; a stop/start (rebalance, disable/enable) must renegotiate.
+    DeviceContext->NtbParametersCached = FALSE;
 }
 
 static
