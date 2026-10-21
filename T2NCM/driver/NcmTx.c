@@ -12,6 +12,12 @@
 #include "Device.h"
 #include "NdisMiniport.h"
 
+// Longest an async bulk-OUT write may stay with the USB stack before WDF
+// cancels it. Generous for a healthy write (sub-millisecond) while short
+// enough that a wedged endpoint cannot hold an NBL through a power
+// transition. Same budget as the synchronous diagnostic write (2 s).
+#define T2NCM_TX_WRITE_TIMEOUT_MS   2000
+
 // ---- NTB16 / NDP16 wire structures — intentionally re-declared here
 // rather than shared with NcmRx.c, matching this codebase's existing
 // per-file wire-struct convention (see T2NCM_WIRE_NTB_PARAMETERS in
@@ -394,6 +400,7 @@ T2NcmTxSubmitNetBuffer(
     WDFMEMORY memory = NULL;
     WDF_OBJECT_ATTRIBUTES attributes;
     PT2NCM_TX_REQUEST_CONTEXT requestContext;
+    WDF_REQUEST_SEND_OPTIONS sendOptions;
     BOOLEAN sent;
 
     frameLength = NET_BUFFER_DATA_LENGTH(NetBuffer);
@@ -512,9 +519,19 @@ T2NcmTxSubmitNetBuffer(
     // zero while a write was still in flight.
     InterlockedIncrement(&DeviceContext->OutstandingTxRequests);
 
+    // Bounded on purpose. An NBL that is never completed makes tcpip wait
+    // for it forever while NDIS pauses the protocol before sleep
+    // (tcpip!FlpWaitForMiniportToReturnTransmittedPackets), which ends in
+    // bugcheck 0x9F. If the T2 stops answering on bulk OUT, the timeout
+    // cancels the write and the completion routine fails the NBL back
+    // to NDIS instead of leaving it pending.
+    WDF_REQUEST_SEND_OPTIONS_INIT(&sendOptions, WDF_REQUEST_SEND_OPTION_TIMEOUT);
+    WDF_REQUEST_SEND_OPTIONS_SET_TIMEOUT(&sendOptions,
+        WDF_REL_TIMEOUT_IN_MS(T2NCM_TX_WRITE_TIMEOUT_MS));
+
     sent = WdfRequestSend(request,
         WdfUsbTargetPipeGetIoTarget(DeviceContext->BulkOutPipe),
-        WDF_NO_SEND_OPTIONS);
+        &sendOptions);
 
     if (!sent)
     {
@@ -706,4 +723,56 @@ T2NcmTxSendFrame(
         sequence, blockLength, FrameLength));
 
     return STATUS_SUCCESS;
+}
+
+// ---------------------------------------------------------------------
+// Pause / resume of the bulk-OUT engine
+// ---------------------------------------------------------------------
+
+// Cancels every bulk-OUT write still owned by the USB stack. Each
+// cancelled write runs T2NcmEvtTxWriteComplete, which fails its NBL back
+// to NDIS, so nothing is left pending afterwards. Leaves the pipe target
+// stopped: T2NcmTxResume must be called before the next send.
+// PASSIVE_LEVEL only (WdfIoTargetStop with CancelSentIo waits).
+VOID
+T2NcmTxCancelOutstanding(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
+    )
+{
+    WDFUSBPIPE pipe = DeviceContext->BulkOutPipe;
+
+    NT_ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
+
+    if (pipe == NULL)
+    {
+        return;
+    }
+
+    WdfIoTargetStop(WdfUsbTargetPipeGetIoTarget(pipe), WdfIoTargetCancelSentIo);
+}
+
+// Counterpart of T2NcmTxCancelOutstanding. Safe to call on a target that
+// is already started.
+NTSTATUS
+T2NcmTxResume(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
+    )
+{
+    WDFUSBPIPE pipe = DeviceContext->BulkOutPipe;
+    NTSTATUS status;
+
+    NT_ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
+
+    if (pipe == NULL)
+    {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
+    status = WdfIoTargetStart(WdfUsbTargetPipeGetIoTarget(pipe));
+    if (!NT_SUCCESS(status))
+    {
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+            "T2Ncm: WdfIoTargetStart(BulkOutPipe) failed (0x%08X)\n", status));
+    }
+    return status;
 }

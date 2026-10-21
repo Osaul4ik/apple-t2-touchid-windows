@@ -900,6 +900,12 @@ T2NcmMiniportPause(
     (VOID)T2NcmTrySetState(context, T2NcmStateRunning, T2NcmStateStopping);
 
     T2NcmRxStop(context);
+
+    // Cancel bulk-OUT writes the T2 has not completed, so their NBLs are
+    // failed back to NDIS now instead of being waited on until the
+    // drain below times out. T2NcmMiniportRestart restarts the target.
+    T2NcmTxCancelOutstanding(context);
+
     T2NcmWaitForDrain(context);
 
     // Back to NdisRegistered: the adapter still exists and the hardware
@@ -972,6 +978,15 @@ T2NcmMiniportRestart(
                 "T2Ncm: restart - re-arm failed 0x%08X\n", status));
             return NDIS_STATUS_FAILURE;
         }
+    }
+
+    // MiniportPause stopped the bulk-OUT target to cancel in-flight
+    // writes; sends fail on a stopped target, so start it again before
+    // the gate opens.
+    status = T2NcmTxResume(context);
+    if (!NT_SUCCESS(status))
+    {
+        return NDIS_STATUS_FAILURE;
     }
 
     // Open the gate BEFORE arming the reader: a read completion that
@@ -1095,11 +1110,11 @@ T2NcmMiniportCancelSend(
     UNREFERENCED_PARAMETER(MiniportAdapterContext);
     UNREFERENCED_PARAMETER(CancelId);
 
-    // Nothing to cancel: this driver never queues NBLs. Every NET_BUFFER
-    // is turned into a USB write request and submitted immediately, so
-    // by the time a cancel could arrive the work is either in the USB
-    // stack or already completed. Present because NDIS requires the
-    // handler, not because there is a queue behind it.
+    // Nothing queued here: this driver never holds NBLs of its own. Every
+    // NET_BUFFER becomes a USB write submitted immediately, so a cancel
+    // finds the work either in the USB stack or already completed. Writes
+    // in the USB stack are bounded by the send timeout in NcmTx.c and are
+    // cancelled wholesale by T2NcmTxCancelOutstanding from MiniportPause.
 }
 
 // ---------------------------------------------------------------------

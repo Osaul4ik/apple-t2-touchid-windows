@@ -54,3 +54,19 @@ T2NcmTxSendFrame(
     _In_reads_bytes_(FrameLength) const UCHAR* Frame,
     _In_ ULONG FrameLength
     );
+
+// Cancels every in-flight bulk-OUT write (their NBLs are failed back to
+// NDIS by the completion routine) and leaves the OUT pipe target
+// stopped. Called from MiniportPause so a write the T2 never completes
+// cannot outlive the pause. PASSIVE_LEVEL only.
+VOID
+T2NcmTxCancelOutstanding(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
+    );
+
+// Restarts the OUT pipe target after T2NcmTxCancelOutstanding. Idempotent.
+// Called from MiniportRestart before the data path is reopened.
+NTSTATUS
+T2NcmTxResume(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
+    );
