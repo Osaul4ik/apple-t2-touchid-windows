@@ -425,7 +425,38 @@ inline bool IsTunnelMappedIpv4(const in_addr& a) {
     return a.S_un.S_un_b.s_b1 == 169 && a.S_un.S_un_b.s_b2 == 254;
 }
 
+// A MAC we may put into the ARP table / registry: not all-zero (an
+// Incomplete/Unreachable NDP row, or a row Windows cleared), not broadcast,
+// not multicast. A zero MAC used to slip through and was written into the
+// static ARP row, so every SYN went to 00:00:00:00:00:00 and was silently
+// dropped (WSA=10060) until the bridge process was restarted.
+inline bool IsUsableMac(const UCHAR mac[6]) {
+    if (!mac) return false;
+    if (mac[0] & 0x01) return false; // multicast / broadcast
+    for (int i = 0; i < 6; ++i) {
+        if (mac[i] != 0) return true;
+    }
+    return false;
+}
+
+// The T2 link-local address is EUI-64 derived from its MAC
+// (fe80::aede:48ff:fe33:4455 <-> AC:DE:48:33:44:55). When NDP is blocked
+// (VPN/WFP) and nothing usable is persisted, this still yields the right MAC.
+// Returns false if the address is not EUI-64 shaped (no ff:fe in the middle).
+inline bool MacFromEui64(const in6_addr& peer6, UCHAR outMac[6]) {
+    if (peer6.s6_addr[0] != 0xFE || (peer6.s6_addr[1] & 0xC0) != 0x80) return false;
+    if (peer6.s6_addr[11] != 0xFF || peer6.s6_addr[12] != 0xFE) return false;
+    outMac[0] = static_cast<UCHAR>(peer6.s6_addr[8] ^ 0x02); // flip U/L bit
+    outMac[1] = peer6.s6_addr[9];
+    outMac[2] = peer6.s6_addr[10];
+    outMac[3] = peer6.s6_addr[13];
+    outMac[4] = peer6.s6_addr[14];
+    outMac[5] = peer6.s6_addr[15];
+    return IsUsableMac(outMac);
+}
+
 // Publish peer fe80 (+ optional MAC) for T2Ncm.sys (read at PASSIVE refresh).
+// A non-usable MAC is never persisted (it would poison the next cold boot).
 inline void PublishTunnelPeer(const in6_addr& peer6, const UCHAR mac[6] /*nullable*/) {
     HKEY key = nullptr;
     if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, kNetworkRegPath, 0, nullptr, 0,
@@ -434,7 +465,7 @@ inline void PublishTunnelPeer(const in6_addr& peer6, const UCHAR mac[6] /*nullab
     }
     RegSetValueExW(key, kPeerIpv6Value, 0, REG_BINARY,
                    reinterpret_cast<const BYTE*>(&peer6), sizeof(peer6));
-    if (mac) {
+    if (IsUsableMac(mac)) {
         RegSetValueExW(key, kPeerMacValue, 0, REG_BINARY, mac, 6);
     }
     RegCloseKey(key);
@@ -458,13 +489,15 @@ inline bool ReadPersistedPeer(in6_addr* peer6, UCHAR mac[6], bool* haveMac) {
         type = 0;
         *haveMac = RegQueryValueExW(key, kPeerMacValue, nullptr, &type,
                                     mac, &cb) == ERROR_SUCCESS &&
-                   type == REG_BINARY && cb == 6;
+                   type == REG_BINARY && cb == 6 && IsUsableMac(mac);
     }
     RegCloseKey(key);
     return ok;
 }
 
 // Look up peer MAC from the IPv6 neighbor table (same entry as discovery).
+// Only rows that carry a real, resolved MAC count: Incomplete/Unreachable rows
+// and zero/multicast MACs are skipped (see IsUsableMac).
 inline bool LookupPeerMac(unsigned long ifIndex, const in6_addr& peer6, UCHAR outMac[6]) {
     PMIB_IPNET_TABLE2 table = nullptr;
     if (GetIpNetTable2(AF_INET6, &table) != NO_ERROR || !table) {
@@ -477,17 +510,17 @@ inline bool LookupPeerMac(unsigned long ifIndex, const in6_addr& peer6, UCHAR ou
         const auto& e = table->Table[i];
         if (e.InterfaceIndex != ifIndex) continue;
         if (e.Address.si_family != AF_INET6) continue;
-        if (e.PhysicalAddressLength < 6) continue;
-        // Skip multicast/solicited-node style permanent junk: need a real MAC.
-        if (e.PhysicalAddress[0] & 0x01) continue;
-        if (!any) {
-            std::memcpy(anyMac, e.PhysicalAddress, 6);
-            any = true;
-        }
+        if (e.PhysicalAddressLength != 6) continue;
+        if (e.State == NlnsUnreachable || e.State == NlnsIncomplete) continue;
+        if (!IsUsableMac(e.PhysicalAddress)) continue;
         if (std::memcmp(&e.Address.Ipv6.sin6_addr, &peer6, sizeof(in6_addr)) == 0) {
             std::memcpy(outMac, e.PhysicalAddress, 6);
             found = true;
             break;
+        }
+        if (!any) {
+            std::memcpy(anyMac, e.PhysicalAddress, 6);
+            any = true;
         }
     }
     FreeMibTable(table);
@@ -499,8 +532,14 @@ inline bool LookupPeerMac(unsigned long ifIndex, const in6_addr& peer6, UCHAR ou
 }
 
 // Static neighbor so TCP SYN is not stuck on ARP for 169.254.x.y.
-inline void EnsureTunnelIpv4Neighbor(unsigned long ifIndex, const in_addr& peer4,
+// Returns true only if the row now holds `mac`. A non-usable MAC is refused
+// outright - a static row pointing at 00-00-00-00-00-00 black-holes the tunnel.
+inline bool EnsureTunnelIpv4Neighbor(unsigned long ifIndex, const in_addr& peer4,
                                      const UCHAR mac[6]) {
+    if (!IsUsableMac(mac)) {
+        T2_LOG("tunnel", L"ARP neighbor not set: refusing unusable MAC (zero/multicast) for ifIndex=%lu", ifIndex);
+        return false;
+    }
     MIB_IPNET_ROW2 row{};
     row.Address.Ipv4.sin_family = AF_INET;
     row.Address.Ipv4.sin_addr = peer4;
@@ -536,6 +575,7 @@ inline void EnsureTunnelIpv4Neighbor(unsigned long ifIndex, const in_addr& peer4
                                                   : L"UPDATE FAILED"),
            c,
            createdFresh ? L"" : (setResult == NO_ERROR ? L", set=OK" : L", set FAILED"));
+    return createdFresh || setResult == NO_ERROR;
 }
 
 
@@ -1066,33 +1106,45 @@ inline TunnelPrep PrepareTunnelPeer(unsigned long ifIndex, const in6_addr& peer6
         PushTunnelLocalToDriver(ifIndex);
         return TunnelPrep::Ok;
     }
+    // MAC resolution order (first usable wins):
+    //   1. IPv6 neighbor table (live, same peer)
+    //   2. MAC persisted from the last successful session (same peer only)
+    //   3. EUI-64 derivation from the peer's own link-local address
+    // 2 and 3 matter when a VPN/WFP blocks ND and the table is empty or holds
+    // only Incomplete rows. Zero MACs are never accepted at any step.
     UCHAR mac[6]{};
-    bool haveMac = LookupPeerMac(ifIndex, peer6, mac);
-    if (!haveMac) {
-        // Neighbor table empty (VPN/WFP dropped ND) - fall back to the MAC
-        // persisted from the last time IPv6 worked, but only if it belongs
-        // to this same peer.
+    const wchar_t* macSource = nullptr;
+    if (LookupPeerMac(ifIndex, peer6, mac)) {
+        macSource = L"neighbor table";
+    } else {
         in6_addr savedPeer{};
         UCHAR savedMac[6]{};
         bool savedHaveMac = false;
         if (ReadPersistedPeer(&savedPeer, savedMac, &savedHaveMac) && savedHaveMac &&
             std::memcmp(&savedPeer, &peer6, sizeof(in6_addr)) == 0) {
             std::memcpy(mac, savedMac, 6);
-            haveMac = true;
-            T2_LOG("tunnel", L"PrepareTunnelPeer: neighbor table empty - using persisted peer MAC");
+            macSource = L"persisted";
+        } else if (MacFromEui64(peer6, mac)) {
+            macSource = L"EUI-64 of peer address";
         }
     }
-    T2_LOG("tunnel", L"PrepareTunnelPeer: ifIndex=%lu peer=%02x%02x:%02x%02x mac=%s",
+    const bool haveMac = macSource != nullptr;
+    T2_LOG("tunnel", L"PrepareTunnelPeer: ifIndex=%lu peer=%02x%02x:%02x%02x mac=%s%s%s",
            ifIndex, peer6.s6_addr[12], peer6.s6_addr[13],
            peer6.s6_addr[14], peer6.s6_addr[15],
-           haveMac ? L"found" : L"NOT FOUND (ARP neighbor will not be set - tunnel will not work)");
+           haveMac ? L"found (" : L"NOT FOUND (ARP neighbor will not be set - tunnel will not work)",
+           haveMac ? macSource : L"", haveMac ? L")" : L"");
     PublishTunnelPeer(peer6, haveMac ? mac : nullptr);
     PushTunnelPeerToDriver(peer6);
     PushTunnelLocalToDriver(ifIndex);
     if (haveMac) {
-        EnsureTunnelIpv4Neighbor(ifIndex, MapPeerToIpv4(peer6), mac);
-        RememberArpPrepared(peer6);
-        return TunnelPrep::Ok;
+        // Only cache "prepared" if the ARP row really took the MAC; otherwise
+        // the fast path above would skip the repair on every later attempt.
+        if (EnsureTunnelIpv4Neighbor(ifIndex, MapPeerToIpv4(peer6), mac)) {
+            RememberArpPrepared(peer6);
+            return TunnelPrep::Ok;
+        }
+        return TunnelPrep::NoMac;
     }
     return TunnelPrep::NoMac;
 }

@@ -524,6 +524,36 @@ static void TestPortCache_RegistryRoundTrip() {
     discovery::NcmEndpoint noMac; // no stable key => always a miss
     CHECK(!discovery::LoadCachedPort(noMac, &port, &rsd));
 }
+// A zero / multicast MAC must never reach the static ARP row (the VPN bug:
+// SYNs went to 00-00-00-00-00-00 and the tunnel stayed SILENT).
+static void TestPeerMac_ZeroAndMulticastAreRejected() {
+    const UCHAR zero[6] = {0, 0, 0, 0, 0, 0};
+    const UCHAR bcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    const UCHAR mcast[6] = {0x33, 0x33, 0x00, 0x00, 0x00, 0x01};
+    const UCHAR good[6] = {0xAC, 0xDE, 0x48, 0x33, 0x44, 0x55};
+    CHECK(!transport::IsUsableMac(zero));
+    CHECK(!transport::IsUsableMac(bcast));
+    CHECK(!transport::IsUsableMac(mcast));
+    CHECK(!transport::IsUsableMac(nullptr));
+    CHECK(transport::IsUsableMac(good));
+}
+// fe80::aede:48ff:fe33:4455 <-> AC:DE:48:33:44:55 (U/L bit flipped back).
+static void TestPeerMac_DerivedFromEui64LinkLocal() {
+    in6_addr a{};
+    const UCHAR bytes[16] = {0xFE, 0x80, 0, 0, 0, 0, 0, 0,
+                             0xAE, 0xDE, 0x48, 0xFF, 0xFE, 0x33, 0x44, 0x55};
+    std::memcpy(&a, bytes, 16);
+    UCHAR mac[6]{};
+    CHECK(transport::MacFromEui64(a, mac));
+    const UCHAR want[6] = {0xAC, 0xDE, 0x48, 0x33, 0x44, 0x55};
+    CHECK(std::memcmp(mac, want, 6) == 0);
+    a.s6_addr[11] = 0x00; // not EUI-64 shaped -> no guess
+    CHECK(!transport::MacFromEui64(a, mac));
+    in6_addr notLinkLocal = a;
+    notLinkLocal.s6_addr[0] = 0x20;
+    notLinkLocal.s6_addr[11] = 0xFF;
+    CHECK(!transport::MacFromEui64(notLinkLocal, mac));
+}
 int wmain() {
     TestFrameHeader_Valid();
     TestFrameHeader_Truncated();
@@ -564,6 +594,8 @@ int wmain() {
     TestNativeSilence_ZeroGraceIsTheOldBehavior();
     TestNativeRevalidate_UnlockRequestsExactlyOneCheck();
     TestPortCache_RegistryRoundTrip();
+    TestPeerMac_ZeroAndMulticastAreRejected();
+    TestPeerMac_DerivedFromEui64LinkLocal();
 
     if (g_failures == 0) {
         std::wcout << L"All tests passed.\n";
