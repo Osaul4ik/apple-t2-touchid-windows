@@ -412,7 +412,7 @@ T2NcmTxSubmitNetBuffer(
 {
     NTSTATUS status;
     ULONG frameLength;
-    ULONG ndpOffset, ndpLength, datagramOffset, blockLength;
+    ULONG ndpOffset = 0, ndpLength = 0, datagramOffset = 0, blockLength = 0;
     PUCHAR buffer = NULL;
     PVOID frameData;
     WDFREQUEST request = NULL;
