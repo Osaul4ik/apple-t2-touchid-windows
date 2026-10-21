@@ -1095,7 +1095,7 @@ inline bool ApplyTunnelIpv4Mtu(unsigned long ifIndex) {
     if (ifIndex == 0 || IsTransportIoSuspended()) {
         return false;
     }
-    MIB_IPINTERFACE_ROW row;
+    MIB_IPINTERFACE_ROW row{}; // zero-init: PREfast (C6001) does not treat the call below as initialization
     InitializeIpInterfaceEntry(&row);
     row.Family = AF_INET;
     row.InterfaceIndex = ifIndex;
