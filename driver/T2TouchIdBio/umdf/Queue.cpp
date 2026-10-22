@@ -2181,13 +2181,24 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
                          static_cast<long long>(kCaptureMatchWindow.count()));
                 continue;
             }
-            if (!gaveUp && IsDeviceNotReadyOutcome(outcome) && InBringUpWindow()) {
+            // A TransportError is never final while Windows can still cancel: a command that
+            // failed/timed out after a good HELO (T2 restarted its BridgeXPC, port changed
+            // after a long sleep, link flapped) does not set ConnectionLost, and outside the
+            // bring-up window it used to end the CAPTURE - WBF does not re-arm a failed
+            // CAPTURE, so the fingerprint stayed dead. Retrying re-runs the whole connect
+            // flow (cached port -> full rescan) on the next round. Other device-not-ready
+            // outcomes keep the bring-up-window condition.
+            const bool transportRetry = cancelEvent && outcome == VerifyOutcome::TransportError;
+            if (!gaveUp && (transportRetry ||
+                            (IsDeviceNotReadyOutcome(outcome) && InBringUpWindow()))) {
                 // BridgeXPC just (re)appeared and BiometricKit answered "not ready" (setup
-                // command failed, empty/unstable identity list, StartMatch rejected). Same
-                // warm-up as above: ending the CAPTURE here would leave the lock screen
-                // without a fingerprint until the next session.
-                T2BioLog("CAPTURE_DATA(verify): device not ready (outcome=%d) inside the bring-up "
-                         "window - CAPTURE stays pending, retrying after %lu ms",
+                // command failed, empty/unstable identity list, StartMatch rejected), or the
+                // session failed at transport level. Same warm-up as above: ending the
+                // CAPTURE here would leave the lock screen without a fingerprint until the
+                // next session.
+                T2BioLog("CAPTURE_DATA(verify): device not ready / transport error (outcome=%d) - "
+                         "CAPTURE stays pending, reconnecting (full discovery if the port changed) "
+                         "after %lu ms",
                          static_cast<int>(outcome), static_cast<unsigned long>(kSessionLostCooldownMs));
                 if (cancelEvent) {
                     WaitForSingleObject(cancelEvent, kSessionLostCooldownMs);
