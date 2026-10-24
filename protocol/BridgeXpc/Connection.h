@@ -102,7 +102,8 @@ public:
     // A partly received frame still uses ReadFrame's bounded tail timeout.
     bool WaitForEvent(std::vector<uint8_t>* outEventPayload,
                        std::chrono::steady_clock::time_point deadline,
-                       HANDLE cancelEvent = nullptr);
+                       HANDLE cancelEvent = nullptr,
+                   HANDLE prearmedReadEvent = nullptr);
 
     // Discard events retained during LoadCalibration / identity warm-up
     // BEFORE StartMatch is issued. Linux keeps load_calibration_events
@@ -177,7 +178,8 @@ private:
     // sensor sat waiting for a finger).
     bool ReadFrame(RawFrame* out, std::chrono::milliseconds timeout,
                    ReadFailure* why = nullptr, bool quietIdleTimeout = false,
-                   HANDLE cancelEvent = nullptr);
+                   HANDLE cancelEvent = nullptr,
+                   HANDLE prearmedReadEvent = nullptr);
     // ---- receive buffering (hot path) ----
     // ReadFrame() used to cost 2 recv() + up to 2 setsockopt(SO_RCVTIMEO) per frame, and a
     // match session delivers ~25 small events back to back. Frames are now parsed out of

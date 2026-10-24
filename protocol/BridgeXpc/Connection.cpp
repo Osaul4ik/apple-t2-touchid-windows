@@ -1037,26 +1037,40 @@ Connection::WaitStep Connection::WaitForEventStep(std::vector<uint8_t>* outEvent
         // Wait on the readiness event only when the receive buffer is empty.
         // Partial frames remain owned by this reader and are never handed to
         // a competing transaction (a mid-frame cancel makes the stream dead).
-        if (cancelEvent && rxLen_ == rxPos_) {
+        // Keep one Winsock registration alive across readiness and the whole
+        // frame read. Re-arming FD_READ between these operations can suppress
+        // an already-delivered readiness notification.
+        std::optional<ScopedSocketReadEvent> readEvent;
+        HANDLE socketReadEvent = nullptr;
+        if (cancelEvent) {
             if (!ioWaiterEvent_) {
                 T2_LOG("waitForEvent", L"I/O waiter event creation failed");
                 return WaitStep::Fail;
             }
-            ScopedSocketReadEvent socketEvent(socket_);
-            if (!socketEvent.ready()) {
+            readEvent.emplace(socket_, &connectionLost_);
+            if (!readEvent->ready()) {
                 T2_LOG("waitForEvent", L"WSAEventSelect failed WSA=%d", WSAGetLastError());
                 connectionLost_.store(true);
                 return WaitStep::Fail;
             }
-            HANDLE handles[3] = { cancelEvent, ioWaiterEvent_, socketEvent.handle() };
+            socketReadEvent = readEvent->handle();
+            // First drain any bytes already in the per-connection buffer.
+            // Only wait for FD_READ if we have none.
+            if (rxLen_ == rxPos_) {
+            u_long queuedBytes = 0;
+            if (ioctlsocket(socket_, FIONREAD, &queuedBytes) != 0) {
+                connectionLost_.store(true);
+                return WaitStep::Fail;
+            }
+            if (queuedBytes == 0) {
+            HANDLE handles[3] = { cancelEvent, ioWaiterEvent_, socketReadEvent };
             const DWORD waitMs = remaining.count() > static_cast<long long>(INFINITE - 1)
                 ? INFINITE - 1 : static_cast<DWORD>(remaining.count());
             const DWORD result = WaitForMultipleObjects(3, handles, FALSE, waitMs);
             WSANETWORKEVENTS events{};
             const bool socketReady = result == 2;
-            const bool enumOk = !socketReady || socketEvent.NetworkEvents(&events);
-            const bool restored = socketEvent.Disarm();
-            if (!restored || !enumOk) {
+            const bool enumOk = !socketReady || readEvent->NetworkEvents(&events);
+            if (!enumOk) {
                 T2_LOG("waitForEvent", L"socket event cleanup failed WSA=%d", WSAGetLastError());
                 connectionLost_.store(true);
                 return WaitStep::Fail;
@@ -1076,6 +1090,8 @@ Connection::WaitStep Connection::WaitForEventStep(std::vector<uint8_t>* outEvent
             }
             // FD_CLOSE may coexist with FD_READ: still read any queued bytes.
             // The frame reader will detect EOF if the peer actually closed.
+            }
+            }
         }
         // Recompute after the socket readiness wait: the previous budget
         // was captured before WaitForMultipleObjects and may now be stale.
@@ -1083,7 +1099,17 @@ Connection::WaitStep Connection::WaitForEventStep(std::vector<uint8_t>* outEvent
         if (readBudget.count() <= 0) return WaitStep::Fail;
         RawFrame frame;
         ReadFailure why = ReadFailure::None;
-        if (!ReadFrame(&frame, readBudget, &why, /*quietIdleTimeout=*/cancelEvent != nullptr, cancelEvent)) {
+        const bool frameOk = ReadFrame(&frame, readBudget, &why,
+                                       /*quietIdleTimeout=*/cancelEvent != nullptr,
+                                       cancelEvent, socketReadEvent);
+        // ACK and other BridgeXPC writes must always see a blocking socket.
+        // Do not re-register FD_READ in the gap between readiness and recv.
+        if (readEvent && !readEvent->Disarm()) {
+            connectionLost_.store(true);
+            T2_LOG("waitForEvent", L"socket event cleanup after ReadFrame failed WSA=%d", WSAGetLastError());
+            return WaitStep::Fail;
+        }
+        if (!frameOk) {
             if (why == ReadFailure::IdleTimeout) {
                 if (!cancelEvent) {
                     T2_LOG("waitForEvent", L"ReadFrame timed out, %lldms remained",
@@ -1199,7 +1225,8 @@ static constexpr size_t kRxFrameHeaderBytes = 16;
 static constexpr size_t kRxKeepBytes = 65536;
 
 bool Connection::ReadFrame(RawFrame* out, std::chrono::milliseconds timeout,
-                            ReadFailure* why, bool quietIdleTimeout, HANDLE cancelEvent) {
+                            ReadFailure* why, bool quietIdleTimeout, HANDLE cancelEvent,
+                            HANDLE prearmedReadEvent) {
     if (why) *why = ReadFailure::None;
 
     // During a match, keep the entire frame under the same ioMu_ owner.
@@ -1207,7 +1234,7 @@ bool Connection::ReadFrame(RawFrame* out, std::chrono::milliseconds timeout,
     // immediately available data and waits for readiness/cancel otherwise.
     // Other BridgeXPC operations retain the existing blocking ReadFrame path.
     std::optional<ScopedSocketReadEvent> eventReader;
-    if (cancelEvent) {
+    if (cancelEvent && !prearmedReadEvent) {
         eventReader.emplace(socket_, &connectionLost_);
         if (!eventReader->ready()) {
             connectionLost_.store(true);
@@ -1283,7 +1310,9 @@ bool Connection::ReadFrame(RawFrame* out, std::chrono::milliseconds timeout,
                     }
                     const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
                     const auto waitMs = static_cast<DWORD>((std::max)(1LL, left.count()));
-                    HANDLE handles[2] = {cancelEvent, eventReader->handle()};
+                    const HANDLE socketEvent = prearmedReadEvent
+                        ? prearmedReadEvent : eventReader->handle();
+                    HANDLE handles[2] = {cancelEvent, socketEvent};
                     const DWORD result = WaitForMultipleObjects(2, handles, FALSE, waitMs);
                     if (result == 0) {
                         connectionLost_.store(true);
@@ -1292,7 +1321,11 @@ bool Connection::ReadFrame(RawFrame* out, std::chrono::milliseconds timeout,
                     }
                     if (result == 1) {
                         WSANETWORKEVENTS events{};
-                        if (!eventReader->NetworkEvents(&events) ||
+                        const bool enumOk = prearmedReadEvent
+                            ? WSAEnumNetworkEvents(socket_,
+                                reinterpret_cast<WSAEVENT>(prearmedReadEvent), &events) != SOCKET_ERROR
+                            : eventReader->NetworkEvents(&events);
+                        if (!enumOk ||
                             events.iErrorCode[FD_READ_BIT] || events.iErrorCode[FD_CLOSE_BIT] ||
                             !(events.lNetworkEvents & (FD_READ | FD_CLOSE))) {
                             connectionLost_.store(true);
