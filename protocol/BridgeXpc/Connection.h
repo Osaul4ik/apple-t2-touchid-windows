@@ -96,22 +96,10 @@ public:
     // (BiometricKit verify engine) must treat false as fail-closed, never
     // as an implicit NO_MATCH signal by itself (see MatchResult.h).
     //
-    // cancelEvent (design doc §9.4 "Таймаут CAPTURE_DATA і скасування"):
-    // optional, defaults to nullptr (existing CLI behavior — wait for the
-    // full deadline, unchanged). When non-null, the wait is sliced into
-    // kCancelPollSlice chunks and cancelEvent is polled between them; a
-    // signaled event makes WaitForEvent return false almost immediately
-    // instead of blocking up to `deadline`. This is a deliberate
-    // approximation of "wait on the SEP event and the cancel HANDLE at
-    // once": the underlying SOCKET is a plain blocking socket (Milestone 1
-    // reasoning, see Connect()'s SO_RCVTIMEO use), so a single recv() call
-    // cannot be interrupted mid-flight by a Win32 event the way an
-    // overlapped I/O WaitForMultipleObjects could. Bounding recv()'s own
-    // timeout to the poll slice keeps a real SEP event from starving the
-    // cancel check, at the cost of adding up to one slice of latency to
-    // cancellation — see the constant's own comment in Connection.cpp for
-    // why that trade is acceptable here (freeing g_captureBusy is what
-    // actually matters, not sub-100ms cancel latency).
+    // With cancelEvent, wait for socket readability, cancellation, or a
+    // competing I/O request via Win32 events instead of polling recv().
+    // Socket readiness is armed only while ioMu_ is held and blocking mode
+    // is restored before calling the buffered ReadFrame() parser.
     bool WaitForEvent(std::vector<uint8_t>* outEventPayload,
                        std::chrono::steady_clock::time_point deadline,
                        HANDLE cancelEvent = nullptr);
@@ -221,18 +209,19 @@ private:
     // socket interleave frames: the logs show ParseFrameHeader failures on
     // a bplist body ("62706c6973743030...") and "torn frame" after every
     // cancel, which kills the session and forces a full reconnect.
-    // ioMu_ makes each wire transaction atomic: SendBiometricCommand /
-    // GetFdrCalibration / Get/SetVersion hold it for the whole
-    // request+reply, WaitForEvent holds it for ONE poll slice at a time, so
-    // a cancel waits at most ~one slice (kCancelPollSlice) instead of
-    // racing. ioWaiters_ lets the worker yield between slices so the
-    // (non-fair) mutex cannot starve the cancel sender.
+    // ioMu_ makes each wire transaction atomic. WaitForEvent releases it
+    // when ioWakeEvent_ signals that another command wants the socket.
+    // ioWaiters_ lets the reader yield so a cancel sender can acquire it.
     std::timed_mutex ioMu_;
     std::atomic<int> ioWaiters_{0};
+    // Auto-reset event: wake the event-driven socket waiter so another
+    // thread can acquire ioMu_ to send CancelMatch or another command.
+    HANDLE ioWakeEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     class IoLock {
     public:
-        IoLock(Connection& c, std::chrono::milliseconds wait) : c_(c) {
+        IoLock(Connection& c, std::chrono::milliseconds wait, bool notify = true) : c_(c) {
             c_.ioWaiters_.fetch_add(1, std::memory_order_acq_rel);
+            if (notify && c_.ioWakeEvent_) SetEvent(c_.ioWakeEvent_);
             owns_ = c_.ioMu_.try_lock_for(wait);
             c_.ioWaiters_.fetch_sub(1, std::memory_order_acq_rel);
         }
