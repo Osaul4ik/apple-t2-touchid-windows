@@ -999,6 +999,7 @@ Connection::WaitStep Connection::WaitForEventStep(std::vector<uint8_t>* outEvent
                 WSAEVENT socketReady = WSACreateEvent();
                 if (socketReady == WSA_INVALID_EVENT) return WaitStep::Fail;
                 if (WSAEventSelect(socket_, socketReady, FD_READ | FD_CLOSE) != 0) {
+                    connectionLost_.store(true);
                     WSACloseEvent(socketReady);
                     return WaitStep::Fail;
                 }
@@ -1006,6 +1007,14 @@ Connection::WaitStep Connection::WaitForEventStep(std::vector<uint8_t>* outEvent
                 const auto budget = RemainingBudget(deadline);
                 const DWORD waitMs = static_cast<DWORD>((std::min)(budget.count(), 0xFFFFFFFELL));
                 const DWORD result = WaitForMultipleObjects(3, handles, FALSE, waitMs);
+                WSANETWORKEVENTS networkEvents{};
+                int networkStatus = 0;
+                // Check the actual Winsock event before disabling event selection:
+                // a signaled WSAEVENT may indicate FD_CLOSE or an FD_READ error,
+                // neither of which is a valid invitation to call ReadFrame().
+                if (result == WAIT_OBJECT_0 + 1) {
+                    networkStatus = WSAEnumNetworkEvents(socket_, socketReady, &networkEvents);
+                }
                 const int eventError = WSAEventSelect(socket_, nullptr, 0);
                 u_long blocking = 0;
                 const int blockingError = ioctlsocket(socket_, FIONBIO, &blocking);
@@ -1015,11 +1024,25 @@ Connection::WaitStep Connection::WaitForEventStep(std::vector<uint8_t>* outEvent
                     T2_LOG("waitForEvent", L"failed restoring blocking socket after event wait");
                     return WaitStep::Fail;
                 }
-                if (result == 0) return WaitStep::Fail; // cancelEvent
-                if (result == 2) return WaitStep::Again; // another I/O sender needs ioMu_
+                if (result == WAIT_OBJECT_0) return WaitStep::Fail; // cancelEvent
+                if (result == WAIT_OBJECT_0 + 2) return WaitStep::Again; // I/O sender
                 if (result == WAIT_TIMEOUT) return WaitStep::Fail;
-                if (result != 1) return WaitStep::Fail; // failed or unexpected wait
-                // Socket has data/closed. ReadFrame consumes and parses it below.
+                if (result != WAIT_OBJECT_0 + 1 || networkStatus != 0) {
+                    connectionLost_.store(true);
+                    T2_LOG("waitForEvent", L"failed waiting for socket readiness");
+                    return WaitStep::Fail;
+                }
+                if ((networkEvents.lNetworkEvents & FD_READ) == 0 ||
+                    networkEvents.iErrorCode[FD_READ_BIT] != 0 ||
+                    ((networkEvents.lNetworkEvents & FD_CLOSE) != 0 &&
+                     networkEvents.iErrorCode[FD_CLOSE_BIT] != 0)) {
+                    connectionLost_.store(true);
+                    T2_LOG("waitForEvent", L"socket readiness reported close/error (events=0x%lx)",
+                           static_cast<unsigned long>(networkEvents.lNetworkEvents));
+                    return WaitStep::Fail;
+                }
+                // FD_READ is present without an associated error. Consume buffered
+                // data even if FD_CLOSE is also reported (there may be a final frame).
                 // Check cancellation again before starting the receive.
                 if (Connection::IsEventSignaled(cancelEvent)) return WaitStep::Fail;
             }
@@ -1029,7 +1052,7 @@ Connection::WaitStep Connection::WaitForEventStep(std::vector<uint8_t>* outEvent
 
         RawFrame frame;
         ReadFailure why = ReadFailure::None;
-        if (!ReadFrame(&frame, readTimeout, &why, /*quietIdleTimeout=*/cancelEvent != nullptr)) {
+        if (!ReadFrame(&frame, readTimeout, &why, /*quietIdleTimeout=*/cancelEvent != nullptr, cancelEvent)) {
             if (why == ReadFailure::IdleTimeout) {
                 // Readiness notification can race with another transport event.
                 // Re-arm the socket readiness event rather than polling.
@@ -1155,7 +1178,7 @@ static constexpr size_t kRxFrameHeaderBytes = 16;
 static constexpr size_t kRxKeepBytes = 65536;
 
 bool Connection::ReadFrame(RawFrame* out, std::chrono::milliseconds timeout,
-                            ReadFailure* why, bool quietIdleTimeout) {
+                            ReadFailure* why, bool quietIdleTimeout, HANDLE cancelEvent) {
     if (why) *why = ReadFailure::None;
 
     FrameHeader hdr{};
@@ -1200,6 +1223,52 @@ bool Connection::ReadFrame(RawFrame* out, std::chrono::milliseconds timeout,
                 // Windows treats SO_RCVTIMEO=0 as infinite. Round up a
                 // positive sub-millisecond remainder to 1 ms.
                 recvTimeout = remaining.count() > 0 ? remaining : std::chrono::milliseconds(1);
+            }
+            // For match-event reads, make the *entire* frame cancellable,
+            // not just the wait for its first byte. Do not yield ioMu_
+            // while part of a frame is buffered: another reader could
+            // consume its tail and desynchronize the BridgeXPC stream.
+            if (cancelEvent) {
+                if (Connection::IsEventSignaled(cancelEvent)) {
+                    if (why) *why = ReadFailure::Error;
+                    return false;
+                }
+                WSAEVENT ready = WSACreateEvent();
+                if (ready == WSA_INVALID_EVENT) {
+                    if (why) *why = ReadFailure::Error;
+                    return false;
+                }
+                bool readyToRead = false;
+                if (WSAEventSelect(socket_, ready, FD_READ | FD_CLOSE) == 0) {
+                    const HANDLE waitHandles[] = {cancelEvent, ready};
+                    const DWORD waitMs = static_cast<DWORD>(
+                        (std::min)(recvTimeout.count(), 0xFFFFFFFELL));
+                    const DWORD waitResult = WaitForMultipleObjects(2, waitHandles, FALSE, waitMs);
+                    WSANETWORKEVENTS events{};
+                    const int enumResult = waitResult == WAIT_OBJECT_0 + 1
+                        ? WSAEnumNetworkEvents(socket_, ready, &events) : SOCKET_ERROR;
+                    readyToRead = waitResult == WAIT_OBJECT_0 + 1 && enumResult == 0 &&
+                        (events.lNetworkEvents & FD_READ) != 0 &&
+                        events.iErrorCode[FD_READ_BIT] == 0 &&
+                        (!(events.lNetworkEvents & FD_CLOSE) || events.iErrorCode[FD_CLOSE_BIT] == 0);
+                    if (waitResult == WAIT_TIMEOUT && !midFrame) {
+                        if (why) *why = ReadFailure::IdleTimeout;
+                    }
+                }
+                // WSAEventSelect enables nonblocking mode. Restore the
+                // original socket mode on every exit path, including cancel.
+                const int disableResult = WSAEventSelect(socket_, nullptr, 0);
+                u_long blocking = 0;
+                const int restoreResult = ioctlsocket(socket_, FIONBIO, &blocking);
+                WSACloseEvent(ready);
+                if (disableResult != 0 || restoreResult != 0) {
+                    if (why) *why = ReadFailure::Error;
+                    return false;
+                }
+                if (!readyToRead || Connection::IsEventSignaled(cancelEvent)) {
+                    if (why && *why == ReadFailure::None) *why = ReadFailure::Error;
+                    return false;
+                }
             }
             if (!SetRcvTimeoutCached(recvTimeout)) {
                 if (why) *why = ReadFailure::Error;

@@ -176,7 +176,8 @@ private:
     // logged (it used to flood the log at 5 lines/second for as long as the
     // sensor sat waiting for a finger).
     bool ReadFrame(RawFrame* out, std::chrono::milliseconds timeout,
-                   ReadFailure* why = nullptr, bool quietIdleTimeout = false);
+                   ReadFailure* why = nullptr, bool quietIdleTimeout = false,
+                   HANDLE cancelEvent = nullptr);
     // ---- receive buffering (hot path) ----
     // ReadFrame() used to cost 2 recv() + up to 2 setsockopt(SO_RCVTIMEO) per frame, and a
     // match session delivers ~25 small events back to back. Frames are now parsed out of
