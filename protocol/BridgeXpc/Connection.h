@@ -29,7 +29,7 @@ enum class ConnectResult {
 // optimize against unverified assumptions.
 class Connection {
 public:
-    Connection() = default;
+    Connection();
     ~Connection();
 
     // interfaceIndex selects the T2 CDC-NCM adapter (IPv6 scope id / IPv4
@@ -96,22 +96,10 @@ public:
     // (BiometricKit verify engine) must treat false as fail-closed, never
     // as an implicit NO_MATCH signal by itself (see MatchResult.h).
     //
-    // cancelEvent (design doc §9.4 "Таймаут CAPTURE_DATA і скасування"):
-    // optional, defaults to nullptr (existing CLI behavior — wait for the
-    // full deadline, unchanged). When non-null, the wait is sliced into
-    // kCancelPollSlice chunks and cancelEvent is polled between them; a
-    // signaled event makes WaitForEvent return false almost immediately
-    // instead of blocking up to `deadline`. This is a deliberate
-    // approximation of "wait on the SEP event and the cancel HANDLE at
-    // once": the underlying SOCKET is a plain blocking socket (Milestone 1
-    // reasoning, see Connect()'s SO_RCVTIMEO use), so a single recv() call
-    // cannot be interrupted mid-flight by a Win32 event the way an
-    // overlapped I/O WaitForMultipleObjects could. Bounding recv()'s own
-    // timeout to the poll slice keeps a real SEP event from starving the
-    // cancel check, at the cost of adding up to one slice of latency to
-    // cancellation — see the constant's own comment in Connection.cpp for
-    // why that trade is acceptable here (freeing g_captureBusy is what
-    // actually matters, not sub-100ms cancel latency).
+    // With cancelEvent, receive idling waits on the socket, cancellation, and
+    // a competing I/O waiter without periodic polling. The temporary Winsock
+    // event subscription is disabled before returning to blocking socket I/O.
+    // A partly received frame still uses ReadFrame's bounded tail timeout.
     bool WaitForEvent(std::vector<uint8_t>* outEventPayload,
                        std::chrono::steady_clock::time_point deadline,
                        HANDLE cancelEvent = nullptr);
@@ -188,7 +176,8 @@ private:
     // logged (it used to flood the log at 5 lines/second for as long as the
     // sensor sat waiting for a finger).
     bool ReadFrame(RawFrame* out, std::chrono::milliseconds timeout,
-                   ReadFailure* why = nullptr, bool quietIdleTimeout = false);
+                   ReadFailure* why = nullptr, bool quietIdleTimeout = false,
+                   HANDLE cancelEvent = nullptr);
     // ---- receive buffering (hot path) ----
     // ReadFrame() used to cost 2 recv() + up to 2 setsockopt(SO_RCVTIMEO) per frame, and a
     // match session delivers ~25 small events back to back. Frames are now parsed out of
@@ -229,10 +218,12 @@ private:
     // (non-fair) mutex cannot starve the cancel sender.
     std::timed_mutex ioMu_;
     std::atomic<int> ioWaiters_{0};
+    HANDLE ioWaiterEvent_ = nullptr; // auto-reset: wake an idle receiver for a competing I/O transaction
     class IoLock {
     public:
         IoLock(Connection& c, std::chrono::milliseconds wait) : c_(c) {
             c_.ioWaiters_.fetch_add(1, std::memory_order_acq_rel);
+            if (c_.ioWaiterEvent_) SetEvent(c_.ioWaiterEvent_);
             owns_ = c_.ioMu_.try_lock_for(wait);
             c_.ioWaiters_.fetch_sub(1, std::memory_order_acq_rel);
         }
