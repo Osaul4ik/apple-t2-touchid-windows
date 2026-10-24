@@ -102,8 +102,7 @@ public:
     // A partly received frame still uses ReadFrame's bounded tail timeout.
     bool WaitForEvent(std::vector<uint8_t>* outEventPayload,
                        std::chrono::steady_clock::time_point deadline,
-                       HANDLE cancelEvent = nullptr,
-                   HANDLE prearmedReadEvent = nullptr);
+                       HANDLE cancelEvent = nullptr);
 
     // Discard events retained during LoadCalibration / identity warm-up
     // BEFORE StartMatch is issued. Linux keeps load_calibration_events
