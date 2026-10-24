@@ -17,6 +17,10 @@ namespace t2::bridgexpc {
 using t2::log::HexDump;
 using t2::log::Widen;
 
+// WaitForMultipleObjects success base is zero. Avoid WAIT_OBJECT_0 here:
+// some UMDF/WDK header combinations expand it to undefined STATUS_WAIT_0.
+constexpr DWORD kWaitObject0 = 0;
+
 // VERIFIED FROM SOURCE: bridge-xpc-probe.py generates a fresh
 // str(uuid.uuid4()).upper() per request — every request/reply/event id in
 // this file must be a real, unique UUIDv4, never a fixed placeholder.
@@ -1012,7 +1016,7 @@ Connection::WaitStep Connection::WaitForEventStep(std::vector<uint8_t>* outEvent
                 // Check the actual Winsock event before disabling event selection:
                 // a signaled WSAEVENT may indicate FD_CLOSE or an FD_READ error,
                 // neither of which is a valid invitation to call ReadFrame().
-                if (result == WAIT_OBJECT_0 + 1) {
+                if (result == kWaitObject0 + 1) {
                     networkStatus = WSAEnumNetworkEvents(socket_, socketReady, &networkEvents);
                 }
                 const int eventError = WSAEventSelect(socket_, nullptr, 0);
@@ -1024,10 +1028,10 @@ Connection::WaitStep Connection::WaitForEventStep(std::vector<uint8_t>* outEvent
                     T2_LOG("waitForEvent", L"failed restoring blocking socket after event wait");
                     return WaitStep::Fail;
                 }
-                if (result == WAIT_OBJECT_0) return WaitStep::Fail; // cancelEvent
-                if (result == WAIT_OBJECT_0 + 2) return WaitStep::Again; // I/O sender
+                if (result == kWaitObject0) return WaitStep::Fail; // cancelEvent
+                if (result == kWaitObject0 + 2) return WaitStep::Again; // I/O sender
                 if (result == WAIT_TIMEOUT) return WaitStep::Fail;
-                if (result != WAIT_OBJECT_0 + 1 || networkStatus != 0) {
+                if (result != kWaitObject0 + 1 || networkStatus != 0) {
                     connectionLost_.store(true);
                     T2_LOG("waitForEvent", L"failed waiting for socket readiness");
                     return WaitStep::Fail;
@@ -1245,9 +1249,9 @@ bool Connection::ReadFrame(RawFrame* out, std::chrono::milliseconds timeout,
                         (std::min)(recvTimeout.count(), 0xFFFFFFFELL));
                     const DWORD waitResult = WaitForMultipleObjects(2, waitHandles, FALSE, waitMs);
                     WSANETWORKEVENTS events{};
-                    const int enumResult = waitResult == WAIT_OBJECT_0 + 1
+                    const int enumResult = waitResult == kWaitObject0 + 1
                         ? WSAEnumNetworkEvents(socket_, ready, &events) : SOCKET_ERROR;
-                    readyToRead = waitResult == WAIT_OBJECT_0 + 1 && enumResult == 0 &&
+                    readyToRead = waitResult == kWaitObject0 + 1 && enumResult == 0 &&
                         (events.lNetworkEvents & FD_READ) != 0 &&
                         events.iErrorCode[FD_READ_BIT] == 0 &&
                         (!(events.lNetworkEvents & FD_CLOSE) || events.iErrorCode[FD_CLOSE_BIT] == 0);
