@@ -421,6 +421,18 @@ T2NcmTxSubmitNetBuffer(
     PT2NCM_TX_REQUEST_CONTEXT requestContext;
     WDF_REQUEST_SEND_OPTIONS sendOptions;
     BOOLEAN sent;
+    WDFUSBPIPE bulkOut;
+
+    // Read the pipe handle once: it is used for the request's I/O target,
+    // the write format and the send, and re-reading the field between them
+    // (no PipeLock on this DISPATCH_LEVEL path) could mix a valid handle
+    // with a NULL one if the data interface is torn down meanwhile.
+    bulkOut = DeviceContext->BulkOutPipe;
+    if (bulkOut == NULL)
+    {
+        status = STATUS_INVALID_DEVICE_STATE;
+        goto Fail;
+    }
 
     frameLength = NET_BUFFER_DATA_LENGTH(NetBuffer);
 
@@ -502,7 +514,7 @@ T2NcmTxSubmitNetBuffer(
     attributes.ParentObject = DeviceContext->WdfDevice;
 
     status = WdfRequestCreate(&attributes,
-        WdfUsbTargetPipeGetIoTarget(DeviceContext->BulkOutPipe), &request);
+        WdfUsbTargetPipeGetIoTarget(bulkOut), &request);
     if (!NT_SUCCESS(status))
     {
         goto Fail;
@@ -530,7 +542,7 @@ T2NcmTxSubmitNetBuffer(
     }
 
     status = WdfUsbTargetPipeFormatRequestForWrite(
-        DeviceContext->BulkOutPipe, request, memory, NULL);
+        bulkOut, request, memory, NULL);
     if (!NT_SUCCESS(status))
     {
         goto Fail;
@@ -555,7 +567,7 @@ T2NcmTxSubmitNetBuffer(
         WDF_REL_TIMEOUT_IN_MS(T2NCM_TX_WRITE_TIMEOUT_MS));
 
     sent = WdfRequestSend(request,
-        WdfUsbTargetPipeGetIoTarget(DeviceContext->BulkOutPipe),
+        WdfUsbTargetPipeGetIoTarget(bulkOut),
         &sendOptions);
 
     if (!sent)

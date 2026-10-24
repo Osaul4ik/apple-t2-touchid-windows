@@ -3,6 +3,7 @@
 #include "Client.h"
 #include "../../driver/T2TouchIdTransport/public.h"
 #include <setupapi.h>
+#include <cstring>
 #include <string>
 #include <mutex>
 #pragma comment(lib, "setupapi.lib")

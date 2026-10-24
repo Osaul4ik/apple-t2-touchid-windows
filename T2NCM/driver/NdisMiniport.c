@@ -283,6 +283,16 @@ T2NcmDispatchDeviceControl(
             status = STATUS_INVALID_PARAMETER;
             break;
         }
+        // Same rule as SET_TUNNEL_LOCAL: the tunnel only ever speaks
+        // link-local (fe80::/10), so anything else is a caller bug.
+        {
+            const UCHAR* peerAddr = (const UCHAR*)Irp->AssociatedIrp.SystemBuffer;
+            if (peerAddr[0] != 0xFE || (peerAddr[1] & 0xC0) != 0x80)
+            {
+                status = STATUS_INVALID_PARAMETER;
+                break;
+            }
+        }
         {
             KIRQL peerIrql;
             KeAcquireSpinLock(&context->TunnelPeerLock, &peerIrql);

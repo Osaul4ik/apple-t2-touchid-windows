@@ -1154,7 +1154,18 @@ static bool WriteAll(SOCKET s, const uint8_t* data, size_t len) {
                      static_cast<int>(len - sent), 0);
         if (n <= 0) {
             int e = WSAGetLastError();
-            if (n < 0 && e == WSAEWOULDBLOCK) continue;
+            if (n < 0 && e == WSAEWOULDBLOCK) {
+                // Send buffer full on a non-blocking socket: wait until it is
+                // writable instead of spinning on send(), bounded so a dead
+                // peer cannot hold the caller forever.
+                fd_set writeSet;
+                FD_ZERO(&writeSet);
+                FD_SET(s, &writeSet);
+                timeval tv{};
+                tv.tv_sec = 5;
+                if (select(0, nullptr, &writeSet, nullptr, &tv) > 0) continue;
+                e = WSAETIMEDOUT;
+            }
             T2_LOG("writeAll", L"send failed after %zu/%zuB, n=%d, WSAGetLastError=%d",
                    sent, len, n, e);
             return false; // hard error or peer closed: fail closed

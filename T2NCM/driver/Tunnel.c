@@ -342,6 +342,15 @@ BOOLEAN T2NcmTunnelRewriteTxIpv4ToIpv6(
     // just be hardcoded to a fixed 169.254.x.y.
     T2NcmTunnelNoteLocalFromIpv4Frame(DeviceContext, Frame + 14 + 12);
 
+    // A fragment (MF set or non-zero fragment offset) must not be rewritten:
+    // a non-first fragment has no L4 header at all, so the checksum fix-up
+    // below would overwrite payload bytes 6/7, and the L4 checksum of a first
+    // fragment covers data that is not in this frame. Leave it untouched, like
+    // every other frame this tunnel does not handle. (Flags/offset word:
+    // DF 0x4000 is irrelevant, MF 0x2000 + offset 0x1FFF are what matter.)
+    if ((T2NcmReadBe16(Frame + 14 + 6) & 0x3FFF) != 0)
+        return TRUE;
+
     ihl = Frame[14] & 0x0F;
     ipHdrLen = (ULONG)ihl * 4;
     proto = Frame[14 + 9];

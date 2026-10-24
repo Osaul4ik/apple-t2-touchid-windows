@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <vector>
 #include <cstddef>
+#include <exception>
 #include <thread>
 
 // ---------------------------------------------------------------------------
@@ -2368,7 +2369,19 @@ void StartCaptureWorker(_In_ WDFREQUEST Request, const CaptureKey& key)
     g_captureWorkers.fetch_add(1);
     try {
         std::thread([Request, key]() {
-            ProcessCapture(Request, key);
+            // An exception escaping a detached thread is std::terminate, which
+            // takes the whole WUDFHost down. ProcessCapture's RAII guards
+            // (busy slot, cancelable scope) unwind on the way out; the request
+            // itself is NOT completed here because its state is unknown at
+            // this level (it may already be completed or owned by
+            // EvtCaptureCancel) and a second WdfRequestComplete is worse.
+            try {
+                ProcessCapture(Request, key);
+            } catch (const std::exception& ex) {
+                T2BioLog("CAPTURE_DATA: worker aborted by exception: %s", ex.what());
+            } catch (...) {
+                T2BioLog("CAPTURE_DATA: worker aborted by unknown exception");
+            }
             g_captureWorkers.fetch_sub(1);
         }).detach();
     } catch (...) {
