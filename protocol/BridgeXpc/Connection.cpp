@@ -348,7 +348,7 @@ ConnectResult Connection::ConnectOnce(bool tunnel, const in6_addr& linkLocalAddr
     *outTcpMs = GetTickCount64() - tcpStart;
     TuneEstablishedSocket(socket_);
     if (overallDeadline) {
-        heloTimeout = std::min(heloTimeout, RemainingBudget(*overallDeadline));
+        heloTimeout = (std::min)(heloTimeout, RemainingBudget(*overallDeadline));
         if (heloTimeout.count() <= 0) {
             Close();
             return ConnectResult::HeloTimeout;
@@ -461,7 +461,7 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
     bool tunnel = tp::IsTunnelModeActive();
     const std::chrono::milliseconds firstTcp =
         (autoSwitch && !tunnel) ? tp::NativeConnectBudget(connectTimeout) : connectTimeout;
-    const auto firstBudget = std::min(firstTcp, remaining());
+    const auto firstBudget = (std::min)(firstTcp, remaining());
     if (firstBudget.count() <= 0) return ConnectResult::ConnectFailed;
     bool tcpFailed = false;
     ULONGLONG tcpMs = 0;
@@ -491,7 +491,7 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
     }
     const std::chrono::milliseconds fallbackTcp =
         other ? std::chrono::milliseconds(fbMs) : tp::NativeConnectBudget(connectTimeout);
-    const auto fallbackBudget = std::min(fallbackTcp, remaining());
+    const auto fallbackBudget = (std::min)(fallbackTcp, remaining());
     if (fallbackBudget.count() <= 0) return r;
     bool tcpFailed2 = false;
     ULONGLONG tcpMs2 = 0;
@@ -1292,7 +1292,7 @@ static bool WriteAll(SOCKET s, const uint8_t* data, size_t len,
         return false;
     }
     const auto deadline = std::chrono::steady_clock::now() +
-                          std::min(budget, kFrameWriteTimeout);
+                          (std::min)(budget, kFrameWriteTimeout);
     size_t sent = 0;
     while (sent < len) {
         const auto now = std::chrono::steady_clock::now();
