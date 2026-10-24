@@ -505,10 +505,15 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
             // No global mutex is held across socket I/O or its timeout.
             auto cancelCmd = EncodeBmCommand(Command::Cancel, 1, 0);
             std::vector<uint8_t> discard;
+            const auto started = steady_clock::now();
+            T2_LOG("verify", L"CancelGuard: cmd 0x0c begin, budget=%lld ms",
+                   static_cast<long long>(kCancelBestEffortTimeout.count()));
             const bool ok = conn->SendBiometricCommand(
                 cancelCmd, 0, &discard, kCancelBestEffortTimeout);
-            T2_LOG("verify", L"CancelGuard: cmd 0x0c %s",
-                   ok ? L"OK" : L"failed/best-effort");
+            const auto elapsed = duration_cast<milliseconds>(steady_clock::now() - started).count();
+            T2_LOG("verify", L"CancelGuard: cmd 0x0c %s elapsed=%lld ms connectionLost=%d",
+                   ok ? L"OK" : L"failed/best-effort", static_cast<long long>(elapsed),
+                   conn->ConnectionLost() ? 1 : 0);
         }
         ~CancelGuard() { Send(); }
     } cancelGuard{conn};

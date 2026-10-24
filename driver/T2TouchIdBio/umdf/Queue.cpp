@@ -746,17 +746,15 @@ void InvalidateActiveCapture(_In_z_ const char* source, bool resetResumeEvent, b
         std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
         g_stickyNcm.valid = false;
     }
-    // Wake the receive worker FIRST. A synchronous CancelMatch can block on
-    // ioMu_ held by the reader; sending Cancel before signaling would leave
-    // that reader asleep and can prevent the previous capture from unwinding.
+    // Do not perform BridgeXPC I/O on the suspend/session notification
+    // thread: it can block on ioMu_ while the receive worker is unwinding.
+    // The verify worker owns Connection and its CancelGuard sends cmd 0x0c
+    // exactly once during teardown after observing this event.
     HANDLE cancelEvent = GetCaptureCancelEvent();
     if (cancelEvent) SetEvent(cancelEvent);
-    // Best effort after the wakeup: retains the SEP Cancel command but its
-    // latency can no longer defer the cancellation signal to the worker.
-    t2::biometrickit::BestEffortCancelActiveMatch();
     NotifyCaptureStateChanged();
     T2BioLog("%s: invalidated active fingerprint result; aborting BiometricKit match "
-             "(cmd 0x0c best-effort if session was live); keeping WBF CAPTURE_DATA pending",
+             "(worker sends cmd 0x0c best-effort on teardown); keeping WBF CAPTURE_DATA pending",
              source);
 }
 
@@ -928,17 +926,14 @@ VOID EvtCaptureCancel(_In_ WDFREQUEST Request)
     T2BioLog("CAPTURE_DATA: EvtCaptureCancel fired (Windows called CancelIoEx)");
     T2_DIAG("capture", L"Windows CANCELLED the pending CAPTURE_DATA (CancelIoEx) after %llu ms",
             static_cast<unsigned long long>(DiagCapturePendingMs()));
-    // Wake the worker before taking the active-match mutex or attempting
-    // BridgeXPC I/O. CancelMatch competes with the receiver for ioMu_.
+    // Never take g_activeMatchMu or perform socket I/O in WDF cancellation:
+    // CancelGuard in the capture worker owns the connection and performs
+    // best-effort cmd 0x0c after this event wakes the receiver. This keeps
+    // WdfRequestComplete independent of ioMu_ and network timeouts.
     HANDLE cancelEvent = GetCaptureCancelEvent();
     if (cancelEvent) SetEvent(cancelEvent);
-    t2::biometrickit::BestEffortCancelActiveMatch();
-    // Watchdog: if the worker is stuck inside Connect()/port-scan (those
-    // paths do not poll cancelEvent), g_captureBusy stays true and every
-    // later CAPTURE_DATA dies with DATA_COLLECTION_IN_PROGRESS. After 5s
-    // force-drop the slot so Hello can arm again. Harmless if the worker
-    // already released the flag — compare_exchange only clears when still set.
-    // Coalesced + early-exit: see ArmCancelWatchdog().
+    // Diagnostic only: a stalled worker must release its slot itself;
+    // watchdog never clears g_captureBusy or starts a second SEP session.
     ArmCancelWatchdog();
     bool owns = false;
     CancelTrack* claimedTrack = nullptr;
@@ -1083,9 +1078,19 @@ public:
             // The callback won: do not remove its stack-backed registration
             // until WdfRequestComplete and callback bookkeeping have finished.
             std::unique_lock<std::mutex> lock(track_.completionMu);
-            track_.completionCv.wait(lock, [this] {
-                return track_.owner.load(std::memory_order_acquire) == 3;
-            });
+            // Do not time out and destroy stack-owned CancelTrack while WDF's
+            // callback may still access it. Emit progress every 2s instead.
+            const auto waitStarted = std::chrono::steady_clock::now();
+            while (track_.owner.load(std::memory_order_acquire) != 3) {
+                if (track_.completionCv.wait_for(lock, std::chrono::seconds(2), [this] {
+                        return track_.owner.load(std::memory_order_acquire) == 3;
+                    })) break;
+                const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - waitStarted).count();
+                T2BioLog("CAPTURE_DATA: Release waiting for WDF cancel callback completion, "
+                         "owner=%d elapsed=%lld ms", track_.owner.load(std::memory_order_acquire),
+                         static_cast<long long>(elapsed));
+            }
             lock.unlock();
             Unregister();
             return false;
@@ -1095,9 +1100,19 @@ public:
             // WDF owns cancellation now. The callback may not yet have run;
             // keep the stack-based CancelTrack alive until it completes.
             std::unique_lock<std::mutex> lock(track_.completionMu);
-            track_.completionCv.wait(lock, [this] {
-                return track_.owner.load(std::memory_order_acquire) == 3;
-            });
+            // Do not time out and destroy stack-owned CancelTrack while WDF's
+            // callback may still access it. Emit progress every 2s instead.
+            const auto waitStarted = std::chrono::steady_clock::now();
+            while (track_.owner.load(std::memory_order_acquire) != 3) {
+                if (track_.completionCv.wait_for(lock, std::chrono::seconds(2), [this] {
+                        return track_.owner.load(std::memory_order_acquire) == 3;
+                    })) break;
+                const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - waitStarted).count();
+                T2BioLog("CAPTURE_DATA: Release waiting for WDF cancel callback completion, "
+                         "owner=%d elapsed=%lld ms", track_.owner.load(std::memory_order_acquire),
+                         static_cast<long long>(elapsed));
+            }
             lock.unlock();
             Unregister();
             return false;
