@@ -7,7 +7,6 @@
 #include <algorithm>
 #include <cstring>
 #include <string>
-#include <mutex>
 
 using t2::log::HexDump;
 
@@ -23,62 +22,6 @@ namespace {
 // destructor can see it — MSVC C2326 rejects a function-local constexpr
 // from a local-class member function.
 constexpr std::chrono::milliseconds kCancelBestEffortTimeout{300};
-
-// ---------------------------------------------------------------------------
-// Active StartMatch session (Linux parity for suspend / CancelIoEx).
-//
-// After StartMatch succeeds the SEP may be in capture mode until cmd 0x0c.
-// InvalidateActiveCapture / EvtCaptureCancel used to only SetEvent(cancelEvent);
-// the worker then sent Cancel via CancelGuard *after* waking — racing NCM
-// MiniportPause on suspend. Register the live Connection here so the power
-// path can send 0x0c on the open socket *before* SetEvent (and before Dx).
-// All access is under g_activeMatchMu; SendBiometricCommand may run on the
-// suspend thread while the worker is blocked in WaitForEvent (recv) — same
-// best-effort contract as tearing the socket on sleep.
-// ---------------------------------------------------------------------------
-std::mutex g_activeMatchMu;
-bridgexpc::Connection* g_activeMatchConn = nullptr;
-bool g_activeMatchNeedsCancel = false;
-
-void RegisterActiveMatchSession(bridgexpc::Connection* conn)
-{
-    std::lock_guard<std::mutex> lock(g_activeMatchMu);
-    g_activeMatchConn = conn;
-    g_activeMatchNeedsCancel = true;
-}
-
-// Sends cmd 0x0c once if a live match was registered. Clears the need-cancel
-// flag so CancelGuard / a second BestEffort call do not double-send. Connection
-// pointer is cleared only when the worker unregisters (Verify exit).
-bool SendCancelOnActiveMatch_Locked()
-{
-    if (!g_activeMatchNeedsCancel || g_activeMatchConn == nullptr) {
-        return false;
-    }
-    g_activeMatchNeedsCancel = false;
-    auto cancelCmd = EncodeBmCommand(Command::Cancel, /*version=*/1, /*value=*/0);
-    std::vector<uint8_t> discard;
-    const bool ok = g_activeMatchConn->SendBiometricCommand(
-        cancelCmd, /*outputCapacity=*/0, &discard, kCancelBestEffortTimeout);
-    T2_LOG("verify",
-           L"BestEffortCancelActiveMatch: cmd 0x0c %s (Linux parity before cancelEvent/SetEvent)",
-           ok ? L"OK" : L"failed/best-effort");
-    return ok;
-}
-
-void UnregisterActiveMatchSession(bridgexpc::Connection* conn)
-{
-    std::lock_guard<std::mutex> lock(g_activeMatchMu);
-    if (g_activeMatchConn == conn) {
-        // If StartMatch was live and cancel never went out (e.g. process tear),
-        // try once more while the pointer is still valid.
-        if (g_activeMatchNeedsCancel) {
-            (void)SendCancelOnActiveMatch_Locked();
-        }
-        g_activeMatchConn = nullptr;
-        g_activeMatchNeedsCancel = false;
-    }
-}
 
 bool Uuid16IsZero(const uint8_t* p) {
     for (int i = 0; i < 16; i++) {
@@ -413,8 +356,8 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     T2_LOG("verify", L"identity inventory stable across 0x42->0x51->0x42->0x51 (%zu configured)",
            configuredFirst.size());
 
-    // Cancel (cmd 0x0c) after StartMatch is owned by CancelGuard /
-    // BestEffortCancelActiveMatch (Linux parity) — no pre-built cancelCmd here.
+    // Cancel (cmd 0x0c) after StartMatch is owned solely by the verify-worker
+    // CancelGuard (Linux parity) — no pre-built cancelCmd here.
 
     // REVERTED (16.09.2026): the macOS-log-derived pre-match sequence that
     // used to live here (GetEnabledForUnlock/GetSksLockStateMac/
@@ -549,9 +492,8 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     // IMPORTANT (20.09.2026 hardware): do NOT use config_.ioTimeout (5s) here.
     // Cancel is best-effort teardown — see kCancelBestEffortTimeout above.
     // Same bound is used on the NoMatch restart path below.
-    // Register before any WaitForEvent so suspend/CancelIoEx can send 0x0c
-    // on this socket before SetEvent (see BestEffortCancelActiveMatch).
-    RegisterActiveMatchSession(conn);
+    // The verify worker exclusively owns Connection. Cancellation callbacks
+    // only signal cancelEvent; cleanup never shares the connection pointer.
     struct CancelGuard {
         bridgexpc::Connection* conn;
         bool active = true;
@@ -559,25 +501,14 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
         void Send() {
             if (!active) return;
             active = false;
-            // Prefer the shared path (idempotent if suspend already cancelled).
-            // Clear registration under the same lock — do not call
-            // UnregisterActiveMatchSession here (it would re-enter the mutex).
-            {
-                std::lock_guard<std::mutex> lock(g_activeMatchMu);
-                if (g_activeMatchConn == conn && g_activeMatchNeedsCancel) {
-                    (void)SendCancelOnActiveMatch_Locked();
-                } else if (g_activeMatchConn != conn && g_activeMatchConn != nullptr) {
-                    // Another session owns the slot; still best-effort on *this* conn.
-                    auto cancelCmd = EncodeBmCommand(Command::Cancel, 1, 0);
-                    std::vector<uint8_t> discard;
-                    conn->SendBiometricCommand(cancelCmd, 0, &discard, kCancelBestEffortTimeout);
-                }
-                // else: already cancelled by BestEffortCancelActiveMatch, or no session.
-                if (g_activeMatchConn == conn) {
-                    g_activeMatchConn = nullptr;
-                    g_activeMatchNeedsCancel = false;
-                }
-            }
+            // Only the owning verify worker sends the best-effort Cancel.
+            // No global mutex is held across socket I/O or its timeout.
+            auto cancelCmd = EncodeBmCommand(Command::Cancel, 1, 0);
+            std::vector<uint8_t> discard;
+            const bool ok = conn->SendBiometricCommand(
+                cancelCmd, 0, &discard, kCancelBestEffortTimeout);
+            T2_LOG("verify", L"CancelGuard: cmd 0x0c %s",
+                   ok ? L"OK" : L"failed/best-effort");
         }
         ~CancelGuard() { Send(); }
     } cancelGuard{conn};
@@ -845,14 +776,5 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
     return outcome;
 }
 
-
-void BestEffortCancelActiveMatch()
-{
-    std::lock_guard<std::mutex> lock(g_activeMatchMu);
-    if (!g_activeMatchNeedsCancel || g_activeMatchConn == nullptr) {
-        return;
-    }
-    (void)SendCancelOnActiveMatch_Locked();
-}
 
 } // namespace t2::biometrickit

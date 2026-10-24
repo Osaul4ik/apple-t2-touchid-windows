@@ -239,12 +239,4 @@ private:
     bool busy_ = false;
 };
 
-// Best-effort biometric Cancel (cmd 0x0c) on the in-flight StartMatch session,
-// if any. Safe to call from a power/suspend or CancelIoEx path *before*
-// signaling cancelEvent: when a BridgeXPC connection still has an active match,
-// this mirrors Linux (bridge-xpc-probe always sends cmd 12 on the live socket
-// before tearing the session down). No-op if no match is registered.
-// Double-call is idempotent (second call is a no-op until the next StartMatch).
-void BestEffortCancelActiveMatch();
-
 } // namespace t2::biometrickit
