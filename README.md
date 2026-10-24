@@ -1,186 +1,159 @@
-# T2 TouchID for Windows
+# T2 Touch ID for Windows
 
-<img width="1400" height="420" alt="fDhvq" src="https://github.com/user-attachments/assets/ae5efc29-7ed3-4b4b-96b0-0978328ae352" />
+<img width="1400" height="420" alt="T2 Touch ID for Windows" src="https://github.com/user-attachments/assets/ae5efc29-7ed3-4b4b-96b0-0978328ae352" />
 
-**Touch ID on Windows** for Intel MacBooks with an Apple T2 chip.
+**Windows Hello fingerprint sign-in for Intel Macs with the Apple T2 Security Chip.**
 
-This project talks to the same Secure Enclave and fingerprint sensor that macOS uses, and exposes them to Windows as a Windows Hello biometric device.
+**Status: Release Candidate (RC1)** — fingerprint verification, Windows lock-screen unlock, and repeated lock/unlock and sleep/resume scenarios have been tested on real hardware. This is an independent project, not an Apple or Microsoft driver.
 
-> **Proof of concept.** Matching fingerprints on real hardware works. Full Windows Hello sign-in is still evolving. Read the safety notes before installing anything.
+> **Important:** This is a release candidate, not a production-certified driver. It uses test-signed drivers and communicates with the T2 Secure Enclave. Back up your data and keep macOS recovery available before installing.
 
----
+## ✨ Features
 
-## ✨ What you get
+- **Windows Hello unlock:** use fingerprints already enrolled in macOS to unlock Windows.
+- **T2 Secure Enclave integration:** native communication with the T2 SEP and BiometricKit via BridgeXPC.
+- **Fast verification:** optional short verification path without unnecessary sensor reset/calibration reload.
+- **Responsive event handling:** event-driven BridgeXPC receive path with cancellation-aware waits instead of continuous polling.
+- **Sleep/resume support:** power-state handling and recovery of the T2/NCM communication path.
+- **Network fallback:** native IPv6 over T2 NCM, with an IPv4 tunnel fallback.
+- **Cold-boot bootstrap:** `T2SepBootstrap` initializes the SEP using an encrypted macOS keybag vault.
+- **SepVault GUI:** keybag setup, verification settings, status, logging, and advanced transport controls.
+- **Diagnostics:** selectable log categories and optional `t2touchid.exe` CLI.
 
-| Piece | Role |
-|--------|------|
-| **T2TouchIdTransport** | Kernel driver for the T2 SEP (PCI) |
-| **T2 NCM** | Network adapter over the T2 USB NCM link (BridgeXPC) |
-| **T2TouchIdBio** | Windows Biometric driver + engine adapter |
-| **SepVault GUI** | One-time macOS keybag setup, options, status |
-| **T2SepBootstrap** | Service that unlocks the SEP on every cold boot |
-| **t2touchid.exe** | Optional CLI for diagnostics |
+## 🧩 Components
 
-After setup: power button can turn the display off and lock the PC; Touch ID can unlock it again (when Hello is configured).
-
----
-
-## ⚠️ Disclaimer
-
-Experimental research software. **No warranty.**
-
-You install **unsigned** drivers that talk to the same Secure Enclave that holds FileVault / Data Protection keys. That can mean data loss, an unusable keybag, crashes, or worse.
-
-Use only on a machine you can afford to break, and only if you understand the steps below. See `LICENSE` (GPL-2.0-only).
-
----
+| Component | Purpose |
+| --- | --- |
+| `T2TouchIdTransport` | PCI/SEP transport driver |
+| `T2NCM` | T2 USB NCM network interface and control channel |
+| `T2TouchIdBio` | UMDF 2 biometric sensor driver for Windows Biometric Framework |
+| `T2TouchIdEngineAdapter` | Windows Hello biometric engine adapter |
+| `T2SepBootstrap` | SEP/keybag initialization during Windows startup |
+| `SepVault GUI` | Configuration and diagnostics |
+| `t2touchid.exe` | Optional command-line diagnostics |
 
 ## 📋 Requirements
 
-- Intel MacBook **with T2**, Windows 10 x64 via Boot Camp  
-- macOS still bootable (needed once to copy `user.kb`)  
-- Administrator rights  
-- **Test signing** enabled, or Secure Boot off (drivers are not WHQL-signed)
+- An **Intel Mac equipped with an Apple T2 Security Chip**, with Windows 10/11 x64 via Boot Camp. Not every model/Windows build has been individually verified.
+- A working macOS installation with Touch ID fingerprints already enrolled.
+- Administrator access to Windows and access to the macOS account's `user.kb` keybag.
+- A recovery path and recent backups.
+- Driver test-signing enabled; the supplied drivers are **not WHQL-certified**. If Secure Boot prevents `testsigning`, do not attempt to bypass platform security without understanding the implications.
 
-```
-bcdedit /set testsigning on
-:: reboot
-```
+**Not supported:** Apple silicon Macs, non-T2 Macs, and native fingerprint enrollment entirely within Windows.
 
----
+## 🚀 Installation
 
-## 🚀 Quick start
+**Upgrading from an earlier experimental build?** Uninstall the old T2 driver packages using `remove-t2-drivers.bat` as Administrator, then run the new `InstallDriver.bat` **without rebooting between removal and installation**. Restart Windows after installation. The removal script preserves `%ProgramData%\T2TouchId\sep-vault.bin`, but resets driver and GUI registry settings; back up your settings first if needed. It also offers to disable Test Mode — **leave Test Mode enabled** when reinstalling a test-signed build.
 
-### 1. Install drivers
+### 1. Install the drivers
 
-As Administrator, run `InstallDriver.bat` from a folder that contains the built packages (`SEP\`, `NCM\`, `Bio\`, `Inst\`).
+Download the appropriate release package from GitHub Releases and **extract it first**. From the extracted release package, run `InstallDriver.bat` as Administrator. Its expected layout includes `SEP/`, `NCM/`, `Bio/`, and `Inst/` directories.
 
-That will:
+The installer configures test signing (when needed), installs the certificate and T2 drivers, configures the IPv4 fallback address, and sets the Windows Biometric Service startup ordering. **Reboot Windows when installation is complete.**
 
-1. Install the test certificate  
-2. Install **T2TouchIdTransport** (SEP PCI device)  
-3. Install **Apple T2 NCM** network adapter  
-4. Install the **biometric** driver  
-5. Restart the Windows Biometric Service  
+Check Device Manager for the T2 transport, T2 NCM network adapter, and biometric device without device errors.
 
-In Device Manager you should see healthy nodes for transport, NCM adapter, and a biometric device (no Code 43).
+### 2. Obtain your macOS keybag
 
-### 1.1 REBOOT!
+Boot macOS and sign in to the account that has your fingerprints enrolled. In Finder, press **Command + Shift + .** to show hidden files. Find `user.kb` in the appropriate UUID-named directory under `/Library/Keychains/` and copy it to a location accessible from Windows.
 
-### 2. Copy `user.kb` from macOS
+The first ordinary macOS user commonly has special bag ID `-501`, but verify the value for your account rather than assuming it.
 
-Boot into **macOS**, log in as the account whose Touch ID you want on Windows.
+**Treat `user.kb` and the macOS account password as sensitive credentials.** Do not attach them to bug reports or publish them.
 
-```bash
-Open UserFolder and Press ⌘ Command + ⇧ Shift + .
-then open /Library/Keychains/ UUID-named folder → copy user.kb to the Boot Camp volume or a USB stick
-```
+### 3. Set up SepVault
 
-Special bag ID is usually **`-501`** (first normal macOS user).
+Launch **SepVault GUI** as Administrator:
 
-### 3. Import the keybag (once)
+1. Open **macOS Keybag**.
+2. Select the copied `user.kb`.
+3. Enter the correct special bag ID and macOS account password.
+4. Save the encrypted vault.
 
-Run **SepVault GUI** as Administrator:
+The vault is saved as a DPAPI-protected `%ProgramData%\T2TouchId\sep-vault.bin`. The bootstrap service uses it at startup to unlock the required SEP state.
 
-1. Open the **macOS Keybag** card  
-2. Browse to `user.kb`  
-3. Set special bag ID (`-501`) and the **macOS login password**  
-4. Save  
+### 4. Configure Windows Hello
 
-The file is stored as DPAPI-protected `%ProgramData%\T2TouchId\sep-vault.bin`.  
-On every cold boot, **T2SepBootstrap** unlocks the SEP with that vault.
+Open **Settings → Accounts → Sign-in options → Fingerprint recognition (Windows Hello)** and complete setup.
 
-If the keybag is already configured, the GUI shows status and a **Clear keybag** button.
+**Enrollment note:** Matching depends on identities already enrolled in macOS; this project does not yet implement an independent Windows fingerprint enrollment pipeline.
 
-### 4. Windows Hello
+## ⚙️ SepVault GUI
 
-Settings → Accounts → Sign-in options → Fingerprint → set up.
+| Feature | Description |
+| --- | --- |
+| **Fast verification** | Uses a short verification sequence to reduce unlock latency |
+| **Lock on display off** | Optional integration with the Mac power button/display state |
+| **Developer mode** | Shows logging and advanced transport controls |
+| **Logging** | Select Bio, BridgeXPC, and Power/diagnostic categories |
+| **Transport selection** | Auto selection, with native IPv6 preferred and IPv4 fallback |
 
-Enrollment still relies on identities already present in the SEP from macOS; this is not a full enrollment pipeline yet.
+Use **Developer mode** for verbose logging. Disable verbose tracing during everyday use when it is no longer needed.
 
----
+## 🌐 Communication
 
-## ⚙️ T2TouchID_GUI options
+Windows reaches BridgeXPC through the Apple T2 NCM adapter:
 
-| Option | Default | Meaning |
-|--------|---------|---------|
-| **Fast verification** | On | Skips sensor reset + calibration reload; still runs cancel, identity list, and stability checks |
-| **Lock on power-button display off** | Off | Sets power button to “Turn off the display” on all plans and locks the PC when the screen goes off (bootstrap service performs the lock) |
-| **Logging** | Off | DebugView categories under Developer tools |
+1. **Native IPv6**, preferred when reachable.
+2. **IPv4 tunnel**, as a fallback; the installer attempts to configure `169.254.84.1` on the NCM interface.
 
-Developer tools (logging, transport override) stay hidden until you enable **Developer mode** in the footer.
+BridgeXPC processes asynchronous biometric events and acknowledges them. Verification requests support cancellation when Windows locks, changes sessions, or transitions power states.
 
----
+## 🧪 Release Candidate verification
 
-## 🌐 Network transport
+RC1 has been exercised on actual T2 hardware with repeated Windows Hello unlocks, cancellations, and sleep/resume transitions. In one collected extended trace:
 
-BridgeXPC needs a working path to the T2:
+- **18 fingerprint MATCH outcomes** and **14 cancelled sessions** were observed.
+- **34/34 logged `CancelMatch` operations** completed successfully; the maximum recorded elapsed time was **157 ms**, within the configured 300 ms budget.
+- No logged `DATA_COLLECTION_IN_PROGRESS`, `connectionLost=1`, or WDF cancellation wait warning in that trace.
+- The user reported **no growth in the WUDFHost HANDLE count** across the test.
 
-- **Native IPv6** (preferred) when the adapter has a link-local address  
-- **IPv4 tunnel** (`169.254.84.1/16`) as fallback — `Set-T2NcmStaticIp.ps1` runs during install  
-
-The GUI can force a mode under Developer tools if needed.
-
----
-
-## 💻 CLI (`t2touchid.exe`)
-
-Optional diagnostics: connect, identities, verify, bootstrap-related commands. Prefer the GUI for day-to-day setup. See `tools/t2touchid/` and design docs for command details.
-
----
+These results describe the tested scenarios only. They do **not** establish the absence of all race conditions, memory leaks, or failures on other Mac models and Windows versions.
 
 ## 🛠️ Troubleshooting
 
-| Symptom | What to check |
-|---------|----------------|
-| Code 43 on transport / NCM | Test signing, correct INF, reboot; try disable/enable the device |
-| SEP never “ready” | `C:\LogSEP.txt` from T2SepBootstrap; vault present; password/bag ID correct |
-| No biometric device | Bio INF installed; `WbioSrvc` running; engine adapter DLL in `WinBioPlugIns` |
-| Lock on display-off does nothing | Toggle on in GUI (admin); service **T2SepBootstrap** running; look for `lock:` lines in `C:\LogSEP.txt` |
-| Fingerprint works in macOS only | Expected until Hello enrollment on Windows succeeds |
+| Issue | Check |
+| --- | --- |
+| Device Manager error / missing biometric device | Test signing, driver installation, and reboot; verify `WbioSrvc` |
+| SEP not initialized after cold boot | Vault configuration and `T2SepBootstrap`; review `C:\LogSEP.txt` if present |
+| Touch ID does not respond at the lock screen | Verify Bio/BridgeXPC logging; look for `CAPTURE_DATA`, `StartMatch`, and `FingerOn` |
+| Unlock stops working after cancellation | Collect logs with `CancelGuard`, `CAPTURE_DATA`, and `DATA_COLLECTION_IN_PROGRESS` |
+| Unlock fails after sleep | Collect Power/T2NCM events alongside biometric logs |
+| Connection cannot be established | Check NCM adapter and native IPv6 / IPv4 fallback path |
 
-More detail: `driver/T2TouchIdBio/docs/`, `T2NCM/docs/`.
+When reporting a regression, include: Mac model, Windows version, release/build, whether cold boot or sleep/resume was involved, and a **redacted** debug log. Never share `user.kb`, vault files, account passwords, or SEP secrets.
 
----
+Diagnostic details: `driver/T2TouchIdBio/docs/`, `T2NCM/docs/`, and `tools/t2touchid/`.
 
-## 🔐 Safety notes
+## 🔐 Security and limitations
 
-- **Unsigned drivers** — test signing only; do not use on a production-only machine.  
-- **SEP is shared with FileVault** — a bad unlock sequence is not “just another driver bug.”  
-- Keep a **macOS recovery path** and backups.  
-- This is not an Apple-supported configuration.
+- These are **test-signed, non-WHQL drivers**. Use at your own risk.
+- The SEP is also used by macOS security features. Keep verified backups and macOS recovery options.
+- Fingerprints must be enrolled in macOS; independent Windows enrollment is not implemented.
+- RC status does not imply independent security audit, broad device compatibility, or guaranteed support.
 
----
+## 📁 Repository structure
 
-## 📁 Repository layout
+```text
+driver/T2TouchIdTransport/   SEP PCI transport
+driver/T2TouchIdBio/         UMDF biometrics, GUI, and bootstrap service
+T2NCM/                       USB NCM network drivers
+protocol/                    BridgeXPC, BiometricKit, and AppleKeyStore
+tools/                       Install/removal scripts and CLI
+tests/                       Protocol tests
 ```
-driver/T2TouchIdTransport/   KMDF SEP PCI driver
-driver/T2TouchIdBio/         WBDI biometric stack, GUI, bootstrap service
-T2NCM/                       NDIS NCM miniport + INFs
-protocol/                    BridgeXPC, BiometricKit, AppleKeyStore clients
-tools/                       Install scripts, t2touchid CLI
-tests/                       Unit tests (no hardware)
-```
-
 
 ## ☕ Support
 
-If you find this project useful, consider buying me a coffee!
+If this project is useful, you can support the development here:
 
 [![Ko-fi](https://img.shields.io/badge/Support%20me%20on-Ko--fi-ff5e5b?logo=ko-fi&logoColor=white)](https://ko-fi.com/osaul4ik)
 
-
-
 ## 🙏 Acknowledgements
 
-This project was developed with reference to the excellent research and implementation work in [t2-touchid-linux](https://github.com/jmurth1234/t2-touchid-linux) by **jmurth1234**.
-
-The project was used as a technical reference to understand the T2 Touch ID communication flow and Apple-specific behavior.
-
-
+Thanks to **jmurth1234** and the research behind [t2-touchid-linux](https://github.com/jmurth1234/t2-touchid-linux), which provided valuable reference material for the Apple T2 biometric communication flow.
 
 ## License
 
-GPL-2.0-only — see `LICENSE` and `NOTICE.md`.
-
-
+GPL-2.0-only. See [`LICENSE`](LICENSE) and [`NOTICE.md`](NOTICE.md).
