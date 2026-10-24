@@ -222,9 +222,9 @@ private:
     HANDLE ioWaiterEvent_ = nullptr; // auto-reset: wake an idle receiver for a competing I/O transaction
     class IoLock {
     public:
-        IoLock(Connection& c, std::chrono::milliseconds wait) : c_(c) {
+        IoLock(Connection& c, std::chrono::milliseconds wait, bool wakeReceiver = true) : c_(c) {
             c_.ioWaiters_.fetch_add(1, std::memory_order_acq_rel);
-            if (c_.ioWaiterEvent_) SetEvent(c_.ioWaiterEvent_);
+            if (wakeReceiver && c_.ioWaiterEvent_) SetEvent(c_.ioWaiterEvent_);
             owns_ = c_.ioMu_.try_lock_for(wait);
             c_.ioWaiters_.fetch_sub(1, std::memory_order_acq_rel);
         }

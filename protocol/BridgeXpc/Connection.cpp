@@ -998,7 +998,7 @@ Connection::WaitStep Connection::WaitForEventStep(std::vector<uint8_t>* outEvent
     {
         // Give waiting commands priority before entering another receive.
         if (ioWaiters_.load(std::memory_order_acquire) > 0) Sleep(1);
-        IoLock ioLock(*this, kIoLockWait);
+        IoLock ioLock(*this, kIoLockWait, /*wakeReceiver=*/false);
         if (!ioLock.owns()) return WaitStep::Again;
         // Checked at the TOP of every iteration — including before the
         // very first ReadFrame — so a cancel that arrives while this
