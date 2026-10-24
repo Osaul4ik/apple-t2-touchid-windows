@@ -746,14 +746,14 @@ void InvalidateActiveCapture(_In_z_ const char* source, bool resetResumeEvent, b
         std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
         g_stickyNcm.valid = false;
     }
-    // Linux parity: if StartMatch is live on an open BridgeXPC socket, send
-    // biometric Cancel (cmd 0x0c) *before* waking the worker. Otherwise the
-    // worker's CancelGuard races NCM MiniportPause / D0Exit and the cancel
-    // may never reach SEP (Touch Bar left in capture mode).
-    t2::biometrickit::BestEffortCancelActiveMatch();
-
+    // Wake the receive worker FIRST. A synchronous CancelMatch can block on
+    // ioMu_ held by the reader; sending Cancel before signaling would leave
+    // that reader asleep and can prevent the previous capture from unwinding.
     HANDLE cancelEvent = GetCaptureCancelEvent();
-    if (cancelEvent) SetEvent(cancelEvent); // interrupts WaitForEvent if still blocked
+    if (cancelEvent) SetEvent(cancelEvent);
+    // Best effort after the wakeup: retains the SEP Cancel command but its
+    // latency can no longer defer the cancellation signal to the worker.
+    t2::biometrickit::BestEffortCancelActiveMatch();
     NotifyCaptureStateChanged();
     T2BioLog("%s: invalidated active fingerprint result; aborting BiometricKit match "
              "(cmd 0x0c best-effort if session was live); keeping WBF CAPTURE_DATA pending",
@@ -928,13 +928,11 @@ VOID EvtCaptureCancel(_In_ WDFREQUEST Request)
     T2BioLog("CAPTURE_DATA: EvtCaptureCancel fired (Windows called CancelIoEx)");
     T2_DIAG("capture", L"Windows CANCELLED the pending CAPTURE_DATA (CancelIoEx) after %llu ms",
             static_cast<unsigned long long>(DiagCapturePendingMs()));
-    // Same ordering as suspend: cmd 0x0c on the live socket first, then wake.
-    t2::biometrickit::BestEffortCancelActiveMatch();
+    // Wake the worker before taking the active-match mutex or attempting
+    // BridgeXPC I/O. CancelMatch competes with the receiver for ioMu_.
     HANDLE cancelEvent = GetCaptureCancelEvent();
-    if (cancelEvent) {
-        SetEvent(cancelEvent); // wakes the blocked Verify()/WaitForEvent() loop
-                                // within kCancelPollSlice (Connection.cpp)
-    }
+    if (cancelEvent) SetEvent(cancelEvent);
+    t2::biometrickit::BestEffortCancelActiveMatch();
     // Watchdog: if the worker is stuck inside Connect()/port-scan (those
     // paths do not poll cancelEvent), g_captureBusy stays true and every
     // later CAPTURE_DATA dies with DATA_COLLECTION_IN_PROGRESS. After 5s
