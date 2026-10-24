@@ -100,17 +100,6 @@ Windows reaches BridgeXPC through the Apple T2 NCM adapter:
 
 BridgeXPC processes asynchronous biometric events and acknowledges them. Verification requests support cancellation when Windows locks, changes sessions, or transitions power states.
 
-## 🧪 Release Candidate verification
-
-RC1 has been exercised on actual T2 hardware with repeated Windows Hello unlocks, cancellations, and sleep/resume transitions. In one collected extended trace:
-
-- **18 fingerprint MATCH outcomes** and **14 cancelled sessions** were observed.
-- **34/34 logged `CancelMatch` operations** completed successfully; the maximum recorded elapsed time was **157 ms**, within the configured 300 ms budget.
-- No logged `DATA_COLLECTION_IN_PROGRESS`, `connectionLost=1`, or WDF cancellation wait warning in that trace.
-- The user reported **no growth in the WUDFHost HANDLE count** across the test.
-
-These results describe the tested scenarios only. They do **not** establish the absence of all race conditions, memory leaks, or failures on other Mac models and Windows versions.
-
 ## 🛠️ Troubleshooting
 
 | Issue | Check |
