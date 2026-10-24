@@ -10,13 +10,17 @@
 #include "Discovery/Adapter.h"
 #include <atomic>
 #include <mutex>
+#include <condition_variable>
 #include <optional>
 #include <array>
 #include <algorithm>
 #include <vector>
 #include <cstddef>
 #include <exception>
+#include <new>
 #include <thread>
+#include <list>
+#include <memory>
 
 // ---------------------------------------------------------------------------
 // Type names below were checked against winbio_ioctl.h / winbio_types.h of
@@ -399,7 +403,12 @@ void NotifyCaptureSlotReleased()
 // detached thread sleeping 5s on every cancel), and it exits as soon as the
 // worker releases the slot instead of always sleeping the full 5s.
 std::atomic<bool> g_watchdogActive{false};
-std::atomic<int> g_watchdogThreads{0};          // drained at driver unload
+std::atomic<int> g_watchdogThreads{0};          // diagnostic count
+// Watchdog code lives in this UMDF DLL. Keep its thread joinable so unload
+// never returns while the watchdog is still executing our code.
+std::mutex g_watchdogLifecycleMu;
+std::thread g_watchdogThread;
+std::atomic<bool> g_watchdogStopping{false};
 std::atomic<ULONGLONG> g_watchdogDeadlineMs{0};
 // Serializes final WBF request completion against power-stop callbacks. A
 // result is either committed before suspend begins, or the suspend epoch is
@@ -617,61 +626,69 @@ HANDLE GetCaptureCancelEvent()
               // rather than crash, so this isn't checked here.
 }
 
-// Arms (or extends) the 5s cancel watchdog. At most one watchdog thread
-// exists; it is counted in g_watchdogThreads so EvtDriverUnload can wake and
-// drain it (the old detached thread could outlive the DLL). It returns as
-// soon as the capture slot is released. If the previous watchdog is just
-// finishing while a new cancel arrives, the new cancel may go unguarded;
-// the predecessor-unwind recovery in the next CAPTURE_DATA still frees a
-// hung slot, so that window only costs latency, never a lockout.
+// Diagnostic-only watchdog: a cancelled worker must relinquish the capture
+// slot itself. Force-clearing g_captureBusy would allow a second worker to
+// talk to SEP concurrently, and the first worker could subsequently release
+// the second worker's slot. Never change slot ownership from a timeout.
 void ArmCancelWatchdog()
 {
-    if (!g_captureBusy.load(std::memory_order_acquire)) {
-        return; // nothing is holding the slot: nothing to guard
-    }
+    if (!g_captureBusy.load(std::memory_order_acquire)) return;
     HANDLE ev = SlotReleasedWatchEvent();
-    if (!ev) {
-        return;
-    }
+    if (!ev) return;
+    // Serialize admission with the unload path. A finished watchdog is joined
+    // before replacing its thread object (assigning to a joinable std::thread
+    // would call std::terminate).
+    std::lock_guard<std::mutex> lifecycle(g_watchdogLifecycleMu);
+    if (g_watchdogStopping.load(std::memory_order_acquire)) return;
     ResetEvent(ev);
     g_watchdogDeadlineMs.store(GetTickCount64() + 5000, std::memory_order_release);
-    if (g_watchdogActive.exchange(true)) {
-        return; // running watchdog picks up the extended deadline
-    }
+    if (g_watchdogActive.load(std::memory_order_acquire)) return;
+    if (g_watchdogThread.joinable()) g_watchdogThread.join();
+    g_watchdogActive.store(true, std::memory_order_release);
     g_watchdogThreads.fetch_add(1);
     try {
-        std::thread([ev]() {
+        g_watchdogThread = std::thread([ev]() {
             for (;;) {
+                if (g_watchdogStopping.load(std::memory_order_acquire)) break;
                 const ULONGLONG now = GetTickCount64();
-                const ULONGLONG dl = g_watchdogDeadlineMs.load(std::memory_order_acquire);
-                if (now >= dl) {
-                    bool expected = true;
-                    if (g_captureBusy.compare_exchange_strong(expected, false,
-                                                              std::memory_order_relaxed)) {
-                        T2BioLog("CAPTURE_DATA: cancel watchdog force-cleared g_captureBusy "
-                                 "after 5s (worker did not unwind)");
-                        {
-                            std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
-                            g_stickyNcm.valid = false;
-                        }
-                        HANDLE ce = GetCaptureCancelEvent();
-                        if (ce) {
-                            ResetEvent(ce);
-                        }
+                const ULONGLONG deadline = g_watchdogDeadlineMs.load(std::memory_order_acquire);
+                if (now >= deadline) {
+                    if (g_captureBusy.load(std::memory_order_acquire) &&
+                        !g_watchdogStopping.load(std::memory_order_acquire)) {
+                        T2BioLog("CAPTURE_DATA: cancelled worker still owns capture slot after 5s; "
+                                 "refusing unsafe concurrent SEP access");
+                        std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
+                        g_stickyNcm.valid = false;
                     }
                     break;
                 }
-                if (WaitForSingleObject(ev, static_cast<DWORD>(dl - now)) == 0) {
-                    break; // slot released normally (or driver unloading)
+                const ULONGLONG remaining = deadline - now;
+                const DWORD slice = static_cast<DWORD>(remaining < 250 ? remaining : 250);
+                if (WaitForSingleObject(ev, slice) == WAIT_OBJECT_0) {
+                    if (g_watchdogStopping.load(std::memory_order_acquire) ||
+                        !g_captureBusy.load(std::memory_order_acquire)) break;
+                    ResetEvent(ev);
                 }
             }
-            g_watchdogActive.store(false);
             g_watchdogThreads.fetch_sub(1);
-        }).detach();
+            g_watchdogActive.store(false, std::memory_order_release);
+        });
     } catch (...) {
-        g_watchdogActive.store(false);
+        g_watchdogActive.store(false, std::memory_order_release);
         g_watchdogThreads.fetch_sub(1);
     }
+}
+
+void StopAndJoinCancelWatchdog()
+{
+    std::thread finished;
+    {
+        std::lock_guard<std::mutex> lifecycle(g_watchdogLifecycleMu);
+        g_watchdogStopping.store(true, std::memory_order_release);
+        if (HANDLE ev = SlotReleasedWatchEvent()) SetEvent(ev);
+        finished = std::move(g_watchdogThread);
+    }
+    if (finished.joinable()) finished.join();
 }
 
 // Signaled while running; reset on suspend and signaled again on resume.
@@ -883,15 +900,19 @@ ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_
 //   0 = pending
 //   1 = the cancel routine won: it completes the request, the worker must not
 //       touch it again
-//   2 = the worker won (it is finishing): the cancel routine only wakes the
-//       wait; if the framework says the request was cancelled after all, the
-//       worker completes it with STATUS_CANCELLED itself
+//   2 = worker is attempting WdfRequestUnmarkCancelable. The cancel callback
+//       can still win if WDF returns STATUS_CANCELLED; it then completes the
+//       request. If unmark succeeds, WDF guarantees no cancel callback.
 // The registry lets the cancel routine find the state from the bare WDFREQUEST
 // it is given; entries are added before WdfRequestMarkCancelable and removed
 // before the worker completes/returns, and the state itself lives on the
 // worker's stack, so the routine only touches it under g_cancelTrackMu.
 struct CancelTrack {
+    // 0 = pending, 1 = cancel callback claimed, 2 = unmark in progress,
+    // 3 = cancel callback has finished completing the WDF request.
     std::atomic<int> owner{0};
+    std::mutex completionMu;
+    std::condition_variable completionCv;
 };
 std::mutex g_cancelTrackMu;
 std::vector<std::pair<WDFREQUEST, CancelTrack*>> g_cancelTracks;
@@ -922,12 +943,18 @@ VOID EvtCaptureCancel(_In_ WDFREQUEST Request)
     // Coalesced + early-exit: see ArmCancelWatchdog().
     ArmCancelWatchdog();
     bool owns = false;
+    CancelTrack* claimedTrack = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_cancelTrackMu);
         for (auto& e : g_cancelTracks) {
             if (e.first == Request) {
-                int expected = 0;
-                owns = e.second->owner.compare_exchange_strong(expected, 1);
+                // The cancel callback owns completion even if Release() has
+                // already claimed the normal-completion path (owner == 2).
+                // In that case UnmarkCancelable returns STATUS_CANCELLED;
+                // the worker MUST NOT complete or touch the request again.
+                const int previous = e.second->owner.exchange(1, std::memory_order_acq_rel);
+                owns = previous != 1;
+                if (owns) claimedTrack = e.second;
                 break;
             }
         }
@@ -939,42 +966,39 @@ VOID EvtCaptureCancel(_In_ WDFREQUEST Request)
         // WINBIO_CAPTURE_DATA payload — there is no capture result to report.
         std::lock_guard<std::mutex> commitLock(g_captureRequestCommitMu);
         WdfRequestComplete(Request, STATUS_CANCELLED);
+        // Release() must not destroy the stack-owned CancelTrack before this
+        // callback is finished. Signal only AFTER WdfRequestComplete returns.
+        claimedTrack->owner.store(3, std::memory_order_release);
+        claimedTrack->completionCv.notify_all();
     }
 }
 
-// Shutdown / reboot (S5): abort BiometricKit and FORCE-complete every tracked
-// CAPTURE_DATA. Sleep keeps the WBF request pending; shutdown must not —
-// otherwise an in-flight StartMatch hangs the T2 (Touch Bar lit) and the
-// power manager waits on outstanding I/O forever. Called from
-// SessionLockWndProc on WM_QUERYENDSESSION / WM_ENDSESSION and from EvtIoStop
-// when the queue is purged (device removal / host teardown during power-off).
+// Shutdown / reboot (S5): stop new SEP work and interrupt active capture waits.
+// IMPORTANT: A request registered with WdfRequestMarkCancelable cannot be
+// completed here without first resolving its WDF cancellation ownership.
+// In particular, writing CancelTrack::owner=1 does NOT transfer ownership from
+// WDF and races both EvtCaptureCancel and WdfRequestUnmarkCancelable.
+// Let EvtCaptureCancel or the worker's CancelableScope::Release() finish it.
 void BeginCaptureShutdown(_In_z_ const char* source)
 {
     g_systemShuttingDown.store(true, std::memory_order_release);
-    g_sleepBarrier.store(true, std::memory_order_release); // blocks DisplayBlocksSuccess / StartMatch
+    g_sleepBarrier.store(true, std::memory_order_release);
     InvalidateActiveCapture(source, /*resetResumeEvent=*/true, /*clearStickyEndpoint=*/true);
 
-    std::vector<WDFREQUEST> toComplete;
+    // Best-effort wakeup: shutdown is a *state*, not a synthetic WDF cancel.
+    // Existing workers check SystemIsShuttingDown() and release their own
+    // requests; a real EvtCaptureCancel may independently take ownership.
+    HANDLE cancelEvent = GetCaptureCancelEvent();
+    if (cancelEvent) SetEvent(cancelEvent);
+    NotifyCaptureStateChanged();
+
+    size_t outstanding = 0;
     {
         std::lock_guard<std::mutex> lock(g_cancelTrackMu);
-        for (auto& e : g_cancelTracks) {
-            int expected = 0;
-            if (e.second->owner.compare_exchange_strong(expected, 1)) {
-                toComplete.push_back(e.first);
-            }
-        }
+        outstanding = g_cancelTracks.size();
     }
-    NotifyCaptureStateChanged();   // g_systemShuttingDown / owner flags just changed
-    std::lock_guard<std::mutex> commitLock(g_captureRequestCommitMu);
-    for (WDFREQUEST req : toComplete) {
-        T2BioLog("%s: force-completing pending CAPTURE_DATA with STATUS_CANCELLED "
-                 "(shutdown — do not open SEP)", source);
-        WdfRequestComplete(req, STATUS_CANCELLED);
-    }
-    if (toComplete.empty()) {
-        T2BioLog("%s: no in-flight CAPTURE_DATA to complete; new captures will be rejected",
-                 source);
-    }
+    T2BioLog("%s: shutdown signaled %llu active capture request(s); completion remains with WDF/worker",
+             source, static_cast<unsigned long long>(outstanding));
 }
 
 // Marks a request cancelable for the duration of a wait and settles who
@@ -984,19 +1008,71 @@ public:
     explicit CancelableScope(WDFREQUEST request) : request_(request) {}
     CancelableScope(const CancelableScope&) = delete;
     CancelableScope& operator=(const CancelableScope&) = delete;
-    ~CancelableScope() { Unregister(); }
-
-    // If the request was already cancelled, EvtCaptureCancel runs before this
-    // returns (WdfRequestMarkCancelable's documented behaviour) - registered
-    // first, so it finds its state.
-    void Arm()
+    ~CancelableScope() noexcept
     {
-        {
+        // Exception safety: an unexpected C++ exception can unwind past an
+        // armed scope before any explicit Release(). Simply unregistering the
+        // stack-owned CancelTrack here would leave a WDF cancel callback
+        // pointing at destroyed stack memory. Resolve WDF ownership first.
+        if (!registered_) return;
+        try {
+            if (Release()) {
+                // Release() successfully unmarked the request: this worker
+                // owns completion. Without this fallback the pending IOCTL
+                // would otherwise be stranded by exception unwinding.
+                std::lock_guard<std::mutex> commitLock(g_captureRequestCommitMu);
+                WdfRequestComplete(request_, STATUS_UNSUCCESSFUL);
+            }
+        } catch (...) {
+            // Never allow a C++ exception to escape a destructor during
+            // stack unwinding; inability to settle ownership is still fatal
+            // for reliable unload and must be diagnosed separately.
+            T2BioLog("CAPTURE_DATA: CancelableScope cleanup threw");
+        }
+    }
+
+    // WdfRequestMarkCancelableEx never invokes EvtCaptureCancel inline.
+    // Unlike MarkCancelable, it reports an already-cancelled request as
+    // STATUS_CANCELLED, leaving completion with this worker. This avoids a
+    // reentrant callback touching stack-backed CancelTrack during Arm().
+    // On failure WDF has not installed the callback; never enter a blocking
+    // capture wait with an untracked request.
+    bool Arm()
+    {
+        // A registry allocation failure must not strand the pending WDF
+        // request: the outer worker exception handler cannot determine who
+        // owns the completion after an arbitrary exception.
+        try {
             std::lock_guard<std::mutex> lock(g_cancelTrackMu);
             g_cancelTracks.emplace_back(request_, &track_);
+        } catch (const std::bad_alloc&) {
+            T2BioLog("CAPTURE_DATA: cancel registry allocation failed");
+            std::lock_guard<std::mutex> commitLock(g_captureRequestCommitMu);
+            WdfRequestComplete(request_, STATUS_INSUFFICIENT_RESOURCES);
+            return false;
         }
         registered_ = true;
-        WdfRequestMarkCancelable(request_, EvtCaptureCancel);
+        const NTSTATUS status = WdfRequestMarkCancelableEx(request_, EvtCaptureCancel);
+        if (!NT_SUCCESS(status)) {
+            // Ex does not invoke EvtCaptureCancel when registration fails,
+            // including STATUS_CANCELLED for a previously-cancelled request.
+            // The worker still owns completion. Remove the stack registration
+            // before completing, so no observer sees a dangling CancelTrack.
+            Unregister();
+            T2BioLog("CAPTURE_DATA: WdfRequestMarkCancelableEx failed (0x%08x)",
+                     static_cast<unsigned>(status));
+            if (status == STATUS_CANCELLED) {
+                // Mirror the cancellation wakeup for any other capture wait.
+                if (HANDLE cancelEvent = GetCaptureCancelEvent()) {
+                    SetEvent(cancelEvent);
+                }
+                NotifyCaptureStateChanged();
+            }
+            std::lock_guard<std::mutex> commitLock(g_captureRequestCommitMu);
+            WdfRequestComplete(request_, status);
+            return false;
+        }
+        return true;
     }
 
     // true  -> not cancelled; the caller still owns Request and completes it.
@@ -1006,13 +1082,36 @@ public:
     {
         int expected = 0;
         if (!track_.owner.compare_exchange_strong(expected, 2)) {
+            // The callback won: do not remove its stack-backed registration
+            // until WdfRequestComplete and callback bookkeeping have finished.
+            std::unique_lock<std::mutex> lock(track_.completionMu);
+            track_.completionCv.wait(lock, [this] {
+                return track_.owner.load(std::memory_order_acquire) == 3;
+            });
+            lock.unlock();
             Unregister();
-            return false;              // the cancel routine owns the completion
+            return false;
         }
         const NTSTATUS st = WdfRequestUnmarkCancelable(request_);
-        Unregister();
         if (st == STATUS_CANCELLED) {
-            WdfRequestComplete(request_, STATUS_CANCELLED);
+            // WDF owns cancellation now. The callback may not yet have run;
+            // keep the stack-based CancelTrack alive until it completes.
+            std::unique_lock<std::mutex> lock(track_.completionMu);
+            track_.completionCv.wait(lock, [this] {
+                return track_.owner.load(std::memory_order_acquire) == 3;
+            });
+            lock.unlock();
+            Unregister();
+            return false;
+        }
+        Unregister();
+        if (!NT_SUCCESS(st)) {
+            T2BioLog("CAPTURE_DATA: WdfRequestUnmarkCancelable failed (0x%08x)",
+                     static_cast<unsigned>(st));
+            // A non-CANCELLED return guarantees the cancel callback will not
+            // execute; completion remains the worker's responsibility.
+            std::lock_guard<std::mutex> commitLock(g_captureRequestCommitMu);
+            WdfRequestComplete(request_, st);
             return false;
         }
         return true;
@@ -1020,7 +1119,8 @@ public:
 
     bool IsCancelled() const
     {
-        return track_.owner.load(std::memory_order_acquire) == 1;
+        const int owner = track_.owner.load(std::memory_order_acquire);
+        return owner == 1 || owner == 3;
     }
 
 private:
@@ -1243,7 +1343,9 @@ SlotWait WaitForCancelledPredecessor(_In_ WDFREQUEST Request, CaptureBusyGuard& 
 
     // This request can be cancelled while it waits too.
     CancelableScope scope(Request);
-    scope.Arm();
+    if (!scope.Arm()) {
+        return SlotWait::RequestCancelled; // Arm already completed the request
+    }
     SlotWait result = SlotWait::StillBusy;
     const ULONGLONG start = GetTickCount64();
     while (GetTickCount64() - start < kPredecessorUnwindWaitMs) {
@@ -1270,32 +1372,14 @@ SlotWait WaitForCancelledPredecessor(_In_ WDFREQUEST Request, CaptureBusyGuard& 
         T2BioLog("CAPTURE_DATA: predecessor wait finished after %llu ms (%s)",
              static_cast<unsigned long long>(GetTickCount64() - start),
              result == SlotWait::Acquired ? "slot acquired" : "still busy");
-    // Hung-worker recovery: the cancelled predecessor held g_captureBusy past
-    // the full 8s budget (typical after a mid-capture IPv6→tunnel fallback
-    // where Connect/port-scan does not poll the cancel event). Leaving the
-    // flag set would make every later CAPTURE_DATA fail with
-    // DATA_COLLECTION_IN_PROGRESS until the process restarts — Windows Hello
-    // then "does not see the finger". Force-drop the slot so the current
-    // request can proceed; risk of a late double-complete is lower than a
-    // permanent lockout (EvtCaptureCancel already completed the old request).
+    // Do NOT steal the previous worker's slot on timeout. A stuck worker may
+    // resume later; overlapping SEP sessions are unsafe. Keep the request BUSY
+    // and let the watchdog log the stalled predecessor for diagnosis.
     if (result == SlotWait::StillBusy) {
-        T2BioLog("CAPTURE_DATA: forcing g_captureBusy=false after hung predecessor "
-                 "(cancel was signaled, worker never released the slot)");
-        g_captureBusy.store(false, std::memory_order_relaxed);
-        HANDLE ce = GetCaptureCancelEvent();
-        if (ce) {
-            ResetEvent(ce); // clear stale cancel so the next wait path is clean
-        }
-        // Also drop sticky NCM: the hung worker almost always died inside
-        // Connect on a transport that just changed (VPN up → tunnel).
-        {
-            std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
-            g_stickyNcm.valid = false;
-        }
-        if (guard.TryAcquire()) {
-            result = SlotWait::Acquired;
-            T2BioLog("CAPTURE_DATA: slot re-acquired after force-clear");
-        }
+        T2BioLog("CAPTURE_DATA: cancelled predecessor did not release slot within %llu ms; "
+                 "not forcing another capture", static_cast<unsigned long long>(kPredecessorUnwindWaitMs));
+        std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
+        g_stickyNcm.valid = false;
     }
     return result;
 }
@@ -1834,12 +1918,14 @@ void HandleCaptureEnroll(_In_ WDFREQUEST Request, const CaptureKey& key)
     T2BioLog("CAPTURE_DATA(enroll): begin, macosUserId=%u", static_cast<unsigned>(kDefaultMacosUserId));
     // Same cancel-aware connect retry as verify: cold-boot NCM lag must not
     // turn enroll into an immediate DEVICE_FAILURE (Settings → Fingerprint).
+    // The shared event is reset only by ProcessCapture after acquiring the
+    // capture slot. Resetting it here would erase the predecessor's cancellation
+    // while WaitForCancelledPredecessor is still waiting for that worker.
     HANDLE cancelEvent = GetCaptureCancelEvent();
-    if (cancelEvent) {
-        ResetEvent(cancelEvent);
-    }
     CancelableScope cancelScope(Request);
-    cancelScope.Arm();
+    if (!cancelScope.Arm()) {
+        return; // MarkCancelable failed and request has been completed
+    }
     t2::bridgexpc::Connection conn;
     const ConnectWait cw = ConnectForCaptureWithRetry(cancelEvent, &conn);
     if (cw == ConnectWait::Cancelled) {
@@ -1936,16 +2022,16 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
     // during discovery/connect should still complete the IOCTL promptly,
     // even though today only the Verify() event-loop wait actually watches
     // cancelEvent; see the header comment on VerificationEngine::Verify).
-    // ResetEvent first: this is a process-wide, reused-across-sessions
-    // event (GetCaptureCancelEvent's own comment), so a stale signal left
-    // over from the PREVIOUS capture's cancellation must not immediately
-    // cancel this brand-new one.
+    // The shared event is reset by ProcessCapture only after ownership of
+    // the SEP slot is established; do not clear the predecessor's cancel.
+    // The shared event is reset only by ProcessCapture after acquiring the
+    // capture slot. Resetting it here would erase the predecessor's cancellation
+    // while WaitForCancelledPredecessor is still waiting for that worker.
     HANDLE cancelEvent = GetCaptureCancelEvent();
-    if (cancelEvent) {
-        ResetEvent(cancelEvent);
-    }
     CancelableScope cancelScope(Request);
-    cancelScope.Arm();
+    if (!cancelScope.Arm()) {
+        return; // MarkCancelable failed and request has been completed
+    }
 
     // Cold boot: the SEP bootstrap may still be running (see WaitForSepBootstrap).
     WINBIO_SENSOR_STATUS sepWaitStatus = WINBIO_SENSOR_READY;
@@ -2317,6 +2403,14 @@ void ProcessCapture(_In_ WDFREQUEST Request, const CaptureKey& key)
         return;
     }
 
+    // We exclusively own the SEP capture slot now. Only at this point is it
+    // safe to clear a stale cancellation signal from the preceding capture.
+    // A cancellation that arrived before Arm() will still be reported by
+    // WdfRequestMarkCancelableEx as STATUS_CANCELLED.
+    if (HANDLE cancelEvent = GetCaptureCancelEvent()) {
+        ResetEvent(cancelEvent);
+    }
+
     switch (key.Purpose) {
     case WINBIO_PURPOSE_VERIFY:
     case WINBIO_PURPOSE_IDENTIFY:
@@ -2358,36 +2452,81 @@ void ProcessCapture(_In_ WDFREQUEST Request, const CaptureKey& key)
 // at once. EvtCaptureCancel still completes a cancelled request with
 // STATUS_CANCELLED right away, but the worker must now learn about it through
 // CancelableScope (see CancelTrack) rather than by touching the request. The
-// worker marks the request cancelable itself, after ResetEvent(cancelEvent) -
-// a cancel that arrived before that makes WdfRequestMarkCancelable invoke
-// EvtCaptureCancel immediately, which sets the freshly reset event, so it is
-// not lost.
+// The new owner resets the shared cancel event only AFTER acquiring the SEP
+// capture slot. If the new request was already cancelled before Arm(),
+// WdfRequestMarkCancelableEx reports STATUS_CANCELLED without a synchronous
+// callback, and Arm() finishes the request.
 std::atomic<int> g_captureWorkers{0};
+// The worker thread must not outlive this UMDF module. Keep joinable handles
+// and reclaim completed threads on subsequent admissions, not only at unload.
+struct CaptureWorkerEntry {
+    std::thread thread;
+    std::shared_ptr<std::atomic<bool>> finished;
+};
+std::mutex g_captureWorkerLifecycleMu;
+std::list<CaptureWorkerEntry> g_captureWorkerThreads;
+bool g_captureWorkerDraining = false; // protected by g_captureWorkerLifecycleMu
+
+// Requires g_captureWorkerLifecycleMu. Never join a worker that is still active;
+// workers do not acquire this mutex, so joining a *finished* thread is safe.
+void ReapFinishedCaptureWorkers()
+{
+    for (auto it = g_captureWorkerThreads.begin(); it != g_captureWorkerThreads.end();) {
+        if (it->finished->load(std::memory_order_acquire)) {
+            if (it->thread.joinable()) it->thread.join();
+            it = g_captureWorkerThreads.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
 
 void StartCaptureWorker(_In_ WDFREQUEST Request, const CaptureKey& key)
 {
-    g_captureWorkers.fetch_add(1);
-    try {
-        std::thread([Request, key]() {
-            // An exception escaping a detached thread is std::terminate, which
-            // takes the whole WUDFHost down. ProcessCapture's RAII guards
-            // (busy slot, cancelable scope) unwind on the way out; the request
-            // itself is NOT completed here because its state is unknown at
-            // this level (it may already be completed or owned by
-            // EvtCaptureCancel) and a second WdfRequestComplete is worse.
+    bool started = false;
+    bool draining = false;
+    {
+        std::lock_guard<std::mutex> lifecycle(g_captureWorkerLifecycleMu);
+        draining = g_captureWorkerDraining;
+        if (!draining) {
+            ReapFinishedCaptureWorkers();
             try {
-                ProcessCapture(Request, key);
-            } catch (const std::exception& ex) {
-                T2BioLog("CAPTURE_DATA: worker aborted by exception: %s", ex.what());
+                // Allocate the registry node before starting the thread. If
+                // allocation fails, there is no untracked running thread.
+                auto finished = std::make_shared<std::atomic<bool>>(false);
+                auto entry = g_captureWorkerThreads.emplace(g_captureWorkerThreads.end());
+                entry->finished = finished;
+                g_captureWorkers.fetch_add(1, std::memory_order_relaxed);
+                try {
+                    entry->thread = std::thread([Request, key, finished]() {
+                        try {
+                            ProcessCapture(Request, key);
+                        } catch (const std::exception& ex) {
+                            T2BioLog("CAPTURE_DATA: worker aborted by exception: %s", ex.what());
+                        } catch (...) {
+                            T2BioLog("CAPTURE_DATA: worker aborted by unknown exception");
+                        }
+                        g_captureWorkers.fetch_sub(1, std::memory_order_acq_rel);
+                        finished->store(true, std::memory_order_release);
+                    });
+                    started = true;
+                } catch (...) {
+                    g_captureWorkers.fetch_sub(1, std::memory_order_acq_rel);
+                    g_captureWorkerThreads.erase(entry);
+                }
             } catch (...) {
-                T2BioLog("CAPTURE_DATA: worker aborted by unknown exception");
+                // Failed registry allocation: no thread was launched.
             }
-            g_captureWorkers.fetch_sub(1);
-        }).detach();
-    } catch (...) {
-        g_captureWorkers.fetch_sub(1);
-        T2BioLog("CAPTURE_DATA: could not start the capture worker -> DEVICE_FAILURE");
-        CompleteCaptureData(Request, WINBIO_E_DEVICE_FAILURE, WINBIO_SENSOR_FAILURE, 0, {});
+        }
+    }
+    if (!started) {
+        if (draining) {
+            T2BioLog("CAPTURE_DATA: reject worker during driver unload");
+            WdfRequestComplete(Request, STATUS_CANCELLED);
+        } else {
+            T2BioLog("CAPTURE_DATA: could not start the capture worker -> DEVICE_FAILURE");
+            CompleteCaptureData(Request, WINBIO_E_DEVICE_FAILURE, WINBIO_SENSOR_FAILURE, 0, {});
+        }
     }
 }
 
@@ -2528,13 +2667,14 @@ extern "C" VOID T2BioEvtIoDeviceControl(_In_ WDFQUEUE Queue,
             std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
             g_stickyNcm.valid = false;
         }
-        HANDLE cancelEvent = GetCaptureCancelEvent();
-        if (cancelEvent) {
-            ResetEvent(cancelEvent);
-        }
-        g_captureBusy.store(false, std::memory_order_release);
-        NotifyCaptureSlotReleased();
-        T2BioLog("  RESET -> session state cleared, STATUS_SUCCESS");
+        // Do not clear the process-wide capture cancellation event here.
+        // RESET may race with EvtCaptureCancel / shutdown while an existing
+        // capture worker still needs that signal to unwind. The next capture
+        // resets this event immediately before arming its own cancel callback
+        // in HandleCaptureVerify / HandleCaptureEnroll.
+        // RESET does not mean an in-flight worker has exited. Only its
+        // CaptureBusyGuard may release the single SEP capture slot.
+        T2BioLog("  RESET -> session state cleared (active capture slot preserved), STATUS_SUCCESS");
         WdfRequestComplete(Request, STATUS_SUCCESS);
         return;
     }
@@ -2605,22 +2745,10 @@ extern "C" VOID T2BioEvtIoStop(_In_ WDFQUEUE Queue,
         // Device/queue teardown (including host shutdown): force-complete any
         // Arm'd CAPTURE so power-off is not blocked by an unbounded verify.
         BeginCaptureShutdown("EvtIoStop(Purge)");
-        // If this Request was force-completed above, do not touch it again.
-        // Otherwise keep ownership; worker exits via SystemIsShuttingDown.
-        bool completedByShutdown = false;
-        {
-            std::lock_guard<std::mutex> lock(g_cancelTrackMu);
-            for (const auto& e : g_cancelTracks) {
-                if (e.first == Request &&
-                    e.second->owner.load(std::memory_order_acquire) == 1) {
-                    completedByShutdown = true;
-                    break;
-                }
-            }
-        }
-        if (!completedByShutdown) {
-            WdfRequestStopAcknowledge(Request, FALSE);
-        }
+        // Shutdown only signals cancellation; it does not take WDF completion
+        // ownership. Acknowledge the stop, retaining driver ownership until
+        // either EvtCaptureCancel or the capture worker completes the request.
+        WdfRequestStopAcknowledge(Request, FALSE);
         return;
     }
     if (suspend) {
@@ -2687,23 +2815,31 @@ extern "C" VOID T2BioRegisterSuspendResumeNotification(VOID)
 // and give them a bounded moment to unwind before the host may unload us.
 extern "C" VOID T2BioDrainCaptureWorkers(VOID)
 {
-    if (g_captureWorkers.load() == 0 && g_watchdogThreads.load() == 0) {
-        return;
+    // Serialize worker admission with the terminal transition. The list of
+    // joinable threads is transferred out only after new admission is closed.
+    std::list<CaptureWorkerEntry> threads;
+    {
+        std::lock_guard<std::mutex> lifecycle(g_captureWorkerLifecycleMu);
+        g_captureWorkerDraining = true;
+        threads.splice(threads.end(), g_captureWorkerThreads);
     }
-    // Wake a sleeping cancel watchdog so it does not outlive the DLL.
-    if (HANDLE wd = SlotReleasedWatchEvent()) {
-        SetEvent(wd);
-    }
-    T2BioLog("EvtDriverUnload: waiting for %d capture worker(s) to unwind", g_captureWorkers.load());
-    HANDLE cancelEvent = GetCaptureCancelEvent();
-    if (cancelEvent) {
-        SetEvent(cancelEvent);
-    }
+    BeginCaptureShutdown("EvtDriverUnload");
+    StopAndJoinCancelWatchdog();
+    if (HANDLE cancelEvent = GetCaptureCancelEvent()) SetEvent(cancelEvent);
+
+    // Unlike the previous 3-second drain, never return while code from this
+    // DLL may still execute. NOTE: a truly stuck transport call can now hold
+    // unload indefinitely. Transport cancellation/deadlines must be validated.
     const ULONGLONG start = GetTickCount64();
-    while ((g_captureWorkers.load() != 0 || g_watchdogThreads.load() != 0) &&
-           GetTickCount64() - start < 3000) {
-        Sleep(10);
+    T2BioLog("EvtDriverUnload: joining %llu capture worker(s)",
+             static_cast<unsigned long long>(threads.size()));
+    for (auto& entry : threads) {
+        if (entry.thread.joinable()) entry.thread.join();
+        if (GetTickCount64() - start > 3000) {
+            T2BioLog("EvtDriverUnload: WARNING capture drain exceeded 3 seconds");
+        }
     }
+    T2BioLog("EvtDriverUnload: all capture workers joined");
 }
 
 // Called once from EvtDriverUnload (Driver.cpp).
@@ -2747,6 +2883,7 @@ constexpr UINT kSessionLockShutdownMessage = WM_APP + 1;
 
 HANDLE g_sessionLockThread = nullptr;
 DWORD g_sessionLockThreadId = 0;
+HANDLE g_sessionLockReadyEvent = nullptr;
 std::atomic<HWND> g_sessionLockWindow{nullptr};
 
 // GUID_CONSOLE_DISPLAY_STATE: 0=off, 1=on, 2=dimmed.
@@ -2900,6 +3037,9 @@ LRESULT CALLBACK SessionLockWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 
 DWORD WINAPI SessionLockThreadProc(LPVOID)
 {
+    const auto signalReady = []() {
+        if (g_sessionLockReadyEvent) SetEvent(g_sessionLockReadyEvent);
+    };
     WNDCLASSW wc = {};
     wc.lpfnWndProc = SessionLockWndProc;
     wc.hInstance = GetModuleHandleW(nullptr);
@@ -2910,6 +3050,7 @@ DWORD WINAPI SessionLockThreadProc(LPVOID)
     if (!RegisterClassW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
         T2BioLog("SessionLockThreadProc: RegisterClassW failed, error=%lu",
                  static_cast<unsigned long>(GetLastError()));
+        signalReady();
         return 0;
     }
 
@@ -2926,6 +3067,7 @@ DWORD WINAPI SessionLockThreadProc(LPVOID)
     if (!hwnd) {
         T2BioLog("SessionLockThreadProc: CreateWindowExW failed, error=%lu",
                  static_cast<unsigned long>(GetLastError()));
+        signalReady();
         return 0;
     }
     // Stay invisible; no taskbar entry (WS_EX_TOOLWINDOW).
@@ -2935,6 +3077,7 @@ DWORD WINAPI SessionLockThreadProc(LPVOID)
         T2BioLog("SessionLockThreadProc: WTSRegisterSessionNotification failed, error=%lu",
                  static_cast<unsigned long>(GetLastError()));
         DestroyWindow(hwnd);
+        signalReady();
         return 0;
     }
 
@@ -2949,6 +3092,7 @@ DWORD WINAPI SessionLockThreadProc(LPVOID)
 
     g_sessionLockWindow.store(hwnd, std::memory_order_release);
     T2BioLog("SessionLockThreadProc: WTSRegisterSessionNotification ok, pumping messages");
+    signalReady();
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
@@ -2970,31 +3114,57 @@ DWORD WINAPI SessionLockThreadProc(LPVOID)
 // above still protects the actual-suspend case on its own).
 extern "C" VOID T2BioRegisterSessionLockNotification(VOID)
 {
+    if (g_sessionLockThread) return;
+    g_sessionLockReadyEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_sessionLockReadyEvent) {
+        T2BioLog("SessionLock registration: CreateEvent failed err=%lu", GetLastError());
+        return;
+    }
     g_sessionLockThread = CreateThread(nullptr, 0, SessionLockThreadProc, nullptr, 0,
                                         &g_sessionLockThreadId);
     if (!g_sessionLockThread) {
-        T2BioLog("T2BioRegisterSessionLockNotification: CreateThread failed, error=%lu",
-                 static_cast<unsigned long>(GetLastError()));
+        T2BioLog("SessionLock registration: CreateThread failed err=%lu", GetLastError());
+        CloseHandle(g_sessionLockReadyEvent);
+        g_sessionLockReadyEvent = nullptr;
     }
 }
 
-// Called from EvtDriverUnload (Driver.cpp), before the process may unload
-// this DLL. Posts the window its own shutdown message and waits, bounded,
-// for the pump thread to unwind.
+// Never return from unload while this DLL's message-loop thread is still alive.
+// Readiness event closes the race where unload precedes window creation.
 extern "C" VOID T2BioUnregisterSessionLockNotification(VOID)
 {
-    if (!g_sessionLockThread) {
-        return;
+    if (!g_sessionLockThread) return;
+    HANDLE waits[] = {g_sessionLockReadyEvent, g_sessionLockThread};
+    if (g_sessionLockReadyEvent) {
+        const DWORD ready = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
+        if (ready == WAIT_FAILED) {
+            T2BioLog("SessionLock unregister: readiness wait failed err=%lu", GetLastError());
+        }
+    }
+    HWND hwnd = g_sessionLockWindow.load(std::memory_order_acquire);
+    if (hwnd) {
+        if (!PostMessageW(hwnd, kSessionLockShutdownMessage, 0, 0)) {
+            T2BioLog("SessionLock unregister: PostMessage failed err=%lu", GetLastError());
+            // Window may have disappeared. Message-loop thread may already be exiting.
+            PostThreadMessageW(g_sessionLockThreadId, WM_QUIT, 0, 0);
+        }
+    }
+    // A prior thread exit requires no shutdown message. The ready event is
+    // signalled on both success and failed initialization paths.
+    const DWORD wait = WaitForSingleObject(g_sessionLockThread, INFINITE);
+    if (wait != WAIT_OBJECT_0) {
+        T2BioLog("SessionLock unregister: wait returned %lu err=%lu", wait, GetLastError());
+        // Do not pretend it is safe to unload if the thread is still running.
     }
     if (g_displayStateNotify) {
         UnregisterPowerSettingNotification(g_displayStateNotify);
         g_displayStateNotify = nullptr;
     }
-    HWND hwnd = g_sessionLockWindow.load(std::memory_order_acquire);
-    if (hwnd) {
-        PostMessageW(hwnd, kSessionLockShutdownMessage, 0, 0);
-    }
-    WaitForSingleObject(g_sessionLockThread, 3000);
     CloseHandle(g_sessionLockThread);
     g_sessionLockThread = nullptr;
+    g_sessionLockThreadId = 0;
+    if (g_sessionLockReadyEvent) {
+        CloseHandle(g_sessionLockReadyEvent);
+        g_sessionLockReadyEvent = nullptr;
+    }
 }

@@ -170,7 +170,8 @@ private:
                               std::chrono::milliseconds tcpTimeout,
                               std::chrono::milliseconds heloTimeout,
                               bool* outTcpFailed, ULONGLONG* outTcpMs,
-                              t2::transport::PathEvidence* outEvidence = nullptr);
+                              t2::transport::PathEvidence* outEvidence = nullptr,
+                              const std::chrono::steady_clock::time_point* overallDeadline = nullptr);
     SOCKET socket_ = INVALID_SOCKET;
     std::atomic<bool> connectionLost_{false};
 
@@ -200,14 +201,15 @@ private:
     size_t rxLen_ = 0;                       // one past the last valid byte
     DWORD rcvTimeoutMs_ = 0xFFFFFFFFu;       // SO_RCVTIMEO last set on socket_; sentinel = unknown
     void ResetRx() { rxPos_ = rxLen_ = 0; rcvTimeoutMs_ = 0xFFFFFFFFu; }
-    void SetRcvTimeoutCached(std::chrono::milliseconds timeout);
-    bool WriteFrame(FrameType type, const std::vector<uint8_t>& body);
-    bool AcknowledgeEvent(const std::string& requestId);
+    bool SetRcvTimeoutCached(std::chrono::milliseconds timeout);
+    bool WriteFrame(FrameType type, const std::vector<uint8_t>& body,
+                    std::chrono::milliseconds budget = std::chrono::milliseconds(10000));
+    bool AcknowledgeEvent(const std::string& requestId, std::chrono::milliseconds budget);
     // Same event-before-reply loop as SendBiometricCommand/GetFdr:
     // ACK+queue async events, return only the matching reply envelope.
     bool ReadUntilMatchingReply(const std::string& expectedReqId,
                                 MessageEnvelope* outEnv,
-                                std::chrono::milliseconds timeout,
+                                std::chrono::steady_clock::time_point deadline,
                                 const wchar_t* logTag);
     std::deque<std::vector<uint8_t>> pendingEvents_;
 

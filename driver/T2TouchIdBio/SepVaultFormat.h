@@ -98,6 +98,12 @@ inline VaultReadResult ReadVaultFile(const std::wstring& path) {
         return result;
     }
 
+    // Reject trailing bytes: a valid vault must have exactly two DPAPI blobs.
+    // Do not silently accept appended data or a mismatched container layout.
+    if (f.peek() != std::char_traits<char>::eof()) {
+        return result;
+    }
+
     result.ok = true;
     result.specialUserBag = specialUserBag;
     result.protectedKeybag = std::move(keybagBlob);

@@ -8,6 +8,8 @@
 #include <ws2tcpip.h>
 #include <rpc.h>
 #include <cctype>
+#include <climits>
+#include <algorithm>
 #pragma comment(lib, "Ws2_32.lib")
 #pragma comment(lib, "Rpcrt4.lib")
 
@@ -58,6 +60,9 @@ void Connection::Close() {
 }
 
 static bool SetSocketTimeout(SOCKET s, int optname, std::chrono::milliseconds timeout) {
+    // A zero value disables SO_RCVTIMEO/SO_SNDTIMEO on Windows.
+    // Never permit a non-positive or overflowing deadline to turn I/O unbounded.
+    if (timeout.count() <= 0 || timeout.count() > 0xFFFFFFFFLL) return false;
     DWORD ms = static_cast<DWORD>(timeout.count());
     return setsockopt(s, SOL_SOCKET, optname, reinterpret_cast<const char*>(&ms), sizeof(ms)) == 0;
 }
@@ -82,6 +87,10 @@ static bool ConnectWithTimeout(SOCKET s, const sockaddr* addr, int addrlen,
     // apart from "the SYN vanished" (timeout - path broken) need this; a
     // bare bool collapses both into false.
     if (outWsaError) *outWsaError = 0;
+    if (timeout.count() <= 0) {
+        if (outWsaError) *outWsaError = WSAETIMEDOUT;
+        return false;
+    }
     u_long nonBlocking = 1;
     if (ioctlsocket(s, FIONBIO, &nonBlocking) != 0) {
         if (outWsaError) *outWsaError = WSAGetLastError();
@@ -111,14 +120,17 @@ static bool ConnectWithTimeout(SOCKET s, const sockaddr* addr, int addrlen,
             ok = haveErr && err == 0 && FD_ISSET(s, &writeSet) && !FD_ISSET(s, &errSet);
             if (!ok && outWsaError) *outWsaError = haveErr && err != 0 ? err : WSAECONNABORTED;
         } else if (outWsaError) {
-            *outWsaError = WSAETIMEDOUT;
+            *outWsaError = sel == 0 ? WSAETIMEDOUT : WSAGetLastError();
         }
-        // sel <= 0 (timeout/error) or an errSet hit both leave ok=false, which
-        // is exactly "no first connect within the deadline" from the caller's
-        // point of view - the case the 400ms IPv6 fallback below depends on.
     }
     u_long blocking = 0;
-    ioctlsocket(s, FIONBIO, &blocking);
+    if (ioctlsocket(s, FIONBIO, &blocking) != 0) {
+        // A connected nonblocking socket cannot safely be passed to
+        // synchronous WriteFrame/ReadFrame, which rely on socket timeouts.
+        const int restoreError = WSAGetLastError();
+        if (outWsaError) *outWsaError = restoreError;
+        return false;
+    }
     return ok;
 }
 
@@ -208,6 +220,8 @@ static std::vector<uint8_t> BuildClientHeloBody(int64_t bridgeXpcVersion) {
     return std::vector<uint8_t>(json.begin(), json.end());
 }
 
+static std::chrono::milliseconds RemainingBudget(std::chrono::steady_clock::time_point end);
+
 // One transport attempt (no fallback logic). `tcpTimeout` bounds only the TCP
 // handshake; `heloTimeout` bounds the HELO exchange and the established
 // socket's later send/recv defaults. *outTcpFailed is set when the handshake
@@ -218,7 +232,8 @@ ConnectResult Connection::ConnectOnce(bool tunnel, const in6_addr& linkLocalAddr
                                       std::chrono::milliseconds tcpTimeout,
                                       std::chrono::milliseconds heloTimeout,
                                       bool* outTcpFailed, ULONGLONG* outTcpMs,
-                                      t2::transport::PathEvidence* outEvidence) {
+                                      t2::transport::PathEvidence* outEvidence,
+                                      const std::chrono::steady_clock::time_point* overallDeadline) {
     *outTcpFailed = false;
     *outTcpMs = 0;
     t2::transport::PathEvidence evidenceLocal = t2::transport::PathEvidence::Silent;
@@ -228,6 +243,11 @@ ConnectResult Connection::ConnectOnce(bool tunnel, const in6_addr& linkLocalAddr
         tunnel ? t2::transport::TransportMode::Ipv4Tunnel
                : t2::transport::TransportMode::NativeIpv6);
 
+    // Bound TCP plus tunnel preparation by the caller's overall deadline.
+    const auto tcpStartTime = std::chrono::steady_clock::now();
+    auto tcpDeadline = tcpStartTime + tcpTimeout;
+    if (overallDeadline && *overallDeadline < tcpDeadline) tcpDeadline = *overallDeadline;
+    if (tcpDeadline <= tcpStartTime) return ConnectResult::ConnectFailed;
     const ULONGLONG tcpStart = GetTickCount64();
     int wsa = 0;
     if (tunnel) {
@@ -240,6 +260,14 @@ ConnectResult Connection::ConnectOnce(bool tunnel, const in6_addr& linkLocalAddr
             // tunnel failure; the caller re-resolves the peer.
             T2_LOG("connect", L"Ipv4Tunnel not attemptable (%s) - LocalError",
                    prep == t2::transport::TunnelPrep::NoMac ? L"no peer MAC" : L"no peer");
+            evidence = t2::transport::PathEvidence::LocalError;
+            return ConnectResult::ConnectFailed;
+        }
+        // Tunnel preparation may perform synchronous neighbor/driver operations.
+        // Do not start TCP when that work has already exhausted this attempt's budget.
+        // Treat it as local preparation exhaustion, not evidence of a dead T2 path.
+        if (RemainingBudget(tcpDeadline).count() <= 0) {
+            T2_LOG("connect", L"Ipv4Tunnel preparation exhausted TCP budget before socket creation");
             evidence = t2::transport::PathEvidence::LocalError;
             return ConnectResult::ConnectFailed;
         }
@@ -265,7 +293,7 @@ ConnectResult Connection::ConnectOnce(bool tunnel, const in6_addr& linkLocalAddr
                peer4.S_un.S_un_b.s_b3, peer4.S_un.S_un_b.s_b4,
                static_cast<unsigned>(port), interfaceIndex);
         if (!ConnectWithTimeout(socket_, reinterpret_cast<sockaddr*>(&addr4), sizeof(addr4),
-                                tcpTimeout, &wsa)) {
+                                RemainingBudget(tcpDeadline), &wsa)) {
             T2_LOG("connect", L"connect(AF_INET) failed WSA=%d (%llu ms)", wsa,
                    static_cast<unsigned long long>(GetTickCount64() - tcpStart));
             Close();
@@ -297,7 +325,7 @@ ConnectResult Connection::ConnectOnce(bool tunnel, const in6_addr& linkLocalAddr
                interfaceIndex, static_cast<unsigned>(port),
                static_cast<long long>(tcpTimeout.count()));
         if (!ConnectWithTimeout(socket_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr),
-                                tcpTimeout, &wsa)) {
+                                RemainingBudget(tcpDeadline), &wsa)) {
             T2_LOG("connect", L"connect(AF_INET6) failed WSA=%d (%llu ms)", wsa,
                    static_cast<unsigned long long>(GetTickCount64() - tcpStart));
             Close();
@@ -319,16 +347,30 @@ ConnectResult Connection::ConnectOnce(bool tunnel, const in6_addr& linkLocalAddr
     evidence = t2::transport::PathEvidence::Positive; // handshake completed
     *outTcpMs = GetTickCount64() - tcpStart;
     TuneEstablishedSocket(socket_);
-    SetSocketTimeout(socket_, SO_RCVTIMEO, heloTimeout);
-    SetSocketTimeout(socket_, SO_SNDTIMEO, heloTimeout);
+    if (overallDeadline) {
+        heloTimeout = std::min(heloTimeout, RemainingBudget(*overallDeadline));
+        if (heloTimeout.count() <= 0) {
+            Close();
+            return ConnectResult::HeloTimeout;
+        }
+    }
+    if (!SetSocketTimeout(socket_, SO_RCVTIMEO, heloTimeout) ||
+        !SetSocketTimeout(socket_, SO_SNDTIMEO, heloTimeout)) {
+        T2_LOG("connect", L"unable to configure bounded HELO socket I/O (WSA=%d)",
+               WSAGetLastError());
+        Close();
+        return ConnectResult::ConnectFailed;
+    }
     ResetRx();   // new stream: no buffered bytes
     rcvTimeoutMs_ = static_cast<DWORD>(heloTimeout.count());   // what was just set
     T2_LOG("connect", L"TCP connected (%s): ifIndex=%lu port=%u, %llu ms (waiting for peer HELO)",
            tunnel ? L"IPv4 tunnel" : L"Native IPv6", interfaceIndex,
            static_cast<unsigned>(port), static_cast<unsigned long long>(*outTcpMs));
 
+    auto heloDeadline = std::chrono::steady_clock::now() + heloTimeout;
+    if (overallDeadline && *overallDeadline < heloDeadline) heloDeadline = *overallDeadline;
     RawFrame helo;
-    if (!ReadFrame(&helo, heloTimeout) || helo.type != FrameType::Helo) {
+    if (!ReadFrame(&helo, RemainingBudget(heloDeadline)) || helo.type != FrameType::Helo) {
         T2_LOG("connect", L"HELO read failed or wrong frame type "
                "(connected=true, timeout=%lldms)", static_cast<long long>(heloTimeout.count()));
         if (tunnel) t2::transport::InvalidateTunnelPrepCache();
@@ -349,7 +391,8 @@ ConnectResult Connection::ConnectOnce(bool tunnel, const in6_addr& linkLocalAddr
         return ConnectResult::HeloMalformed;
     }
     std::vector<uint8_t> ownHelo = BuildClientHeloBody(bridgeXpcVersion);
-    if (!WriteFrame(FrameType::Helo, ownHelo)) {
+    if (std::chrono::steady_clock::now() >= heloDeadline ||
+        !WriteFrame(FrameType::Helo, ownHelo, RemainingBudget(heloDeadline))) {
         T2_LOG("connect", L"writing own HELO failed, WSAGetLastError=%d", WSAGetLastError());
         Close();
         return ConnectResult::HeloMalformed;
@@ -402,6 +445,14 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
         T2_LOG("connect", L"EnsureWinsock failed - cannot create sockets");
         return ConnectResult::ConnectFailed;
     }
+    if (connectTimeout.count() <= 0) return ConnectResult::ConnectFailed;
+    const auto overallDeadline = std::chrono::steady_clock::now() + connectTimeout;
+    auto remaining = [&]() -> std::chrono::milliseconds {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= overallDeadline) return std::chrono::milliseconds(0);
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(overallDeadline - now);
+        return ms.count() ? ms : std::chrono::milliseconds(1);
+    };
     namespace tp = t2::transport;
     connectionLost_.store(false);
 
@@ -410,12 +461,15 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
     bool tunnel = tp::IsTunnelModeActive();
     const std::chrono::milliseconds firstTcp =
         (autoSwitch && !tunnel) ? tp::NativeConnectBudget(connectTimeout) : connectTimeout;
+    const auto firstBudget = std::min(firstTcp, remaining());
+    if (firstBudget.count() <= 0) return ConnectResult::ConnectFailed;
     bool tcpFailed = false;
     ULONGLONG tcpMs = 0;
     tp::PathEvidence ev1 = tp::PathEvidence::Silent;
     const ULONGLONG t0 = GetTickCount64();
     ConnectResult r = ConnectOnce(tunnel, linkLocalAddress, interfaceIndex, port,
-                                  firstTcp, connectTimeout, &tcpFailed, &tcpMs, &ev1);
+                                  firstBudget, connectTimeout, &tcpFailed, &tcpMs, &ev1,
+                                  &overallDeadline);
     // LocalError (no peer MAC for the tunnel, socket() failure) is "cannot try this
     // transport", not "the transport answered": still worth the other one.
     if (!tcpFailed && ev1 != tp::PathEvidence::LocalError) {
@@ -428,6 +482,7 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
     // TCP handshake did not complete: this transport is dead right now. Try
     // the other one immediately. Tunnel handshakes get a floor because the
     // ARP/peer prep is part of them; native ones use the adaptive budget.
+    if (remaining().count() <= 0) return r;
     const bool other = !tunnel;
     long long fbMs = connectTimeout.count();
     if (other) {
@@ -436,11 +491,14 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
     }
     const std::chrono::milliseconds fallbackTcp =
         other ? std::chrono::milliseconds(fbMs) : tp::NativeConnectBudget(connectTimeout);
+    const auto fallbackBudget = std::min(fallbackTcp, remaining());
+    if (fallbackBudget.count() <= 0) return r;
     bool tcpFailed2 = false;
     ULONGLONG tcpMs2 = 0;
     tp::PathEvidence ev2 = tp::PathEvidence::Silent;
     ConnectResult r2 = ConnectOnce(other, linkLocalAddress, interfaceIndex, port,
-                                   fallbackTcp, connectTimeout, &tcpFailed2, &tcpMs2, &ev2);
+                                   fallbackBudget, connectTimeout, &tcpFailed2, &tcpMs2, &ev2,
+                                   &overallDeadline);
     if (!tcpFailed2 && ev2 != tp::PathEvidence::LocalError) {
         if (other) tp::CommitAutoTunnel(true);
         else       tp::RecordNativeSuccess(tcpMs2);
@@ -459,19 +517,28 @@ ConnectResult Connection::Connect(const in6_addr& linkLocalAddress, unsigned lon
 }
 
 
+// One deadline shared by the write and the subsequent reply wait.
+// Round a positive sub-millisecond remainder up rather than accidentally
+// passing zero (which disables Winsock socket timeouts).
+static std::chrono::milliseconds RemainingBudget(std::chrono::steady_clock::time_point end) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= end) return std::chrono::milliseconds(0);
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - now);
+    return ms.count() ? ms : std::chrono::milliseconds(1);
+}
+
 bool Connection::ReadUntilMatchingReply(const std::string& expectedReqId,
                                         MessageEnvelope* outEnv,
-                                        std::chrono::milliseconds timeout,
+                                        std::chrono::steady_clock::time_point deadline,
                                         const wchar_t* logTag) {
-    auto deadline = std::chrono::steady_clock::now() + timeout;
     for (;;) {
         auto now = std::chrono::steady_clock::now();
         if (now >= deadline) {
-            ::t2::log::Logf(logTag, L"deadline reached waiting for reply (reqId=%s, timeout=%lldms)",
-                   Widen(expectedReqId).c_str(), static_cast<long long>(timeout.count()));
+            ::t2::log::Logf(logTag, L"deadline reached waiting for reply (reqId=%s)",
+                   Widen(expectedReqId).c_str());
             return false;
         }
-        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+        auto remaining = RemainingBudget(deadline);
 
         RawFrame frame;
         if (!ReadFrame(&frame, remaining)) {
@@ -495,7 +562,7 @@ bool Connection::ReadUntilMatchingReply(const std::string& expectedReqId,
                    L"payload=%zuB - acking and queuing",
                    Widen(expectedReqId).c_str(), Widen(env->requestId).c_str(),
                    env->payloadPlist.size());
-            if (!AcknowledgeEvent(env->requestId)) {
+            if (!AcknowledgeEvent(env->requestId, RemainingBudget(deadline))) {
                 ::t2::log::Logf(logTag, L"AcknowledgeEvent failed for event reqId=%s",
                        Widen(env->requestId).c_str());
                 return false;
@@ -516,23 +583,29 @@ bool Connection::ReadUntilMatchingReply(const std::string& expectedReqId,
 }
 
 bool Connection::GetBridgeVersion(int64_t* outVersion, std::chrono::milliseconds timeout) {
+    // Include mutex contention in the operation budget, not only wire I/O.
+    const auto operationDeadline = std::chrono::steady_clock::now() + timeout;
     IoLock ioLock(*this, timeout);
     if (!ioLock.owns()) {
         T2_LOG("io", L"could not acquire connection I/O lock within %lldms",
                static_cast<long long>((timeout).count()));
         return false;
     }
+    if (RemainingBudget(operationDeadline).count() <= 0) {
+        T2_LOG("io", L"operation deadline expired while acquiring I/O lock");
+        return false;
+    }
     std::string reqId = NewRequestUuid();
     if (reqId.empty()) return false;
     auto req = EncodeRequestEnvelope(reqId, {0});
-    if (!WriteFrame(FrameType::Message, req)) {
+    if (!WriteFrame(FrameType::Message, req, RemainingBudget(operationDeadline))) {
         T2_LOG("getBridgeVersion", L"WriteFrame failed, WSAGetLastError=%d", WSAGetLastError());
         return false;
     }
 
     // Same event-before-reply loop as SendBiometricCommand (ACK+queue).
     MessageEnvelope env;
-    if (!ReadUntilMatchingReply(reqId, &env, timeout, L"getBridgeVersion")) {
+    if (!ReadUntilMatchingReply(reqId, &env, operationDeadline, L"getBridgeVersion")) {
         return false;
     }
 
@@ -551,22 +624,28 @@ bool Connection::GetBridgeVersion(int64_t* outVersion, std::chrono::milliseconds
 }
 
 bool Connection::SetClientVersion(int64_t version, std::chrono::milliseconds timeout) {
+    // Include mutex contention in the operation budget, not only wire I/O.
+    const auto operationDeadline = std::chrono::steady_clock::now() + timeout;
     IoLock ioLock(*this, timeout);
     if (!ioLock.owns()) {
         T2_LOG("io", L"could not acquire connection I/O lock within %lldms",
                static_cast<long long>((timeout).count()));
         return false;
     }
+    if (RemainingBudget(operationDeadline).count() <= 0) {
+        T2_LOG("io", L"operation deadline expired while acquiring I/O lock");
+        return false;
+    }
     std::string reqId = NewRequestUuid();
     if (reqId.empty()) return false;
     auto req = EncodeRequestEnvelope(reqId, {10, version});
-    if (!WriteFrame(FrameType::Message, req)) {
+    if (!WriteFrame(FrameType::Message, req, RemainingBudget(operationDeadline))) {
         T2_LOG("setClientVersion", L"WriteFrame failed, WSAGetLastError=%d", WSAGetLastError());
         return false;
     }
 
     MessageEnvelope env;
-    if (!ReadUntilMatchingReply(reqId, &env, timeout, L"setClientVersion")) {
+    if (!ReadUntilMatchingReply(reqId, &env, operationDeadline, L"setClientVersion")) {
         return false;
     }
 
@@ -579,6 +658,8 @@ bool Connection::SendBiometricCommand(const std::vector<uint8_t>& innerBmMessage
                                        std::vector<uint8_t>* outReply,
                                        std::chrono::milliseconds timeout,
                                        int64_t* outCommandStatus) {
+    // Include mutex contention in the operation budget, not only wire I/O.
+    const auto operationDeadline = std::chrono::steady_clock::now() + timeout;
     IoLock ioLock(*this, timeout);
     if (!ioLock.owns()) {
         T2_LOG("sendBiometricCommand", L"could not acquire connection I/O lock within %lldms",
@@ -586,6 +667,10 @@ bool Connection::SendBiometricCommand(const std::vector<uint8_t>& innerBmMessage
         return false;
     }
     if (outCommandStatus) *outCommandStatus = 0;
+    if (RemainingBudget(operationDeadline).count() <= 0) {
+        T2_LOG("io", L"operation deadline expired while acquiring I/O lock");
+        return false;
+    }
     std::string reqId = NewRequestUuid();
     if (reqId.empty()) return false;
     // VERIFIED FROM SOURCE: outer payload is exactly
@@ -600,7 +685,7 @@ bool Connection::SendBiometricCommand(const std::vector<uint8_t>& innerBmMessage
            HexDump(innerBmMessage, 8).c_str(), outputCapacity,
            static_cast<long long>(timeout.count()));
 
-    if (!WriteFrame(FrameType::Message, req)) {
+    if (!WriteFrame(FrameType::Message, req, RemainingBudget(operationDeadline))) {
         T2_LOG("sendBiometricCommand", L"WriteFrame failed, WSAGetLastError=%d, "
                "outer envelope was %zuB", WSAGetLastError(), req.size());
         return false;
@@ -616,7 +701,7 @@ bool Connection::SendBiometricCommand(const std::vector<uint8_t>& innerBmMessage
     // by one such event. Loop, acknowledging (and discarding, same as
     // WaitForEvent) anything that isn't our reply, until either the
     // matching reply arrives or the deadline passes.
-    auto deadline = std::chrono::steady_clock::now() + timeout;
+    auto deadline = operationDeadline;
     for (;;) {
         auto now = std::chrono::steady_clock::now();
         if (now >= deadline) {
@@ -625,7 +710,7 @@ bool Connection::SendBiometricCommand(const std::vector<uint8_t>& innerBmMessage
                    static_cast<long long>(timeout.count()));
             return false;
         }
-        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+        auto remaining = RemainingBudget(deadline);
 
         RawFrame reply;
         if (!ReadFrame(&reply, remaining)) {
@@ -662,7 +747,7 @@ bool Connection::SendBiometricCommand(const std::vector<uint8_t>& innerBmMessage
                    "(reqId=%s), event reqId=%s payload=%zuB %s - acking and queuing",
                    Widen(reqId).c_str(), Widen(env->requestId).c_str(),
                    env->payloadPlist.size(), HexDump(env->payloadPlist, 512).c_str());
-            if (!AcknowledgeEvent(env->requestId)) {
+            if (!AcknowledgeEvent(env->requestId, RemainingBudget(deadline))) {
                 T2_LOG("sendBiometricCommand", L"AcknowledgeEvent failed for "
                        "event reqId=%s", Widen(env->requestId).c_str());
                 return false;
@@ -740,16 +825,22 @@ bool Connection::SendBiometricCommand(const std::vector<uint8_t>& innerBmMessage
 }
 
 bool Connection::GetFdrCalibration(std::vector<uint8_t>* outBlob, std::chrono::milliseconds timeout) {
+    // Include mutex contention in the operation budget, not only wire I/O.
+    const auto operationDeadline = std::chrono::steady_clock::now() + timeout;
     IoLock ioLock(*this, timeout);
     if (!ioLock.owns()) {
         T2_LOG("io", L"could not acquire connection I/O lock within %lldms",
                static_cast<long long>((timeout).count()));
         return false;
     }
+    if (RemainingBudget(operationDeadline).count() <= 0) {
+        T2_LOG("io", L"operation deadline expired while acquiring I/O lock");
+        return false;
+    }
     std::string reqId = NewRequestUuid();
     if (reqId.empty()) return false;
     auto req = EncodeRequestEnvelope(reqId, {11});
-    if (!WriteFrame(FrameType::Message, req)) {
+    if (!WriteFrame(FrameType::Message, req, RemainingBudget(operationDeadline))) {
         T2_LOG("getFdrCalibration", L"WriteFrame failed, WSAGetLastError=%d", WSAGetLastError());
         return false;
     }
@@ -760,7 +851,7 @@ bool Connection::GetFdrCalibration(std::vector<uint8_t>* outBlob, std::chrono::m
     // the first frame as the reply and fail if bkremoted pushed a
     // serviceStatus event first — the same bug SendBiometricCommand
     // already fixed for BM commands.
-    auto deadline = std::chrono::steady_clock::now() + timeout;
+    auto deadline = operationDeadline;
     for (;;) {
         auto now = std::chrono::steady_clock::now();
         if (now >= deadline) {
@@ -769,7 +860,7 @@ bool Connection::GetFdrCalibration(std::vector<uint8_t>* outBlob, std::chrono::m
                    static_cast<long long>(timeout.count()));
             return false;
         }
-        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+        auto remaining = RemainingBudget(deadline);
 
         RawFrame reply;
         if (!ReadFrame(&reply, remaining)) {
@@ -797,7 +888,7 @@ bool Connection::GetFdrCalibration(std::vector<uint8_t>* outBlob, std::chrono::m
                    "(reqId=%s), event reqId=%s payload=%zuB - acking and queuing",
                    Widen(reqId).c_str(), Widen(env->requestId).c_str(),
                    env->payloadPlist.size());
-            if (!AcknowledgeEvent(env->requestId)) {
+            if (!AcknowledgeEvent(env->requestId, RemainingBudget(deadline))) {
                 T2_LOG("getFdrCalibration", L"AcknowledgeEvent failed for event reqId=%s",
                        Widen(env->requestId).c_str());
                 return false;
@@ -908,7 +999,7 @@ Connection::WaitStep Connection::WaitForEventStep(std::vector<uint8_t>* outEvent
             T2_LOG("waitForEvent", L"deadline reached, giving up");
             return WaitStep::Fail;
         }
-        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+        auto remaining = RemainingBudget(deadline);
         // Clamp to the poll slice only when there's actually a cancelEvent
         // to poll for; without one this is byte-identical to the previous
         // behavior (CLI `verify`, which never passes cancelEvent, still
@@ -971,7 +1062,7 @@ Connection::WaitStep Connection::WaitForEventStep(std::vector<uint8_t>* outEvent
         if (!env->isReply) {
             // Async bridge-side callback: must be acknowledged (Milestone 1,
             // section 7) before we can keep reading.
-            if (!AcknowledgeEvent(env->requestId)) {
+            if (!AcknowledgeEvent(env->requestId, RemainingBudget(deadline))) {
                 T2_LOG("waitForEvent", L"AcknowledgeEvent failed for reqId=%s",
                        Widen(env->requestId).c_str());
                 return WaitStep::Fail;
@@ -1014,9 +1105,14 @@ bool Connection::WaitForEvent(std::vector<uint8_t>* outEventPayload,
     }
 }
 
-bool Connection::AcknowledgeEvent(const std::string& requestId) {
+bool Connection::AcknowledgeEvent(const std::string& requestId,
+                                  std::chrono::milliseconds budget) {
+    if (budget.count() <= 0) {
+        WSASetLastError(WSAETIMEDOUT);
+        return false;
+    }
     auto ack = EncodeAckEnvelope(requestId);
-    return WriteFrame(FrameType::Message, ack);
+    return WriteFrame(FrameType::Message, ack, budget);
 }
 
 // Once the FIRST byte of a frame has arrived the rest of it is already in
@@ -1028,10 +1124,24 @@ bool Connection::AcknowledgeEvent(const std::string& requestId) {
 // parsed body bytes as a frame header).
 static constexpr std::chrono::milliseconds kFrameTailTimeout{3000};
 
-void Connection::SetRcvTimeoutCached(std::chrono::milliseconds timeout) {
+bool Connection::SetRcvTimeoutCached(std::chrono::milliseconds timeout) {
+    // Never issue recv() with a missing, disabled or stale timeout.
+    if (timeout.count() <= 0 || timeout.count() > 0xFFFFFFFFLL) {
+        T2_LOG("readFrame", L"invalid receive timeout: %lld ms",
+               static_cast<long long>(timeout.count()));
+        return false;
+    }
     const DWORD ms = static_cast<DWORD>(timeout.count());
-    if (ms == rcvTimeoutMs_) return;
-    rcvTimeoutMs_ = SetSocketTimeout(socket_, SO_RCVTIMEO, timeout) ? ms : 0xFFFFFFFFu;
+    if (ms == rcvTimeoutMs_) return true;
+    if (!SetSocketTimeout(socket_, SO_RCVTIMEO, timeout)) {
+        const int error = WSAGetLastError();
+        rcvTimeoutMs_ = 0xFFFFFFFFu;
+        T2_LOG("readFrame", L"SO_RCVTIMEO failed (timeout=%lu ms, WSA=%d)",
+               static_cast<unsigned long>(ms), error);
+        return false;
+    }
+    rcvTimeoutMs_ = ms;
+    return true;
 }
 
 // Smallest read issued against the socket. A frame header + typical event body is
@@ -1048,6 +1158,12 @@ bool Connection::ReadFrame(RawFrame* out, std::chrono::milliseconds timeout,
 
     FrameHeader hdr{};
     bool haveHeader = false;
+
+    // The tail allowance belongs to the whole frame, not each recv().
+    // Without a fixed deadline a peer sending one byte every ~3 seconds
+    // can keep a capture worker alive indefinitely.
+    bool tailStarted = rxLen_ != rxPos_;
+    auto tailDeadline = std::chrono::steady_clock::now() + kFrameTailTimeout;
 
     // Reads from the socket until at least `need` bytes of the current frame are
     // buffered. Failure semantics are those of the old two-recv() loop: a timeout with
@@ -1067,11 +1183,26 @@ bool Connection::ReadFrame(RawFrame* out, std::chrono::milliseconds timeout,
             const size_t want = need > kRxChunkBytes ? need : kRxChunkBytes;
             if (rxBuf_.size() < want) rxBuf_.resize(want);
 
-            // Once the FIRST byte of a frame is here the rest is already in flight, so
-            // the remaining recv()s get at least kFrameTailTimeout no matter how short
-            // the caller's slice was (see kFrameTailTimeout).
+            // Keep the first-byte idle poll short, but cap ALL subsequent
+            // reads by one shared frame-tail deadline (not 3 seconds each).
             const bool midFrame = rxLen_ != rxPos_;
-            SetRcvTimeoutCached(midFrame && timeout < kFrameTailTimeout ? kFrameTailTimeout : timeout);
+            std::chrono::milliseconds recvTimeout = timeout;
+            if (midFrame) {
+                const auto now = std::chrono::steady_clock::now();
+                if (now >= tailDeadline) {
+                    if (why) *why = ReadFailure::Error;
+                    T2_LOG("readFrame", L"frame-tail deadline expired");
+                    return false;
+                }
+                const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(tailDeadline - now);
+                // Windows treats SO_RCVTIMEO=0 as infinite. Round up a
+                // positive sub-millisecond remainder to 1 ms.
+                recvTimeout = remaining.count() > 0 ? remaining : std::chrono::milliseconds(1);
+            }
+            if (!SetRcvTimeoutCached(recvTimeout)) {
+                if (why) *why = ReadFailure::Error;
+                return false;
+            }
 
             const int n = recv(socket_, reinterpret_cast<char*>(rxBuf_.data()) + rxLen_,
                                static_cast<int>(rxBuf_.size() - rxLen_), 0);
@@ -1103,6 +1234,10 @@ bool Connection::ReadFrame(RawFrame* out, std::chrono::milliseconds timeout,
                 return false;
             }
             rxLen_ += static_cast<size_t>(n);
+            if (!tailStarted) {
+                tailStarted = true;
+                tailDeadline = std::chrono::steady_clock::now() + kFrameTailTimeout;
+            }
         }
         return true;
     };
@@ -1147,35 +1282,72 @@ bool Connection::ReadFrame(RawFrame* out, std::chrono::milliseconds timeout,
 // always fit in one send() and masked this bug during earlier hardware
 // runs. Mirrors RemoteXpcConnection::WriteRaw in
 // protocol/Discovery/RemoteXpc.cpp, which already gets this right.
-static bool WriteAll(SOCKET s, const uint8_t* data, size_t len) {
+// Bound the ENTIRE frame write, not each short send(). A peer that only
+// accepts a few bytes per timeout must not keep the capture worker alive forever.
+static constexpr std::chrono::milliseconds kFrameWriteTimeout{10000};
+static bool WriteAll(SOCKET s, const uint8_t* data, size_t len,
+                     std::chrono::milliseconds budget) {
+    if (budget.count() <= 0) {
+        WSASetLastError(WSAETIMEDOUT);
+        return false;
+    }
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::min(budget, kFrameWriteTimeout);
     size_t sent = 0;
     while (sent < len) {
-        int n = send(s, reinterpret_cast<const char*>(data + sent),
-                     static_cast<int>(len - sent), 0);
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            T2_LOG("writeAll", L"frame write deadline expired after %zu/%zuB", sent, len);
+            WSASetLastError(WSAETIMEDOUT);
+            return false;
+        }
+        const auto left = deadline - now;
+        const auto leftMs = std::chrono::duration_cast<std::chrono::milliseconds>(left);
+        const auto remaining = leftMs.count() > 0 ? leftMs : std::chrono::milliseconds(1);
+        // SO_SNDTIMEO applies to blocking sends, but each successful short
+        // write could otherwise reset it. Re-apply the shared remaining budget.
+        if (!SetSocketTimeout(s, SO_SNDTIMEO, remaining)) {
+            const int error = WSAGetLastError();
+            T2_LOG("writeAll", L"SO_SNDTIMEO failed: WSA=%d", error);
+            return false;
+        }
+        const size_t bytesLeft = len - sent;
+        const int toSend = static_cast<int>(bytesLeft > static_cast<size_t>(INT_MAX)
+                                            ? INT_MAX : bytesLeft);
+        const int n = send(s, reinterpret_cast<const char*>(data + sent), toSend, 0);
         if (n <= 0) {
-            int e = WSAGetLastError();
-            if (n < 0 && e == WSAEWOULDBLOCK) {
-                // Send buffer full on a non-blocking socket: wait until it is
-                // writable instead of spinning on send(), bounded so a dead
-                // peer cannot hold the caller forever.
+            int error = n < 0 ? WSAGetLastError() : WSAECONNRESET;
+            if (n < 0 && error == WSAEWOULDBLOCK) {
+                // Defensive fallback if the socket unexpectedly remains
+                // non-blocking. select() also uses the remaining deadline.
                 fd_set writeSet;
                 FD_ZERO(&writeSet);
                 FD_SET(s, &writeSet);
-                timeval tv{};
-                tv.tv_sec = 5;
-                if (select(0, nullptr, &writeSet, nullptr, &tv) > 0) continue;
-                e = WSAETIMEDOUT;
+                const auto after = std::chrono::steady_clock::now();
+                if (after < deadline) {
+                    const auto waitUs = std::chrono::duration_cast<std::chrono::microseconds>(deadline - after).count();
+                    timeval tv{};
+                    tv.tv_sec = static_cast<long>(waitUs / 1000000);
+                    tv.tv_usec = static_cast<long>(waitUs % 1000000);
+                    const int ready = select(0, nullptr, &writeSet, nullptr, &tv);
+                    if (ready > 0) continue;
+                    error = ready == 0 ? WSAETIMEDOUT : WSAGetLastError();
+                } else {
+                    error = WSAETIMEDOUT;
+                }
             }
-            T2_LOG("writeAll", L"send failed after %zu/%zuB, n=%d, WSAGetLastError=%d",
-                   sent, len, n, e);
-            return false; // hard error or peer closed: fail closed
+            T2_LOG("writeAll", L"send failed after %zu/%zuB, n=%d, WSA=%d",
+                   sent, len, n, error);
+            WSASetLastError(error);
+            return false;
         }
         sent += static_cast<size_t>(n);
     }
     return true;
 }
 
-bool Connection::WriteFrame(FrameType type, const std::vector<uint8_t>& body) {
+bool Connection::WriteFrame(FrameType type, const std::vector<uint8_t>& body,
+                            std::chrono::milliseconds budget) {
     // Header and body go out in ONE send(): two back-to-back small sends
     // are the Nagle/delayed-ACK trap described at TuneEstablishedSocket.
     // Small frames (the common case) use a stack buffer, no allocation.
@@ -1200,7 +1372,7 @@ bool Connection::WriteFrame(FrameType type, const std::vector<uint8_t>& body) {
     if (!body.empty()) {
         std::memcpy(out + 16, body.data(), body.size());
     }
-    return WriteAll(socket_, out, total);
+    return WriteAll(socket_, out, total, budget);
 }
 
 } // namespace t2::bridgexpc

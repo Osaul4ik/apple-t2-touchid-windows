@@ -457,18 +457,55 @@ inline bool MacFromEui64(const in6_addr& peer6, UCHAR outMac[6]) {
 
 // Publish peer fe80 (+ optional MAC) for T2Ncm.sys (read at PASSIVE refresh).
 // A non-usable MAC is never persisted (it would poison the next cold boot).
-inline void PublishTunnelPeer(const in6_addr& peer6, const UCHAR mac[6] /*nullable*/) {
+// In-process serialization for the registry pair. Other processes may still
+// modify these values independently; this does not make the pair transactional.
+inline std::mutex& TunnelPeerRegistryMutex() {
+    static std::mutex mu;
+    return mu;
+}
+
+inline bool PublishTunnelPeer(const in6_addr& peer6, const UCHAR mac[6] /*nullable*/) {
+    std::lock_guard<std::mutex> guard(TunnelPeerRegistryMutex());
     HKEY key = nullptr;
-    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, kNetworkRegPath, 0, nullptr, 0,
-                        KEY_WRITE, nullptr, &key, nullptr) != ERROR_SUCCESS) {
-        return;
+    const LSTATUS opened = RegCreateKeyExW(HKEY_LOCAL_MACHINE, kNetworkRegPath, 0, nullptr, 0,
+                                           KEY_READ | KEY_WRITE, nullptr, &key, nullptr);
+    if (opened != ERROR_SUCCESS) {
+        T2_LOG("tunnel", L"PublishTunnelPeer: cannot open registry key (error=%ld)", opened);
+        return false;
     }
-    RegSetValueExW(key, kPeerIpv6Value, 0, REG_BINARY,
-                   reinterpret_cast<const BYTE*>(&peer6), sizeof(peer6));
-    if (IsUsableMac(mac)) {
-        RegSetValueExW(key, kPeerMacValue, 0, REG_BINARY, mac, 6);
+    in6_addr previousPeer{};
+    DWORD previousType = 0;
+    DWORD previousSize = sizeof(previousPeer);
+    const bool samePeer =
+        RegQueryValueExW(key, kPeerIpv6Value, nullptr, &previousType,
+                         reinterpret_cast<LPBYTE>(&previousPeer), &previousSize) == ERROR_SUCCESS &&
+        previousType == REG_BINARY && previousSize == sizeof(previousPeer) &&
+        std::memcmp(&previousPeer, &peer6, sizeof(peer6)) == 0;
+    const bool writeMac = IsUsableMac(mac);
+    // Invalidate stale MAC before switching to a new peer. Preserve it when
+    // the exact peer is unchanged and discovery has no new MAC.
+    if (!samePeer) {
+        const LSTATUS deleted = RegDeleteValueW(key, kPeerMacValue);
+        if (deleted != ERROR_SUCCESS && deleted != ERROR_FILE_NOT_FOUND) {
+            T2_LOG("tunnel", L"PublishTunnelPeer: cannot invalidate old MAC (error=%ld)", deleted);
+            RegCloseKey(key);
+            return false;
+        }
+    }
+    LSTATUS result = RegSetValueExW(key, kPeerIpv6Value, 0, REG_BINARY,
+                                   reinterpret_cast<const BYTE*>(&peer6), sizeof(peer6));
+    if (result == ERROR_SUCCESS && writeMac) {
+        result = RegSetValueExW(key, kPeerMacValue, 0, REG_BINARY, mac, 6);
+    }
+    if (result != ERROR_SUCCESS) {
+        // Fail closed: don't leave a new peer paired with a previous MAC.
+        // Best effort only: registry writes are not an atomic transaction.
+        RegDeleteValueW(key, kPeerMacValue);
+        RegDeleteValueW(key, kPeerIpv6Value);
+        T2_LOG("tunnel", L"PublishTunnelPeer: write failed (error=%ld)", result);
     }
     RegCloseKey(key);
+    return result == ERROR_SUCCESS;
 }
 
 // Last-known peer (fe80 + MAC) persisted by PublishTunnelPeer. Lets discovery
@@ -476,6 +513,7 @@ inline void PublishTunnelPeer(const in6_addr& peer6, const UCHAR mac[6] /*nullab
 // is still empty because a VPN/WFP drops the ff02::1 ping and Neighbor
 // Discovery (the exact case the IPv4 tunnel exists for).
 inline bool ReadPersistedPeer(in6_addr* peer6, UCHAR mac[6], bool* haveMac) {
+    std::lock_guard<std::mutex> guard(TunnelPeerRegistryMutex());
     HKEY key = nullptr;
     if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kNetworkRegPath, 0, KEY_READ, &key) != ERROR_SUCCESS) {
         return false;
@@ -495,17 +533,17 @@ inline bool ReadPersistedPeer(in6_addr* peer6, UCHAR mac[6], bool* haveMac) {
     return ok;
 }
 
-// Look up peer MAC from the IPv6 neighbor table (same entry as discovery).
+// Look up the exact peer MAC from the IPv6 neighbor table (same entry as discovery).
 // Only rows that carry a real, resolved MAC count: Incomplete/Unreachable rows
-// and zero/multicast MACs are skipped (see IsUsableMac).
+// and zero/multicast MACs are skipped (see IsUsableMac). Never borrow a MAC
+// from another IPv6 neighbor on the interface: it could belong to a router
+// or an unrelated device and would poison the static IPv4 tunnel neighbor.
 inline bool LookupPeerMac(unsigned long ifIndex, const in6_addr& peer6, UCHAR outMac[6]) {
     PMIB_IPNET_TABLE2 table = nullptr;
     if (GetIpNetTable2(AF_INET6, &table) != NO_ERROR || !table) {
         return false;
     }
     bool found = false;
-    UCHAR anyMac[6]{};
-    bool any = false;
     for (ULONG i = 0; i < table->NumEntries; ++i) {
         const auto& e = table->Table[i];
         if (e.InterfaceIndex != ifIndex) continue;
@@ -518,16 +556,8 @@ inline bool LookupPeerMac(unsigned long ifIndex, const in6_addr& peer6, UCHAR ou
             found = true;
             break;
         }
-        if (!any) {
-            std::memcpy(anyMac, e.PhysicalAddress, 6);
-            any = true;
-        }
     }
     FreeMibTable(table);
-    if (!found && any) {
-        std::memcpy(outMac, anyMac, 6);
-        found = true;
-    }
     return found;
 }
 
@@ -732,6 +762,10 @@ inline ULONGLONG GetRealSuspendGeneration() {
 // IOCTL, not by the lease itself.
 struct T2NcmControlState {
     std::mutex mu;
+    // Serializes IOCTL use and stale-handle replacement. A lease only protects
+    // the final close; without this lock another caller may close a handle
+    // while DeviceIoControl is using it. Acquire before mu, never vice versa.
+    std::mutex ioctlMu;
     HANDLE h = INVALID_HANDLE_VALUE;
     unsigned refs = 0;
 };
@@ -786,6 +820,9 @@ inline T2NcmIoctlResult T2NcmControlIoctl(const wchar_t* who, DWORD code,
                                           DWORD* outReturned = nullptr) {
     T2NcmControlLease lease; // keeps the handle open for the duration of this call at least
     auto& s = T2NcmControl();
+    // Do not let a competing IOCTL invalidate and close our handle mid-call.
+    // Lease construction holds mu only briefly; no path takes mu and then ioctlMu.
+    std::lock_guard<std::mutex> ioctlLock(s.ioctlMu);
     T2NcmIoctlResult r;
     for (int attempt = 0; attempt < 2; ++attempt) {
         HANDLE h;
@@ -1093,7 +1130,10 @@ inline TunnelPrep PrepareTunnelPeer(unsigned long ifIndex, const in6_addr& peer6
     // driver still native" cannot happen - e.g. cold-discovery's provisional
     // tunnel (CommitAutoTunnel only flips a flag in this process) scanning into
     // a void. Deduped by LastPushedModeFlag, so it is a no-op when already armed.
-    (void)PushTransportModeToDriver(TransportMode::Ipv4Tunnel);
+    if (!PushTransportModeToDriver(TransportMode::Ipv4Tunnel)) {
+        T2_LOG("tunnel", L"PrepareTunnelPeer: failed to arm IPv4 tunnel mode");
+        return TunnelPrep::NoPeer;
+    }
     // Fast path: same peer as last time we successfully prepared it, and
     // nothing has invalidated that since (see InvalidateTunnelPrepCache).
     // Skips the neighbor-table walk and the ARP create/set syscalls -
@@ -1101,8 +1141,15 @@ inline TunnelPrep PrepareTunnelPeer(unsigned long ifIndex, const in6_addr& peer6
     // IsSameAsLastPushedPeer dedupe inside it) pushes it to the driver,
     // both of which are already cheap early-outs.
     if (IsArpAlreadyPrepared(peer6)) {
-        PublishTunnelPeer(peer6, nullptr);
-        PushTunnelPeerToDriver(peer6);
+        if (!PublishTunnelPeer(peer6, nullptr)) {
+            InvalidateTunnelPrepCache();
+            return TunnelPrep::NoPeer;
+        }
+        if (!PushTunnelPeerToDriver(peer6)) {
+            InvalidateTunnelPrepCache();
+            T2_LOG("tunnel", L"PrepareTunnelPeer: failed to publish cached tunnel peer");
+            return TunnelPrep::NoPeer;
+        }
         PushTunnelLocalToDriver(ifIndex);
         return TunnelPrep::Ok;
     }
@@ -1134,8 +1181,14 @@ inline TunnelPrep PrepareTunnelPeer(unsigned long ifIndex, const in6_addr& peer6
            peer6.s6_addr[14], peer6.s6_addr[15],
            haveMac ? L"found (" : L"NOT FOUND (ARP neighbor will not be set - tunnel will not work)",
            haveMac ? macSource : L"", haveMac ? L")" : L"");
-    PublishTunnelPeer(peer6, haveMac ? mac : nullptr);
-    PushTunnelPeerToDriver(peer6);
+    if (!PublishTunnelPeer(peer6, haveMac ? mac : nullptr)) {
+        InvalidateTunnelPrepCache();
+        return TunnelPrep::NoPeer;
+    }
+    if (!PushTunnelPeerToDriver(peer6)) {
+        T2_LOG("tunnel", L"PrepareTunnelPeer: failed to publish tunnel peer");
+        return TunnelPrep::NoPeer;
+    }
     PushTunnelLocalToDriver(ifIndex);
     if (haveMac) {
         // Only cache "prepared" if the ARP row really took the MAC; otherwise

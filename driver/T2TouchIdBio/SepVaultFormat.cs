@@ -11,6 +11,8 @@
 using System;
 using System.IO;
 using System.Security.Cryptography;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Text;
 
 namespace T2TouchId.SepVaultGui
@@ -41,33 +43,51 @@ namespace T2TouchId.SepVaultGui
                 Array.Clear(passwordBytes, 0, passwordBytes.Length);
             }
 
-            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            // Never expose a partially written or inheritably-readable final vault.
+            // Stage the new file in the same directory, restrict its ACL while
+            // empty, then atomically replace the final name on the same volume.
+            string directory = Path.GetDirectoryName(Path.GetFullPath(path))!;
+            Directory.CreateDirectory(directory);
+            string temporaryPath = Path.Combine(directory, ".t2sep-" + Path.GetRandomFileName());
+            try
+            {
+                // Create empty first so that FileInfo can open it to set ACLs
+                // without conflicting with a FileShare.None writer handle.
+                using (new FileStream(temporaryPath, FileMode.CreateNew,
+                                      FileAccess.Write, FileShare.None)) { }
+                var fileInfo = new FileInfo(temporaryPath);
+                var acl = new FileSecurity();
+                acl.SetAccessRuleProtection(true, false);
+                acl.AddAccessRule(new FileSystemAccessRule(
+                    new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null),
+                    FileSystemRights.FullControl, AccessControlType.Allow));
+                acl.AddAccessRule(new FileSystemAccessRule(
+                    new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null),
+                    FileSystemRights.FullControl, AccessControlType.Allow));
+                fileInfo.SetAccessControl(acl);
 
-            using var stream = new FileStream(path, FileMode.Create, FileAccess.Write);
-            using var writer = new BinaryWriter(stream);
-
-            writer.Write(Magic);
-            writer.Write(Version);
-            writer.Write(specialUserBag);
-            writer.Write((uint)protectedKeybag.Length);
-            writer.Write((uint)protectedPassword.Length);
-            writer.Write(protectedKeybag);
-            writer.Write(protectedPassword);
-
-            // Restrict to SYSTEM + Administrators, mirroring the ACL pattern
-            // the WBDI biometric device node itself needs (design doc §9.1,
-            // §7.2) — DPAPI-machine protects the bytes, but the file itself
-            // should not be world-readable while it's sitting on disk.
-            var fileInfo = new FileInfo(path);
-            var acl = fileInfo.GetAccessControl();
-            acl.SetAccessRuleProtection(true, false); // strip inherited rules
-            acl.AddAccessRule(new System.Security.AccessControl.FileSystemAccessRule(
-                "SYSTEM", System.Security.AccessControl.FileSystemRights.FullControl,
-                System.Security.AccessControl.AccessControlType.Allow));
-            acl.AddAccessRule(new System.Security.AccessControl.FileSystemAccessRule(
-                "Administrators", System.Security.AccessControl.FileSystemRights.FullControl,
-                System.Security.AccessControl.AccessControlType.Allow));
-            fileInfo.SetAccessControl(acl);
+                using (var stream = new FileStream(temporaryPath, FileMode.Open,
+                                                   FileAccess.Write, FileShare.None))
+                {
+                    using var writer = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true);
+                    writer.Write(Magic);
+                    writer.Write(Version);
+                    writer.Write(specialUserBag);
+                    writer.Write((uint)protectedKeybag.Length);
+                    writer.Write((uint)protectedPassword.Length);
+                    writer.Write(protectedKeybag);
+                    writer.Write(protectedPassword);
+                    writer.Flush();
+                    stream.Flush(flushToDisk: true);
+                }
+                File.Move(temporaryPath, path, overwrite: true);
+            }
+            finally
+            {
+                if (File.Exists(temporaryPath)) File.Delete(temporaryPath);
+                Array.Clear(protectedKeybag, 0, protectedKeybag.Length);
+                Array.Clear(protectedPassword, 0, protectedPassword.Length);
+            }
         }
     }
 }
