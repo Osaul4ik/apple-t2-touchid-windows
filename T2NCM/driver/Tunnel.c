@@ -28,17 +28,6 @@ static ULONG T2NcmChecksumFold(ULONG sum)
     return sum;
 }
 
-static USHORT T2NcmIpChecksum(_In_reads_bytes_(HeaderLen) const UCHAR* Header, ULONG HeaderLen)
-{
-    ULONG sum = 0;
-    ULONG i;
-    for (i = 0; i + 1 < HeaderLen; i += 2)
-        sum += ((ULONG)Header[i] << 8) | Header[i + 1];
-    if (i < HeaderLen)
-        sum += (ULONG)Header[i] << 8;
-    return (USHORT)~T2NcmChecksumFold(sum);
-}
-
 // One's complement sum of 16-bit words; len may be odd.
 static ULONG T2NcmSumBuffer(_In_reads_bytes_(Len) const UCHAR* Buf, ULONG Len)
 {
@@ -49,6 +38,11 @@ static ULONG T2NcmSumBuffer(_In_reads_bytes_(Len) const UCHAR* Buf, ULONG Len)
     if (i < Len)
         sum += (ULONG)Buf[i] << 8;
     return sum;
+}
+
+static USHORT T2NcmIpChecksum(_In_reads_bytes_(HeaderLen) const UCHAR* Header, ULONG HeaderLen)
+{
+    return (USHORT)~T2NcmChecksumFold(T2NcmSumBuffer(Header, HeaderLen));
 }
 
 static USHORT T2NcmTcpChecksumV4(
@@ -242,10 +236,13 @@ VOID T2NcmTunnelNoteLocalFromIpv6Frame(
             newLocal[8], newLocal[9], newLocal[10], newLocal[11],
             newLocal[12], newLocal[13], newLocal[14], newLocal[15]));
         DeviceContext->TunnelLocalIpv6UnknownLogged = FALSE; // give the next outage its own log line
-    }
 
-    RtlCopyMemory(DeviceContext->TunnelLocalIpv6, newLocal, 16);
-    DeviceContext->TunnelLocalIpv6Valid = TRUE;
+        // Only touch the shared field when the address actually changed: this
+        // runs for every outbound IPv6 frame, and rewriting identical bytes
+        // each time just dirties the cache line the TX/RX paths also read.
+        RtlCopyMemory(DeviceContext->TunnelLocalIpv6, newLocal, 16);
+        DeviceContext->TunnelLocalIpv6Valid = TRUE;
+    }
 }
 
 VOID T2NcmTunnelNoteLocalFromIpv4Frame(
