@@ -308,7 +308,16 @@ T2NcmDeviceCreate(
 
     // Last on purpose: every failure path above returns before this exists.
     // Deleted in MiniportHaltEx / the MiniportInitializeEx Fail path.
-    (VOID)ExInitializeResourceLite(&context->PipeLock);
+    status = ExInitializeResourceLite(&context->PipeLock);
+    if (!NT_SUCCESS(status))
+    {
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+            "T2Ncm: PipeLock initialization failed 0x%08X\n", status));
+        // PipeLock was not initialized: no ExDeleteResourceLite is valid.
+        // WDFDEVICE owns StateLock and both optional work items.
+        WdfObjectDelete(device);
+        return status;
+    }
 
     *Device = device;
     *DeviceContext = context;
