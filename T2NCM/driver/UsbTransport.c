@@ -141,6 +141,9 @@ T2NcmUsbReleaseHardware(
     DeviceContext->DataInterface = NULL;
     DeviceContext->UsbDevice = NULL;
     DeviceContext->RxReaderConfigured = FALSE;
+    // Hardware release invalidates any previously acknowledged CDC filter.
+    // Keep the cache invalid even when a prior alt-0 transition failed.
+    DeviceContext->CdcPacketFilterApplied = FALSE;
     // The cached NTB parameters describe the device as it was configured by the
     // previous Prepare; a stop/start (rebalance, disable/enable) must renegotiate.
     DeviceContext->NtbParametersCached = FALSE;
@@ -175,6 +178,14 @@ T2NcmUsbActivateDataInterfaceLocked(
     // Task 12: only reachable once NCM control-plane negotiation (Tasks
     // 7-11) has already succeeded — callers (Device.c) are responsible
     // for that ordering.
+    // Fail closed even if a previous alt-1 activation left cached pipe
+    // handles: a failed re-selection cannot validate those handles.
+    DeviceContext->BulkInPipe = NULL;
+    DeviceContext->BulkOutPipe = NULL;
+    DeviceContext->BulkOutMaxPacketSize = 0;
+    DeviceContext->RxReaderConfigured = FALSE;
+    DeviceContext->CdcPacketFilterApplied = FALSE;
+
     status = T2NcmUsbSelectDataAltSetting(DeviceContext, T2NCM_DATA_ALT_ACTIVE);
     if (!NT_SUCCESS(status))
     {

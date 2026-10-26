@@ -246,6 +246,10 @@ T2NcmPowerArmHardware(
     status = T2NcmUsbActivateDataInterface(DeviceContext);
     if (!NT_SUCCESS(status))
     {
+        // Fast re-arm already invalidates this cache on an alt-1 failure.
+        // Do the same here: the next arm must renegotiate rather than
+        // trusting a setup whose final USB activation never completed.
+        DeviceContext->NtbParametersCached = FALSE;
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
             "T2Ncm: MI_01 alt-1 activation failed 0x%08X\n", status));
         return status;
