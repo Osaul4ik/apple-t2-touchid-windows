@@ -906,7 +906,13 @@ thread_local bool g_workerCaptureCompleted = false;
 bool CompleteCaptureRequestOnce(WDFREQUEST request, NTSTATUS status,
                                 ULONG_PTR information = 0, bool withInformation = false)
 {
-    if (request == g_workerCaptureRequest && request != nullptr) {
+    // WDF completion APIs require a valid request handle. A null handle
+    // must not update worker completion state or reach WDF.
+    if (request == nullptr) {
+        T2BioLog("CAPTURE_DATA: suppressed null WDF request completion");
+        return false;
+    }
+    if (request == g_workerCaptureRequest) {
         if (g_workerCaptureCompleted) {
             T2BioLog("CAPTURE_DATA: suppressed duplicate worker completion");
             return false;

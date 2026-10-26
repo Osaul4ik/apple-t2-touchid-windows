@@ -11,6 +11,8 @@
 #include <cstring>
 #include <bcrypt.h>
 #include <vector>
+#include <climits>
+#include <algorithm>
 
 #pragma comment(lib, "Ws2_32.lib")
 #pragma comment(lib, "Bcrypt.lib")
@@ -372,6 +374,16 @@ bool RemoteXpcConnection::WaitReadable(std::chrono::milliseconds timeout) {
     return select(0, &rset, nullptr, nullptr, &tv) > 0;
 }
 
+bool RemoteXpcConnection::WaitWritable(std::chrono::milliseconds timeout) {
+    fd_set wset;
+    FD_ZERO(&wset);
+    FD_SET(socket_, &wset);
+    timeval tv{};
+    tv.tv_sec = static_cast<long>(timeout.count() / 1000);
+    tv.tv_usec = static_cast<long>((timeout.count() % 1000) * 1000);
+    return select(0, nullptr, &wset, nullptr, &tv) > 0;
+}
+
 bool RemoteXpcConnection::ReadExact(uint8_t* buf, size_t len,
                                      std::chrono::steady_clock::time_point deadline) {
     size_t got = 0;
@@ -396,13 +408,17 @@ bool RemoteXpcConnection::ReadExact(uint8_t* buf, size_t len,
 bool RemoteXpcConnection::WriteRaw(const uint8_t* data, size_t len) {
     size_t sent = 0;
     while (sent < len) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= writeDeadline_) return false;
+        // FIONBIO sockets must wait for writability rather than spin on
+        // WSAEWOULDBLOCK. This also bounds a peer that stops reading.
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(writeDeadline_ - now);
+        if (!WaitWritable(remaining)) return false;
+        const size_t chunk = (std::min)(len - sent, static_cast<size_t>(INT_MAX));
         int n = send(socket_, reinterpret_cast<const char*>(data + sent),
-                     static_cast<int>(len - sent), 0);
-        if (n <= 0) {
-            int e = WSAGetLastError();
-            if (n < 0 && e == WSAEWOULDBLOCK) continue;
-            return false;
-        }
+                     static_cast<int>(chunk), 0);
+        if (n < 0 && WSAGetLastError() == WSAEWOULDBLOCK) continue;
+        if (n <= 0) return false;
         sent += static_cast<size_t>(n);
     }
     return true;
@@ -616,6 +632,7 @@ RemoteXpcResult RemoteXpcConnection::Connect(const NcmEndpoint& endpoint, uint16
         }
     }
 
+    writeDeadline_ = std::chrono::steady_clock::now() + connectTimeout;
     static constexpr char kHttp2Preface[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
     if (!WriteRaw(reinterpret_cast<const uint8_t*>(kHttp2Preface), sizeof(kHttp2Preface) - 1)) {
         Close();
@@ -628,6 +645,7 @@ RemoteXpcResult RemoteXpcConnection::FetchPeerRecord(std::chrono::milliseconds t
                                                       XpcObject* outPeerRecord) {
     if (socket_ == INVALID_SOCKET) return RemoteXpcResult::HandshakeIoFailed;
     auto deadline = std::chrono::steady_clock::now() + timeout;
+    writeDeadline_ = deadline; // share one budget across all handshake writes and reads
 
     // --- do_handshake() ---------------------------------------------------
     if (!SendSettings({{static_cast<uint16_t>(0x0003), static_cast<uint32_t>(100)},

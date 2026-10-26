@@ -125,6 +125,8 @@ private:
 
     bool WriteRaw(const uint8_t* data, size_t len);
     bool WaitReadable(std::chrono::milliseconds timeout);
+    bool WaitWritable(std::chrono::milliseconds timeout);
+    std::chrono::steady_clock::time_point writeDeadline_{};
     bool ReadExact(uint8_t* buf, size_t len, std::chrono::steady_clock::time_point deadline);
 
     bool SendSettings(const std::vector<std::pair<uint16_t, uint32_t>>& settings,
