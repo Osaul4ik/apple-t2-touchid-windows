@@ -210,26 +210,32 @@ VOID T2NcmTunnelNoteLocalFromIpv6Frame(
     if (newLocal[0] != 0xFE || (newLocal[1] & 0xC0) != 0x80)
         return; // only care about link-local (fe80::/10); ignore the rest
 
-    wasValid = DeviceContext->TunnelLocalIpv6Valid;
-    if (!wasValid || !RtlEqualMemory(DeviceContext->TunnelLocalIpv6, newLocal, 16)) {
-        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
-            "T2Ncm: tunnel local address %s (from native outbound v6 frame): "
-            "%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x\n",
-            wasValid ? "changed to" : "learned",
-            newLocal[0], newLocal[1], newLocal[2], newLocal[3],
-            newLocal[4], newLocal[5], newLocal[6], newLocal[7],
-            newLocal[8], newLocal[9], newLocal[10], newLocal[11],
-            newLocal[12], newLocal[13], newLocal[14], newLocal[15]));
-        DeviceContext->TunnelLocalIpv6UnknownLogged = FALSE; // give the next outage its own log line
-
-        // Only touch the shared field when the address actually changed: this
-        // runs for every outbound IPv6 frame, and rewriting identical bytes
-        // each time just dirties the cache line the TX/RX paths also read.
+    // Compare and publish under the same lock used by IOCTL and TX.
+    // A prior unlocked 16-byte comparison raced with live address changes.
+    {
         KIRQL localIrql;
+        BOOLEAN changed;
         KeAcquireSpinLock(&DeviceContext->TunnelPeerLock, &localIrql);
-        RtlCopyMemory(DeviceContext->TunnelLocalIpv6, newLocal, 16);
-        DeviceContext->TunnelLocalIpv6Valid = TRUE;
+        wasValid = DeviceContext->TunnelLocalIpv6Valid;
+        changed = !wasValid ||
+            !RtlEqualMemory(DeviceContext->TunnelLocalIpv6, newLocal, 16);
+        if (changed) {
+            RtlCopyMemory(DeviceContext->TunnelLocalIpv6, newLocal, 16);
+            DeviceContext->TunnelLocalIpv6Valid = TRUE;
+        }
         KeReleaseSpinLock(&DeviceContext->TunnelPeerLock, localIrql);
+
+        if (changed) {
+            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
+                "T2Ncm: tunnel local address %s (from native outbound v6 frame): "
+                "%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x\n",
+                wasValid ? "changed to" : "learned",
+                newLocal[0], newLocal[1], newLocal[2], newLocal[3],
+                newLocal[4], newLocal[5], newLocal[6], newLocal[7],
+                newLocal[8], newLocal[9], newLocal[10], newLocal[11],
+                newLocal[12], newLocal[13], newLocal[14], newLocal[15]));
+            DeviceContext->TunnelLocalIpv6UnknownLogged = FALSE;
+        }
     }
 }
 
