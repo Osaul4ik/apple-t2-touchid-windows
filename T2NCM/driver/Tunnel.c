@@ -252,7 +252,7 @@ VOID T2NcmTunnelNoteLocalFromIpv6Frame(
         if (changed) {
             T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
                 "T2Ncm: tunnel local address %s (from native outbound v6 frame): "
-                "%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x\n",
+                "%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x\n",
                 wasValid ? "changed to" : "learned",
                 newLocal[0], newLocal[1], newLocal[2], newLocal[3],
                 newLocal[4], newLocal[5], newLocal[6], newLocal[7],
