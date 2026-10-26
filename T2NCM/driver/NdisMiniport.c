@@ -1068,13 +1068,27 @@ T2NcmMiniportRestart(
     // silent-RX failure.
     if (!context->CdcPacketFilterApplied)
     {
-        (VOID)T2NcmApplyPacketFilter(context);
+        status = T2NcmApplyPacketFilter(context);
+        if (!NT_SUCCESS(status))
+        {
+            // A running RX reader without a programmed CDC filter can
+            // look healthy to NDIS while receiving no traffic.
+            InterlockedExchange(&context->DataPathRunning, 0);
+            T2NcmTxCancelOutstanding(context);
+            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+                "T2Ncm: packet filter failed on restart (0x%08X)\n", status));
+            return NDIS_STATUS_FAILURE;
+        }
     }
 
     status = T2NcmRxStart(context);
     if (!NT_SUCCESS(status))
     {
         InterlockedExchange(&context->DataPathRunning, 0);
+
+        // TX was resumed before RX. Roll it back when restart fails so
+        // the adapter remains fully paused until a later restart.
+        T2NcmTxCancelOutstanding(context);
 
         // Log the REAL status here instead of only the generic value
         // returned to NDIS below — this is what actually shows up as

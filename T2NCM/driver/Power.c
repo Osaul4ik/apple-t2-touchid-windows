@@ -156,7 +156,16 @@ T2NcmPowerArmHardware(
         status = T2NcmUsbActivateDataInterface(DeviceContext);
         if (NT_SUCCESS(status))
         {
-            (VOID)T2NcmApplyPacketFilter(DeviceContext);
+            status = T2NcmApplyPacketFilter(DeviceContext);
+            if (!NT_SUCCESS(status))
+            {
+                // The interface is active, but RX cannot be considered
+                // armed until the device accepts the requested filter.
+                // Keep negotiated NTB parameters for the next arm attempt.
+                T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+                    "T2Ncm: fast arm packet filter failed 0x%08X\n", status));
+                return status;
+            }
 
             T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
                 "T2Ncm: hardware fast-armed (NTB params reused: ntbIn=%lu "
@@ -255,15 +264,16 @@ T2NcmPowerArmHardware(
         return status;
     }
 
-    // MUST come after the alt-1 switch: SET_INTERFACE resets the
-    // device's packet filter to zero, i.e. "forward nothing to the
-    // host". Without this the adapter transmits fine and receives
-    // literally zero bytes - which is exactly what it did before this
-    // call existed. Not fatal on failure: the control plane is
-    // otherwise up, the failure is logged loudly by
-    // T2NcmSetEthernetPacketFilter, and the NDIS packet-filter OID will
-    // retry it as soon as the stack sets a filter.
-    (VOID)T2NcmApplyPacketFilter(DeviceContext);
+    // SET_INTERFACE resets the device-side filter. An armed control plane
+    // without this request can look healthy but receive no frames.
+    // Failure is retryable on the next arm; NTB negotiation remains valid.
+    status = T2NcmApplyPacketFilter(DeviceContext);
+    if (!NT_SUCCESS(status))
+    {
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+            "T2Ncm: slow arm packet filter failed 0x%08X\n", status));
+        return status;
+    }
 
     T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
         "T2Ncm: hardware armed - ntbIn=%lu ntbOut=%lu, MI_01 on alt %u\n",
