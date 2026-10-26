@@ -1125,6 +1125,9 @@ inline TunnelPrep PrepareTunnelPeer(unsigned long ifIndex, const in6_addr& peer6
     }
     // One control handle for the mode + peer + local pushes below (see T2NcmControlLease).
     T2NcmControlLease controlLease;
+    // The lease may have waited on the shared control mutex. Close()/Dx can
+    // become visible during that wait: check again before the first IOCTL.
+    if (stopped()) return TunnelPrep::Suspended;
     if (IN6_IS_ADDR_UNSPECIFIED(&peer6)) {
         T2_LOG("tunnel", L"PrepareTunnelPeer: no peer address (LocalError, not a tunnel failure)");
         return TunnelPrep::NoPeer;
@@ -1212,9 +1215,9 @@ inline TunnelPrep PrepareTunnelPeer(unsigned long ifIndex, const in6_addr& peer6
             RememberArpPrepared(peer6);
             return TunnelPrep::Ok;
         }
-        return TunnelPrep::NoMac;
+        return stopped() ? TunnelPrep::Suspended : TunnelPrep::NoMac;
     }
-    return TunnelPrep::NoMac;
+    return stopped() ? TunnelPrep::Suspended : TunnelPrep::NoMac;
 }
 
 // ---- Path-silence streak -> distrust of the persisted peer (section 9) -----
