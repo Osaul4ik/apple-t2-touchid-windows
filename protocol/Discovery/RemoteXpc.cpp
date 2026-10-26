@@ -164,17 +164,20 @@ bool DecodeObjectAt(const uint8_t* data, size_t len, size_t* off, XpcObject* out
             if (!GetU32LE(data, len, *off, &count)) return false;
             *off += 4;
             const size_t contentStart = *off - 4; // encoded length includes the count field
-            if (contentLen > len - contentStart) return false;
+            // The encoded length includes the count field. Never let a child
+            // consume bytes belonging to the next sibling or parent.
+            if (contentLen < 4 || contentLen > len - contentStart) return false;
+            const size_t contentEnd = contentStart + contentLen;
             out->kind = XpcObject::Kind::Array;
             out->arrayValue.clear();
-            if (count > kMaxXpcDecodeNodes - *nodes || *off > len || count > (len - *off) / 4) return false;
+            if (count > kMaxXpcDecodeNodes - *nodes || *off > len || count > (contentEnd - *off) / 4) return false;
             out->arrayValue.reserve(count);
             for (uint32_t i = 0; i < count; ++i) {
                 XpcObject item;
-                if (!DecodeObjectAt(data, len, off, &item, depth + 1, nodes)) return false;
+                if (!DecodeObjectAt(data, contentEnd, off, &item, depth + 1, nodes)) return false;
                 out->arrayValue.push_back(std::move(item));
             }
-            if (*off - contentStart != contentLen) return false;
+            if (*off != contentEnd) return false;
             return true;
         }
         case kTypeDictionary: {
@@ -184,28 +187,31 @@ bool DecodeObjectAt(const uint8_t* data, size_t len, size_t* off, XpcObject* out
             if (!GetU32LE(data, len, *off, &count)) return false;
             *off += 4;
             const size_t contentStart = *off - 4; // encoded length includes the count field
-            if (contentLen > len - contentStart) return false;
+            // The encoded length includes the count field. Never let a child
+            // consume bytes belonging to the next sibling or parent.
+            if (contentLen < 4 || contentLen > len - contentStart) return false;
+            const size_t contentEnd = contentStart + contentLen;
             out->kind = XpcObject::Kind::Dictionary;
             out->dictValue.clear();
-            if (count > kMaxXpcDecodeNodes - *nodes || *off > len || count > (len - *off) / 8) return false;
+            if (count > kMaxXpcDecodeNodes - *nodes || *off > len || count > (contentEnd - *off) / 8) return false;
             out->dictValue.reserve(count);
             for (uint32_t i = 0; i < count; ++i) {
                 // NUL-terminated key, then padding to 4-byte alignment
                 // (padding computed on key-length-including-NUL, per
                 // format.rs's calculate_padding(key.len() + 1)).
                 size_t start = *off;
-                while (*off < len && data[*off] != 0) ++*off;
-                if (*off >= len) return false; // no terminating NUL found
+                while (*off < contentEnd && data[*off] != 0) ++*off;
+                if (*off >= contentEnd) return false; // no terminating NUL inside container
                 std::string key(reinterpret_cast<const char*>(data + start), *off - start);
                 *off += 1; // NUL
                 const size_t pad = Padding(key.size() + 1);
-                if (pad > len - *off) return false;
+                if (pad > contentEnd - *off) return false;
                 *off += pad;
                 XpcObject value;
-                if (!DecodeObjectAt(data, len, off, &value, depth + 1, nodes)) return false;
+                if (!DecodeObjectAt(data, contentEnd, off, &value, depth + 1, nodes)) return false;
                 out->dictValue.emplace_back(std::move(key), std::move(value));
             }
-            if (*off - contentStart != contentLen) return false;
+            if (*off != contentEnd) return false;
             return true;
         }
         default:
