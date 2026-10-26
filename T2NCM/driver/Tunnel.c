@@ -567,6 +567,27 @@ static BOOLEAN T2NcmTunnelValidateIpv6Extensions(
     return FALSE;
 }
 
+
+// Read-only classification/validation of IPv6 frames that need no rewrite.
+// Called on the original NTB datagram: no temporary frame copy required.
+BOOLEAN T2NcmTunnelValidateRxIpv6Passthrough(
+    _In_reads_bytes_(FrameLength) const UCHAR* Frame,
+    _In_ ULONG FrameLength)
+{
+    ULONG payloadLen;
+    UCHAR nextHdr;
+    if (FrameLength < 14u + 40u || (Frame[14] >> 4) != 6u)
+        return FALSE;
+    payloadLen = T2NcmReadBe16(Frame + 14 + 4);
+    if (payloadLen > FrameLength - (14u + 40u))
+        return FALSE;
+    nextHdr = Frame[14 + 6];
+    if (nextHdr == T2NCM_IPPROTO_TCP || nextHdr == T2NCM_IPPROTO_UDP)
+        return FALSE; // Must use rewriting path, not passthrough.
+    return T2NcmTunnelValidateIpv6Extensions(Frame + 14 + 40,
+                                              payloadLen, nextHdr);
+}
+
 BOOLEAN T2NcmTunnelRewriteRxIpv6ToIpv4(
     _In_ PT2NCM_DEVICE_CONTEXT DeviceContext,
     _Inout_updates_bytes_(*FrameLength) PUCHAR Frame,

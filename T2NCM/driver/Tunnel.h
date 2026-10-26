@@ -31,6 +31,12 @@ BOOLEAN T2NcmTunnelRewriteTxIpv4ToIpv6(
     _In_ ULONG BufferCapacity
     );
 
+// Validate non-TCP/UDP IPv6 directly in the NTB buffer; never modifies it.
+BOOLEAN T2NcmTunnelValidateRxIpv6Passthrough(
+    _In_reads_bytes_(FrameLength) const UCHAR* Frame,
+    _In_ ULONG FrameLength
+    );
+
 // RX: if tunnel on and frame is IPv6 TCP/UDP, rewrite to IPv4 toward 169.254.
 BOOLEAN T2NcmTunnelRewriteRxIpv6ToIpv4(
     _In_ PT2NCM_DEVICE_CONTEXT DeviceContext,

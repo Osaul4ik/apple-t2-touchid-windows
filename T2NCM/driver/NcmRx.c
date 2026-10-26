@@ -685,20 +685,36 @@ T2NcmRxParseNtb(
                 const BOOLEAN tunnelModeSnapshot =
                     (InterlockedCompareExchange(&DeviceContext->TunnelModeEnabled, 0, 0) != 0);
                 if (tunnelModeSnapshot &&
-                    ((ULONG)frame[12] << 8 | frame[13]) == 0x86DDu &&
-                    tunLen <= sizeof(tunFrame))
+                    ((ULONG)frame[12] << 8 | frame[13]) == 0x86DDu)
                 {
-                    RtlCopyMemory(tunFrame, frame, tunLen);
-                    if (T2NcmTunnelRewriteRxIpv6ToIpv4(DeviceContext, tunFrame, &tunLen, tunnelModeSnapshot))
+                    // Only direct TCP/UDP needs the mutable scratch buffer.
+                    // All other IPv6 packets are length-checked in place;
+                    // the original NTB remains unchanged and is copied only
+                    // once into its eventual NDIS NBL.
+                    if (tunLen >= 14u + 40u &&
+                        frame[14] >> 4 == 6u &&
+                        frame[14 + 6] != 6u && frame[14 + 6] != 17u)
                     {
+                        if (!T2NcmTunnelValidateRxIpv6Passthrough(frame, tunLen))
+                        {
+                            InterlockedIncrement64(&DeviceContext->RxFramesRejected);
+                            InterlockedIncrement64(&DeviceContext->InErrors);
+                            continue;
+                        }
+                    }
+                    else if (tunLen <= sizeof(tunFrame))
+                    {
+                        RtlCopyMemory(tunFrame, frame, tunLen);
+                        if (!T2NcmTunnelRewriteRxIpv6ToIpv4(DeviceContext, tunFrame, &tunLen, tunnelModeSnapshot))
+                        {
+                            InterlockedIncrement64(&DeviceContext->RxFramesRejected);
+                            InterlockedIncrement64(&DeviceContext->InErrors);
+                            continue;
+                        }
                         deliver = tunFrame;
                     }
                     else
                     {
-                        // A FALSE result means the IPv6 TCP/UDP frame was
-                        // rejected (e.g. truncated payload). Do not indicate
-                        // the original, invalid frame up to NDIS. Other
-                        // protocols return TRUE for ordinary passthrough.
                         InterlockedIncrement64(&DeviceContext->RxFramesRejected);
                         InterlockedIncrement64(&DeviceContext->InErrors);
                         continue;
