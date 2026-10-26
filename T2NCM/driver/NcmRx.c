@@ -680,7 +680,7 @@ T2NcmRxParseNtb(
                 // (already cached at PASSIVE, safe to read at DISPATCH)
                 // skips that copy entirely on the hot path when there is
                 // nothing for the rewrite to do.
-                if (DeviceContext->TunnelModeEnabled && tunLen <= sizeof(tunFrame))
+                if (InterlockedCompareExchange(&DeviceContext->TunnelModeEnabled, 0, 0) && tunLen <= sizeof(tunFrame))
                 {
                     RtlCopyMemory(tunFrame, frame, tunLen);
                     if (T2NcmTunnelRewriteRxIpv6ToIpv4(DeviceContext, tunFrame, &tunLen))

@@ -148,7 +148,7 @@ VOID T2NcmTunnelRefreshMode(_In_ PT2NCM_DEVICE_CONTEXT DeviceContext)
 {
     /* Re-seed the freshly created device context from driver memory.
      * No registry access: nothing here can fail or block. */
-    DeviceContext->TunnelModeEnabled = T2NcmTunnelGetMode();
+    InterlockedExchange(&DeviceContext->TunnelModeEnabled, T2NcmTunnelGetMode() ? 1 : 0);
 
     T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
         "T2Ncm: TunnelModeEnabled=%u PeerIpv6Valid=%u (from driver memory)\n",
@@ -296,10 +296,20 @@ BOOLEAN T2NcmTunnelRewriteTxIpv4ToIpv6(
             T2NcmTunnelNoteLocalFromIpv6Frame(DeviceContext, Frame, probeLen);
     }
 
-    if (!DeviceContext->TunnelModeEnabled)
+    if (InterlockedCompareExchange(&DeviceContext->TunnelModeEnabled, 0, 0) == 0)
         return TRUE;
 
-    if (!DeviceContext->TunnelPeerIpv6Valid) {
+    // Validity and peer address must be captured under one lock: an IOCTL or
+    // RX observation may install a different peer while TX is rewriting.
+    {
+        KIRQL peerIrql;
+        BOOLEAN peerValid;
+        KeAcquireSpinLock(&DeviceContext->TunnelPeerLock, &peerIrql);
+        peerValid = DeviceContext->TunnelPeerIpv6Valid;
+        if (peerValid)
+            RtlCopyMemory(dst6, DeviceContext->TunnelPeerIpv6, sizeof(dst6));
+        KeReleaseSpinLock(&DeviceContext->TunnelPeerLock, peerIrql);
+        if (!peerValid) {
         // Log once per outage, not once per frame — this is exactly the
         // state a stuck port scan looks like from the driver's side (every
         // SYN arrives here and gets silently dropped because RX hasn't
@@ -312,6 +322,7 @@ BOOLEAN T2NcmTunnelRewriteTxIpv4ToIpv6(
             DeviceContext->TunnelTxPeerUnknownLogged = TRUE;
         }
         return TRUE; // peer unknown yet — leave frame (will fail until RX learns)
+        }
     }
 
     fl = *FrameLength;
@@ -361,12 +372,6 @@ BOOLEAN T2NcmTunnelRewriteTxIpv4ToIpv6(
     if (newFl > BufferCapacity)
         return FALSE;
 
-    {
-        KIRQL peerIrql;
-        KeAcquireSpinLock(&DeviceContext->TunnelPeerLock, &peerIrql);
-        RtlCopyMemory(dst6, DeviceContext->TunnelPeerIpv6, 16);
-        KeReleaseSpinLock(&DeviceContext->TunnelPeerLock, peerIrql);
-    }
     {
         KIRQL localIrql;
         BOOLEAN localValid;
@@ -489,7 +494,7 @@ BOOLEAN T2NcmTunnelRewriteRxIpv6ToIpv4(
     UCHAR* tcp;
     USHORT csum;
 
-    if (!DeviceContext->TunnelModeEnabled)
+    if (InterlockedCompareExchange(&DeviceContext->TunnelModeEnabled, 0, 0) == 0)
         return TRUE;
 
     fl = *FrameLength;

@@ -260,7 +260,7 @@ typedef struct _T2NCM_DEVICE_CONTEXT
     // IPv4 tunnel (Cisco blocks IPv6): host uses 169.254/16; wire stays IPv6.
     // TunnelModeEnabled is a per-device cached copy of the driver-global mode (Tunnel.c).
     // PeerIpv6 is learned from the first inbound IPv6 frame source.
-    BOOLEAN              TunnelModeEnabled;
+    volatile LONG        TunnelModeEnabled;
     // L2 MTU handed to NDIS at MiniportInitializeEx (always T2NCM_MTU).
     ULONG                L2Mtu;
     BOOLEAN              TunnelPeerIpv6Valid;

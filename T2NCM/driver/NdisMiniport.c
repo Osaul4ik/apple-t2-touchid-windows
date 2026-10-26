@@ -369,7 +369,7 @@ T2NcmDispatchDeviceControl(
         // cached copy. Plain assignment on the context field: the TX/RX
         // rewrite paths only ever read it.
         T2NcmTunnelSetMode(mode == 1ul);
-        context->TunnelModeEnabled = (mode == 1ul);
+        InterlockedExchange(&context->TunnelModeEnabled, mode == 1ul ? 1 : 0);
 
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
             "T2Ncm: TunnelModeEnabled set live via IOCTL -> %u\n",

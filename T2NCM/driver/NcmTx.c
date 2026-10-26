@@ -440,7 +440,7 @@ T2NcmTxSubmitNetBuffer(
     // Headroom only when the tunnel is on: in native mode it just put 20
     // zero bytes into every NTB's wBlockLength.
     status = STATUS_INVALID_PARAMETER;
-    if (DeviceContext->TunnelModeEnabled)
+    if (InterlockedCompareExchange(&DeviceContext->TunnelModeEnabled, 0, 0))
     {
         status = T2NcmTxComputeLayout(DeviceContext, frameLength + 20,
             &ndpOffset, &ndpLength, &datagramOffset, &blockLength);

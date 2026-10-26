@@ -897,6 +897,30 @@ void BeginCaptureShutdown(_In_z_ const char* source)
     T2BioLog("%s: shutdown signaled active capture; worker owns WDF completion", source);
 }
 
+// R116: a capture worker owns at most one WDF request. Record its completion
+// BEFORE invoking WDF: after completion the WDFREQUEST is no longer valid.
+// Thread-local tracking also covers CancelableScope and shutdown exits.
+thread_local WDFREQUEST g_workerCaptureRequest = nullptr;
+thread_local bool g_workerCaptureCompleted = false;
+
+bool CompleteCaptureRequestOnce(WDFREQUEST request, NTSTATUS status,
+                                ULONG_PTR information = 0, bool withInformation = false)
+{
+    if (request == g_workerCaptureRequest && request != nullptr) {
+        if (g_workerCaptureCompleted) {
+            T2BioLog("CAPTURE_DATA: suppressed duplicate worker completion");
+            return false;
+        }
+        g_workerCaptureCompleted = true;
+    }
+    if (withInformation) {
+        WdfRequestCompleteWithInformation(request, status, information);
+    } else {
+        WdfRequestComplete(request, status);
+    }
+    return true;
+}
+
 // Round 59: driver-owned cancellation polling.
 // Microsoft WDF permits WdfRequestIsCanceled() only while the driver owns an
 // unmarked request. We NEVER mark it cancelable: there is therefore no
@@ -915,7 +939,7 @@ public:
             try {
                 if (Release()) {
                     std::lock_guard<std::mutex> lock(g_captureRequestCommitMu);
-                    WdfRequestComplete(request_, STATUS_UNSUCCESSFUL);
+                    CompleteCaptureRequestOnce(request_, STATUS_UNSUCCESSFUL);
                 }
             } catch (...) {
                 T2BioLog("CAPTURE_DATA: polling cancellation cleanup threw");
@@ -931,7 +955,7 @@ public:
         if (!stopEvent_) {
             T2BioLog("CAPTURE_DATA: cancellation watcher stop-event creation failed: %lu", GetLastError());
             std::lock_guard<std::mutex> lock(g_captureRequestCommitMu);
-            WdfRequestComplete(request_, STATUS_INSUFFICIENT_RESOURCES);
+            CompleteCaptureRequestOnce(request_, STATUS_INSUFFICIENT_RESOURCES);
             return false;
         }
         try {
@@ -963,14 +987,14 @@ public:
             CloseHandle(stopEvent_);
             stopEvent_ = nullptr;
             std::lock_guard<std::mutex> lock(g_captureRequestCommitMu);
-            WdfRequestComplete(request_, STATUS_INSUFFICIENT_RESOURCES);
+            CompleteCaptureRequestOnce(request_, STATUS_INSUFFICIENT_RESOURCES);
             return false;
         } catch (const std::bad_alloc&) {
             T2BioLog("CAPTURE_DATA: cancellation watcher allocation failed");
             CloseHandle(stopEvent_);
             stopEvent_ = nullptr;
             std::lock_guard<std::mutex> lock(g_captureRequestCommitMu);
-            WdfRequestComplete(request_, STATUS_INSUFFICIENT_RESOURCES);
+            CompleteCaptureRequestOnce(request_, STATUS_INSUFFICIENT_RESOURCES);
             return false;
         }
         armed_ = true;
@@ -992,7 +1016,7 @@ public:
                                WdfRequestIsCanceled(request_);
         if (cancelled) {
             std::lock_guard<std::mutex> lock(g_captureRequestCommitMu);
-            WdfRequestComplete(request_, STATUS_CANCELLED);
+            CompleteCaptureRequestOnce(request_, STATUS_CANCELLED);
             return false;
         }
         return true;
@@ -1336,7 +1360,7 @@ void CompleteCaptureData(_In_ WDFREQUEST Request, HRESULT winBioHresult,
         Request, sizeof(DWORD), reinterpret_cast<PVOID*>(&out), &outLen);
     if (!NT_SUCCESS(status) || out == nullptr) {
         T2BioLog("  CAPTURE_DATA: output buffer unusable (status=0x%08x)", status);
-        WdfRequestComplete(Request, NT_SUCCESS(status) ? STATUS_INVALID_PARAMETER : status);
+        CompleteCaptureRequestOnce(Request, NT_SUCCESS(status) ? STATUS_INVALID_PARAMETER : status);
         return;
     }
     if (outLen < needed) {
@@ -1347,7 +1371,7 @@ void CompleteCaptureData(_In_ WDFREQUEST Request, HRESULT winBioHresult,
         T2BioLog("  CAPTURE_DATA: buffer too small for the result (have=%llu need=%llu) -> reporting required size",
                  static_cast<unsigned long long>(outLen), static_cast<unsigned long long>(needed));
         out->PayloadSize = static_cast<DWORD>(needed);
-        WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, sizeof(DWORD));
+        CompleteCaptureRequestOnce(Request, STATUS_SUCCESS, sizeof(DWORD), true);
         return;
     }
 
@@ -1372,7 +1396,7 @@ void CompleteCaptureData(_In_ WDFREQUEST Request, HRESULT winBioHresult,
     }
     T2BioLog("  CAPTURE_DATA delivered: %llu bytes (winBioHresult=0x%08x)",
              static_cast<unsigned long long>(needed), static_cast<unsigned>(winBioHresult));
-    WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, static_cast<ULONG_PTR>(needed));
+    CompleteCaptureRequestOnce(Request, STATUS_SUCCESS, static_cast<ULONG_PTR>(needed), true);
 }
 
 // Shared connect step for both purposes below. Returns false (and has
@@ -1866,7 +1890,7 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
     if (SystemIsShuttingDown()) {
         T2BioLog("CAPTURE_DATA(verify): system shutting down — no SEP");
         std::lock_guard<std::mutex> commitLock(g_captureRequestCommitMu);
-        WdfRequestComplete(Request, STATUS_CANCELLED);
+        CompleteCaptureRequestOnce(Request, STATUS_CANCELLED);
         return;
     }
 
@@ -2248,7 +2272,7 @@ void ProcessCapture(_In_ WDFREQUEST Request, const CaptureKey& key)
     if (SystemIsShuttingDown()) {
         T2BioLog("CAPTURE_DATA: system shutting down — reject without SEP");
         std::lock_guard<std::mutex> commitLock(g_captureRequestCommitMu);
-        WdfRequestComplete(Request, STATUS_CANCELLED);
+        CompleteCaptureRequestOnce(Request, STATUS_CANCELLED);
         return;
     }
 
@@ -2366,15 +2390,21 @@ void StartCaptureWorker(_In_ WDFREQUEST Request, const CaptureKey& key)
                 g_captureWorkers.fetch_add(1, std::memory_order_relaxed);
                 try {
                     entry->thread = std::thread([Request, key, finished]() {
+                        g_workerCaptureRequest = Request;
+                        g_workerCaptureCompleted = false;
                         try {
                             ProcessCapture(Request, key);
                         } catch (const std::exception& ex) {
                             T2BioLog("CAPTURE_DATA: worker aborted by exception: %s", ex.what());
-                            CompleteCaptureData(Request, WINBIO_E_DEVICE_FAILURE, WINBIO_SENSOR_FAILURE, 0, {});
+                            if (!g_workerCaptureCompleted)
+                                CompleteCaptureData(Request, WINBIO_E_DEVICE_FAILURE, WINBIO_SENSOR_FAILURE, 0, {});
                         } catch (...) {
                             T2BioLog("CAPTURE_DATA: worker aborted by unknown exception");
-                            CompleteCaptureData(Request, WINBIO_E_DEVICE_FAILURE, WINBIO_SENSOR_FAILURE, 0, {});
+                            if (!g_workerCaptureCompleted)
+                                CompleteCaptureData(Request, WINBIO_E_DEVICE_FAILURE, WINBIO_SENSOR_FAILURE, 0, {});
                         }
+                        g_workerCaptureRequest = nullptr;
+                        g_workerCaptureCompleted = false;
                         g_captureWorkers.fetch_sub(1, std::memory_order_acq_rel);
                         finished->store(true, std::memory_order_release);
                     });
