@@ -35,7 +35,8 @@ BOOLEAN T2NcmTunnelRewriteTxIpv4ToIpv6(
 BOOLEAN T2NcmTunnelRewriteRxIpv6ToIpv4(
     _In_ PT2NCM_DEVICE_CONTEXT DeviceContext,
     _Inout_updates_bytes_(*FrameLength) PUCHAR Frame,
-    _Inout_ PULONG FrameLength
+    _Inout_ PULONG FrameLength,
+    _In_ BOOLEAN TunnelModeSnapshot
     );
 
 VOID T2NcmTunnelNotePeerFromIpv6Frame(

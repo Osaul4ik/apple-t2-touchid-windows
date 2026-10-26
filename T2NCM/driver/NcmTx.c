@@ -497,9 +497,23 @@ T2NcmTxSubmitNetBuffer(
     {
         ULONG tunLen = frameLength;
         ULONG capacity = blockLength - datagramOffset;
-        if (T2NcmTunnelRewriteTxIpv4ToIpv6(DeviceContext,
-                buffer + datagramOffset, &tunLen, capacity) &&
-            tunLen != frameLength && tunLen <= 0xFFFF)
+        // Fail closed: malformed IPv4 or insufficient expansion headroom
+        // must never be transmitted unchanged after rewrite rejection.
+        if (!T2NcmTunnelRewriteTxIpv4ToIpv6(DeviceContext,
+                buffer + datagramOffset, &tunLen, capacity))
+        {
+            status = STATUS_INVALID_PARAMETER;
+            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
+                "T2Ncm: TX tunnel rewrite rejected frame of %lu bytes\n",
+                frameLength));
+            goto Fail;
+        }
+        if (tunLen > 0xFFFFu)
+        {
+            status = STATUS_INVALID_BUFFER_SIZE;
+            goto Fail;
+        }
+        if (tunLen != frameLength)
         {
             frameLength = tunLen;
             {

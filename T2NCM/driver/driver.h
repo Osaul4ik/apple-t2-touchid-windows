@@ -270,7 +270,7 @@ typedef struct _T2NCM_DEVICE_CONTEXT
     // learned. Without this a scan that starts before RX has learned the
     // peer would log the same "peer unknown" line once per probed port
     // instead of once per outage.
-    BOOLEAN              TunnelTxPeerUnknownLogged;
+    volatile LONG        TunnelTxPeerUnknownLogged;
 
     // Windows' real link-local source address on this adapter (learned
     // passively from a native, un-rewritten outbound IPv6 frame — the
@@ -285,7 +285,7 @@ typedef struct _T2NCM_DEVICE_CONTEXT
     UCHAR                TunnelLocalIpv6[16];
     // Mirrors TunnelTxPeerUnknownLogged: log the "local address not
     // learned yet" condition once per outage, not once per frame.
-    BOOLEAN              TunnelLocalIpv6UnknownLogged;
+    volatile LONG        TunnelLocalIpv6UnknownLogged;
 
     // Windows' real IPv4 address on this adapter (APIPA, 169.254/16),
     // learned passively from the source address of the host's own

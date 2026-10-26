@@ -680,17 +680,28 @@ T2NcmRxParseNtb(
                 // (already cached at PASSIVE, safe to read at DISPATCH)
                 // skips that copy entirely on the hot path when there is
                 // nothing for the rewrite to do.
-                if (InterlockedCompareExchange(&DeviceContext->TunnelModeEnabled, 0, 0) && tunLen <= sizeof(tunFrame))
+                // A single per-datagram mode decision prevents the rewrite
+                // helper from observing a different mode after RX copies.
+                const BOOLEAN tunnelModeSnapshot =
+                    (InterlockedCompareExchange(&DeviceContext->TunnelModeEnabled, 0, 0) != 0);
+                if (tunnelModeSnapshot &&
+                    ((ULONG)frame[12] << 8 | frame[13]) == 0x86DDu &&
+                    tunLen <= sizeof(tunFrame))
                 {
                     RtlCopyMemory(tunFrame, frame, tunLen);
-                    if (T2NcmTunnelRewriteRxIpv6ToIpv4(DeviceContext, tunFrame, &tunLen))
+                    if (T2NcmTunnelRewriteRxIpv6ToIpv4(DeviceContext, tunFrame, &tunLen, tunnelModeSnapshot))
                     {
                         deliver = tunFrame;
                     }
                     else
                     {
-                        tunLen = entry.wDatagramLength;
-                        deliver = frame;
+                        // A FALSE result means the IPv6 TCP/UDP frame was
+                        // rejected (e.g. truncated payload). Do not indicate
+                        // the original, invalid frame up to NDIS. Other
+                        // protocols return TRUE for ordinary passthrough.
+                        InterlockedIncrement64(&DeviceContext->RxFramesRejected);
+                        InterlockedIncrement64(&DeviceContext->InErrors);
+                        continue;
                     }
                 }
 

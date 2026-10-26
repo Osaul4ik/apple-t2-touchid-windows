@@ -337,7 +337,7 @@ T2NcmDispatchDeviceControl(
             context->TunnelLocalIpv6Valid = TRUE;
             KeReleaseSpinLock(&context->TunnelPeerLock, localIrql);
         }
-        context->TunnelLocalIpv6UnknownLogged = FALSE;
+        InterlockedExchange(&context->TunnelLocalIpv6UnknownLogged, 0);
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
             "T2Ncm: TunnelLocalIpv6 set via IOCTL (real Windows link-local, no native frame needed)\n"));
         status = STATUS_SUCCESS;

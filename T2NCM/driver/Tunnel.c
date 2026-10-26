@@ -15,6 +15,30 @@ static USHORT T2NcmReadBe16(_In_reads_bytes_(2) const UCHAR* p)
     return (USHORT)((p[0] << 8) | p[1]);
 }
 
+// Constant-time structural checks; no checksum computation or allocations.
+// Apply before peer learning and before in-place header expansion/collapse.
+static BOOLEAN T2NcmTunnelValidTransport(
+    _In_reads_bytes_(Length) const UCHAR* Segment,
+    _In_ ULONG Length,
+    _In_ UCHAR Protocol)
+{
+    if (Protocol == T2NCM_IPPROTO_TCP) {
+        ULONG headerLength;
+        if (Length < 20)
+            return FALSE;
+        headerLength = (ULONG)(Segment[12] >> 4) * 4u;
+        return headerLength >= 20 && headerLength <= 60 && headerLength <= Length;
+    }
+    if (Protocol == T2NCM_IPPROTO_UDP) {
+        if (Length < 8)
+            return FALSE;
+        // The IP payload and UDP length must agree for these unfragmented
+        // tunnel datagrams. IPv6 jumbograms are not supported here.
+        return T2NcmReadBe16(Segment + 4) == Length;
+    }
+    return FALSE;
+}
+
 static VOID T2NcmWriteBe16(_Out_writes_bytes_(2) UCHAR* p, USHORT v)
 {
     p[0] = (UCHAR)(v >> 8);
@@ -185,7 +209,7 @@ VOID T2NcmTunnelNotePeerFromIpv6Frame(
         if (!wasValid || !RtlEqualMemory(DeviceContext->TunnelPeerIpv6, newPeer, 16)) {
             RtlCopyMemory(DeviceContext->TunnelPeerIpv6, newPeer, 16);
             DeviceContext->TunnelPeerIpv6Valid = TRUE;
-            DeviceContext->TunnelTxPeerUnknownLogged = FALSE;
+            InterlockedExchange(&DeviceContext->TunnelTxPeerUnknownLogged, 0);
         }
         KeReleaseSpinLock(&DeviceContext->TunnelPeerLock, irql);
     }
@@ -234,7 +258,7 @@ VOID T2NcmTunnelNoteLocalFromIpv6Frame(
                 newLocal[4], newLocal[5], newLocal[6], newLocal[7],
                 newLocal[8], newLocal[9], newLocal[10], newLocal[11],
                 newLocal[12], newLocal[13], newLocal[14], newLocal[15]));
-            DeviceContext->TunnelLocalIpv6UnknownLogged = FALSE;
+            InterlockedExchange(&DeviceContext->TunnelLocalIpv6UnknownLogged, 0);
         }
     }
 }
@@ -244,21 +268,25 @@ VOID T2NcmTunnelNoteLocalFromIpv4Frame(
     _In_reads_bytes_(4) const UCHAR* SrcIpv4)
 {
     BOOLEAN wasValid;
+    BOOLEAN changed;
     KIRQL localIrql;
     KeAcquireSpinLock(&DeviceContext->TunnelPeerLock, &localIrql);
     wasValid = DeviceContext->TunnelLocalIpv4Valid;
+    changed = !wasValid ||
+        !RtlEqualMemory(DeviceContext->TunnelLocalIpv4, SrcIpv4, 4);
+    if (changed) {
+        RtlCopyMemory(DeviceContext->TunnelLocalIpv4, SrcIpv4, 4);
+        DeviceContext->TunnelLocalIpv4Valid = TRUE;
+    }
+    KeReleaseSpinLock(&DeviceContext->TunnelPeerLock, localIrql);
 
-    if (!wasValid || !RtlEqualMemory(DeviceContext->TunnelLocalIpv4, SrcIpv4, 4)) {
+    if (changed) {
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
             "T2Ncm: tunnel local IPv4 %s (from host's own outbound frame): "
             "%u.%u.%u.%u\n",
             wasValid ? "changed to" : "learned",
             SrcIpv4[0], SrcIpv4[1], SrcIpv4[2], SrcIpv4[3]));
     }
-
-    RtlCopyMemory(DeviceContext->TunnelLocalIpv4, SrcIpv4, 4);
-    DeviceContext->TunnelLocalIpv4Valid = TRUE;
-    KeReleaseSpinLock(&DeviceContext->TunnelPeerLock, localIrql);
 }
 
 BOOLEAN T2NcmTunnelRewriteTxIpv4ToIpv6(
@@ -305,32 +333,6 @@ BOOLEAN T2NcmTunnelRewriteTxIpv4ToIpv6(
     if (InterlockedCompareExchange(&DeviceContext->TunnelModeEnabled, 0, 0) == 0)
         return TRUE;
 
-    // Validity and peer address must be captured under one lock: an IOCTL or
-    // RX observation may install a different peer while TX is rewriting.
-    {
-        KIRQL peerIrql;
-        BOOLEAN peerValid;
-        KeAcquireSpinLock(&DeviceContext->TunnelPeerLock, &peerIrql);
-        peerValid = DeviceContext->TunnelPeerIpv6Valid;
-        if (peerValid)
-            RtlCopyMemory(dst6, DeviceContext->TunnelPeerIpv6, sizeof(dst6));
-        KeReleaseSpinLock(&DeviceContext->TunnelPeerLock, peerIrql);
-        if (!peerValid) {
-        // Log once per outage, not once per frame — this is exactly the
-        // state a stuck port scan looks like from the driver's side (every
-        // SYN arrives here and gets silently dropped because RX hasn't
-        // learned a peer yet), so it's worth knowing about, but a full
-        // 16384-port scan would otherwise print this 16384 times.
-        if (!DeviceContext->TunnelTxPeerUnknownLogged) {
-            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
-                "T2Ncm: tunnel TX dropped - peer IPv6 not learned yet "
-                "(waiting on an inbound IPv6 frame, e.g. ND reply)\n"));
-            DeviceContext->TunnelTxPeerUnknownLogged = TRUE;
-        }
-        return TRUE; // peer unknown yet — leave frame (will fail until RX learns)
-        }
-    }
-
     fl = *FrameLength;
     if (fl < 14 + 20)
         return TRUE;
@@ -374,9 +376,37 @@ BOOLEAN T2NcmTunnelRewriteTxIpv4ToIpv6(
             return FALSE;
         payloadLen = totalLen - ipHdrLen;
     }
+    if (!T2NcmTunnelValidTransport(Frame + 14 + ipHdrLen, payloadLen, proto))
+        return FALSE;
     newFl = 14 + 40 + payloadLen;
     if (newFl > BufferCapacity)
         return FALSE;
+
+    // Validity and peer address must be captured under one lock: an IOCTL or
+    // RX observation may install a different peer while TX is rewriting.
+    {
+        KIRQL peerIrql;
+        BOOLEAN peerValid;
+        KeAcquireSpinLock(&DeviceContext->TunnelPeerLock, &peerIrql);
+        peerValid = DeviceContext->TunnelPeerIpv6Valid;
+        if (peerValid)
+            RtlCopyMemory(dst6, DeviceContext->TunnelPeerIpv6, sizeof(dst6));
+        KeReleaseSpinLock(&DeviceContext->TunnelPeerLock, peerIrql);
+        if (!peerValid) {
+        // Log once per outage, not once per frame — this is exactly the
+        // state a stuck port scan looks like from the driver's side (every
+        // SYN arrives here and gets silently dropped because RX hasn't
+        // learned a peer yet), so it's worth knowing about, but a full
+        // 16384-port scan would otherwise print this 16384 times.
+        if (InterlockedCompareExchange(
+                &DeviceContext->TunnelTxPeerUnknownLogged, 1, 0) == 0) {
+            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
+                "T2Ncm: tunnel TX dropped - peer IPv6 not learned yet "
+                "(waiting on an inbound IPv6 frame, e.g. ND reply)\n"));
+        }
+        return TRUE; // peer unknown yet — leave frame (will fail until RX learns)
+        }
+    }
 
     {
         KIRQL localIrql;
@@ -399,12 +429,12 @@ BOOLEAN T2NcmTunnelRewriteTxIpv4ToIpv6(
         // was enabled) — fall back to the synthesized address so TX isn't
         // dropped outright; RX will still fail until the real address is
         // learned. Log this once per outage so it's visible why.
-        if (!DeviceContext->TunnelLocalIpv6UnknownLogged) {
+        if (InterlockedCompareExchange(
+                &DeviceContext->TunnelLocalIpv6UnknownLogged, 1, 0) == 0) {
             T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
                 "T2Ncm: tunnel TX using synthesized (not yet real) local IPv6 "
                 "- waiting on a native outbound v6 frame to learn Windows' "
                 "actual link-local address\n"));
-            DeviceContext->TunnelLocalIpv6UnknownLogged = TRUE;
         }
         T2NcmMacToLinkLocal(DeviceContext->PermanentMacAddress, src6);
     } else {
@@ -484,10 +514,64 @@ BOOLEAN T2NcmTunnelRewriteTxIpv4ToIpv6(
     return TRUE;
 }
 
+// Validate extension-header lengths before forwarding an IPv6 packet unchanged.
+// This does NOT attempt reassembly or conversion. Fragment payloads are opaque.
+// The caller has already checked the base header and payload bounds.
+static BOOLEAN T2NcmTunnelValidateIpv6Extensions(
+    _In_reads_bytes_(PayloadLength) const UCHAR* Payload,
+    _In_ ULONG PayloadLength,
+    _In_ UCHAR NextHeader)
+{
+    ULONG offset = 0;
+    ULONG depth;
+    for (depth = 0; depth < 16; ++depth) {
+        ULONG remaining = PayloadLength - offset;
+        ULONG length;
+        UCHAR following;
+        switch (NextHeader) {
+        case 0:   // Hop-by-Hop Options
+        case 43:  // Routing
+        case 60:  // Destination Options
+        case 135: // Mobility
+        case 139: // Host Identity Protocol
+        case 140: // Shim6
+            if (remaining < 2)
+                return FALSE;
+            following = Payload[offset];
+            length = ((ULONG)Payload[offset + 1] + 1u) * 8u;
+            break;
+        case 51:  // Authentication Header (length in 32-bit units)
+            if (remaining < 2)
+                return FALSE;
+            following = Payload[offset];
+            length = ((ULONG)Payload[offset + 1] + 2u) * 4u;
+            if (length < 12)
+                return FALSE;
+            break;
+        case 44:  // Fragment Header; later fragments have opaque payload.
+            if (remaining < 8)
+                return FALSE;
+            // Two reserved bytes/bits in the fixed Fragment Header.
+            if (Payload[offset + 1] != 0 || (Payload[offset + 3] & 0x06u) != 0)
+                return FALSE;
+            return TRUE;
+        default:
+            return TRUE;
+        }
+        if (length > remaining)
+            return FALSE;
+        offset += length;
+        NextHeader = following;
+    }
+    // Chain longer than the bounded parser can establish safely.
+    return FALSE;
+}
+
 BOOLEAN T2NcmTunnelRewriteRxIpv6ToIpv4(
     _In_ PT2NCM_DEVICE_CONTEXT DeviceContext,
     _Inout_updates_bytes_(*FrameLength) PUCHAR Frame,
-    _Inout_ PULONG FrameLength)
+    _Inout_ PULONG FrameLength,
+    _In_ BOOLEAN TunnelModeSnapshot)
 {
     ULONG fl;
     USHORT ethType;
@@ -500,29 +584,39 @@ BOOLEAN T2NcmTunnelRewriteRxIpv6ToIpv4(
     UCHAR* tcp;
     USHORT csum;
 
-    if (InterlockedCompareExchange(&DeviceContext->TunnelModeEnabled, 0, 0) == 0)
+    // The caller freezes the mode decision for this received datagram.
+    // Do not re-read TunnelModeEnabled after the RX copy/dispatch decision.
+    if (!TunnelModeSnapshot)
         return TRUE;
 
     fl = *FrameLength;
-    if (fl < 14 + 40)
-        return TRUE;
+    if (fl < 14)
+        return FALSE;
     ethType = T2NcmReadBe16(Frame + 12);
     if (ethType != T2NCM_ETH_TYPE_IPV6)
         return TRUE;
-    if ((Frame[14] >> 4) != 6)
-        return TRUE;
-
-    T2NcmTunnelNotePeerFromIpv6Frame(DeviceContext, Frame, fl);
+    // A tagged IPv6 Ethernet frame must contain a complete, valid base header.
+    if (fl < 14 + 40 || (Frame[14] >> 4) != 6)
+        return FALSE;
 
     nextHdr = Frame[14 + 6];
     payloadLen = T2NcmReadBe16(Frame + 14 + 4);
-    if (nextHdr != T2NCM_IPPROTO_TCP && nextHdr != T2NCM_IPPROTO_UDP)
-        return TRUE;
+    // R123: never learn a tunnel peer from a truncated IPv6 payload.
+    // Learning previously preceded these checks, so malformed TCP/UDP
+    // packets could poison the peer address even when RX dropped them.
     if ((ULONG)payloadLen > fl - 14ul - 40ul)
         return FALSE;
     if ((nextHdr == T2NCM_IPPROTO_TCP && payloadLen < 20) ||
         (nextHdr == T2NCM_IPPROTO_UDP && payloadLen < 8))
         return FALSE;
+    // Only direct TCP/UDP may be rewritten. Validate the complete length
+    // chain of common IPv6 extension headers before passing other traffic
+    // through unchanged. Fragmented traffic must never train the peer.
+    if (nextHdr != T2NCM_IPPROTO_TCP && nextHdr != T2NCM_IPPROTO_UDP)
+        return T2NcmTunnelValidateIpv6Extensions(Frame + 14 + 40, payloadLen, nextHdr);
+    if (!T2NcmTunnelValidTransport(Frame + 14 + 40, payloadLen, nextHdr))
+        return FALSE;
+    T2NcmTunnelNotePeerFromIpv6Frame(DeviceContext, Frame, fl);
 
     src6 = Frame + 14 + 8;
     // Map peer (src) to 169.254.x.y — same algorithm as userspace MapPeerToIpv4.
