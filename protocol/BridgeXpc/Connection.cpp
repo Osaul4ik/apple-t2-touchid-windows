@@ -353,7 +353,7 @@ ConnectResult Connection::ConnectOnce(bool tunnel, const in6_addr& linkLocalAddr
     int wsa = 0;
     if (tunnel) {
         const t2::transport::TunnelPrep prep =
-            t2::transport::PrepareTunnelPeer(interfaceIndex, linkLocalAddress);
+            t2::transport::PrepareTunnelPeer(interfaceIndex, linkLocalAddress, &closing_);
         // Tunnel preparation is synchronous. Close() may request teardown
         // while it holds ioMu_: never create a TCP socket afterwards.
         if (closing_.load(std::memory_order_acquire)) {

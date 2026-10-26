@@ -1112,8 +1112,14 @@ inline bool PushTransportModeToDriver(TransportMode mode, bool force = false) {
 enum class TunnelPrep { Ok, NoMac, NoPeer, Suspended };
 
 // Call before AF_INET connect in tunnel mode.
-inline TunnelPrep PrepareTunnelPeer(unsigned long ifIndex, const in6_addr& peer6) {
-    if (IsTransportIoSuspended()) {
+inline TunnelPrep PrepareTunnelPeer(unsigned long ifIndex, const in6_addr& peer6,
+                                    const std::atomic<bool>* cancel = nullptr) {
+    // Cooperative cancellation between blocking operations; a synchronous
+    // DeviceIoControl itself cannot be interrupted through this flag.
+    const auto stopped = [&]() {
+        return (cancel && cancel->load(std::memory_order_acquire)) || IsTransportIoSuspended();
+    };
+    if (stopped()) {
         T2_LOG("tunnel", L"PrepareTunnelPeer: skipped (system suspending / Dx)");
         return TunnelPrep::Suspended;
     }
@@ -1134,6 +1140,7 @@ inline TunnelPrep PrepareTunnelPeer(unsigned long ifIndex, const in6_addr& peer6
         T2_LOG("tunnel", L"PrepareTunnelPeer: failed to arm IPv4 tunnel mode");
         return TunnelPrep::NoPeer;
     }
+    if (stopped()) return TunnelPrep::Suspended;
     // Fast path: same peer as last time we successfully prepared it, and
     // nothing has invalidated that since (see InvalidateTunnelPrepCache).
     // Skips the neighbor-table walk and the ARP create/set syscalls -
@@ -1141,17 +1148,20 @@ inline TunnelPrep PrepareTunnelPeer(unsigned long ifIndex, const in6_addr& peer6
     // IsSameAsLastPushedPeer dedupe inside it) pushes it to the driver,
     // both of which are already cheap early-outs.
     if (IsArpAlreadyPrepared(peer6)) {
+        if (stopped()) return TunnelPrep::Suspended;
         if (!PublishTunnelPeer(peer6, nullptr)) {
             InvalidateTunnelPrepCache();
             return TunnelPrep::NoPeer;
         }
+        if (stopped()) return TunnelPrep::Suspended;
         if (!PushTunnelPeerToDriver(peer6)) {
             InvalidateTunnelPrepCache();
             T2_LOG("tunnel", L"PrepareTunnelPeer: failed to publish cached tunnel peer");
             return TunnelPrep::NoPeer;
         }
+        if (stopped()) return TunnelPrep::Suspended;
         PushTunnelLocalToDriver(ifIndex);
-        return TunnelPrep::Ok;
+        return stopped() ? TunnelPrep::Suspended : TunnelPrep::Ok;
     }
     // MAC resolution order (first usable wins):
     //   1. IPv6 neighbor table (live, same peer)
@@ -1175,6 +1185,7 @@ inline TunnelPrep PrepareTunnelPeer(unsigned long ifIndex, const in6_addr& peer6
             macSource = L"EUI-64 of peer address";
         }
     }
+    if (stopped()) return TunnelPrep::Suspended;
     const bool haveMac = macSource != nullptr;
     T2_LOG("tunnel", L"PrepareTunnelPeer: ifIndex=%lu peer=%02x%02x:%02x%02x mac=%s%s%s",
            ifIndex, peer6.s6_addr[12], peer6.s6_addr[13],
@@ -1185,15 +1196,19 @@ inline TunnelPrep PrepareTunnelPeer(unsigned long ifIndex, const in6_addr& peer6
         InvalidateTunnelPrepCache();
         return TunnelPrep::NoPeer;
     }
+    if (stopped()) return TunnelPrep::Suspended;
     if (!PushTunnelPeerToDriver(peer6)) {
         T2_LOG("tunnel", L"PrepareTunnelPeer: failed to publish tunnel peer");
         return TunnelPrep::NoPeer;
     }
+    if (stopped()) return TunnelPrep::Suspended;
     PushTunnelLocalToDriver(ifIndex);
+    if (stopped()) return TunnelPrep::Suspended;
     if (haveMac) {
         // Only cache "prepared" if the ARP row really took the MAC; otherwise
         // the fast path above would skip the repair on every later attempt.
         if (EnsureTunnelIpv4Neighbor(ifIndex, MapPeerToIpv4(peer6), mac)) {
+            if (stopped()) return TunnelPrep::Suspended;
             RememberArpPrepared(peer6);
             return TunnelPrep::Ok;
         }
