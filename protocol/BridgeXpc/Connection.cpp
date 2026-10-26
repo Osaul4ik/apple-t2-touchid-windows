@@ -354,6 +354,18 @@ ConnectResult Connection::ConnectOnce(bool tunnel, const in6_addr& linkLocalAddr
     if (tunnel) {
         const t2::transport::TunnelPrep prep =
             t2::transport::PrepareTunnelPeer(interfaceIndex, linkLocalAddress);
+        // Tunnel preparation is synchronous. Close() may request teardown
+        // while it holds ioMu_: never create a TCP socket afterwards.
+        if (closing_.load(std::memory_order_acquire)) {
+            evidence = t2::transport::PathEvidence::LocalError;
+            return ConnectResult::ConnectFailed;
+        }
+        // Suspended means the transport is not permitted to perform I/O;
+        // it is not evidence that the peer or the tunnel path is dead.
+        if (prep == t2::transport::TunnelPrep::Suspended) {
+            evidence = t2::transport::PathEvidence::LocalError;
+            return ConnectResult::ConnectFailed;
+        }
         if (prep == t2::transport::TunnelPrep::NoMac || prep == t2::transport::TunnelPrep::NoPeer) {
             // LocalError (section 4): without a peer MAC the static ARP row cannot be
             // set, so the SYN would just die after the full TCP timeout. That says
