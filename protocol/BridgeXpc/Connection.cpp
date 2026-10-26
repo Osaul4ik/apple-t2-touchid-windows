@@ -458,15 +458,23 @@ ConnectResult Connection::ConnectOnce(bool tunnel, const in6_addr& linkLocalAddr
 
     // The client replies with its OWN HELO (only the peer's BridgeXPCVersion
     // is reused), not an echo of the peer's - see BuildClientHeloBody.
-    std::string peerHeloJson(helo.body.begin(), helo.body.end());
     int64_t bridgeXpcVersion = 0;
-    if (!ExtractJsonIntField(peerHeloJson, "BridgeXPCVersion", &bridgeXpcVersion)) {
-        T2_LOG("connect", L"BridgeXPCVersion missing/unparseable in peer HELO: %s",
-               Widen(peerHeloJson).c_str());
+    std::vector<uint8_t> ownHelo;
+    try {
+        // Both allocations occur under ioMu_. Fail closed and release the
+        // established socket before returning; no client HELO was sent yet.
+        const std::string peerHeloJson(helo.body.begin(), helo.body.end());
+        if (!ExtractJsonIntField(peerHeloJson, "BridgeXPCVersion", &bridgeXpcVersion)) {
+            T2_LOG("connect", L"BridgeXPCVersion missing/unparseable in peer HELO");
+            discardFailedAttempt();
+            return ConnectResult::HeloMalformed;
+        }
+        ownHelo = BuildClientHeloBody(bridgeXpcVersion);
+    } catch (const std::bad_alloc&) {
         discardFailedAttempt();
-        return ConnectResult::HeloMalformed;
+        WSASetLastError(WSAENOBUFS);
+        return ConnectResult::ConnectFailed;
     }
-    std::vector<uint8_t> ownHelo = BuildClientHeloBody(bridgeXpcVersion);
     if (std::chrono::steady_clock::now() >= heloDeadline ||
         !WriteFrame(FrameType::Helo, ownHelo, RemainingBudget(heloDeadline))) {
         T2_LOG("connect", L"writing own HELO failed, WSAGetLastError=%d", WSAGetLastError());
