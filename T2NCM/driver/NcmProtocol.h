@@ -104,6 +104,18 @@ T2NcmApplyPacketFilter(
 // Declared here because Device.c is what creates the work item.
 EVT_WDF_WORKITEM T2NcmEvtPacketFilterWorkItem;
 
+// Serialize enqueue with closing the gate before WdfWorkItemFlush.
+VOID
+T2NcmSetPacketFilterWorkEnabled(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext,
+    _In_ BOOLEAN Enabled
+    );
+
+VOID
+T2NcmEnqueuePacketFilterWork(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
+    );
+
 // IRQL-safe entry point for the OID path: applies inline at
 // PASSIVE_LEVEL, defers to the device's work item otherwise.
 VOID

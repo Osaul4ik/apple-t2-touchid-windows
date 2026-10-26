@@ -56,13 +56,13 @@ void PutU64LE(std::vector<uint8_t>& buf, uint64_t v) {
     for (int i = 0; i < 8; ++i) buf.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xFF));
 }
 bool GetU32LE(const uint8_t* p, size_t len, size_t off, uint32_t* out) {
-    if (off + 4 > len) return false;
+    if (off > len || len - off < 4) return false;
     *out = static_cast<uint32_t>(p[off]) | (static_cast<uint32_t>(p[off + 1]) << 8) |
            (static_cast<uint32_t>(p[off + 2]) << 16) | (static_cast<uint32_t>(p[off + 3]) << 24);
     return true;
 }
 bool GetU64LE(const uint8_t* p, size_t len, size_t off, uint64_t* out) {
-    if (off + 8 > len) return false;
+    if (off > len || len - off < 8) return false;
     uint64_t v = 0;
     for (int i = 0; i < 8; ++i) v |= static_cast<uint64_t>(p[off + i]) << (8 * i);
     *out = v;
@@ -71,7 +71,14 @@ bool GetU64LE(const uint8_t* p, size_t len, size_t off, uint64_t* out) {
 
 // Decodes one tagged XPC object starting at data[off]; advances *off past
 // it. Returns false on any malformed/truncated/unknown-type input.
-bool DecodeObjectAt(const uint8_t* data, size_t len, size_t* off, XpcObject* out) {
+constexpr size_t kMaxXpcDecodeDepth = 32;
+constexpr size_t kMaxXpcDecodeNodes = 16384;
+constexpr size_t kMaxXpcDecodeBytes = 1024 * 1024;
+// A single decoded tree is bounded in depth and total objects, including
+// nested arrays/dictionaries, independently of the transport frame limit.
+bool DecodeObjectAt(const uint8_t* data, size_t len, size_t* off, XpcObject* out,
+                    size_t depth, size_t* nodes) {
+    if (depth > kMaxXpcDecodeDepth || ++*nodes > kMaxXpcDecodeNodes) return false;
     uint32_t tag = 0;
     if (!GetU32LE(data, len, *off, &tag)) return false;
     *off += 4;
@@ -81,7 +88,7 @@ bool DecodeObjectAt(const uint8_t* data, size_t len, size_t* off, XpcObject* out
             out->kind = XpcObject::Kind::Null;
             return true;
         case kTypeBool: {
-            if (*off + 4 > len) return false;
+            if (*off > len || len - *off < 4) return false;
             out->kind = XpcObject::Kind::Bool;
             out->boolValue = data[*off] != 0;
             *off += 4;
@@ -125,7 +132,7 @@ bool DecodeObjectAt(const uint8_t* data, size_t len, size_t* off, XpcObject* out
             uint32_t l = 0; // includes the trailing NUL
             if (!GetU32LE(data, len, *off, &l)) return false;
             *off += 4;
-            if (l == 0 || *off + l > len) return false;
+            if (l == 0 || *off > len || l > len - *off || Padding(l) > len - *off - l) return false;
             out->kind = XpcObject::Kind::String;
             out->stringValue.assign(reinterpret_cast<const char*>(data + *off), l - 1);
             *off += l;
@@ -136,7 +143,7 @@ bool DecodeObjectAt(const uint8_t* data, size_t len, size_t* off, XpcObject* out
             uint32_t l = 0;
             if (!GetU32LE(data, len, *off, &l)) return false;
             *off += 4;
-            if (*off + l > len) return false;
+            if (*off > len || l > len - *off || Padding(l) > len - *off - l) return false;
             out->kind = XpcObject::Kind::Data;
             out->dataValue.assign(data + *off, data + *off + l);
             *off += l;
@@ -144,7 +151,7 @@ bool DecodeObjectAt(const uint8_t* data, size_t len, size_t* off, XpcObject* out
             return true;
         }
         case kTypeUuid: {
-            if (*off + 16 > len) return false;
+            if (*off > len || len - *off < 16) return false;
             out->kind = XpcObject::Kind::Uuid;
             out->dataValue.assign(data + *off, data + *off + 16);
             *off += 16;
@@ -156,15 +163,18 @@ bool DecodeObjectAt(const uint8_t* data, size_t len, size_t* off, XpcObject* out
             *off += 4;
             if (!GetU32LE(data, len, *off, &count)) return false;
             *off += 4;
+            const size_t contentStart = *off - 4; // encoded length includes the count field
+            if (contentLen > len - contentStart) return false;
             out->kind = XpcObject::Kind::Array;
             out->arrayValue.clear();
+            if (count > kMaxXpcDecodeNodes - *nodes || *off > len || count > (len - *off) / 4) return false;
             out->arrayValue.reserve(count);
             for (uint32_t i = 0; i < count; ++i) {
                 XpcObject item;
-                if (!DecodeObjectAt(data, len, off, &item)) return false;
+                if (!DecodeObjectAt(data, len, off, &item, depth + 1, nodes)) return false;
                 out->arrayValue.push_back(std::move(item));
             }
-            (void)contentLen; // content_len is redundant with walking the entries; not re-validated
+            if (*off - contentStart != contentLen) return false;
             return true;
         }
         case kTypeDictionary: {
@@ -173,8 +183,11 @@ bool DecodeObjectAt(const uint8_t* data, size_t len, size_t* off, XpcObject* out
             *off += 4;
             if (!GetU32LE(data, len, *off, &count)) return false;
             *off += 4;
+            const size_t contentStart = *off - 4; // encoded length includes the count field
+            if (contentLen > len - contentStart) return false;
             out->kind = XpcObject::Kind::Dictionary;
             out->dictValue.clear();
+            if (count > kMaxXpcDecodeNodes - *nodes || *off > len || count > (len - *off) / 8) return false;
             out->dictValue.reserve(count);
             for (uint32_t i = 0; i < count; ++i) {
                 // NUL-terminated key, then padding to 4-byte alignment
@@ -185,12 +198,14 @@ bool DecodeObjectAt(const uint8_t* data, size_t len, size_t* off, XpcObject* out
                 if (*off >= len) return false; // no terminating NUL found
                 std::string key(reinterpret_cast<const char*>(data + start), *off - start);
                 *off += 1; // NUL
-                *off += Padding(key.size() + 1);
+                const size_t pad = Padding(key.size() + 1);
+                if (pad > len - *off) return false;
+                *off += pad;
                 XpcObject value;
-                if (!DecodeObjectAt(data, len, off, &value)) return false;
+                if (!DecodeObjectAt(data, len, off, &value, depth + 1, nodes)) return false;
                 out->dictValue.emplace_back(std::move(key), std::move(value));
             }
-            (void)contentLen;
+            if (*off - contentStart != contentLen) return false;
             return true;
         }
         default:
@@ -321,12 +336,13 @@ std::vector<uint8_t> XpcObject::Encode() const {
 }
 
 bool XpcObject::Decode(const uint8_t* data, size_t len, XpcObject* out) {
-    if (len < 8) return false;
+    if (!data || !out || len < 8 || len > kMaxXpcDecodeBytes) return false;
     uint32_t magic = 0, version = 0;
     if (!GetU32LE(data, len, 0, &magic) || magic != kXpcObjectMagic) return false;
     if (!GetU32LE(data, len, 4, &version) || version != kXpcObjectVersion) return false;
     size_t off = 8;
-    return DecodeObjectAt(data, len, &off, out);
+    size_t nodes = 0;
+    return DecodeObjectAt(data, len, &off, out, 0, &nodes) && off == len;
 }
 
 // ------------------------------------------------------- RemoteXpcConnection
@@ -485,6 +501,12 @@ bool RemoteXpcConnection::ReadDataFrame(uint32_t wantStreamId, std::vector<uint8
                              (static_cast<uint32_t>(header[6]) << 16) |
                              (static_cast<uint32_t>(header[7]) << 8) |
                              static_cast<uint32_t>(header[8]);
+        // HTTP/2 frame length is peer-controlled (24 bits). Reject oversize
+        // before allocating instead of reserving up to 16 MiB per frame.
+        if (payloadLen > kMaxXpcDecodeBytes) {
+            *result = RemoteXpcResult::PeerRecordMalformed;
+            return false;
+        }
         std::vector<uint8_t> payload(payloadLen);
         if (payloadLen > 0 && !ReadExact(payload.data(), payloadLen, deadline)) {
             *result = RemoteXpcResult::PeerRecordTimeout;
@@ -671,7 +693,7 @@ RemoteXpcResult RemoteXpcConnection::FetchPeerRecord(std::chrono::milliseconds t
         (void)msgId;
         if (bodyLen == 0) continue; // bodyless/keepalive frame, per RemoteXpcClient::recv_from_channel
 
-        if (24 + bodyLen > frame.size()) return RemoteXpcResult::PeerRecordMalformed;
+        if (bodyLen > frame.size() - 24 || bodyLen > kMaxXpcDecodeBytes) return RemoteXpcResult::PeerRecordMalformed;
 
         XpcObject decoded;
         if (!XpcObject::Decode(frame.data() + 24, static_cast<size_t>(bodyLen), &decoded)) {

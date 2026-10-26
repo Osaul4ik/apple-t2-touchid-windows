@@ -330,8 +330,13 @@ T2NcmDispatchDeviceControl(
             status = STATUS_INVALID_PARAMETER;
             break;
         }
-        RtlCopyMemory(context->TunnelLocalIpv6, localAddr, 16);
-        context->TunnelLocalIpv6Valid = TRUE;
+        {
+            KIRQL localIrql;
+            KeAcquireSpinLock(&context->TunnelPeerLock, &localIrql);
+            RtlCopyMemory(context->TunnelLocalIpv6, localAddr, 16);
+            context->TunnelLocalIpv6Valid = TRUE;
+            KeReleaseSpinLock(&context->TunnelPeerLock, localIrql);
+        }
         context->TunnelLocalIpv6UnknownLogged = FALSE;
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
             "T2Ncm: TunnelLocalIpv6 set via IOCTL (real Windows link-local, no native frame needed)\n"));
@@ -882,6 +887,7 @@ T2NcmMiniportHaltEx(
     // surprise removal can reach halt through paths where that is less
     // obvious; all of these are idempotent.
     InterlockedExchange(&context->DataPathRunning, 0);
+    T2NcmSetPacketFilterWorkEnabled(context, FALSE);
     if (context->RecoveryWorkItem != NULL)
     {
         WdfWorkItemFlush(context->RecoveryWorkItem);
@@ -941,6 +947,7 @@ T2NcmMiniportPause(
     // flight. Doing it the other way round leaves a window where the
     // reader has stopped but an in-flight completion still indicates.
     InterlockedExchange(&context->DataPathRunning, 0);
+    T2NcmSetPacketFilterWorkEnabled(context, FALSE);
 
     // Let a running recovery/reset work item finish before tearing down
     // underneath it. With the gate closed no new recovery is requested.
@@ -1100,6 +1107,11 @@ T2NcmMiniportRestart(
             "T2Ncm: RX engine did not start on restart (0x%08X)\n", status));
         return NDIS_STATUS_FAILURE;
     }
+
+    // Reopen deferred filter updates only after RX/TX are ready.
+    T2NcmSetPacketFilterWorkEnabled(context, TRUE);
+    // Reconcile OIDs received while paused, using the same enqueue gate.
+    T2NcmEnqueuePacketFilterWork(context);
 
     // Restart is reached from one of two predecessors, and which one is
     // decided by what happened before, not by chance:

@@ -329,6 +329,8 @@ typedef struct _T2NCM_DEVICE_CONTEXT
     // PASSIVE_LEVEL (control transfers are PASSIVE-only).
     WDFWORKITEM          PacketFilterWorkItem;
     volatile LONG        PacketFilterUpdateGeneration;
+    volatile LONG        PacketFilterWorkEnabled;
+    KSPIN_LOCK           PacketFilterQueueLock;
     ULONG                CurrentLookahead;
 
     // MulticastList/MulticastAddressCount are rewritten by

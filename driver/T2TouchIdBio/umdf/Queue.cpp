@@ -2370,8 +2370,10 @@ void StartCaptureWorker(_In_ WDFREQUEST Request, const CaptureKey& key)
                             ProcessCapture(Request, key);
                         } catch (const std::exception& ex) {
                             T2BioLog("CAPTURE_DATA: worker aborted by exception: %s", ex.what());
+                            CompleteCaptureData(Request, WINBIO_E_DEVICE_FAILURE, WINBIO_SENSOR_FAILURE, 0, {});
                         } catch (...) {
                             T2BioLog("CAPTURE_DATA: worker aborted by unknown exception");
+                            CompleteCaptureData(Request, WINBIO_E_DEVICE_FAILURE, WINBIO_SENSOR_FAILURE, 0, {});
                         }
                         g_captureWorkers.fetch_sub(1, std::memory_order_acq_rel);
                         finished->store(true, std::memory_order_release);

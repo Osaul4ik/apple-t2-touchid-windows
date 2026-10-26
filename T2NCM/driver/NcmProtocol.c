@@ -699,6 +699,36 @@ T2NcmApplyPacketFilter(
     return status;
 }
 
+// The enqueue/gate transition must be atomic with respect to Pause/Halt.
+// Never hold this spin lock across Flush or a USB control transfer.
+VOID
+T2NcmSetPacketFilterWorkEnabled(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext,
+    _In_ BOOLEAN Enabled
+    )
+{
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&DeviceContext->PacketFilterQueueLock, &oldIrql);
+    InterlockedExchange(&DeviceContext->PacketFilterWorkEnabled, Enabled ? 1 : 0);
+    KeReleaseSpinLock(&DeviceContext->PacketFilterQueueLock, oldIrql);
+}
+
+VOID
+T2NcmEnqueuePacketFilterWork(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
+    )
+{
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&DeviceContext->PacketFilterQueueLock, &oldIrql);
+    if (DeviceContext->PacketFilterWorkItem != NULL &&
+        DeviceContext->PacketFilterWorkEnabled != 0)
+    {
+        // WdfWorkItemEnqueue is permitted at DISPATCH_LEVEL.
+        WdfWorkItemEnqueue(DeviceContext->PacketFilterWorkItem);
+    }
+    KeReleaseSpinLock(&DeviceContext->PacketFilterQueueLock, oldIrql);
+}
+
 EVT_WDF_WORKITEM T2NcmEvtPacketFilterWorkItem;
 
 VOID
@@ -713,8 +743,17 @@ T2NcmEvtPacketFilterWorkItem(
     // is still running. Enqueueing alone does not tell this callback whether
     // the last transfer used the newest OID state. Drain every generation
     // observed while the callback is active.
-    for (;;)
+    // A continuous stream of OIDs must not keep a single callback alive
+    // indefinitely: MiniportPause/Halt wait for it in WdfWorkItemFlush.
+    // Each OID already requests an enqueue, so yield after a bounded batch.
+    for (ULONG pass = 0; pass < 8; ++pass)
     {
+        // Pause/Halt close this gate before flushing the work item.
+        if (InterlockedCompareExchange(
+                &deviceContext->PacketFilterWorkEnabled, 0, 0) == 0)
+        {
+            break;
+        }
         LONG generation = InterlockedCompareExchange(
             &deviceContext->PacketFilterUpdateGeneration, 0, 0);
         NTSTATUS status = T2NcmApplyPacketFilter(deviceContext);
@@ -727,6 +766,11 @@ T2NcmEvtPacketFilterWorkItem(
                 &deviceContext->PacketFilterUpdateGeneration, 0, 0))
         {
             break;
+        }
+        if (pass == 7)
+        {
+            // Serialize requeue against Pause/Halt closing the gate.
+            T2NcmEnqueuePacketFilterWork(deviceContext);
         }
     }
 }
@@ -745,7 +789,17 @@ T2NcmRequestPacketFilterUpdate(
     // the device is the exact bug this whole path exists to fix.
     if (KeGetCurrentIrql() == PASSIVE_LEVEL)
     {
-        (VOID)T2NcmApplyPacketFilter(DeviceContext);
+        NTSTATUS status = T2NcmApplyPacketFilter(DeviceContext);
+        if (!NT_SUCCESS(status) && status != STATUS_INVALID_DEVICE_STATE)
+        {
+            // The synchronous USB transfer failed. Preserve the OID change
+            // and request one deferred retry instead of silently losing it.
+            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+                "T2Ncm: inline packet-filter update failed 0x%08X; deferring\n",
+                status));
+            InterlockedIncrement(&DeviceContext->PacketFilterUpdateGeneration);
+            T2NcmEnqueuePacketFilterWork(DeviceContext);
+        }
         return;
     }
 
@@ -754,7 +808,7 @@ T2NcmRequestPacketFilterUpdate(
         // Publish before enqueue: the callback checks this generation
         // again after each transfer and handles changes made while it ran.
         InterlockedIncrement(&DeviceContext->PacketFilterUpdateGeneration);
-        WdfWorkItemEnqueue(DeviceContext->PacketFilterWorkItem);
+        T2NcmEnqueuePacketFilterWork(DeviceContext);
         return;
     }
 

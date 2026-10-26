@@ -228,6 +228,7 @@ T2NcmDeviceCreate(
 
     KeInitializeEvent(&context->QuiesceEvent, NotificationEvent, FALSE);
     KeInitializeSpinLock(&context->MulticastLock);
+    KeInitializeSpinLock(&context->PacketFilterQueueLock);
     KeInitializeSpinLock(&context->TunnelPeerLock);
     KeInitializeMutex(&context->PacketFilterMutex, 0);
 
@@ -282,6 +283,8 @@ T2NcmDeviceCreate(
             return status;
         }
     }
+
+    InterlockedExchange(&context->PacketFilterWorkEnabled, 1);
 
     // Work item that runs the PASSIVE_LEVEL half of TX recovery (bulk-OUT
     // pipe reset) and of MiniportResetEx. Non-fatal if it cannot be

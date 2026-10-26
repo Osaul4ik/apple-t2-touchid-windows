@@ -178,30 +178,15 @@ VOID T2NcmTunnelNotePeerFromIpv6Frame(
     // real peer and every tunneled packet went to the wrong destination.
     if (newPeer[0] != 0xFE || (newPeer[1] & 0xC0) != 0x80)
         return;
-    wasValid = DeviceContext->TunnelPeerIpv6Valid;
-
-    // Log only on first learn or on an actual change (T2 re-addressed,
-    // e.g. after reboot) — this runs on every inbound IPv6 frame
-    // (including ND/ICMPv6 keepalives), so logging unconditionally here
-    // would be exactly the per-frame spam that was just removed from the
-    // TX/RX rewrite paths.
-    if (!wasValid || !RtlEqualMemory(DeviceContext->TunnelPeerIpv6, newPeer, 16)) {
-        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
-            "T2Ncm: tunnel peer %s: "
-            "%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x\n",
-            wasValid ? "changed to" : "learned",
-            newPeer[0], newPeer[1], newPeer[2], newPeer[3],
-            newPeer[4], newPeer[5], newPeer[6], newPeer[7],
-            newPeer[8], newPeer[9], newPeer[10], newPeer[11],
-            newPeer[12], newPeer[13], newPeer[14], newPeer[15]));
-        DeviceContext->TunnelTxPeerUnknownLogged = FALSE; // give the next outage its own log line
-    }
-
-    if (!wasValid || !RtlEqualMemory(DeviceContext->TunnelPeerIpv6, newPeer, 16)) {
+    {
         KIRQL irql;
         KeAcquireSpinLock(&DeviceContext->TunnelPeerLock, &irql);
-        RtlCopyMemory(DeviceContext->TunnelPeerIpv6, newPeer, 16);
-        DeviceContext->TunnelPeerIpv6Valid = TRUE;
+        wasValid = DeviceContext->TunnelPeerIpv6Valid;
+        if (!wasValid || !RtlEqualMemory(DeviceContext->TunnelPeerIpv6, newPeer, 16)) {
+            RtlCopyMemory(DeviceContext->TunnelPeerIpv6, newPeer, 16);
+            DeviceContext->TunnelPeerIpv6Valid = TRUE;
+            DeviceContext->TunnelTxPeerUnknownLogged = FALSE;
+        }
         KeReleaseSpinLock(&DeviceContext->TunnelPeerLock, irql);
     }
 }
@@ -240,8 +225,11 @@ VOID T2NcmTunnelNoteLocalFromIpv6Frame(
         // Only touch the shared field when the address actually changed: this
         // runs for every outbound IPv6 frame, and rewriting identical bytes
         // each time just dirties the cache line the TX/RX paths also read.
+        KIRQL localIrql;
+        KeAcquireSpinLock(&DeviceContext->TunnelPeerLock, &localIrql);
         RtlCopyMemory(DeviceContext->TunnelLocalIpv6, newLocal, 16);
         DeviceContext->TunnelLocalIpv6Valid = TRUE;
+        KeReleaseSpinLock(&DeviceContext->TunnelPeerLock, localIrql);
     }
 }
 
@@ -249,7 +237,10 @@ VOID T2NcmTunnelNoteLocalFromIpv4Frame(
     _In_ PT2NCM_DEVICE_CONTEXT DeviceContext,
     _In_reads_bytes_(4) const UCHAR* SrcIpv4)
 {
-    BOOLEAN wasValid = DeviceContext->TunnelLocalIpv4Valid;
+    BOOLEAN wasValid;
+    KIRQL localIrql;
+    KeAcquireSpinLock(&DeviceContext->TunnelPeerLock, &localIrql);
+    wasValid = DeviceContext->TunnelLocalIpv4Valid;
 
     if (!wasValid || !RtlEqualMemory(DeviceContext->TunnelLocalIpv4, SrcIpv4, 4)) {
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
@@ -261,6 +252,7 @@ VOID T2NcmTunnelNoteLocalFromIpv4Frame(
 
     RtlCopyMemory(DeviceContext->TunnelLocalIpv4, SrcIpv4, 4);
     DeviceContext->TunnelLocalIpv4Valid = TRUE;
+    KeReleaseSpinLock(&DeviceContext->TunnelPeerLock, localIrql);
 }
 
 BOOLEAN T2NcmTunnelRewriteTxIpv4ToIpv6(
@@ -361,8 +353,9 @@ BOOLEAN T2NcmTunnelRewriteTxIpv4ToIpv6(
         // Trust the IPv4 Total Length over the frame length: anything after
         // it is Ethernet padding and must not enter the IPv6 payload.
         ULONG totalLen = ((ULONG)Frame[14 + 2] << 8) | Frame[14 + 3];
-        if (totalLen >= ipHdrLen + 8 && 14 + totalLen <= fl)
-            payloadLen = totalLen - ipHdrLen;
+        if (totalLen < ipHdrLen + 8 || totalLen > fl - 14)
+            return FALSE;
+        payloadLen = totalLen - ipHdrLen;
     }
     newFl = 14 + 40 + payloadLen;
     if (newFl > BufferCapacity)
@@ -374,7 +367,14 @@ BOOLEAN T2NcmTunnelRewriteTxIpv4ToIpv6(
         RtlCopyMemory(dst6, DeviceContext->TunnelPeerIpv6, 16);
         KeReleaseSpinLock(&DeviceContext->TunnelPeerLock, peerIrql);
     }
-    if (DeviceContext->TunnelLocalIpv6Valid) {
+    {
+        KIRQL localIrql;
+        BOOLEAN localValid;
+        KeAcquireSpinLock(&DeviceContext->TunnelPeerLock, &localIrql);
+        localValid = DeviceContext->TunnelLocalIpv6Valid;
+        if (localValid) RtlCopyMemory(src6, DeviceContext->TunnelLocalIpv6, 16);
+        KeReleaseSpinLock(&DeviceContext->TunnelPeerLock, localIrql);
+    if (localValid) {
         // Real address Windows actually has bound to this adapter (learned
         // from a native outbound v6 frame). Modern Windows randomizes the
         // link-local interface identifier, so this is NOT the modified-
@@ -383,7 +383,6 @@ BOOLEAN T2NcmTunnelRewriteTxIpv4ToIpv6(
         // tunneled packet from an address Windows never actually owns, so
         // the T2's Neighbor Solicitation for it can never be answered and
         // no reply ever gets routed back (RX stays silent forever).
-        RtlCopyMemory(src6, DeviceContext->TunnelLocalIpv6, 16);
     } else if (DeviceContext->MacAddressValid) {
         // Haven't seen a native v6 frame yet (e.g. right after tunnel mode
         // was enabled) — fall back to the synthesized address so TX isn't
@@ -399,6 +398,7 @@ BOOLEAN T2NcmTunnelRewriteTxIpv4ToIpv6(
         T2NcmMacToLinkLocal(DeviceContext->PermanentMacAddress, src6);
     } else {
         RtlZeroMemory(src6, 16), src6[0] = 0xFE, src6[1] = 0x80;
+    }
     }
 
     // Move L4 payload to make room for IPv6 header (40 vs 20).
@@ -507,8 +507,11 @@ BOOLEAN T2NcmTunnelRewriteRxIpv6ToIpv4(
     payloadLen = T2NcmReadBe16(Frame + 14 + 4);
     if (nextHdr != T2NCM_IPPROTO_TCP && nextHdr != T2NCM_IPPROTO_UDP)
         return TRUE;
-    if (fl < 14ul + 40ul + (ULONG)payloadLen)
-        payloadLen = (USHORT)(fl - 14ul - 40ul);
+    if ((ULONG)payloadLen > fl - 14ul - 40ul)
+        return FALSE;
+    if ((nextHdr == T2NCM_IPPROTO_TCP && payloadLen < 20) ||
+        (nextHdr == T2NCM_IPPROTO_UDP && payloadLen < 8))
+        return FALSE;
 
     src6 = Frame + 14 + 8;
     // Map peer (src) to 169.254.x.y — same algorithm as userspace MapPeerToIpv4.
@@ -529,10 +532,15 @@ BOOLEAN T2NcmTunnelRewriteRxIpv6ToIpv4(
     // autoconfiguration does not pick a fixed address, so a hardcoded
     // 169.254.84.1 here only works if that exact address was statically
     // assigned. Fall back to it only until something real is learned.
-    if (DeviceContext->TunnelLocalIpv4Valid) {
-        RtlCopyMemory(dst4, DeviceContext->TunnelLocalIpv4, 4);
-    } else {
-        dst4[0] = 169; dst4[1] = 254; dst4[2] = 84; dst4[3] = 1;
+    {
+        KIRQL localIrql;
+        KeAcquireSpinLock(&DeviceContext->TunnelPeerLock, &localIrql);
+        if (DeviceContext->TunnelLocalIpv4Valid) {
+            RtlCopyMemory(dst4, DeviceContext->TunnelLocalIpv4, 4);
+        } else {
+            dst4[0] = 169; dst4[1] = 254; dst4[2] = 84; dst4[3] = 1;
+        }
+        KeReleaseSpinLock(&DeviceContext->TunnelPeerLock, localIrql);
     }
 
     newFl = 14 + 20 + payloadLen;
