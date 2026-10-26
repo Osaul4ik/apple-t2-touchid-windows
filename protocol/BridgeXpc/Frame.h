@@ -32,6 +32,11 @@ constexpr uint16_t kProtocolVersion = 1;
 // Linux reference would accept.
 constexpr uint64_t kMaxFrameBodyBytes = 16u * 1024u * 1024u; // 16 MiB
 
+// Enforce the same local limit on outgoing frames before allocating buffers.
+constexpr bool IsValidFrameBodySize(uint64_t bodyBytes) noexcept {
+    return bodyBytes <= kMaxFrameBodyBytes;
+}
+
 enum class FrameType : uint32_t {
     Helo = 1,
     Message = 2,

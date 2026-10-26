@@ -9,6 +9,7 @@
 #include "PlistPayload.h"
 #include <plist/plist.h>
 #include <cstdlib>
+#include <memory>
 
 namespace t2::bridgexpc {
 
@@ -23,12 +24,13 @@ std::vector<uint8_t> PlistToBinary(plist_t node) {
     char* data = nullptr;
     uint32_t length = 0;
     plist_to_bin(node, &data, &length);
+    // libplist owns this malloc buffer until it is copied. Keep it owned
+    // even if vector allocation throws while constructing the copy.
+    std::unique_ptr<char, decltype(&std::free)> dataGuard(data, &std::free);
     std::vector<uint8_t> out;
     if (data && length) {
-        out.assign(reinterpret_cast<uint8_t*>(data), reinterpret_cast<uint8_t*>(data) + length);
-    }
-    if (data) {
-        free(data);
+        out.assign(reinterpret_cast<const uint8_t*>(data),
+                   reinterpret_cast<const uint8_t*>(data) + length);
     }
     return out;
 }
@@ -81,8 +83,8 @@ std::optional<MessageEnvelope> ParseMessageBody(const std::vector<uint8_t>& bpli
     char* reqIdStr = nullptr;
     plist_get_string_val(requestIdNode, &reqIdStr);
     if (!reqIdStr) return std::nullopt;
+    std::unique_ptr<char, decltype(&std::free)> requestIdGuard(reqIdStr, &std::free);
     env.requestId = reqIdStr;
-    free(reqIdStr);
 
     // Re-encode the payload node as its own standalone bplist blob so
     // callers (BiometricKit) can decode it independently without this
@@ -120,9 +122,9 @@ std::vector<uint8_t> EncodeEnvelope(int64_t version, bool isReply,
     plist_array_append_item(root, plist_new_string(requestId.c_str()));
     plist_array_append_item(root, payload); // ownership transferred to root array
 
-    auto bytes = PlistToBinary(root);
-    plist_free(root); // frees payload too, since it is now root's child
-    return bytes;
+    // root owns payload after append. Guard both against serialization throws.
+    PlistGuard rootGuard{root};
+    return PlistToBinary(root);
 }
 
 } // namespace
@@ -176,11 +178,11 @@ std::optional<std::vector<uint8_t>> DecodeSingleBlobPayload(const std::vector<ui
     char* data = nullptr;
     uint64_t length = 0;
     plist_get_data_val(blobNode, &data, &length);
+    std::unique_ptr<char, decltype(&std::free)> dataGuard(data, &std::free);
     std::vector<uint8_t> out;
     if (data && length) {
         out.assign(reinterpret_cast<uint8_t*>(data), reinterpret_cast<uint8_t*>(data) + length);
     }
-    if (data) free(data);
     return out;
 }
 
@@ -217,8 +219,8 @@ std::optional<StatusBlobPayload> DecodeStatusBlobPayload(const std::vector<uint8
         // and must still fail closed.
         char* str = nullptr;
         plist_get_string_val(blobNode, &str);
+        std::unique_ptr<char, decltype(&std::free)> strGuard(str, &std::free);
         bool isNilSentinel = str && std::string(str) == kBiometricNilOutputSentinel;
-        if (str) free(str);
         if (!isNilSentinel) return std::nullopt;
         // out.blob stays empty - matches DecodeSingleBlobPayload's/this
         // struct's own convention that "no data" is an empty blob, not
@@ -230,10 +232,10 @@ std::optional<StatusBlobPayload> DecodeStatusBlobPayload(const std::vector<uint8
     char* data = nullptr;
     uint64_t length = 0;
     plist_get_data_val(blobNode, &data, &length);
+    std::unique_ptr<char, decltype(&std::free)> dataGuard(data, &std::free);
     if (data && length) {
         out.blob.assign(reinterpret_cast<uint8_t*>(data), reinterpret_cast<uint8_t*>(data) + length);
     }
-    if (data) free(data);
     return out;
 }
 
@@ -257,11 +259,11 @@ std::optional<std::vector<uint8_t>> DecodeStatusEventData(const std::vector<uint
     char* data = nullptr;
     uint64_t length = 0;
     plist_get_data_val(dataNode, &data, &length);
+    std::unique_ptr<char, decltype(&std::free)> dataGuard(data, &std::free);
     std::vector<uint8_t> out;
     if (data && length) {
         out.assign(reinterpret_cast<uint8_t*>(data), reinterpret_cast<uint8_t*>(data) + length);
     }
-    if (data) free(data);
     return out;
 }
 

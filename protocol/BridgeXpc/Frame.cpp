@@ -30,7 +30,7 @@ ParseResult ParseFrameHeader(const uint8_t* data, size_t len, FrameHeader* out) 
     if (version != kProtocolVersion) {
         return ParseResult::BadVersion;
     }
-    if (bodyLength > kMaxFrameBodyBytes) {
+    if (!IsValidFrameBodySize(bodyLength)) {
         return ParseResult::BodyTooLarge;
     }
     if (frameType != static_cast<uint32_t>(FrameType::Helo) &&

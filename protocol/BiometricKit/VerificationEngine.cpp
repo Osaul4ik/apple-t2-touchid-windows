@@ -2,6 +2,7 @@
 // VerificationEngine.cpp
 #include <optional>
 #include "VerificationEngine.h"
+#include <limits>
 #include "../BridgeXpc/PlistPayload.h"
 #include "../BridgeXpc/Log.h"
 #include <algorithm>
@@ -424,6 +425,10 @@ VerifyOutcome VerificationEngine::Verify(bridgexpc::Connection* conn,
         *rejectedByDevice = false;
         std::vector<std::vector<uint8_t>> discardedPayloads;
         const size_t discardedPreMatchEvents = conn->DiscardPendingEvents(&discardedPayloads);
+        if (discardedPreMatchEvents == (std::numeric_limits<size_t>::max)()) {
+            T2_LOG("verify", L"cannot discard pre-match events; aborting StartMatch");
+            return false;
+        }
         if (discardedPreMatchEvents > 0) {
             T2_LOG("verify",
                    L"discarded %zu pre-StartMatch event(s) accumulated since the last "

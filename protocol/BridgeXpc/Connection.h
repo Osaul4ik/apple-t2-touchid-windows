@@ -201,31 +201,34 @@ private:
                                 MessageEnvelope* outEnv,
                                 std::chrono::steady_clock::time_point deadline,
                                 const wchar_t* logTag);
+    // Fail closed on malformed envelopes or allocation failure during plist parsing.
+    std::optional<MessageEnvelope> ParseEnvelopeSafely(const std::vector<uint8_t>& body);
+    bool QueuePendingEvent(std::vector<uint8_t>&& payload);
     std::deque<std::vector<uint8_t>> pendingEvents_;
 
     // ---- I/O serialization (perf/robustness fix) ----
-    // The cancel path (Queue.cpp EvtCaptureCancel / suspend ->
-    // BestEffortCancelActiveMatch) sends cmd 0x0c on THIS connection from
-    // another thread while the capture worker is blocked in
-    // WaitForEvent()/recv(). Two threads doing send+recv on one stream
-    // socket interleave frames: the logs show ParseFrameHeader failures on
-    // a bplist body ("62706c6973743030...") and "torn frame" after every
-    // cancel, which kills the session and forces a full reconnect.
-    // ioMu_ makes each wire transaction atomic: SendBiometricCommand /
-    // GetFdrCalibration / Get/SetVersion hold it for the whole
-    // request+reply, WaitForEvent holds it for ONE poll slice at a time, so
-    // a cancel waits at most ~one slice (kCancelPollSlice) instead of
-    // racing. ioWaiters_ lets the worker yield between slices so the
-    // (non-fair) mutex cannot starve the cancel sender.
+    // Command/reply and event receive operations serialize on ioMu_.
+    // Round 44+ cancellation is worker-owned: WDF callbacks signal an event,
+    // and only the verification worker sends CancelMatch. Close() now takes
+    // ioMu_ too, so socket/buffer/queue teardown cannot race these operations.
+    // Connecting and object destruction still require an externally enforced
+    // lifetime/ownership contract; the mutex cannot prevent use-after-free.
     std::timed_mutex ioMu_;
+    // Stops new I/O ownership while Close waits for an in-flight operation.
+    std::atomic<bool> closing_{false};
     std::atomic<int> ioWaiters_{0};
     HANDLE ioWaiterEvent_ = nullptr; // auto-reset: wake an idle receiver for a competing I/O transaction
     class IoLock {
     public:
         IoLock(Connection& c, std::chrono::milliseconds wait, bool wakeReceiver = true) : c_(c) {
+            if (c_.closing_.load(std::memory_order_acquire)) return;
             c_.ioWaiters_.fetch_add(1, std::memory_order_acq_rel);
             if (wakeReceiver && c_.ioWaiterEvent_) SetEvent(c_.ioWaiterEvent_);
             owns_ = c_.ioMu_.try_lock_for(wait);
+            if (owns_ && c_.closing_.load(std::memory_order_acquire)) {
+                c_.ioMu_.unlock();
+                owns_ = false;
+            }
             c_.ioWaiters_.fetch_sub(1, std::memory_order_acq_rel);
         }
         ~IoLock() { if (owns_) c_.ioMu_.unlock(); }

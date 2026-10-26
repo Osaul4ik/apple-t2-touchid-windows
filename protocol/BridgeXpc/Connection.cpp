@@ -11,6 +11,8 @@
 #include <climits>
 #include <algorithm>
 #include <optional>
+#include <new>
+#include <limits>
 #pragma comment(lib, "Ws2_32.lib")
 #pragma comment(lib, "Rpcrt4.lib")
 
@@ -28,16 +30,41 @@ static std::string NewRequestUuid() {
         return {}; // caller must treat an empty id as a hard failure
     }
     RPC_CSTR str = nullptr;
+    // Own the RPC-allocated text on every path, including C++ exceptions.
+    struct RpcStringGuard {
+        RPC_CSTR* value;
+        ~RpcStringGuard() { if (*value) RpcStringFreeA(value); }
+    } guard{&str};
     if (UuidToStringA(&uuid, &str) != RPC_S_OK || !str) {
         T2_LOG("uuid", L"UuidToStringA failed");
         return {};
     }
-    std::string result(reinterpret_cast<char*>(str));
-    RpcStringFreeA(&str);
+    std::string result;
+    try {
+        result.assign(reinterpret_cast<const char*>(str));
+    } catch (const std::bad_alloc&) {
+        WSASetLastError(WSAENOBUFS);
+        return {};
+    }
     for (auto& c : result) {
         c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
     }
     return result;
+}
+
+// Serialize an envelope before touching the TCP stream. Allocation failure
+// leaves the existing connection usable: no frame bytes were submitted.
+template <typename Encoder>
+static bool TryEncodeOutbound(Encoder&& encoder, std::vector<uint8_t>* output) {
+    try {
+        *output = encoder();
+        if (!output->empty()) return true;
+        WSASetLastError(WSAENOBUFS);
+        return false;
+    } catch (const std::bad_alloc&) {
+        WSASetLastError(WSAENOBUFS);
+        return false;
+    }
 }
 
 Connection::Connection() {
@@ -50,6 +77,24 @@ Connection::~Connection() {
 }
 
 void Connection::Close() {
+    // Serialize teardown against frame reads, ACKs, and command/reply I/O.
+    // Wake an idle FD_READ receiver before taking the lock; its next step
+    // releases ioMu_ without touching a socket that has already been closed.
+    // The object must still outlive every caller of its methods.
+    closing_.store(true, std::memory_order_release);
+    if (ioWaiterEvent_) SetEvent(ioWaiterEvent_);
+    // A close must not race a reader or release its receive buffers while
+    // the reader still owns them. Keep waiting rather than force-closing,
+    // but report lock starvation so a capture stall has an identifiable cause.
+    std::unique_lock<std::timed_mutex> closeLock(ioMu_, std::defer_lock);
+    const auto closeWaitStart = std::chrono::steady_clock::now();
+    while (!closeLock.try_lock_for(std::chrono::seconds(2))) {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - closeWaitStart).count();
+        T2_LOG("connect", L"Close waiting for ioMu_, elapsed=%lld ms waiters=%d",
+               static_cast<long long>(elapsed), ioWaiters_.load(std::memory_order_relaxed));
+        if (ioWaiterEvent_) SetEvent(ioWaiterEvent_);
+    }
     if (socket_ != INVALID_SOCKET) {
         T2_LOG("connect", L"disconnect: closesocket (socket was open, pendingEvents=%zu)",
                pendingEvents_.size());
@@ -242,6 +287,29 @@ ConnectResult Connection::ConnectOnce(bool tunnel, const in6_addr& linkLocalAddr
                                       bool* outTcpFailed, ULONGLONG* outTcpMs,
                                       t2::transport::PathEvidence* outEvidence,
                                       const std::chrono::steady_clock::time_point* overallDeadline) {
+    // Serialize socket creation, handshake, and failed-attempt cleanup with Close().
+    // Close() is terminal for this Connection instance; a transport fallback must
+    // never clear closing_ and inadvertently resurrect a closing connection.
+    const auto admissionStart = std::chrono::steady_clock::now();
+    if (closing_.load(std::memory_order_acquire))
+        return ConnectResult::ConnectFailed;
+    std::unique_lock<std::timed_mutex> connectLock(ioMu_, std::defer_lock);
+    if (tcpTimeout.count() <= 0 || !connectLock.try_lock_for(tcpTimeout) ||
+        closing_.load(std::memory_order_acquire))
+        return ConnectResult::ConnectFailed;
+
+    // Called only while connectLock owns ioMu_. Never use Close() here: that
+    // function takes ioMu_ itself and makes closing_ terminal. TCP fallback
+    // must keep the instance open for the second transport attempt.
+    auto discardFailedAttempt = [this]() {
+        if (socket_ != INVALID_SOCKET) {
+            closesocket(socket_);
+            socket_ = INVALID_SOCKET;
+        }
+        ResetRx();
+        pendingEvents_.clear();
+        rcvTimeoutMs_ = 0;
+    };
     *outTcpFailed = false;
     *outTcpMs = 0;
     t2::transport::PathEvidence evidenceLocal = t2::transport::PathEvidence::Silent;
@@ -253,7 +321,7 @@ ConnectResult Connection::ConnectOnce(bool tunnel, const in6_addr& linkLocalAddr
 
     // Bound TCP plus tunnel preparation by the caller's overall deadline.
     const auto tcpStartTime = std::chrono::steady_clock::now();
-    auto tcpDeadline = tcpStartTime + tcpTimeout;
+    auto tcpDeadline = admissionStart + tcpTimeout;
     if (overallDeadline && *overallDeadline < tcpDeadline) tcpDeadline = *overallDeadline;
     if (tcpDeadline <= tcpStartTime) return ConnectResult::ConnectFailed;
     const ULONGLONG tcpStart = GetTickCount64();
@@ -304,7 +372,7 @@ ConnectResult Connection::ConnectOnce(bool tunnel, const in6_addr& linkLocalAddr
                                 RemainingBudget(tcpDeadline), &wsa)) {
             T2_LOG("connect", L"connect(AF_INET) failed WSA=%d (%llu ms)", wsa,
                    static_cast<unsigned long long>(GetTickCount64() - tcpStart));
-            Close();
+            discardFailedAttempt();
             evidence = t2::transport::ClassifyWsaError(wsa);
             if (wsa == WSAECONNREFUSED) {
                 // RST from the T2 (rewritten back by T2Ncm.sys): the tunnel path
@@ -336,7 +404,7 @@ ConnectResult Connection::ConnectOnce(bool tunnel, const in6_addr& linkLocalAddr
                                 RemainingBudget(tcpDeadline), &wsa)) {
             T2_LOG("connect", L"connect(AF_INET6) failed WSA=%d (%llu ms)", wsa,
                    static_cast<unsigned long long>(GetTickCount64() - tcpStart));
-            Close();
+            discardFailedAttempt();
             evidence = t2::transport::ClassifyWsaError(wsa);
             if (wsa == WSAECONNREFUSED) {
                 // RST from the T2: the SYN got there and back, so native IPv6
@@ -358,7 +426,7 @@ ConnectResult Connection::ConnectOnce(bool tunnel, const in6_addr& linkLocalAddr
     if (overallDeadline) {
         heloTimeout = (std::min)(heloTimeout, RemainingBudget(*overallDeadline));
         if (heloTimeout.count() <= 0) {
-            Close();
+            discardFailedAttempt();
             return ConnectResult::HeloTimeout;
         }
     }
@@ -366,7 +434,7 @@ ConnectResult Connection::ConnectOnce(bool tunnel, const in6_addr& linkLocalAddr
         !SetSocketTimeout(socket_, SO_SNDTIMEO, heloTimeout)) {
         T2_LOG("connect", L"unable to configure bounded HELO socket I/O (WSA=%d)",
                WSAGetLastError());
-        Close();
+        discardFailedAttempt();
         return ConnectResult::ConnectFailed;
     }
     ResetRx();   // new stream: no buffered bytes
@@ -382,7 +450,7 @@ ConnectResult Connection::ConnectOnce(bool tunnel, const in6_addr& linkLocalAddr
         T2_LOG("connect", L"HELO read failed or wrong frame type "
                "(connected=true, timeout=%lldms)", static_cast<long long>(heloTimeout.count()));
         if (tunnel) t2::transport::InvalidateTunnelPrepCache();
-        Close();
+        discardFailedAttempt();
         return ConnectResult::HeloTimeout;
     }
     T2_LOG("connect", L"peer HELO received, %zu bytes: %s",
@@ -395,15 +463,23 @@ ConnectResult Connection::ConnectOnce(bool tunnel, const in6_addr& linkLocalAddr
     if (!ExtractJsonIntField(peerHeloJson, "BridgeXPCVersion", &bridgeXpcVersion)) {
         T2_LOG("connect", L"BridgeXPCVersion missing/unparseable in peer HELO: %s",
                Widen(peerHeloJson).c_str());
-        Close();
+        discardFailedAttempt();
         return ConnectResult::HeloMalformed;
     }
     std::vector<uint8_t> ownHelo = BuildClientHeloBody(bridgeXpcVersion);
     if (std::chrono::steady_clock::now() >= heloDeadline ||
         !WriteFrame(FrameType::Helo, ownHelo, RemainingBudget(heloDeadline))) {
         T2_LOG("connect", L"writing own HELO failed, WSAGetLastError=%d", WSAGetLastError());
-        Close();
+        discardFailedAttempt();
         return ConnectResult::HeloMalformed;
+    }
+    // Close() sets closing_ before taking ioMu_. It may have been requested
+    // while this handshake held the lock: do not publish an established
+    // connection after a terminal shutdown request.
+    if (closing_.load(std::memory_order_acquire)) {
+        T2_LOG("connect", L"HELO finished after Close request; discarding socket");
+        discardFailedAttempt();
+        return ConnectResult::ConnectFailed;
     }
     T2_LOG("connect", L"handshake OK, BridgeXPCVersion=%lld", static_cast<long long>(bridgeXpcVersion));
     return ConnectResult::Ok;
@@ -535,6 +611,52 @@ static std::chrono::milliseconds RemainingBudget(std::chrono::steady_clock::time
     return ms.count() ? ms : std::chrono::milliseconds(1);
 }
 
+// Bound events retained while a synchronous reply is pending. Each event has
+// already been ACKed, so overflow must fail this connection rather than drop
+// one silently and continue with an incomplete match-event stream.
+bool Connection::QueuePendingEvent(std::vector<uint8_t>&& payload) {
+    constexpr size_t kMaxQueuedEvents = 64;
+    constexpr size_t kMaxQueuedPayloadBytes = 16u * 1024u * 1024u;
+    size_t queuedBytes = 0;
+    for (const auto& item : pendingEvents_) {
+        // No overflow: every earlier insert was constrained by the same cap.
+        queuedBytes += item.size();
+    }
+    if (pendingEvents_.size() >= kMaxQueuedEvents ||
+        payload.size() > kMaxQueuedPayloadBytes - queuedBytes) {
+        T2_LOG("eventQueue", L"pending event budget exceeded (count=%zu bytes=%zu incoming=%zu)",
+               pendingEvents_.size(), queuedBytes, payload.size());
+        connectionLost_.store(true, std::memory_order_release);
+        WSASetLastError(WSAENOBUFS);
+        return false;
+    }
+    try {
+        pendingEvents_.push_back(std::move(payload));
+    } catch (const std::bad_alloc&) {
+        connectionLost_.store(true, std::memory_order_release);
+        WSASetLastError(WSAENOBUFS);
+        return false;
+    }
+    return true;
+}
+
+std::optional<MessageEnvelope> Connection::ParseEnvelopeSafely(const std::vector<uint8_t>& body) {
+    try {
+        auto envelope = ParseMessageBody(body);
+        if (!envelope) {
+            // A consumed but undecodable frame cannot be used as a valid reply/event.
+            connectionLost_.store(true, std::memory_order_release);
+        }
+        return envelope;
+    } catch (const std::bad_alloc&) {
+        // Parsing allocates strings and serializes the embedded payload.
+        // Never allow allocation exceptions to escape the transport operation.
+        connectionLost_.store(true, std::memory_order_release);
+        WSASetLastError(WSAENOBUFS);
+        return std::nullopt;
+    }
+}
+
 bool Connection::ReadUntilMatchingReply(const std::string& expectedReqId,
                                         MessageEnvelope* outEnv,
                                         std::chrono::steady_clock::time_point deadline,
@@ -558,7 +680,7 @@ bool Connection::ReadUntilMatchingReply(const std::string& expectedReqId,
             continue;
         }
 
-        auto env = ParseMessageBody(frame.body);
+        auto env = ParseEnvelopeSafely(frame.body);
         if (!env) {
             ::t2::log::Logf(logTag, L"ParseMessageBody failed, body=%zuB %s",
                    frame.body.size(), HexDump(frame.body).c_str());
@@ -575,7 +697,7 @@ bool Connection::ReadUntilMatchingReply(const std::string& expectedReqId,
                        Widen(env->requestId).c_str());
                 return false;
             }
-            pendingEvents_.push_back(std::move(env->payloadPlist));
+            if (!QueuePendingEvent(std::move(env->payloadPlist))) return false;
             continue;
         }
 
@@ -605,7 +727,8 @@ bool Connection::GetBridgeVersion(int64_t* outVersion, std::chrono::milliseconds
     }
     std::string reqId = NewRequestUuid();
     if (reqId.empty()) return false;
-    auto req = EncodeRequestEnvelope(reqId, {0});
+    std::vector<uint8_t> req;
+    if (!TryEncodeOutbound([&] { return EncodeRequestEnvelope(reqId, {0}); }, &req)) return false;
     if (!WriteFrame(FrameType::Message, req, RemainingBudget(operationDeadline))) {
         T2_LOG("getBridgeVersion", L"WriteFrame failed, WSAGetLastError=%d", WSAGetLastError());
         return false;
@@ -646,7 +769,8 @@ bool Connection::SetClientVersion(int64_t version, std::chrono::milliseconds tim
     }
     std::string reqId = NewRequestUuid();
     if (reqId.empty()) return false;
-    auto req = EncodeRequestEnvelope(reqId, {10, version});
+    std::vector<uint8_t> req;
+    if (!TryEncodeOutbound([&] { return EncodeRequestEnvelope(reqId, {10, version}); }, &req)) return false;
     if (!WriteFrame(FrameType::Message, req, RemainingBudget(operationDeadline))) {
         T2_LOG("setClientVersion", L"WriteFrame failed, WSAGetLastError=%d", WSAGetLastError());
         return false;
@@ -685,8 +809,11 @@ bool Connection::SendBiometricCommand(const std::vector<uint8_t>& innerBmMessage
     // [3, 0, innerBmBytes, outputCapacity] — outputCapacity is a real,
     // load-bearing field (it tells bkremoted how large a reply buffer to
     // fill), not a value the caller can silently drop.
-    auto req = EncodeRequestEnvelope(reqId, {3, 0}, &innerBmMessage,
-                                      {static_cast<int64_t>(outputCapacity)});
+    std::vector<uint8_t> req;
+    if (!TryEncodeOutbound([&] {
+        return EncodeRequestEnvelope(reqId, {3, 0}, &innerBmMessage,
+                                     {static_cast<int64_t>(outputCapacity)});
+    }, &req)) return false;
     T2_LOG("sendBiometricCommand",
            L"-> reqId=%s inner=%zuB (%s) outputCapacity=%u timeout=%lldms",
            Widen(reqId).c_str(), innerBmMessage.size(),
@@ -736,7 +863,7 @@ bool Connection::SendBiometricCommand(const std::vector<uint8_t>& innerBmMessage
             continue;
         }
 
-        auto env = ParseMessageBody(reply.body);
+        auto env = ParseEnvelopeSafely(reply.body);
         if (!env) {
             T2_LOG("sendBiometricCommand", L"ParseMessageBody failed (reqId=%s), "
                    "body=%zuB %s", Widen(reqId).c_str(), reply.body.size(),
@@ -773,7 +900,7 @@ bool Connection::SendBiometricCommand(const std::vector<uint8_t>& innerBmMessage
             // Retain in pendingEvents_ (already acked, per protocol) so
             // WaitForEvent() can still deliver it to the match-session
             // loop in receipt order.
-            pendingEvents_.push_back(std::move(env->payloadPlist));
+            if (!QueuePendingEvent(std::move(env->payloadPlist))) return false;
             continue;
         }
 
@@ -847,7 +974,8 @@ bool Connection::GetFdrCalibration(std::vector<uint8_t>* outBlob, std::chrono::m
     }
     std::string reqId = NewRequestUuid();
     if (reqId.empty()) return false;
-    auto req = EncodeRequestEnvelope(reqId, {11});
+    std::vector<uint8_t> req;
+    if (!TryEncodeOutbound([&] { return EncodeRequestEnvelope(reqId, {11}); }, &req)) return false;
     if (!WriteFrame(FrameType::Message, req, RemainingBudget(operationDeadline))) {
         T2_LOG("getFdrCalibration", L"WriteFrame failed, WSAGetLastError=%d", WSAGetLastError());
         return false;
@@ -884,7 +1012,7 @@ bool Connection::GetFdrCalibration(std::vector<uint8_t>* outBlob, std::chrono::m
             continue;
         }
 
-        auto env = ParseMessageBody(reply.body);
+        auto env = ParseEnvelopeSafely(reply.body);
         if (!env) {
             T2_LOG("getFdrCalibration", L"ParseMessageBody failed, body=%zuB %s",
                    reply.body.size(), HexDump(reply.body).c_str());
@@ -909,7 +1037,7 @@ bool Connection::GetFdrCalibration(std::vector<uint8_t>* outBlob, std::chrono::m
             // session (see VerificationEngine::Verify), so any event lost
             // here is lost before the match-session event loop even
             // starts. Retain (already acked) for WaitForEvent() to drain.
-            pendingEvents_.push_back(std::move(env->payloadPlist));
+            if (!QueuePendingEvent(std::move(env->payloadPlist))) return false;
             continue;
         }
 
@@ -938,19 +1066,29 @@ bool Connection::GetFdrCalibration(std::vector<uint8_t>* outBlob, std::chrono::m
 }
 
 size_t Connection::DiscardPendingEvents(std::vector<std::vector<uint8_t>>* outDiscardedPayloads) {
+    // SIZE_MAX is a fail-closed sentinel: the caller must not start a new
+    // match when stale events could not be removed or handed off.
+    constexpr size_t kFailure = (std::numeric_limits<size_t>::max)();
     IoLock ioLock(*this, std::chrono::milliseconds(500));
-    const size_t n = pendingEvents_.size();
-    if (n > 0) {
-        T2_LOG("discardPending",
-               L"dropping %zu pre-match event(s) retained during "
-               L"LoadCalibration/identity warm-up (Linux keeps these "
-               L"out of the match event stream)",
-               n);
-        if (outDiscardedPayloads) {
-            outDiscardedPayloads->assign(pendingEvents_.begin(), pendingEvents_.end());
-        }
-        pendingEvents_.clear();
+    if (!ioLock.owns()) {
+        T2_LOG("discardPending", L"could not acquire I/O lock; pending events retained");
+        return kFailure;
     }
+    const size_t n = pendingEvents_.size();
+    if (n == 0) return 0;
+    if (outDiscardedPayloads) {
+        // Copy before clearing so allocation failure preserves the originals.
+        // Unlike a partial move, vector::assign leaves pendingEvents_ intact.
+        try {
+            outDiscardedPayloads->assign(pendingEvents_.begin(), pendingEvents_.end());
+        } catch (const std::bad_alloc&) {
+            T2_LOG("discardPending", L"allocation failure; pending events retained");
+            WSASetLastError(WSAENOBUFS);
+            return kFailure;
+        }
+    }
+    T2_LOG("discardPending", L"dropping %zu pre-match event(s)", n);
+    pendingEvents_.clear();
     return n;
 }
 
@@ -977,10 +1115,13 @@ public:
     bool Disarm() {
         if (!armed_) return false;
         armed_ = false;
-        const int stop = WSAEventSelect(socket_, nullptr, 0);
+        // WSAEventSelect itself forces nonblocking. Microsoft requires the
+        // event selection to be detached successfully BEFORE FIONBIO=0.
+        // If detachment fails, do not attempt an illegal blocking transition;
+        // the caller marks this connection unusable and closes it.
+        if (WSAEventSelect(socket_, nullptr, 0) == SOCKET_ERROR) return false;
         u_long blocking = 0;
-        const int restore = ioctlsocket(socket_, FIONBIO, &blocking);
-        return stop != SOCKET_ERROR && restore != SOCKET_ERROR;
+        return ioctlsocket(socket_, FIONBIO, &blocking) == 0;
     }
     bool NetworkEvents(WSANETWORKEVENTS* events) {
         return WSAEnumNetworkEvents(socket_, event_, events) != SOCKET_ERROR;
@@ -997,9 +1138,25 @@ Connection::WaitStep Connection::WaitForEventStep(std::vector<uint8_t>* outEvent
                                                    HANDLE cancelEvent) {
     {
         // Give waiting commands priority before entering another receive.
+        // Do not spend another kIoLockWait slice on a capture that is already
+        // cancelled or out of time. This also bounds lock acquisition by the
+        // caller's *remaining* deadline instead of always waiting 100 ms.
+        if (closing_.load(std::memory_order_acquire)) return WaitStep::Fail;
+        if (cancelEvent && Connection::IsEventSignaled(cancelEvent)) return WaitStep::Fail;
+        const auto beforeLock = std::chrono::steady_clock::now();
+        if (beforeLock >= deadline) return WaitStep::Fail;
         if (ioWaiters_.load(std::memory_order_acquire) > 0) Sleep(1);
-        IoLock ioLock(*this, kIoLockWait, /*wakeReceiver=*/false);
-        if (!ioLock.owns()) return WaitStep::Again;
+        const auto lockBudget = (std::min)(kIoLockWait, RemainingBudget(deadline));
+        if (lockBudget.count() <= 0) return WaitStep::Fail;
+        IoLock ioLock(*this, lockBudget, /*wakeReceiver=*/false);
+        if (!ioLock.owns()) {
+            if (closing_.load(std::memory_order_acquire)) return WaitStep::Fail;
+            if (cancelEvent && Connection::IsEventSignaled(cancelEvent)) return WaitStep::Fail;
+            return std::chrono::steady_clock::now() >= deadline ? WaitStep::Fail : WaitStep::Again;
+        }
+        // Close may set closing_ while IoLock is waiting (or immediately
+        // after acquisition). Do not deliver a queued event during teardown.
+        if (closing_.load(std::memory_order_acquire)) return WaitStep::Fail;
         // Checked at the TOP of every iteration — including before the
         // very first ReadFrame — so a cancel that arrives while this
         // socket's previous recv() was already unblocked by a real SEP
@@ -1020,6 +1177,7 @@ Connection::WaitStep Connection::WaitForEventStep(std::vector<uint8_t>* outEvent
         // below - a StartMatch reply race should not let its own
         // already-acked events be silently timed out by the caller.
         if (!pendingEvents_.empty()) {
+            if (closing_.load(std::memory_order_acquire)) return WaitStep::Fail;
             *outEventPayload = std::move(pendingEvents_.front());
             pendingEvents_.pop_front();
             T2_LOG("waitForEvent", L"delivering queued event, payload=%zuB, "
@@ -1124,7 +1282,7 @@ Connection::WaitStep Connection::WaitForEventStep(std::vector<uint8_t>* outEvent
         }
         if (frame.type != FrameType::Message) return WaitStep::Again; // ignore stray HELO-typed noise, keep waiting
 
-        auto env = ParseMessageBody(frame.body);
+        auto env = ParseEnvelopeSafely(frame.body);
         if (!env) {
             T2_LOG("waitForEvent", L"ParseMessageBody failed, body=%zuB %s",
                    frame.body.size(), HexDump(frame.body).c_str());
@@ -1132,6 +1290,9 @@ Connection::WaitStep Connection::WaitForEventStep(std::vector<uint8_t>* outEvent
         }
 
         if (!env->isReply) {
+            // Close can be requested after ReadFrame and parsing. Never start
+            // a fresh ACK once the connection is being torn down.
+            if (closing_.load(std::memory_order_acquire)) return WaitStep::Fail;
             // Async bridge-side callback: must be acknowledged (Milestone 1,
             // section 7) before we can keep reading.
             if (!AcknowledgeEvent(env->requestId, RemainingBudget(deadline))) {
@@ -1183,7 +1344,8 @@ bool Connection::AcknowledgeEvent(const std::string& requestId,
         WSASetLastError(WSAETIMEDOUT);
         return false;
     }
-    auto ack = EncodeAckEnvelope(requestId);
+    std::vector<uint8_t> ack;
+    if (!TryEncodeOutbound([&] { return EncodeAckEnvelope(requestId); }, &ack)) return false;
     return WriteFrame(FrameType::Message, ack, budget);
 }
 
@@ -1195,6 +1357,8 @@ bool Connection::AcknowledgeEvent(const std::string& requestId,
 // bytes already read and left the stream desynchronized (the next call then
 // parsed body bytes as a frame header).
 static constexpr std::chrono::milliseconds kFrameTailTimeout{3000};
+// Bound a blocking recv() so Close() can be observed without cross-thread closesocket.
+static constexpr std::chrono::milliseconds kBlockingReadPollSlice{100};
 
 bool Connection::SetRcvTimeoutCached(std::chrono::milliseconds timeout) {
     // Never issue recv() with a missing, disabled or stale timeout.
@@ -1228,6 +1392,11 @@ bool Connection::ReadFrame(RawFrame* out, std::chrono::milliseconds timeout,
                             ReadFailure* why, bool quietIdleTimeout, HANDLE cancelEvent,
                             HANDLE prearmedReadEvent) {
     if (why) *why = ReadFailure::None;
+    if (closing_.load(std::memory_order_acquire) ||
+        connectionLost_.load(std::memory_order_acquire)) {
+        if (why) *why = ReadFailure::Error;
+        return false;
+    }
 
     // During a match, keep the entire frame under the same ioMu_ owner.
     // WSAEventSelect switches the socket to nonblocking; recv() now drains
@@ -1259,6 +1428,11 @@ bool Connection::ReadFrame(RawFrame* out, std::chrono::milliseconds timeout,
     // else - reset, EOF, or a frame torn mid-way - fails closed.
     auto fill = [&](size_t need) -> bool {
         while (rxLen_ - rxPos_ < need) {
+            if (closing_.load(std::memory_order_acquire)) {
+                if (why) *why = ReadFailure::Error;
+                WSASetLastError(WSAENOTCONN);
+                return false;
+            }
             if (rxPos_ != 0) {   // keep the unread tail at the front
                 if (rxPos_ == rxLen_) {
                     rxPos_ = rxLen_ = 0;
@@ -1269,7 +1443,20 @@ bool Connection::ReadFrame(RawFrame* out, std::chrono::milliseconds timeout,
                 }
             }
             const size_t want = need > kRxChunkBytes ? need : kRxChunkBytes;
-            if (rxBuf_.size() < want) rxBuf_.resize(want);
+            if (rxBuf_.size() < want) {
+                try {
+                    rxBuf_.resize(want);
+                } catch (const std::bad_alloc&) {
+                    // A partially buffered frame cannot be resumed after a
+                    // failed allocation. Fail closed instead of escaping via
+                    // an exception from the transport layer.
+                    connectionLost_.store(true, std::memory_order_release);
+                    if (why) *why = ReadFailure::Error;
+                    WSASetLastError(WSAENOBUFS);
+                    T2_LOG("readFrame", L"receive buffer allocation failed (%zu bytes)", want);
+                    return false;
+                }
+            }
 
             // Keep the first-byte idle poll short, but cap ALL subsequent
             // reads by one shared frame-tail deadline (not 3 seconds each).
@@ -1287,9 +1474,23 @@ bool Connection::ReadFrame(RawFrame* out, std::chrono::milliseconds timeout,
                 // positive sub-millisecond remainder to 1 ms.
                 recvTimeout = remaining.count() > 0 ? remaining : std::chrono::milliseconds(1);
             }
-            if (!cancelEvent && !SetRcvTimeoutCached(recvTimeout)) {
-                if (why) *why = ReadFailure::Error;
-                return false;
+            if (!cancelEvent) {
+                const auto now = std::chrono::steady_clock::now();
+                const auto deadline = midFrame ? tailDeadline : firstDeadline;
+                if (now >= deadline) {
+                    if (why) *why = midFrame ? ReadFailure::Error : ReadFailure::IdleTimeout;
+                    WSASetLastError(WSAETIMEDOUT);
+                    return false;
+                }
+                // Never block in recv() for the whole caller deadline: Close()
+                // sets closing_ from another thread and waits for ioMu_.
+                const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+                recvTimeout = (std::min)(kBlockingReadPollSlice,
+                    (std::max)(left, std::chrono::milliseconds(1)));
+                if (!SetRcvTimeoutCached(recvTimeout)) {
+                    if (why) *why = ReadFailure::Error;
+                    return false;
+                }
             }
             if (cancelEvent && IsEventSignaled(cancelEvent)) {
                 if (why) *why = ReadFailure::Error;
@@ -1303,7 +1504,10 @@ bool Connection::ReadFrame(RawFrame* out, std::chrono::milliseconds timeout,
                 const int wsaErr = (n < 0) ? WSAGetLastError() : 0;
                 if (cancelEvent && n < 0 && wsaErr == WSAEWOULDBLOCK) {
                     const auto now = std::chrono::steady_clock::now();
-                    const auto deadline = midFrame ? (std::min)(tailDeadline, firstDeadline) : firstDeadline;
+                    // Once any bytes of this frame have arrived, use the frame-tail
+                    // deadline, not the earlier first-byte/idle deadline.  A
+                    // late first byte must not truncate a valid frame tail.
+                    const auto deadline = midFrame ? tailDeadline : firstDeadline;
                     if (now >= deadline) {
                         if (why) *why = midFrame ? ReadFailure::Error : ReadFailure::IdleTimeout;
                         return false;
@@ -1341,6 +1545,15 @@ bool Connection::ReadFrame(RawFrame* out, std::chrono::milliseconds timeout,
                 }
                 const bool timedOut = (n < 0) && (wsaErr == WSAETIMEDOUT || wsaErr == WSAEWOULDBLOCK);
                 const size_t have = rxLen_ - rxPos_;
+                if (timedOut && !cancelEvent) {
+                    // A slice timeout does not consume the overall budget.
+                    // Re-evaluate the first-byte or frame-tail deadline and
+                    // closing_ before another blocking recv().
+                    if (std::chrono::steady_clock::now() <
+                        (midFrame ? tailDeadline : firstDeadline)) {
+                        continue;
+                    }
+                }
                 if (timedOut && !midFrame) {
                     // Nothing of a new frame arrived: the stream is still in sync.
                     if (why) *why = ReadFailure::IdleTimeout;
@@ -1373,7 +1586,23 @@ bool Connection::ReadFrame(RawFrame* out, std::chrono::milliseconds timeout,
         return true;
     };
 
-    if (!fill(kRxFrameHeaderBytes)) return false;
+    if (!fill(kRxFrameHeaderBytes)) {
+        // An idle timeout with no bytes is recoverable. Once a frame has
+        // started, any failed read leaves the stream state ambiguous; never
+        // offer these buffered bytes to a later BridgeXPC operation.
+        if (rxLen_ != rxPos_) {
+            connectionLost_.store(true, std::memory_order_release);
+            if (why && *why == ReadFailure::IdleTimeout) *why = ReadFailure::Error;
+            T2_LOG("readFrame", L"partial frame header abandoned; connection unusable");
+        } else if (!why || *why != ReadFailure::IdleTimeout) {
+            // EOF/reset/socket failure at a frame boundary is NOT an idle poll.
+            // Even with zero buffered bytes, this stream cannot carry another
+            // BridgeXPC frame. Only a genuine first-byte timeout is retryable.
+            connectionLost_.store(true, std::memory_order_release);
+            T2_LOG("readFrame", L"header read failed at frame boundary; connection unusable");
+        }
+        return false;
+    }
 
     ParseResult pr = ParseFrameHeader(rxBuf_.data() + rxPos_, kRxFrameHeaderBytes, &hdr);
     if (pr != ParseResult::Ok) {
@@ -1381,24 +1610,45 @@ bool Connection::ReadFrame(RawFrame* out, std::chrono::milliseconds timeout,
                static_cast<int>(pr),
                HexDump(rxBuf_.data() + rxPos_, kRxFrameHeaderBytes, kRxFrameHeaderBytes).c_str());
         rxPos_ = rxLen_ = 0;   // stream is desynchronized; nothing buffered can be trusted
+        connectionLost_.store(true, std::memory_order_release);
         if (why) *why = ReadFailure::Error;
         return false;
     }
     haveHeader = true;
 
     const size_t bodyLen = static_cast<size_t>(hdr.bodyLength);
-    if (!fill(kRxFrameHeaderBytes + bodyLen)) return false;
+    if (!fill(kRxFrameHeaderBytes + bodyLen)) {
+        // The header was already accepted. Even if the peer delivered no
+        // additional body bytes, retrying on this socket would resume in
+        // the middle of a frame, not at the next frame boundary.
+        connectionLost_.store(true);
+        if (why && *why == ReadFailure::IdleTimeout) *why = ReadFailure::Error;
+        T2_LOG("readFrame", L"incomplete frame body abandoned; connection unusable");
+        return false;
+    }
 
     const uint8_t* body = rxBuf_.data() + rxPos_ + kRxFrameHeaderBytes;
-    out->body.assign(body, body + bodyLen);
+    try {
+        out->body.assign(body, body + bodyLen);
+    } catch (const std::bad_alloc&) {
+        // The decoded frame cannot be delivered. Do not reuse this stream:
+        // another request could otherwise consume the same frame again.
+        connectionLost_.store(true, std::memory_order_release);
+        if (why) *why = ReadFailure::Error;
+        WSASetLastError(WSAENOBUFS);
+        T2_LOG("readFrame", L"frame body allocation failed (%zu bytes)", bodyLen);
+        return false;
+    }
     out->type = static_cast<FrameType>(hdr.frameType);
 
     rxPos_ += kRxFrameHeaderBytes + bodyLen;
     if (rxPos_ == rxLen_) {
         rxPos_ = rxLen_ = 0;
         if (rxBuf_.size() > kRxKeepBytes) {   // a huge frame grew the buffer: release it
-            rxBuf_.clear();
-            rxBuf_.shrink_to_fit();
+            // Release the large receive buffer without allocating. Unlike
+            // shrink_to_fit(), swapping with an empty vector cannot throw
+            // for this std::vector<uint8_t> with its default allocator.
+            std::vector<uint8_t>().swap(rxBuf_);
         }
     }
     if (eventReader && !eventReader->Disarm()) {
@@ -1421,69 +1671,133 @@ bool Connection::ReadFrame(RawFrame* out, std::chrono::milliseconds timeout,
 // Bound the ENTIRE frame write, not each short send(). A peer that only
 // accepts a few bytes per timeout must not keep the capture worker alive forever.
 static constexpr std::chrono::milliseconds kFrameWriteTimeout{10000};
+// Write the entire frame with a single monotonic deadline.  The socket is
+// exclusively owned by the caller (ioMu_) for the whole operation; no other
+// thread may attach WSAEventSelect while FIONBIO is temporarily enabled.
+// A blocking send can outlive the capture cancellation, even if SO_SNDTIMEO is
+// set.  Use nonblocking sends and bounded select slices instead.
+static constexpr std::chrono::milliseconds kWritePollSlice{100};
+class ScopedNonblockingWrite {
+public:
+    explicit ScopedNonblockingWrite(SOCKET s) : socket_(s) {
+        u_long nonblocking = 1;
+        active_ = ioctlsocket(socket_, FIONBIO, &nonblocking) == 0;
+    }
+    ScopedNonblockingWrite(const ScopedNonblockingWrite&) = delete;
+    ScopedNonblockingWrite& operator=(const ScopedNonblockingWrite&) = delete;
+    bool Ready() const { return active_; }
+    bool Restore() {
+        if (!active_) return false;
+        // If explicit restoration fails, the caller poisons the connection.
+        // Do not retry silently in the destructor: the socket's state is
+        // unknown, and a second call must not hide the original WSA error.
+        restoreAttempted_ = true;
+        u_long blocking = 0;
+        if (ioctlsocket(socket_, FIONBIO, &blocking) != 0) return false;
+        active_ = false;
+        return true;
+    }
+    ~ScopedNonblockingWrite() {
+        // Early exit during send/select still needs best-effort restoration.
+        // Explicit Restore() failures are terminal for this connection.
+        if (active_ && !restoreAttempted_) {
+            const int savedError = WSAGetLastError();
+            u_long blocking = 0;
+            ioctlsocket(socket_, FIONBIO, &blocking);
+            WSASetLastError(savedError);
+        }
+    }
+private:
+    SOCKET socket_;
+    bool active_ = false;
+    bool restoreAttempted_ = false;
+};
+
 static bool WriteAll(SOCKET s, const uint8_t* data, size_t len,
-                     std::chrono::milliseconds budget) {
+                     std::chrono::milliseconds budget,
+                     const std::atomic<bool>& closing) {
     if (budget.count() <= 0) {
         WSASetLastError(WSAETIMEDOUT);
         return false;
     }
+    ScopedNonblockingWrite nonblocking(s);
+    if (!nonblocking.Ready()) return false;
     const auto deadline = std::chrono::steady_clock::now() +
                           (std::min)(budget, kFrameWriteTimeout);
     size_t sent = 0;
     while (sent < len) {
+        if (closing.load(std::memory_order_acquire)) {
+            WSASetLastError(WSAENOTCONN);
+            return false;
+        }
         const auto now = std::chrono::steady_clock::now();
         if (now >= deadline) {
             T2_LOG("writeAll", L"frame write deadline expired after %zu/%zuB", sent, len);
             WSASetLastError(WSAETIMEDOUT);
             return false;
         }
-        const auto left = deadline - now;
-        const auto leftMs = std::chrono::duration_cast<std::chrono::milliseconds>(left);
-        const auto remaining = leftMs.count() > 0 ? leftMs : std::chrono::milliseconds(1);
-        // SO_SNDTIMEO applies to blocking sends, but each successful short
-        // write could otherwise reset it. Re-apply the shared remaining budget.
-        if (!SetSocketTimeout(s, SO_SNDTIMEO, remaining)) {
-            const int error = WSAGetLastError();
-            T2_LOG("writeAll", L"SO_SNDTIMEO failed: WSA=%d", error);
-            return false;
-        }
         const size_t bytesLeft = len - sent;
-        const int toSend = static_cast<int>(bytesLeft > static_cast<size_t>(INT_MAX)
-                                            ? INT_MAX : bytesLeft);
+        const int toSend = static_cast<int>((std::min)(bytesLeft, static_cast<size_t>(INT_MAX)));
         const int n = send(s, reinterpret_cast<const char*>(data + sent), toSend, 0);
-        if (n <= 0) {
-            int error = n < 0 ? WSAGetLastError() : WSAECONNRESET;
-            if (n < 0 && error == WSAEWOULDBLOCK) {
-                // Defensive fallback if the socket unexpectedly remains
-                // non-blocking. select() also uses the remaining deadline.
-                fd_set writeSet;
-                FD_ZERO(&writeSet);
-                FD_SET(s, &writeSet);
-                const auto after = std::chrono::steady_clock::now();
-                if (after < deadline) {
-                    const auto waitUs = std::chrono::duration_cast<std::chrono::microseconds>(deadline - after).count();
-                    timeval tv{};
-                    tv.tv_sec = static_cast<long>(waitUs / 1000000);
-                    tv.tv_usec = static_cast<long>(waitUs % 1000000);
-                    const int ready = select(0, nullptr, &writeSet, nullptr, &tv);
-                    if (ready > 0) continue;
-                    error = ready == 0 ? WSAETIMEDOUT : WSAGetLastError();
-                } else {
-                    error = WSAETIMEDOUT;
-                }
+        if (n > 0) {
+            sent += static_cast<size_t>(n);
+            continue;
+        }
+        const int error = n == 0 ? WSAECONNRESET : WSAGetLastError();
+        if (n < 0 && error == WSAEWOULDBLOCK) {
+            const auto after = std::chrono::steady_clock::now();
+            if (after >= deadline) {
+                WSASetLastError(WSAETIMEDOUT);
+                return false;
             }
-            T2_LOG("writeAll", L"send failed after %zu/%zuB, n=%d, WSA=%d",
-                   sent, len, n, error);
-            WSASetLastError(error);
+            const auto slice = (std::min)(deadline - after,
+                std::chrono::duration_cast<std::chrono::steady_clock::duration>(kWritePollSlice));
+            const auto usec = std::chrono::duration_cast<std::chrono::microseconds>(slice).count();
+            timeval tv{};
+            tv.tv_sec = static_cast<long>(usec / 1000000);
+            tv.tv_usec = static_cast<long>(usec % 1000000);
+            fd_set writeSet;
+            FD_ZERO(&writeSet);
+            FD_SET(s, &writeSet);
+            const int ready = select(0, nullptr, &writeSet, nullptr, &tv);
+            if (ready >= 0) continue; // timeout is just another poll slice
+            const int selectError = WSAGetLastError();
+            T2_LOG("writeAll", L"select failed after %zu/%zuB WSA=%d", sent, len, selectError);
+            WSASetLastError(selectError);
             return false;
         }
-        sent += static_cast<size_t>(n);
+        T2_LOG("writeAll", L"send failed after %zu/%zuB, n=%d, WSA=%d", sent, len, n, error);
+        WSASetLastError(error);
+        return false;
     }
+    if (!nonblocking.Restore()) return false;
     return true;
 }
 
 bool Connection::WriteFrame(FrameType type, const std::vector<uint8_t>& body,
                             std::chrono::milliseconds budget) {
+    // Keep outbound frames within the same envelope limit enforced by
+    // ParseFrameHeader. Check before allocating the combined frame buffer.
+    if (!IsValidFrameBodySize(static_cast<uint64_t>(body.size()))) {
+        T2_LOG("writeFrame", L"refusing oversized frame body: %zu bytes", body.size());
+        WSASetLastError(WSAEMSGSIZE);
+        return false;
+    }
+    if (closing_.load(std::memory_order_acquire) ||
+        connectionLost_.load(std::memory_order_acquire)) {
+        T2_LOG("writeFrame", L"refusing write on closing or unusable connection");
+        WSASetLastError(WSAENOTCONN);
+        return false;
+    }
+    // The frame buffer can be as large as 16 MiB. A request whose deadline
+    // has already elapsed must fail BEFORE allocating or copying that buffer.
+    // This also makes the zero-budget path consistent with WriteAll().
+    if (budget.count() <= 0) {
+        WSASetLastError(WSAETIMEDOUT);
+        return false;
+    }
+    const auto frameDeadline = std::chrono::steady_clock::now() +
+        (std::min)(budget, kFrameWriteTimeout);
     // Header and body go out in ONE send(): two back-to-back small sends
     // are the Nagle/delayed-ACK trap described at TuneEstablishedSocket.
     // Small frames (the common case) use a stack buffer, no allocation.
@@ -1497,7 +1811,15 @@ bool Connection::WriteFrame(FrameType type, const std::vector<uint8_t>& body,
     uint8_t* out = stackBuf;
     const size_t total = 16 + body.size();
     if (total > sizeof(stackBuf)) {
-        heapBuf.resize(total);
+        // Allocation failure is a recoverable local error: no part of the
+        // frame has reached TCP, so do not poison the connection.
+        try {
+            heapBuf.resize(total);
+        } catch (const std::bad_alloc&) {
+            T2_LOG("writeFrame", L"frame buffer allocation failed (%zu bytes)", total);
+            WSASetLastError(WSAENOBUFS);
+            return false;
+        }
         out = heapBuf.data();
     }
 
@@ -1508,7 +1830,24 @@ bool Connection::WriteFrame(FrameType type, const std::vector<uint8_t>& body,
     if (!body.empty()) {
         std::memcpy(out + 16, body.data(), body.size());
     }
-    return WriteAll(socket_, out, total, budget);
+    // A failed write may have transmitted only a prefix of this frame.
+    // TCP has no transactional rollback: never send another frame on an
+    // ambiguous stream, even when send() reported an ordinary timeout.
+    // Include buffer preparation in the caller's overall frame deadline.
+    // Never restart a full write budget after allocating/copying the body.
+    const auto remaining = frameDeadline - std::chrono::steady_clock::now();
+    if (remaining <= std::chrono::steady_clock::duration::zero()) {
+        WSASetLastError(WSAETIMEDOUT);
+        return false; // no bytes sent; the connection is still reusable
+    }
+    const auto remainingMs = std::chrono::duration_cast<std::chrono::milliseconds>(remaining);
+    if (!WriteAll(socket_, out, total,
+                  (std::max)(remainingMs, std::chrono::milliseconds(1)), closing_)) {
+        connectionLost_.store(true, std::memory_order_release);
+        T2_LOG("writeFrame", L"write failed; connection unusable until reconnect");
+        return false;
+    }
+    return true;
 }
 
 } // namespace t2::bridgexpc
