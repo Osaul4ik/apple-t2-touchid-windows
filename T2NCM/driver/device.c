@@ -259,11 +259,8 @@ T2NcmDeviceCreate(
         return status;
     }
 
-    // Work item for pushing SET_ETHERNET_PACKET_FILTER to the device
-    // when the OID path runs above PASSIVE_LEVEL. Non-fatal if it
-    // cannot be created: T2NcmRequestPacketFilterUpdate still applies
-    // inline whenever it is called at PASSIVE_LEVEL, which is the
-    // common case, and logs when it cannot.
+    // Required: packet-filter OIDs may arrive at DISPATCH_LEVEL. Without
+    // this work item the OID could succeed without updating the device.
     {
         WDF_WORKITEM_CONFIG workItemConfig;
         WDF_OBJECT_ATTRIBUTES workItemAttributes;
@@ -276,11 +273,13 @@ T2NcmDeviceCreate(
             &context->PacketFilterWorkItem);
         if (!NT_SUCCESS(status))
         {
-            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
-                "T2Ncm: WdfWorkItemCreate (packet filter) failed 0x%08X - "
-                "filter updates raised above PASSIVE_LEVEL will be skipped\n",
+            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+                "T2Ncm: WdfWorkItemCreate (packet filter) failed 0x%08X\n",
                 status));
-            context->PacketFilterWorkItem = NULL;
+            // PipeLock has not been initialized yet. The device owns
+            // StateLock and any successfully created WDF children.
+            WdfObjectDelete(device);
+            return status;
         }
     }
 

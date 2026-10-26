@@ -328,6 +328,7 @@ typedef struct _T2NCM_DEVICE_CONTEXT
     // Applies a pending filter change when the OID path lands above
     // PASSIVE_LEVEL (control transfers are PASSIVE-only).
     WDFWORKITEM          PacketFilterWorkItem;
+    volatile LONG        PacketFilterUpdateGeneration;
     ULONG                CurrentLookahead;
 
     // MulticastList/MulticastAddressCount are rewritten by

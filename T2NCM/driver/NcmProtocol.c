@@ -709,7 +709,26 @@ T2NcmEvtPacketFilterWorkItem(
     PT2NCM_DEVICE_CONTEXT deviceContext =
         T2NcmGetDeviceContext(WdfWorkItemGetParentObject(WorkItem));
 
-    (VOID)T2NcmApplyPacketFilter(deviceContext);
+    // Work item requests can arrive while a previous USB control transfer
+    // is still running. Enqueueing alone does not tell this callback whether
+    // the last transfer used the newest OID state. Drain every generation
+    // observed while the callback is active.
+    for (;;)
+    {
+        LONG generation = InterlockedCompareExchange(
+            &deviceContext->PacketFilterUpdateGeneration, 0, 0);
+        NTSTATUS status = T2NcmApplyPacketFilter(deviceContext);
+        if (!NT_SUCCESS(status) && status != STATUS_INVALID_DEVICE_STATE)
+        {
+            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+                "T2Ncm: deferred packet filter failed 0x%08X\n", status));
+        }
+        if (generation == InterlockedCompareExchange(
+                &deviceContext->PacketFilterUpdateGeneration, 0, 0))
+        {
+            break;
+        }
+    }
 }
 
 VOID
@@ -732,6 +751,9 @@ T2NcmRequestPacketFilterUpdate(
 
     if (DeviceContext->PacketFilterWorkItem != NULL)
     {
+        // Publish before enqueue: the callback checks this generation
+        // again after each transfer and handles changes made while it ran.
+        InterlockedIncrement(&DeviceContext->PacketFilterUpdateGeneration);
         WdfWorkItemEnqueue(DeviceContext->PacketFilterWorkItem);
         return;
     }
