@@ -132,7 +132,8 @@ static bool SetSocketTimeout(SOCKET s, int optname, std::chrono::milliseconds ti
 // blocking socket either way, just with a real, enforced connect deadline.
 static bool ConnectWithTimeout(SOCKET s, const sockaddr* addr, int addrlen,
                                 std::chrono::milliseconds timeout,
-                                int* outWsaError = nullptr) {
+                                int* outWsaError = nullptr,
+                                const std::atomic<bool>* closing = nullptr) {
     // outWsaError (optional): 0 on success, WSAETIMEDOUT when nothing came
     // back within `timeout`, otherwise the real socket error (SO_ERROR or
     // the immediate connect() failure). Callers that must tell "the SYN got
@@ -156,24 +157,44 @@ static bool ConnectWithTimeout(SOCKET s, const sockaddr* addr, int addrlen,
     } else if (WSAGetLastError() != WSAEWOULDBLOCK) {
         if (outWsaError) *outWsaError = WSAGetLastError(); // immediate failure
     } else {
-        fd_set writeSet, errSet;
-        FD_ZERO(&writeSet);
-        FD_ZERO(&errSet);
-        FD_SET(s, &writeSet);
-        FD_SET(s, &errSet);
-        timeval tv{};
-        tv.tv_sec = static_cast<long>(timeout.count() / 1000);
-        tv.tv_usec = static_cast<long>((timeout.count() % 1000) * 1000);
-        const int sel = select(0, nullptr, &writeSet, &errSet, &tv);
-        if (sel > 0) {
+        // select() does not observe Close() while it owns ioMu_. Poll the
+        // terminal close flag with bounded slices, without resetting the
+        // caller's overall TCP deadline on each wakeup.
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        for (;;) {
+            if (closing && closing->load(std::memory_order_acquire)) {
+                if (outWsaError) *outWsaError = WSAEINTR;
+                break;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+                if (outWsaError) *outWsaError = WSAETIMEDOUT;
+                break;
+            }
+            auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+            if (left.count() <= 0) left = std::chrono::milliseconds(1);
+            const auto slice = (std::min)(left, std::chrono::milliseconds(100));
+            fd_set writeSet, errSet;
+            FD_ZERO(&writeSet);
+            FD_ZERO(&errSet);
+            FD_SET(s, &writeSet);
+            FD_SET(s, &errSet);
+            timeval tv{};
+            tv.tv_sec = static_cast<long>(slice.count() / 1000);
+            tv.tv_usec = static_cast<long>((slice.count() % 1000) * 1000);
+            const int sel = select(0, nullptr, &writeSet, &errSet, &tv);
+            if (sel == 0) continue;
+            if (sel < 0) {
+                if (outWsaError) *outWsaError = WSAGetLastError();
+                break;
+            }
             int err = 0;
             int errLen = sizeof(err);
             const bool haveErr =
                 getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &errLen) == 0;
             ok = haveErr && err == 0 && FD_ISSET(s, &writeSet) && !FD_ISSET(s, &errSet);
             if (!ok && outWsaError) *outWsaError = haveErr && err != 0 ? err : WSAECONNABORTED;
-        } else if (outWsaError) {
-            *outWsaError = sel == 0 ? WSAETIMEDOUT : WSAGetLastError();
+            break;
         }
     }
     u_long blocking = 0;
@@ -182,6 +203,10 @@ static bool ConnectWithTimeout(SOCKET s, const sockaddr* addr, int addrlen,
         // synchronous WriteFrame/ReadFrame, which rely on socket timeouts.
         const int restoreError = WSAGetLastError();
         if (outWsaError) *outWsaError = restoreError;
+        return false;
+    }
+    if (closing && closing->load(std::memory_order_acquire)) {
+        if (outWsaError) *outWsaError = WSAEINTR;
         return false;
     }
     return ok;
@@ -369,7 +394,7 @@ ConnectResult Connection::ConnectOnce(bool tunnel, const in6_addr& linkLocalAddr
                peer4.S_un.S_un_b.s_b3, peer4.S_un.S_un_b.s_b4,
                static_cast<unsigned>(port), interfaceIndex);
         if (!ConnectWithTimeout(socket_, reinterpret_cast<sockaddr*>(&addr4), sizeof(addr4),
-                                RemainingBudget(tcpDeadline), &wsa)) {
+                                RemainingBudget(tcpDeadline), &wsa, &closing_)) {
             T2_LOG("connect", L"connect(AF_INET) failed WSA=%d (%llu ms)", wsa,
                    static_cast<unsigned long long>(GetTickCount64() - tcpStart));
             discardFailedAttempt();
@@ -401,7 +426,7 @@ ConnectResult Connection::ConnectOnce(bool tunnel, const in6_addr& linkLocalAddr
                interfaceIndex, static_cast<unsigned>(port),
                static_cast<long long>(tcpTimeout.count()));
         if (!ConnectWithTimeout(socket_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr),
-                                RemainingBudget(tcpDeadline), &wsa)) {
+                                RemainingBudget(tcpDeadline), &wsa, &closing_)) {
             T2_LOG("connect", L"connect(AF_INET6) failed WSA=%d (%llu ms)", wsa,
                    static_cast<unsigned long long>(GetTickCount64() - tcpStart));
             discardFailedAttempt();
