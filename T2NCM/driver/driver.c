@@ -57,7 +57,13 @@ DriverEntry(
     // can initialize (and publish itself for the diagnostic device) as
     // soon as registration succeeds. Deleted in MiniportDriverUnload, or
     // on the failure paths below.
-    (VOID)ExInitializeResourceLite(&g_T2NcmDiagnosticLock);
+    status = ExInitializeResourceLite(&g_T2NcmDiagnosticLock);
+    if (!NT_SUCCESS(status))
+    {
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+            "T2Ncm: diagnostic resource initialization failed 0x%08X\n", status));
+        return status;
+    }
 
     // WDF_NO_EVENT_CALLBACK for EvtDriverDeviceAdd: with
     // WdfDriverInitNoDispatchOverride the framework would reject a

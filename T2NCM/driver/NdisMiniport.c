@@ -206,6 +206,13 @@ T2NcmDispatchDeviceControl(
             goto Complete;
         }
         RtlCopyMemory(&sticky, Irp->AssociatedIrp.SystemBuffer, sizeof(ULONG));
+        // The wire contract accepts exactly 0 or 1. Do not silently turn
+        // malformed values into a request to disable sticky tunnel mode.
+        if (sticky > 1ul)
+        {
+            status = STATUS_INVALID_PARAMETER;
+            goto Complete;
+        }
         T2NcmTunnelSetSticky(sticky == 1ul);
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
             "T2Ncm: sticky tunnel set via IOCTL -> %u (driver memory, cleared on reboot)\n",
@@ -343,6 +350,13 @@ T2NcmDispatchDeviceControl(
             break;
         }
         RtlCopyMemory(&mode, Irp->AssociatedIrp.SystemBuffer, sizeof(ULONG));
+        // Reject unknown mode values before changing either the global
+        // mode or the running adapter's cached mode.
+        if (mode > 1ul)
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
 
         // Update the driver-global mode first (this is what a later
         // MiniportInitializeEx / MiniportRestart re-seeds from, so the mode

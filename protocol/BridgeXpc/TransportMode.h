@@ -765,7 +765,7 @@ struct T2NcmControlState {
     // Serializes IOCTL use and stale-handle replacement. A lease only protects
     // the final close; without this lock another caller may close a handle
     // while DeviceIoControl is using it. Acquire before mu, never vice versa.
-    std::mutex ioctlMu;
+    std::timed_mutex ioctlMu;
     HANDLE h = INVALID_HANDLE_VALUE;
     unsigned refs = 0;
 };
@@ -822,9 +822,23 @@ inline T2NcmIoctlResult T2NcmControlIoctl(const wchar_t* who, DWORD code,
     auto& s = T2NcmControl();
     // Do not let a competing IOCTL invalidate and close our handle mid-call.
     // Lease construction holds mu only briefly; no path takes mu and then ioctlMu.
-    std::lock_guard<std::mutex> ioctlLock(s.ioctlMu);
     T2NcmIoctlResult r;
+    // Suspend can arrive while another IOCTL holds this mutex. Bound each
+    // wait slice so we can abort without opening a new handle or issuing IOCTL.
+    std::unique_lock<std::timed_mutex> ioctlLock(s.ioctlMu, std::defer_lock);
+    while (!ioctlLock.try_lock_for(std::chrono::milliseconds(100))) {
+        if (IsTransportIoSuspended()) {
+            r.err = ERROR_OPERATION_ABORTED;
+            return r;
+        }
+    }
     for (int attempt = 0; attempt < 2; ++attempt) {
+        // A stale-handle retry must not reopen T2Ncm after Dx/suspend.
+        // This does not interrupt an already running synchronous IOCTL.
+        if (IsTransportIoSuspended()) {
+            r.err = ERROR_OPERATION_ABORTED;
+            return r;
+        }
         HANDLE h;
         {
             std::lock_guard<std::mutex> lock(s.mu);
@@ -842,6 +856,11 @@ inline T2NcmIoctlResult T2NcmControlIoctl(const wchar_t* who, DWORD code,
                 }
             }
             h = s.h;
+        }
+        // Suspending while waiting to open the handle must not start an IOCTL.
+        if (IsTransportIoSuspended()) {
+            r.err = ERROR_OPERATION_ABORTED;
+            return r;
         }
         DWORD returned = 0;
         if (DeviceIoControl(h, code, in, inSize, out, outSize, &returned, nullptr)) {
@@ -1141,7 +1160,7 @@ inline TunnelPrep PrepareTunnelPeer(unsigned long ifIndex, const in6_addr& peer6
     // a void. Deduped by LastPushedModeFlag, so it is a no-op when already armed.
     if (!PushTransportModeToDriver(TransportMode::Ipv4Tunnel)) {
         T2_LOG("tunnel", L"PrepareTunnelPeer: failed to arm IPv4 tunnel mode");
-        return TunnelPrep::NoPeer;
+        return stopped() ? TunnelPrep::Suspended : TunnelPrep::NoPeer;
     }
     if (stopped()) return TunnelPrep::Suspended;
     // Fast path: same peer as last time we successfully prepared it, and
@@ -1154,13 +1173,13 @@ inline TunnelPrep PrepareTunnelPeer(unsigned long ifIndex, const in6_addr& peer6
         if (stopped()) return TunnelPrep::Suspended;
         if (!PublishTunnelPeer(peer6, nullptr)) {
             InvalidateTunnelPrepCache();
-            return TunnelPrep::NoPeer;
+            return stopped() ? TunnelPrep::Suspended : TunnelPrep::NoPeer;
         }
         if (stopped()) return TunnelPrep::Suspended;
         if (!PushTunnelPeerToDriver(peer6)) {
             InvalidateTunnelPrepCache();
             T2_LOG("tunnel", L"PrepareTunnelPeer: failed to publish cached tunnel peer");
-            return TunnelPrep::NoPeer;
+            return stopped() ? TunnelPrep::Suspended : TunnelPrep::NoPeer;
         }
         if (stopped()) return TunnelPrep::Suspended;
         PushTunnelLocalToDriver(ifIndex);
@@ -1202,7 +1221,7 @@ inline TunnelPrep PrepareTunnelPeer(unsigned long ifIndex, const in6_addr& peer6
     if (stopped()) return TunnelPrep::Suspended;
     if (!PushTunnelPeerToDriver(peer6)) {
         T2_LOG("tunnel", L"PrepareTunnelPeer: failed to publish tunnel peer");
-        return TunnelPrep::NoPeer;
+        return stopped() ? TunnelPrep::Suspended : TunnelPrep::NoPeer;
     }
     if (stopped()) return TunnelPrep::Suspended;
     PushTunnelLocalToDriver(ifIndex);
