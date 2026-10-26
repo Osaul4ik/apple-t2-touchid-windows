@@ -146,3 +146,4 @@ Thanks to **jmurth1234** and the research behind [t2-touchid-linux](https://gith
 ## License
 
 GPL-2.0-only. See [`LICENSE`](LICENSE) and [`NOTICE.md`](NOTICE.md).
+
