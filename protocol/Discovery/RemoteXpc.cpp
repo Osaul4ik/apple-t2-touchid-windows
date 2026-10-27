@@ -746,12 +746,22 @@ bool ProbeServiceOnPort(const NcmEndpoint& endpoint, uint16_t port,
                          const std::string& serviceName,
                          std::chrono::milliseconds timeout,
                          uint16_t* outServicePort) {
+    // One end-to-end budget: connect and peer-record read must not each
+    // consume the entire candidate timeout independently.
+    if (timeout.count() <= 0) return false;
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
     RemoteXpcConnection conn;
     if (conn.Connect(endpoint, port, timeout) != RemoteXpcResult::Ok) {
         return false; // couldn't even open this candidate
     }
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) return false;
+    const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+    // Round up a positive sub-millisecond remainder, never exceed the
+    // original deadline by more than the socket wait granularity.
+    const auto remaining = left.count() > 0 ? left : std::chrono::milliseconds(1);
     XpcObject peerRecord;
-    if (conn.FetchPeerRecord(timeout, &peerRecord) != RemoteXpcResult::Ok) {
+    if (conn.FetchPeerRecord(remaining, &peerRecord) != RemoteXpcResult::Ok) {
         // Several other T2 services share this HTTP/2 transport but
         // reject or never complete an RSD handshake — expected decoy, not
         // a discovery failure (matches discover-biometric-port.py's

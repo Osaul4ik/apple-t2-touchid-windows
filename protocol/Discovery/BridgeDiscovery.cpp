@@ -53,7 +53,7 @@ using t2::bridgexpc::Connection;
 using t2::bridgexpc::ConnectResult;
 
 constexpr const char* kBiometricKitService = "com.apple.eos.BiometricKit";
-constexpr std::chrono::milliseconds kRemoteXpcCheckTimeout{2000};
+constexpr std::chrono::milliseconds kRemoteXpcCheckTimeout{400};
 
 // ---- scan parameters ----------------------------------------------------------
 // Same on both transports and on every pass (owner spec): 256 sockets in flight,
@@ -149,7 +149,7 @@ struct ScanOutcome {
     unsigned tried = 0;
 };
 
-// Every HTTP/2 hit gets its own RemoteXPC checker thread racing the still-running
+// A bounded RemoteXPC checker pool races the still-running
 // scan; the first confirmed BiometricKit hit stops the scan. Checkers are joined
 // before returning (no background threads outlive the call). HTTP/2 hits that were
 // NOT confirmed are reported through `http2Ports` so they can be re-checked first
@@ -160,7 +160,7 @@ struct ScanProbeResult {
 };
 // Bound RemoteXPC checks independently of the 256 TCP scanning workers.
 // Excess HTTP/2 hits remain in http2Ports for the caller's next recheck step.
-constexpr unsigned kMaxRemoteXpcCheckers = 8;
+constexpr unsigned kMaxRemoteXpcCheckers = 20;
 constexpr size_t kMaxQueuedRemoteXpcChecks = 64;
 ScanProbeResult ScanAndProbe(const NcmEndpoint& ep, ScanOptions opt,
                              std::vector<uint16_t>* http2Ports) {
@@ -392,10 +392,12 @@ CacheTry TryCachedBridgePort(const NcmEndpoint& ep, Connection* conn, bool tunne
     r.port = svcPort;
     r.rsd = rsdPort;
 
-    const std::chrono::milliseconds tcp = tunnel ? tp::TunnelConnectBudget(std::chrono::milliseconds(2000))
-                                                 : tp::NativeConnectBudget(std::chrono::milliseconds(250));
-    const std::chrono::milliseconds helo = tunnel ? std::chrono::milliseconds(2000)
-                                                  : std::chrono::milliseconds(500);
+    // Cached-port fast path: cap both TCP and HELO stages at 200 ms.
+    // ConnectVia uses distinct stage budgets; these are not a single 200 ms deadline.
+    constexpr std::chrono::milliseconds cachedTimeout{200};
+    const std::chrono::milliseconds tcp = tunnel ? tp::TunnelConnectBudget(cachedTimeout)
+                                                 : tp::NativeConnectBudget(cachedTimeout);
+    const std::chrono::milliseconds helo = cachedTimeout;
     ConnectResult crA = conn->ConnectVia(tunnel, ep.peerLinkLocal, ep.ifIndex, svcPort, tcp, helo,
                                          &r.ev, &r.tcpMs);
     if (crA == ConnectResult::Ok) {
@@ -411,7 +413,7 @@ CacheTry TryCachedBridgePort(const NcmEndpoint& ep, Connection* conn, bool tunne
 
     // Path B only makes sense when the path itself answered.
     if (rsdPort != 0 && (r.ev == PathEvidence::Positive || r.ev == PathEvidence::Refused)) {
-        const std::chrono::milliseconds half(tunnel ? 1000 : 250);
+        const std::chrono::milliseconds half{200};
         uint16_t advertised = 0;
         if (ProbeServiceOnPort(ep, rsdPort, kBiometricKitService, half, &advertised)) {
             PathEvidence evB = PathEvidence::Silent;
