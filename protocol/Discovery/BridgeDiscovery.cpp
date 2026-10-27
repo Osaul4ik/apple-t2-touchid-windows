@@ -35,6 +35,8 @@
 #include "../BridgeXpc/TransportMode.h"
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <string>
@@ -156,42 +158,84 @@ struct ScanProbeResult {
     uint16_t servicePort = 0;
     uint16_t rsdPort = 0;
 };
+// Bound RemoteXPC checks independently of the 256 TCP scanning workers.
+// Excess HTTP/2 hits remain in http2Ports for the caller's next recheck step.
+constexpr unsigned kMaxRemoteXpcCheckers = 8;
+constexpr size_t kMaxQueuedRemoteXpcChecks = 64;
 ScanProbeResult ScanAndProbe(const NcmEndpoint& ep, ScanOptions opt,
                              std::vector<uint16_t>* http2Ports) {
     std::atomic<bool> stop{false};
     std::atomic<bool> serviceFound{false};
-    std::mutex checkersMu;
+    std::mutex queueMu;
+    std::condition_variable queueCv;
+    std::deque<uint16_t> pending;
+    bool scanFinished = false;
     std::vector<std::thread> checkers;
     ScanProbeResult res;
 
-    opt.cancel = &stop;
-    opt.onHit = [&](const PortCandidate& c) {
-        if (!c.http2PrefaceOk) return;
-        if (serviceFound.load(std::memory_order_relaxed)) return;
-        uint16_t port = c.port;
-        std::lock_guard<std::mutex> lock(checkersMu);
-        if (http2Ports) http2Ports->push_back(port);
-        checkers.emplace_back([&, port]() {
-            if (serviceFound.load(std::memory_order_relaxed)) return;
-            uint16_t servicePort = 0;
-            if (!ProbeServiceOnPort(ep, port, kBiometricKitService, kRemoteXpcCheckTimeout,
-                                    &servicePort)) {
-                return;
+    // A checker never holds queueMu during a network call.
+    auto checker = [&]() {
+        for (;;) {
+            uint16_t port = 0;
+            {
+                std::unique_lock<std::mutex> lock(queueMu);
+                queueCv.wait(lock, [&]() {
+                    return scanFinished || !pending.empty() ||
+                           serviceFound.load(std::memory_order_relaxed);
+                });
+                // Do not drain a backlog after the scan budget expires.
+                // In-flight checks retain their own bounded I/O timeout; unstarted
+                // HTTP/2 hits are preserved in http2Ports for the next retry.
+                if (serviceFound.load(std::memory_order_relaxed) ||
+                    Cancelled(opt.cancelEvent) ||
+                    (opt.deadlineTick != 0 && GetTickCount64() >= opt.deadlineTick)) return;
+                if (pending.empty()) {
+                    if (scanFinished) return;
+                    continue;
+                }
+                port = pending.front();
+                pending.pop_front();
             }
+            // The deadline can expire between dequeuing and starting I/O.
+            if (Cancelled(opt.cancelEvent) ||
+                (opt.deadlineTick != 0 && GetTickCount64() >= opt.deadlineTick)) return;
+            uint16_t servicePort = 0;
+            if (!ProbeServiceOnPort(ep, port, kBiometricKitService,
+                                    kRemoteXpcCheckTimeout, &servicePort)) continue;
             bool expected = false;
             if (serviceFound.compare_exchange_strong(expected, true)) {
                 res.servicePort = servicePort;
                 res.rsdPort = port;
                 stop.store(true, std::memory_order_relaxed);
+                queueCv.notify_all();
+                return;
             }
-        });
+        }
+    };
+
+    checkers.reserve(kMaxRemoteXpcCheckers);
+    for (unsigned i = 0; i < kMaxRemoteXpcCheckers; ++i)
+        checkers.emplace_back(checker);
+
+    opt.cancel = &stop;
+    opt.onHit = [&](const PortCandidate& c) {
+        if (!c.http2PrefaceOk) return;
+        std::lock_guard<std::mutex> lock(queueMu);
+        if (http2Ports) http2Ports->push_back(c.port);
+        if (!serviceFound.load(std::memory_order_relaxed) &&
+            pending.size() < kMaxQueuedRemoteXpcChecks) {
+            pending.push_back(c.port);
+            queueCv.notify_one();
+        }
     };
 
     ScanHttp2Preface(ep, opt);
     {
-        std::lock_guard<std::mutex> lock(checkersMu);
-        for (auto& th : checkers) th.join();
+        std::lock_guard<std::mutex> lock(queueMu);
+        scanFinished = true;
     }
+    queueCv.notify_all();
+    for (auto& th : checkers) th.join();
     return res;
 }
 

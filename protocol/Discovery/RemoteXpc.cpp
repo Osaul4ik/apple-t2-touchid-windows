@@ -390,10 +390,14 @@ bool RemoteXpcConnection::ReadExact(uint8_t* buf, size_t len,
     while (got < len) {
         auto now = std::chrono::steady_clock::now();
         if (now >= deadline) return false;
+        // Round up a positive sub-millisecond remainder rather than
+        // issuing a zero-time select() and spuriously timing out.
         auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+        if (left.count() == 0) left = std::chrono::milliseconds(1);
         if (!WaitReadable(left)) return false;
+        const size_t chunk = (std::min)(len - got, static_cast<size_t>(INT_MAX));
         int n = recv(socket_, reinterpret_cast<char*>(buf + got),
-                     static_cast<int>(len - got), 0);
+                     static_cast<int>(chunk), 0);
         if (n == 0) return false; // peer closed
         if (n < 0) {
             int e = WSAGetLastError();
@@ -412,7 +416,8 @@ bool RemoteXpcConnection::WriteRaw(const uint8_t* data, size_t len) {
         if (now >= writeDeadline_) return false;
         // FIONBIO sockets must wait for writability rather than spin on
         // WSAEWOULDBLOCK. This also bounds a peer that stops reading.
-        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(writeDeadline_ - now);
+        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(writeDeadline_ - now);
+        if (remaining.count() == 0) remaining = std::chrono::milliseconds(1);
         if (!WaitWritable(remaining)) return false;
         const size_t chunk = (std::min)(len - sent, static_cast<size_t>(INT_MAX));
         int n = send(socket_, reinterpret_cast<const char*>(data + sent),
@@ -567,6 +572,10 @@ bool RemoteXpcConnection::ReadDataFrame(uint32_t wantStreamId, std::vector<uint8
 
 RemoteXpcResult RemoteXpcConnection::Connect(const NcmEndpoint& endpoint, uint16_t port,
                                               std::chrono::milliseconds connectTimeout) {
+    // Reusing this object must not leak the previous socket, even if Winsock
+    // initialization or opening the replacement socket fails.
+    Close();
+    if (connectTimeout.count() <= 0) return RemoteXpcResult::ConnectFailed;
     if (!t2::EnsureWinsock()) return RemoteXpcResult::ConnectFailed;
     const bool tunnel = t2::transport::IsTunnelModeActive();
     socket_ = socket(tunnel ? AF_INET : AF_INET6, SOCK_STREAM, IPPROTO_TCP);
