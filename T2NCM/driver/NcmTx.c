@@ -395,8 +395,10 @@ T2NcmEvtTxWriteComplete(
     // releases it too.
     WdfObjectDelete(Request);
 
-    InterlockedDecrement(&deviceContext->OutstandingTxRequests);
-    T2NcmQuiesceCheck(deviceContext);
+    // Last access to deviceContext: once the counter is zero a halt waiting
+    // on the drain is free to delete it.
+    T2NcmDrainRelease(deviceContext,
+        &deviceContext->OutstandingTxRequests, 1);
 }
 
 // Builds and submits one NTB for one NET_BUFFER. On any failure the
@@ -421,6 +423,7 @@ T2NcmTxSubmitNetBuffer(
     PT2NCM_TX_REQUEST_CONTEXT requestContext;
     WDF_REQUEST_SEND_OPTIONS sendOptions;
     BOOLEAN sent;
+    BOOLEAN outstandingTaken = FALSE;
     WDFUSBPIPE bulkOut;
 
     // Read the pipe handle once: it is used for the request's I/O target,
@@ -569,6 +572,7 @@ T2NcmTxSubmitNetBuffer(
     // count that had not been taken yet would let MiniportPause see
     // zero while a write was still in flight.
     InterlockedIncrement(&DeviceContext->OutstandingTxRequests);
+    outstandingTaken = TRUE;
 
     // Bounded on purpose. An NBL that is never completed makes tcpip wait
     // for it forever while NDIS pauses the protocol before sleep
@@ -590,8 +594,6 @@ T2NcmTxSubmitNetBuffer(
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
             "T2Ncm: WdfRequestSend (bulk OUT) failed 0x%08X\n", status));
 
-        InterlockedDecrement(&DeviceContext->OutstandingTxRequests);
-        T2NcmQuiesceCheck(DeviceContext);
         goto Fail;
     }
 
@@ -611,6 +613,15 @@ Fail:
     InterlockedIncrement64(&DeviceContext->OutDiscards);
 
     T2NcmTxCompleteNetBuffer(DeviceContext, Nbl, NDIS_STATUS_FAILURE);
+
+    // The reference taken for the write is given back last, after every
+    // other use of the context, so a drain cannot finish underneath this
+    // function.
+    if (outstandingTaken)
+    {
+        T2NcmDrainRelease(DeviceContext,
+            &DeviceContext->OutstandingTxRequests, 1);
+    }
 }
 
 VOID

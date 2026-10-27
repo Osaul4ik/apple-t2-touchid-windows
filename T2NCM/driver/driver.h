@@ -358,10 +358,19 @@ typedef struct _T2NCM_DEVICE_CONTEXT
     volatile LONG        OutstandingRxNbls;
     volatile LONG        OutstandingTxRequests;
     volatile LONG        PauseInProgress;
-    // Times T2NcmWaitForDrain hit the 5s bound with refs still outstanding.
-    // Diagnostic for sleep/resume ref leaks (pool free is skipped then).
+    // Times T2NcmWaitForDrain logged a 5s interval with refs still
+    // outstanding. Diagnostic for sleep/resume ref leaks: Halt keeps
+    // waiting after each one, Pause completes asynchronously.
     volatile LONG        DrainTimeoutCount;
     KEVENT               QuiesceEvent;
+
+    // Makes "decrement a drain counter + signal QuiesceEvent" one atomic
+    // step (T2NcmDrainRelease), and gives the waiter a barrier: once
+    // T2NcmWaitForDrain has seen both counters at zero it takes and drops
+    // this lock, which guarantees the releaser that produced the zero has
+    // left the context for good. Without it a completion could still be
+    // reading this context after the waiter let MiniportHaltEx free it.
+    KSPIN_LOCK           DrainLock;
 
     // ---- TX hang detection / recovery ----
     // TxCompletedCount advances on every bulk-OUT completion (any
@@ -383,6 +392,11 @@ typedef struct _T2NCM_DEVICE_CONTEXT
     volatile LONG        TxConsecutiveFailures;
     volatile LONG        TxConsecutiveResets;
     WDFWORKITEM          RecoveryWorkItem;
+
+    // Finishes a MiniportPause whose drain did not complete inline.
+    // Created in T2NcmDeviceCreate (NDIS cannot be told a pause failed),
+    // enqueued by MiniportPause, which then returns NDIS_STATUS_PENDING.
+    WDFWORKITEM          PauseDrainWorkItem;
 
     // Current D-state as told to us by OID_PNP_SET_POWER. NDIS owns
     // this value; the driver only reacts to it (Power.c).
@@ -503,6 +517,7 @@ typedef struct _T2NCM_DEVICE_CONTEXT
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(T2NCM_DEVICE_CONTEXT, T2NcmGetDeviceContext)
 
 EVT_WDF_WORKITEM T2NcmEvtRecoveryWorkItem;
+EVT_WDF_WORKITEM T2NcmEvtPauseDrainWorkItem;
 
 // Atomic accessors for PacketFilter (volatile LONG). Keep all call sites
 // on these helpers so Interlocked always sees LONG volatile * — matching

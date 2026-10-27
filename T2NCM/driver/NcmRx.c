@@ -136,20 +136,13 @@ T2NcmRxFreeResources(
     if (DeviceContext->RxNblPool != NULL)
     {
         // Freeing a pool with outstanding allocations is a bugcheck.
-        // MiniportPause/HaltEx must drain first; if a drain timed out
-        // and left OutstandingRxNbls > 0, refuse the free rather than
-        // crash — the pool leaks until unload, which is recoverable,
-        // unlike a bugcheck on Halt during surprise-remove.
-        LONG outstanding = InterlockedCompareExchange(
-            (LONG volatile *)&DeviceContext->OutstandingRxNbls, 0, 0);
-        if (outstanding != 0)
-        {
-            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-                "T2Ncm: T2NcmRxFreeResources skipped - %ld NBLs still outstanding "
-                "(drain timed out?); leaving pool alive to avoid bugcheck\n",
-                outstanding));
-            return;
-        }
+        // MiniportHaltEx waits for the drain without a bound before it gets
+        // here, and the init-failure path never indicated anything, so every
+        // NBL has been returned. If this ever fires it is an accounting bug
+        // that must stay visible; skipping the free would only leak the pool
+        // and leave a later NBL return pointing at a freed context.
+        NT_ASSERT(InterlockedCompareExchange(
+            (LONG volatile *)&DeviceContext->OutstandingRxNbls, 0, 0) == 0);
         NdisFreeNetBufferListPool(DeviceContext->RxNblPool);
         DeviceContext->RxNblPool = NULL;
     }
@@ -339,11 +332,10 @@ T2NcmRxReturnNetBufferLists(
 
     if (returned != 0)
     {
-        InterlockedAdd(&DeviceContext->OutstandingRxNbls, -returned);
-
-        // A pause that was waiting on this drain has to be woken by
-        // whichever decrement reaches zero — see T2NcmQuiesceCheck.
-        T2NcmQuiesceCheck(DeviceContext);
+        // Last access to DeviceContext: once the counter is zero a halt
+        // waiting on the drain is free to delete it.
+        T2NcmDrainRelease(DeviceContext,
+            &DeviceContext->OutstandingRxNbls, returned);
     }
 }
 
@@ -1041,6 +1033,25 @@ T2NcmRxHandleRead(
         (BOOLEAN)(KeGetCurrentIrql() == DISPATCH_LEVEL));
 }
 
+// A slot that will not be re-armed is lost until the next T2NcmRxStart.
+// Every path that retires one has to say so here: otherwise all slots can
+// retire with RxFailedSlots == 0, RX goes silent, and MiniportCheckForHangEx
+// never asks for the reset that re-arms it. While a stop is in progress
+// (Running == 0) a failed re-arm is the expected way for the loop to end and
+// is deliberately not counted.
+static
+VOID
+T2NcmRxRetireSlot(
+    _In_ PT2NCM_RX_RUN         Run,
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
+    )
+{
+    if (Run->Running != 0)
+    {
+        InterlockedIncrement(&DeviceContext->RxFailedSlots);
+    }
+}
+
 VOID
 T2NcmEvtRxReadComplete(
     _In_ WDFREQUEST                     Request,
@@ -1096,14 +1107,18 @@ T2NcmEvtRxReadComplete(
             if (NT_SUCCESS(status))
             {
                 // Takes its own reference before ours is dropped below.
-                // Failure is logged inside and simply retires this slot.
-                (VOID)T2NcmRxSubmitRead(run, Request);
+                // Failure is logged inside and retires this slot.
+                if (!T2NcmRxSubmitRead(run, Request))
+                {
+                    T2NcmRxRetireSlot(run, deviceContext);
+                }
             }
             else
             {
                 T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
                     "T2Ncm: RX WdfRequestReuse failed (0x%08X) - read not re-armed\n",
                     status));
+                T2NcmRxRetireSlot(run, deviceContext);
             }
         }
     }
@@ -1119,7 +1134,7 @@ T2NcmEvtRxReadComplete(
             "not re-armed until the adapter is restarted\n", status));
         InterlockedIncrement64(&deviceContext->InErrors);
         // Nothing re-arms this slot; ask CheckForHang for a reset.
-        InterlockedIncrement(&deviceContext->RxFailedSlots);
+        T2NcmRxRetireSlot(run, deviceContext);
     }
     // else: a stop is in progress and this is the cancelled read coming
     // back. AppleUSBVHCI reports that as 0xC0000001, which is expected

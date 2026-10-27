@@ -227,6 +227,7 @@ T2NcmDeviceCreate(
     T2NcmWritePacketFilter(context, 0);
 
     KeInitializeEvent(&context->QuiesceEvent, NotificationEvent, FALSE);
+    KeInitializeSpinLock(&context->DrainLock);
     KeInitializeSpinLock(&context->MulticastLock);
     KeInitializeSpinLock(&context->PacketFilterQueueLock);
     KeInitializeSpinLock(&context->TunnelPeerLock);
@@ -305,6 +306,31 @@ T2NcmDeviceCreate(
                 "T2Ncm: WdfWorkItemCreate (recovery) failed 0x%08X - TX pipe "
                 "recovery and MiniportResetEx are unavailable\n", status));
             context->RecoveryWorkItem = NULL;
+        }
+    }
+
+    // Completes a MiniportPause that could not drain inline. Not optional:
+    // NDIS has no way to be told a pause failed, and a pause must not be
+    // reported complete while indicated NBLs or sends are still out.
+    {
+        WDF_WORKITEM_CONFIG workItemConfig;
+        WDF_OBJECT_ATTRIBUTES workItemAttributes;
+
+        WDF_WORKITEM_CONFIG_INIT(&workItemConfig, T2NcmEvtPauseDrainWorkItem);
+        WDF_OBJECT_ATTRIBUTES_INIT(&workItemAttributes);
+        workItemAttributes.ParentObject = device;
+
+        status = WdfWorkItemCreate(&workItemConfig, &workItemAttributes,
+            &context->PauseDrainWorkItem);
+        if (!NT_SUCCESS(status))
+        {
+            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+                "T2Ncm: WdfWorkItemCreate (pause drain) failed 0x%08X\n",
+                status));
+            // PipeLock has not been initialized yet; the device owns every
+            // WDF child created so far.
+            WdfObjectDelete(device);
+            return status;
         }
     }
 

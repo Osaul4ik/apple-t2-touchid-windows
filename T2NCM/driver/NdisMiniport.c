@@ -70,8 +70,11 @@ static const NDIS_OID T2NcmSupportedOids[] =
 // Drain bookkeeping
 // ---------------------------------------------------------------------
 
+// Signals the quiesce event once a pause/halt is waiting and both drain
+// counters are zero. Caller holds DrainLock.
+static
 VOID
-T2NcmQuiesceCheck(
+T2NcmQuiesceCheckLocked(
     _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
     )
 {
@@ -83,26 +86,59 @@ T2NcmQuiesceCheck(
     }
 }
 
+// Gives back Count references on one drain counter and wakes a waiter.
+//
+// The decrement and the wake-up are one step under DrainLock, and the
+// waiter finishes with a lock/unlock barrier (T2NcmWaitForDrain). Done as
+// "decrement, then T2NcmQuiesceCheck" the completion was still reading
+// the context after the decrement that let the waiter see zero; the
+// waiter polls the counters, so MiniportHaltEx could free the context in
+// that window. Callers must make this their last access to DeviceContext.
+VOID
+T2NcmDrainRelease(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext,
+    _Inout_ volatile LONG*     Counter,
+    _In_ LONG                  Count
+    )
+{
+    KIRQL oldIrql;
+
+    KeAcquireSpinLock(&DeviceContext->DrainLock, &oldIrql);
+    InterlockedAdd(Counter, -Count);
+    T2NcmQuiesceCheckLocked(DeviceContext);
+    KeReleaseSpinLock(&DeviceContext->DrainLock, oldIrql);
+}
+
 // Waits until nothing this driver handed out is still outstanding.
+// Returns TRUE once drained. With RequireCompleteDrain FALSE it gives up
+// after 5 s and returns FALSE (the caller must then not report the pause
+// as complete); with TRUE it waits for as long as it takes and logs every
+// 5 s. MiniportHaltEx must use TRUE: past this point it frees the context,
+// the TX requests (parented to the WDFDEVICE) and the NBL pool, all of
+// which a late completion or return would still use.
 //
 // Written as a bounded poll rather than a single event wait on purpose.
 // The event is set by whichever decrement reaches zero, but the last
 // decrement can happen between this function clearing the event and
 // re-reading the counters; a plain wait would then block until the next
-// unrelated completion. Re-checking on a short period closes that window
-// without needing a lock around every completion path, and the total
-// bound means a leaked reference shows up as a logged timeout instead of
-// a hung MiniportPause (which would hang the whole system power
-// transition, since NDIS pauses before every Dx).
+// unrelated completion. Re-checking on a short period closes that window.
+//
+// A TRUE return also means every releaser has left the context: the
+// lock/unlock pair at the end cannot be taken until the T2NcmDrainRelease
+// that produced the zero has dropped DrainLock, and that is the releaser's
+// last access.
 static
-VOID
+BOOLEAN
 T2NcmWaitForDrain(
-    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext,
+    _In_ BOOLEAN               RequireCompleteDrain
     )
 {
     const ULONG pollMs = 20;
     const ULONG maxWaitMs = 5000;
     ULONG waitedMs = 0;
+    BOOLEAN drained = TRUE;
+    KIRQL oldIrql;
 
     InterlockedExchange(&DeviceContext->PauseInProgress, 1);
 
@@ -116,14 +152,19 @@ T2NcmWaitForDrain(
             const LONG timeouts =
                 InterlockedIncrement(&DeviceContext->DrainTimeoutCount);
             T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
-                "T2Ncm: drain timed out after %lums (rxNbls=%ld txReqs=%ld, "
-                "lifetimeTimeouts=%ld) - proceeding anyway; this is a "
-                "reference leak, not a slow device\n",
+                "T2Ncm: drain still pending after %lums (rxNbls=%ld txReqs=%ld, "
+                "lifetimeTimeouts=%ld, mustComplete=%u)\n",
                 maxWaitMs,
                 DeviceContext->OutstandingRxNbls,
                 DeviceContext->OutstandingTxRequests,
-                timeouts));
-            break;
+                timeouts, (ULONG)RequireCompleteDrain));
+
+            if (!RequireCompleteDrain)
+            {
+                drained = FALSE;
+                break;
+            }
+            waitedMs = 0;
         }
 
         KeClearEvent(&DeviceContext->QuiesceEvent);
@@ -141,7 +182,14 @@ T2NcmWaitForDrain(
         waitedMs += pollMs;
     }
 
+    if (drained)
+    {
+        KeAcquireSpinLock(&DeviceContext->DrainLock, &oldIrql);
+        KeReleaseSpinLock(&DeviceContext->DrainLock, oldIrql);
+    }
+
     InterlockedExchange(&DeviceContext->PauseInProgress, 0);
+    return drained;
 }
 
 // ---------------------------------------------------------------------
@@ -896,9 +944,16 @@ T2NcmMiniportHaltEx(
     {
         WdfWorkItemFlush(context->PacketFilterWorkItem);
     }
+    if (context->PauseDrainWorkItem != NULL)
+    {
+        WdfWorkItemFlush(context->PauseDrainWorkItem);
+    }
     T2NcmRxStop(context);
     T2NcmTxCancelOutstanding(context);
-    T2NcmWaitForDrain(context);
+
+    // Must not give up: everything below frees what a late completion or
+    // NBL return would still touch.
+    (VOID)T2NcmWaitForDrain(context, TRUE);
 
     // Deregister first so no new IRPs arrive, then withdraw the pointer:
     // that step blocks until any IOCTL already in flight has finished.
@@ -922,6 +977,27 @@ T2NcmMiniportHaltEx(
 // ---------------------------------------------------------------------
 // MiniportPause / MiniportRestart — the new owners of the data path.
 // ---------------------------------------------------------------------
+
+// Finishes a MiniportPause whose bounded inline drain timed out. NDIS will
+// not issue Restart or Halt while the pause is pending, so the WDFDEVICE and
+// this preallocated work item stay alive until the drain is complete.
+VOID
+T2NcmEvtPauseDrainWorkItem(
+    _In_ WDFWORKITEM WorkItem
+    )
+{
+    PT2NCM_DEVICE_CONTEXT context =
+        T2NcmGetDeviceContext(WdfWorkItemGetParentObject(WorkItem));
+
+    (VOID)T2NcmWaitForDrain(context, TRUE);
+
+    (VOID)T2NcmTrySetState(context, T2NcmStateStopping, T2NcmStateNdisRegistered);
+
+    T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
+        "T2Ncm[POWER]: MiniportPause (deferred) EXIT - drain complete, adapter PAUSED\n"));
+
+    NdisMPauseComplete(context->MiniportAdapterHandle);
+}
 
 MINIPORT_PAUSE T2NcmMiniportPause;
 
@@ -969,7 +1045,19 @@ T2NcmMiniportPause(
     // drain below times out. T2NcmMiniportRestart restarts the target.
     T2NcmTxCancelOutstanding(context);
 
-    T2NcmWaitForDrain(context);
+    // Bounded inline wait: the common case drains in milliseconds. A pause
+    // must not be reported complete while indicated NBLs or sends are still
+    // out, so a timeout is not success - finish it asynchronously instead.
+    if (!T2NcmWaitForDrain(context, FALSE))
+    {
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
+            "T2Ncm[POWER]: MiniportPause drain not complete (rxNbls=%ld txReqs=%ld) "
+            "- completing asynchronously\n",
+            context->OutstandingRxNbls,
+            context->OutstandingTxRequests));
+        WdfWorkItemEnqueue(context->PauseDrainWorkItem);
+        return NDIS_STATUS_PENDING;
+    }
 
     // Back to NdisRegistered: the adapter still exists and the hardware
     // is still armed, it is just not moving frames.
@@ -981,10 +1069,7 @@ T2NcmMiniportPause(
         context->OutstandingRxNbls,
         context->OutstandingTxRequests));
 
-    // Synchronous completion. Returning NDIS_STATUS_PENDING would mean
-    // calling NdisMPauseComplete later, and there is nothing here that
-    // cannot be finished inline — T2NcmWaitForDrain has already bounded
-    // how long "inline" can be.
+    // Drained inline: synchronous completion.
     return NDIS_STATUS_SUCCESS;
 }
 

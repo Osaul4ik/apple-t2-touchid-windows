@@ -28,11 +28,14 @@ T2NcmNdisRegisterDriver(
     _In_ PUNICODE_STRING RegistryPath
     );
 
-// Signals the quiesce event if a pause is in progress and both drain
-// counters have reached zero. Called from every place that decrements
-// one of them (RX return, TX completion) — see MiniportPause for why
-// the wait is written the way it is.
+// Releases Count references on one drain counter (OutstandingRxNbls or
+// OutstandingTxRequests) and wakes a pause/halt that is waiting for the
+// drain. Every place that gives such a reference back must use this, and
+// it must be the caller's LAST access to DeviceContext: the moment both
+// counters are zero the waiter may free the context. See T2NcmWaitForDrain.
 VOID
-T2NcmQuiesceCheck(
-    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
+T2NcmDrainRelease(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext,
+    _Inout_ volatile LONG*     Counter,
+    _In_ LONG                  Count
     );
