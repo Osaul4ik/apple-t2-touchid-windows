@@ -25,9 +25,12 @@
 // NOTE ON POWER: this driver is a normal power policy owner for MI_00,
 // unlike T2Ncm.sys where NDIS owns power. That is correct and not an
 // inconsistency — MI_00 is not a network adapter, it is just a USB
-// interface that needs an owner. Its D0Entry/D0Exit are deliberately
-// empty and never block, so the stub can never be the reason a system
-// suspend is delayed.
+// interface that needs an owner. D0Entry/D0Exit only start and stop the
+// notification reader: a continuous reader is NOT power-managed by the
+// framework, so the driver has to do that itself. D0Exit therefore uses
+// WdfIoTargetStop(CancelSentIo), which returns only after the cancelled
+// reads have completed - it can delay a suspend if the USB stack never
+// hands a cancelled interrupt read back.
 
 #include <ntddk.h>
 #include <wdf.h>
