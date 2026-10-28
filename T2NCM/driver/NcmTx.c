@@ -139,15 +139,29 @@ T2NcmTxComputeLayout(
     ULONG datagramOffset;
     ULONG blockLength;
 
+    // Geometry is read ONCE. The diagnostic IOCTL path reaches this
+    // function without the data-path gate, while T2NcmPowerArmHardware
+    // clears these fields before it renegotiates them; validating
+    // DeviceContext->NdpOutDivisor and then dividing by a second read of it
+    // could divide by zero. Everything below uses the snapshot.
+    const ULONG ntbOutMax     = DeviceContext->NtbOutMaxSize;
+    const ULONG ndpDivisor    = DeviceContext->NdpOutDivisor;
+    const ULONG ndpRemainder  = DeviceContext->NdpOutPayloadRemainder;
+    const ULONG ndpAlignment  = DeviceContext->NdpOutAlignment;
+    const ULONG bulkOutMaxPkt = DeviceContext->BulkOutMaxPacketSize;
+
     *NdpOffset = 0;
     *NdpLength = 0;
     *DatagramOffset = 0;
     *BlockLength = 0;
 
-    if (DeviceContext->NtbOutMaxSize == 0 ||
-        DeviceContext->NdpOutDivisor == 0 ||
-        DeviceContext->NdpOutAlignment == 0)
+    if (ntbOutMax == 0 ||
+        ndpDivisor == 0 ||
+        ndpAlignment == 0 ||
+        ndpRemainder >= ndpDivisor ||
+        (ndpAlignment & (ndpAlignment - 1)) != 0)
     {
+        // Also catches a half-updated set (new divisor, old remainder).
         return STATUS_INVALID_DEVICE_STATE;
     }
 
@@ -162,11 +176,10 @@ T2NcmTxComputeLayout(
     // conventional NCM ordering. Nothing observed on real RX traffic
     // (NcmRx.c) or in the spec suggests the device cares about order as
     // long as the offsets it's told are honored.
-    ndpOffset = T2NcmRoundUpToAlignment(T2NCM_TX_NTH16_LEN, DeviceContext->NdpOutAlignment);
+    ndpOffset = T2NcmRoundUpToAlignment(T2NCM_TX_NTH16_LEN, ndpAlignment);
     ndpLength = T2NCM_TX_NDP16_HEADER_LEN + (2u * T2NCM_TX_NDP16_ENTRY_LEN); // one real entry + terminator
     datagramOffset = T2NcmRoundUpToCongruence(
-        ndpOffset + ndpLength, DeviceContext->NdpOutDivisor,
-        DeviceContext->NdpOutPayloadRemainder);
+        ndpOffset + ndpLength, ndpDivisor, ndpRemainder);
     blockLength = datagramOffset + FrameLength;
 
     if (ndpOffset > T2NCM_TX_MAX_WIRE_OFFSET ||
@@ -176,7 +189,7 @@ T2NcmTxComputeLayout(
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (blockLength > DeviceContext->NtbOutMaxSize)
+    if (blockLength > ntbOutMax)
     {
         return STATUS_INVALID_PARAMETER;
     }
@@ -191,9 +204,9 @@ T2NcmTxComputeLayout(
     // cdc_ncm does for the same reason, and the reference T2 setup runs on
     // that driver. The padding lives after the datagram, so the datagram
     // offset and the statistics that read it back are unaffected.
-    if (DeviceContext->BulkOutMaxPacketSize != 0 &&
-        (blockLength % DeviceContext->BulkOutMaxPacketSize) == 0 &&
-        blockLength < DeviceContext->NtbOutMaxSize &&
+    if (bulkOutMaxPkt != 0 &&
+        (blockLength % bulkOutMaxPkt) == 0 &&
+        blockLength < ntbOutMax &&
         blockLength < T2NCM_TX_MAX_WIRE_OFFSET)
     {
         blockLength += 1;
