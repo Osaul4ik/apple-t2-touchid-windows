@@ -64,7 +64,9 @@ T2NcmUsbDeactivateDataInterface(
 // WdfUsbTargetPipeResetSynchronously ("Working with USB Pipes"): the
 // host controller stack itself hands back every transfer queued on the
 // endpoint, which an IRP cancel alone does not guarantee. The caller must
-// already have stopped the pipe's I/O target. PASSIVE_LEVEL only.
+// already have stopped or purged the pipe's I/O target. Used only in the
+// error-recovery paths (pipe reset), never in the normal teardown.
+// PASSIVE_LEVEL only.
 NTSTATUS
 T2NcmUsbAbortPipe(
     _In_ WDFUSBPIPE Pipe,

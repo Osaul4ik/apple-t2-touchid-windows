@@ -1,74 +1,41 @@
 // SPDX-License-Identifier: GPL-2.0-only
-// UsbTransport.h — USB configuration, interface/pipe discovery.
+// NdisMiniport.h — every NDIS entry point this driver exposes.
 //
-// Called from NdisMiniport.c (MiniportInitializeEx / MiniportHaltEx) and
-// Power.c, NOT from WDF PnP callbacks — this driver has none. The
-// WDFDEVICE these functions run against was created with
-// WdfDeviceMiniportCreate and is not a power policy owner; see the
-// POWER-MANAGEMENT INVERSION block at the top of Driver.h.
+// This file is the top of the driver now. Under the inverted model
+// (Driver.h) NDIS owns PnP and power, so the callbacks declared in
+// NdisMiniport.c are the only places the driver is ever entered from
+// the system: there is no EvtDeviceAdd, no D0Entry, no D0Exit and no
+// WDF I/O queue anywhere in T2Ncm.sys.
 //
-// The MI_00 "stub role" entry point that used to live here is gone: the
-// MI_00 claim is now a separate binary (CtrlStub.c / T2NcmCtrl.sys),
-// because an NDIS miniport and a classic KMDF PnP driver cannot share
-// one DriverEntry.
-
+// Mapping from the pre-inversion KMDF design, for anyone reading the
+// git history:
+//
+//   EvtDevicePrepareHardware + EvtDeviceD0Entry  -> MiniportInitializeEx
+//   EvtDeviceD0Entry's "start RX"                -> MiniportRestart
+//   EvtDeviceD0Exit's "stop RX"                  -> MiniportPause
+//   EvtDeviceD0Exit's "go to Dx"                 -> OID_PNP_SET_POWER (Power.c)
+//   EvtDeviceReleaseHardware                     -> MiniportHaltEx
+//   EvtDeviceSelfManagedIo*                      -> (nothing; NDIS covers it)
+//   WdfDeviceCreateDeviceInterface + IO queue    -> NdisMRegisterDeviceEx
 #pragma once
-
 #include "Driver.h"
 
-// Creates the WDFUSBDEVICE against the miniport-mode WDFDEVICE and
-// selects the single-interface configuration, storing the resulting
-// interface handle in the device context. This PDO exposes exactly one
-// interface to itself (whatever its real bInterfaceNumber — MI_01 in
-// practice), starting on alt 0 with zero endpoints per the descriptor
-// dump. No USB I/O is issued here beyond the standard SELECT_CONFIGURATION
-// control transfer WDF itself performs.
-NTSTATUS
-T2NcmUsbPrepareHardware(
-    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
+// Called once from DriverEntry, after WdfDriverCreate. Fills in the
+// NDIS_MINIPORT_DRIVER_CHARACTERISTICS and registers them.
+NDIS_STATUS
+T2NcmNdisRegisterDriver(
+    _In_ PDRIVER_OBJECT  DriverObject,
+    _In_ PUNICODE_STRING RegistryPath
     );
 
-// Tears down the cached pipe/interface/device handles. Safe to call more
-// than once (idempotent) since surprise removal can reach
-// MiniportHaltEx from partially-initialized states.
+// Releases Count references on one drain counter (OutstandingRxNbls or
+// OutstandingTxRequests) and wakes a pause/halt that is waiting for the
+// drain. Every place that gives such a reference back must use this, and
+// it must be the caller's LAST access to DeviceContext: the moment both
+// counters are zero the waiter may free the context. See T2NcmWaitForDrain.
 VOID
-T2NcmUsbReleaseHardware(
-    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
-    );
-
-// Switches the data interface from alt 0 (idle, 0 endpoints) to alt 1
-// (bulk IN/OUT). Only to be called after NCM control-plane negotiation
-// succeeds. Re-validates both bulk pipes after the switch and unwinds
-// back to alt 0 on any failure.
-NTSTATUS
-T2NcmUsbActivateDataInterface(
-    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
-    );
-
-// Switches the data interface back to alt 0 and drops the cached bulk
-// pipe handles. Used when quiescing for a low-power state (Power.c) and
-// on halt. Idempotent; a no-op when the interface was never activated.
-// Callers must have stopped the RX engine and drained outstanding sends
-// first — this does not do it for them.
-VOID
-T2NcmUsbDeactivateDataInterface(
-    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
-    );
-
-// Upper bound for one URB_FUNCTION_ABORT_PIPE.
-#define T2NCM_USB_ABORT_TIMEOUT_MS  2000u
-
-// Sends an abort request to the pipe and waits (bounded) for it.
-// This is the step Microsoft's USB pipe recovery procedure puts between
-// WdfIoTargetStop(WdfIoTargetCancelSentIo) and
-// WdfUsbTargetPipeResetSynchronously ("Working with USB Pipes"): the
-// host controller stack itself hands back every transfer queued on the
-// endpoint, which an IRP cancel alone does not guarantee. The caller must
-// already have stopped or purged the pipe's I/O target. Used only in the
-// error-recovery paths (pipe reset), never in the normal teardown.
-// PASSIVE_LEVEL only.
-NTSTATUS
-T2NcmUsbAbortPipe(
-    _In_ WDFUSBPIPE Pipe,
-    _In_ ULONG      TimeoutMs
+T2NcmDrainRelease(
+    _In_ PT2NCM_DEVICE_CONTEXT DeviceContext,
+    _Inout_ volatile LONG*     Counter,
+    _In_ LONG                  Count
     );
