@@ -392,3 +392,25 @@ T2NcmUsbDeactivateDataInterface(
     T2NcmUsbDeactivateDataInterfaceLocked(DeviceContext);
     T2NcmUsbUnlockPipes(DeviceContext);
 }
+
+NTSTATUS
+T2NcmUsbAbortPipe(
+    _In_ WDFUSBPIPE Pipe,
+    _In_ ULONG      TimeoutMs
+    )
+{
+    WDF_REQUEST_SEND_OPTIONS options;
+
+    NT_ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
+
+    if (Pipe == NULL)
+    {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
+    WDF_REQUEST_SEND_OPTIONS_INIT(&options, WDF_REQUEST_SEND_OPTION_TIMEOUT);
+    WDF_REQUEST_SEND_OPTIONS_SET_TIMEOUT(&options,
+        WDF_REL_TIMEOUT_IN_MS(TimeoutMs));
+
+    return WdfUsbTargetPipeAbortSynchronously(Pipe, WDF_NO_HANDLE, &options);
+}

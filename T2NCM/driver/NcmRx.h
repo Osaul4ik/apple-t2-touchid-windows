@@ -67,3 +67,13 @@ T2NcmRxReturnNetBufferLists(
     _In_ PNET_BUFFER_LIST      NetBufferLists,
     _In_ ULONG                 ReturnFlags
     );
+
+// Blocks until every RX run that T2NcmRxStop had to orphan (reads the USB
+// stack never handed back) has been freed by its last completion. Called
+// from MiniportDriverUnload: a driver must not be unloaded while it still
+// has requests pending in the stack, because their completion routines
+// live in this image. PASSIVE_LEVEL only.
+VOID
+T2NcmRxWaitForOrphanedRuns(
+    VOID
+    );

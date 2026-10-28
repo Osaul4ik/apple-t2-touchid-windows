@@ -54,3 +54,19 @@ VOID
 T2NcmUsbDeactivateDataInterface(
     _In_ PT2NCM_DEVICE_CONTEXT DeviceContext
     );
+
+// Upper bound for one URB_FUNCTION_ABORT_PIPE.
+#define T2NCM_USB_ABORT_TIMEOUT_MS  2000u
+
+// Sends an abort request to the pipe and waits (bounded) for it.
+// This is the step Microsoft's USB pipe recovery procedure puts between
+// WdfIoTargetStop(WdfIoTargetCancelSentIo) and
+// WdfUsbTargetPipeResetSynchronously ("Working with USB Pipes"): the
+// host controller stack itself hands back every transfer queued on the
+// endpoint, which an IRP cancel alone does not guarantee. The caller must
+// already have stopped the pipe's I/O target. PASSIVE_LEVEL only.
+NTSTATUS
+T2NcmUsbAbortPipe(
+    _In_ WDFUSBPIPE Pipe,
+    _In_ ULONG      TimeoutMs
+    );

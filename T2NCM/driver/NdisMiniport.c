@@ -137,6 +137,7 @@ T2NcmWaitForDrain(
     const ULONG pollMs = 20;
     const ULONG maxWaitMs = 5000;
     ULONG waitedMs = 0;
+    ULONG intervals = 0;
     BOOLEAN drained = TRUE;
     KIRQL oldIrql;
 
@@ -165,6 +166,16 @@ T2NcmWaitForDrain(
                 break;
             }
             waitedMs = 0;
+            intervals++;
+
+#if DBG
+            // A drain that never ends is a leaked reference, not slowness:
+            // stop in the debugger once, with the counters in the log above.
+            if (intervals == 6 && !KD_DEBUGGER_NOT_PRESENT)
+            {
+                DbgBreakPoint();
+            }
+#endif
         }
 
         KeClearEvent(&DeviceContext->QuiesceEvent);
@@ -1911,9 +1922,16 @@ T2NcmEvtRecoveryWorkItem(
             T2NcmRxStop(context);
 
             // Clears a halted/stalled bulk-IN endpoint and its data toggle.
+            // Abort first, as in Microsoft's pipe recovery procedure; the
+            // RX target is already stopped by T2NcmRxStop.
             if (context->BulkInPipe != NULL)
             {
-                NTSTATUS inStatus = WdfUsbTargetPipeResetSynchronously(
+                NTSTATUS inStatus;
+
+                (VOID)T2NcmUsbAbortPipe(context->BulkInPipe,
+                    T2NCM_USB_ABORT_TIMEOUT_MS);
+
+                inStatus = WdfUsbTargetPipeResetSynchronously(
                     context->BulkInPipe, NULL, NULL);
                 T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
                     "T2Ncm: bulk-IN pipe reset -> 0x%08X\n", inStatus));
@@ -1993,6 +2011,11 @@ T2NcmMiniportDriverUnload(
         NdisMDeregisterMiniportDriver(g_T2NcmMiniportDriverHandle);
         g_T2NcmMiniportDriverHandle = NULL;
     }
+
+    // A driver must not be unloaded while requests it sent are still
+    // pending in the USB stack (their completion routines live in this
+    // image): wait for any RX run that T2NcmRxStop had to orphan.
+    T2NcmRxWaitForOrphanedRuns();
 
     // Created in DriverEntry. No adapter is left to publish itself and
     // the diagnostic device is gone with the last adapter, so nothing can

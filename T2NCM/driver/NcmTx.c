@@ -11,6 +11,7 @@
 #include "Tunnel.h"
 #include "Device.h"
 #include "NdisMiniport.h"
+#include "UsbTransport.h"
 
 // Longest an async bulk-OUT write may stay with the USB stack before WDF
 // cancels it. Generous for a healthy write (sub-millisecond) while short
@@ -893,7 +894,21 @@ T2NcmTxRecoverPipe(
         return STATUS_INVALID_DEVICE_STATE;
     }
 
+    // Microsoft's recovery procedure for a USB pipe ("Working with USB
+    // Pipes"): stop and cancel, abort, reset, restart. The abort is what
+    // makes the host controller stack return anything still queued on the
+    // endpoint; its failure does not prevent the reset, which is still
+    // worth trying.
     WdfIoTargetStop(WdfUsbTargetPipeGetIoTarget(pipe), WdfIoTargetCancelSentIo);
+
+    {
+        NTSTATUS abortStatus = T2NcmUsbAbortPipe(pipe, T2NCM_USB_ABORT_TIMEOUT_MS);
+        if (!NT_SUCCESS(abortStatus))
+        {
+            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
+                "T2Ncm: bulk-OUT pipe abort -> 0x%08X\n", abortStatus));
+        }
+    }
 
     status = WdfUsbTargetPipeResetSynchronously(pipe, NULL, NULL);
     InterlockedIncrement(&DeviceContext->TxPipeResetCount);

@@ -834,13 +834,14 @@ T2NcmRxParseNtb(
 //
 // The loop below never cancels anything on its own. A read that completes
 // with an error is simply not re-sent, and the only cancel a request ever
-// sees is the single one T2NcmRxTeardownReads issues
-// (WdfRequestCancelSentRequest, after the target has been stopped with
-// WdfIoTargetLeaveSentIoPending). WdfIoTargetStop(CancelSentIo) is NOT used
-// for this: the framework waits for every cancelled request to complete
-// before it returns, so a read the USB stack never hands back would block
-// the stop forever and the bounded drain / orphan logic below would be
-// unreachable exactly when it is needed.
+// sees is the single one T2NcmRxTeardownReads triggers with
+// WdfIoTargetPurge(WdfIoTargetPurgeIo): the framework itself cancels what
+// was sent, exactly once per request, the same way WdfIoTargetStop with
+// CancelSentIo does, but WdfIoTargetPurgeIo returns without waiting.
+// WdfIoTargetStop(CancelSentIo) is NOT used for the teardown: it does not
+// return until every cancelled read has completed, so a read the USB stack
+// never hands back would block it forever and the bounded drain / orphan
+// logic below would be unreachable exactly when it is needed.
 //
 // Ownership rules (see T2NCM_RX_RUN below):
 //   * Everything the completion routine shares with the stop path lives in
@@ -880,7 +881,6 @@ typedef struct _T2NCM_RX_RUN
     volatile LONG         Refs;           // 1 (owner) + reads in flight
     volatile LONG         InCompletion;   // completion routines executing now
     volatile LONG         Orphaned;       // owner gave up; device may be gone
-    volatile LONG         SentSlots;      // Requests[0..SentSlots) were sent at least once
     WDFREQUEST            Requests[T2NCM_RX_MAX_READ_SLOTS];
 } T2NCM_RX_RUN, *PT2NCM_RX_RUN;
 
@@ -1155,8 +1155,46 @@ Done:
     T2NcmRxRunRelease(run);
 }
 
+VOID
+T2NcmRxWaitForOrphanedRuns(
+    VOID
+    )
+{
+    const ULONG pollMs = 100;
+    ULONG waitedMs = 0;
+
+    NT_ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
+
+    // No upper bound on purpose: unloading while a read is still pending in
+    // the USB stack would let its completion routine run in an unmapped
+    // image. A hang here is the safe outcome and is reported below.
+    while (InterlockedCompareExchange(
+               (LONG volatile *)&g_T2NcmRxOrphanedRuns, 0, 0) != 0)
+    {
+        LARGE_INTEGER delay;
+
+        delay.QuadPart = -((LONGLONG)pollMs * 10000);
+        KeDelayExecutionThread(KernelMode, FALSE, &delay);
+        waitedMs += pollMs;
+
+        if ((waitedMs % 5000) == 0)
+        {
+            T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_ERROR_LEVEL,
+                "T2Ncm: unload waiting for %ld orphaned RX run(s) for %lu ms\n",
+                g_T2NcmRxOrphanedRuns, waitedMs));
+
+#if DBG
+            if (waitedMs == 30000 && !KD_DEBUGGER_NOT_PRESENT)
+            {
+                DbgBreakPoint();
+            }
+#endif
+        }
+    }
+}
+
 // Shared by T2NcmRxStop and the failure path of T2NcmRxStart. PASSIVE_LEVEL
-// only (WdfIoTargetStop and a sleeping drain wait). Always detaches
+// only (WdfIoTargetPurge and a sleeping drain wait). Always detaches
 // DeviceContext->RxRun on return.
 static
 VOID
@@ -1179,29 +1217,18 @@ T2NcmRxTeardownReads(
     // target inside T2NcmRxSubmitRead.
     InterlockedExchange(&run->Running, 0);
 
-    // Stop the target so a resend racing this stop fails inside
-    // T2NcmRxSubmitRead, but leave the sent reads alone: with CancelSentIo
-    // WdfIoTargetStop does not return until every read has completed, which
-    // would make the bounded wait below pointless.
-    WdfIoTargetStop(
+    // One framework-level cancel over everything sent to the pipe, without
+    // waiting (WdfIoTargetPurgeIo). It also stops the target from accepting
+    // new requests, so a resend racing this call fails inside
+    // T2NcmRxSubmitRead. This is the documented non-blocking alternative to
+    // WdfIoTargetStop(CancelSentIo), which waits for every read to complete
+    // and would make the bounded wait below pointless. The target is
+    // restarted by WdfIoTargetStart in T2NcmRxStart; a pipe reset or abort
+    // may still be sent to a purged target (Microsoft documents exactly that
+    // for WdfUsbTargetPipeResetSynchronously).
+    WdfIoTargetPurge(
         WdfUsbTargetPipeGetIoTarget(run->Pipe),
-        WdfIoTargetLeaveSentIoPending);
-
-    // The ONLY cancel this engine ever issues: one per read, nothing waits
-    // here. Slots that already completed (or were retired) answer FALSE;
-    // slots that were never sent are skipped because the API is only valid
-    // for a request that was sent to a target. The requests stay valid
-    // until the run is destroyed, which cannot happen while the owner
-    // reference is held.
-    {
-        LONG sent = run->SentSlots;
-        LONG slot;
-
-        for (slot = 0; slot < sent; slot++)
-        {
-            (VOID)WdfRequestCancelSentRequest(run->Requests[slot]);
-        }
-    }
+        WdfIoTargetPurgeIo);
 
     // Wait until no read is owned by the USB stack or a completion
     // routine (only the owner's reference left).
@@ -1421,9 +1448,6 @@ T2NcmRxStart(
             status = STATUS_UNSUCCESSFUL;
             goto Fail;
         }
-
-        // Only slots counted here are ever cancelled by the teardown.
-        InterlockedExchange(&run->SentSlots, (LONG)(i + 1));
     }
 
     DeviceContext->RxStarted = TRUE;
