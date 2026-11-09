@@ -16,6 +16,7 @@
 #include "../../protocol/BridgeXpc/Connection.h"
 #include "../../protocol/BiometricKit/Commands.h"
 #include "../../protocol/BiometricKit/VerificationEngine.h"
+#include "../../protocol/BiometricKit/MacosUserId.h"
 #include "../../protocol/Discovery/Adapter.h"
 #include "../../protocol/Discovery/PortCache.h"
 #include "../../protocol/Discovery/PortScan.h"
@@ -270,6 +271,20 @@ static int CmdLoadKeybag(Client& client, const std::wstring& path) {
     return 0;
 }
 
+// The special user bag is the negated macOS uid (-502 <-> uid 502). Persist it
+// so identities / warmup / verify and the UMDF driver stop using the old
+// hardcoded 501 (HKLM\SOFTWARE\T2TouchIdBio\MacosUserId, needs Administrator).
+static void ReportMacosUserIdFromSpecialBag(int32_t specialUserBag) {
+    uint32_t uid = 0;
+    if (!t2::biometrickit::MacosUserIdFromSpecialBag(specialUserBag, &uid)) return;
+    if (t2::biometrickit::SaveConfiguredMacosUserId(uid)) {
+        std::wcout << L"macOS user id set to " << uid << L" (from special bag " << specialUserBag << L")\n";
+    } else {
+        std::wcout << L"warning: could not save macOS user id " << uid
+                   << L" to HKLM (run as Administrator); use --uid " << uid << L" explicitly\n";
+    }
+}
+
 static int CmdSetSystemKeybag(Client& client, int32_t handle, int32_t specialUserBag) {
     int8_t sepStatus = 0;
     AksResult r = client.MakeSystemKeybag(handle, specialUserBag, 1, &sepStatus);
@@ -291,6 +306,7 @@ static int CmdSetSystemKeybag(Client& client, int32_t handle, int32_t specialUse
     }
 
     std::wcout << L"set-system-keybag: OK\n";
+    ReportMacosUserIdFromSpecialBag(specialUserBag);
     return 0;
 }
 
@@ -326,6 +342,7 @@ static int CmdUnlock(Client& client, int32_t handle) {
         return 1;
     }
     std::wcout << L"unlock: OK\n";
+    ReportMacosUserIdFromSpecialBag(handle); // negative handle = special user bag (-502 -> uid 502)
     return 0;
 }
 
@@ -953,7 +970,9 @@ static int CmdIdentities(int argc, wchar_t* argv[]) {
     using namespace t2::bridgexpc;
     using namespace t2::biometrickit;
 
-    uint32_t macosUserId = 501;
+    // Default = uid derived from the special bag last set via set-system-keybag /
+    // unlock <-bag> / vault (HKLM\SOFTWARE\T2TouchIdBio\MacosUserId); --uid wins.
+    uint32_t macosUserId = LoadConfiguredMacosUserId();
     for (int i = 2; i < argc; ++i) {
         std::wstring a = argv[i];
         if (a == L"--uid" && i + 1 < argc) {
@@ -990,7 +1009,9 @@ static int CmdWarmup(int argc, wchar_t* argv[]) {
     using namespace t2::bridgexpc;
     using namespace t2::biometrickit;
 
-    uint32_t macosUserId = 501;
+    // Default = uid derived from the special bag last set via set-system-keybag /
+    // unlock <-bag> / vault (HKLM\SOFTWARE\T2TouchIdBio\MacosUserId); --uid wins.
+    uint32_t macosUserId = LoadConfiguredMacosUserId();
     for (int i = 2; i < argc; ++i) {
         std::wstring a = argv[i];
         if (a == L"--uid" && i + 1 < argc) {
@@ -1029,6 +1050,7 @@ static int CmdVerify(int argc, wchar_t* argv[]) {
     using namespace t2::biometrickit;
 
     VerifyConfig cfg;
+    cfg.macosUserId = LoadConfiguredMacosUserId(); // --uid below overrides
     for (int i = 2; i < argc; ++i) {
         std::wstring a = argv[i];
         if (a == L"--uid" && i + 1 < argc) {

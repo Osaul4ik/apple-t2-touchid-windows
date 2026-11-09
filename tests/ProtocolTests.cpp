@@ -17,6 +17,7 @@
 #include "../protocol/BridgeXpc/PlistPayload.h"
 #include "../protocol/BiometricKit/MatchResult.h"
 #include "../protocol/BiometricKit/Commands.h"
+#include "../protocol/BiometricKit/MacosUserId.h"
 #include <iostream>
 #include <cstring>
 #include <string>
@@ -32,6 +33,18 @@ static int g_failures = 0;
         g_failures++; \
     } \
 } while (0)
+
+// The special user bag is the negated macOS uid: -502 must give uid 502, not the
+// old hardcoded 501. Non-negative values are keybag handles, never a uid.
+static void TestMacosUserId_DerivedFromSpecialBag() {
+    uint32_t uid = 0;
+    CHECK(biometrickit::MacosUserIdFromSpecialBag(-502, &uid) && uid == 502);
+    CHECK(biometrickit::MacosUserIdFromSpecialBag(-501, &uid) && uid == 501);
+    uid = 7;
+    CHECK(!biometrickit::MacosUserIdFromSpecialBag(0, &uid) && uid == 7);
+    CHECK(!biometrickit::MacosUserIdFromSpecialBag(1, &uid) && uid == 7);
+    CHECK(!biometrickit::MacosUserIdFromSpecialBag(INT32_MIN, &uid) && uid == 7);
+}
 
 static void TestFrameHeader_Valid() {
     uint8_t buf[16];
@@ -556,6 +569,7 @@ static void TestPeerMac_DerivedFromEui64LinkLocal() {
 }
 int wmain() {
     TestFrameHeader_Valid();
+    TestMacosUserId_DerivedFromSpecialBag();
     TestFrameHeader_Truncated();
     TestFrameHeader_BadMagic();
     TestFrameHeader_BadVersion();

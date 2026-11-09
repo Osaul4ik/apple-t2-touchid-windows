@@ -33,6 +33,7 @@
 
 #include "SepVaultFormat.h"
 #include "../../protocol/AppleKeyStore/Client.h"
+#include "../../protocol/BiometricKit/MacosUserId.h"
 #include "../../protocol/BridgeXpc/Log.h"   // shared, TTL-cached registry gates (t2::log)
 
 // Same GUID as public.h / Client::Open — declare only (do not #include
@@ -379,6 +380,22 @@ bool RunBootstrapSequence(HANDLE readyEvent) {
         return false;
     }
     Log(L"bootstrap: sep-vault.bin read OK");
+
+    // The special user bag is the negated macOS uid (-502 <-> uid 502). Publish
+    // it for the UMDF driver (HKLM\SOFTWARE\T2TouchIdBio\MacosUserId) BEFORE
+    // any SEP step, so identity filtering / matching follows the vault even if
+    // a later bootstrap step fails and without needing the GUI to have run.
+    {
+        uint32_t uid = 0;
+        wchar_t buf[128];
+        if (t2::biometrickit::PersistMacosUserIdFromSpecialBag(vault.specialUserBag, &uid)) {
+            swprintf_s(buf, L"bootstrap: macOS user id %u derived from special bag %d", uid, vault.specialUserBag);
+        } else {
+            swprintf_s(buf, L"bootstrap: special bag %d is not a negative uid bag - macOS user id left unchanged",
+                       vault.specialUserBag);
+        }
+        Log(buf);
+    }
 
     ZeroingBuffer keybag;
     ZeroingBuffer password;

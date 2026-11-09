@@ -8,6 +8,7 @@
 #include "BridgeXpc/TransportMode.h"
 // FindT2NcmEndpoints() - peer IPv6 link-local + interface index for the probe.
 #include "Discovery/Adapter.h"
+#include "BiometricKit/MacosUserId.h"
 #include <atomic>
 #include <mutex>
 #include <condition_variable>
@@ -335,7 +336,7 @@ void HandleGetPrivateSensorType(_In_ WDFREQUEST Request)
 //     transaction, then CAPTURE completes (Match / NoMatch / Timeout) so
 //     WBF may open a new CAPTURE. CancelIoEx still ends the wait early.
 //   - Section 4's multi-user case (several macOS fingers under different
-//     macosUserId on one T2) is not handled: kDefaultMacosUserId is the
+//     macosUserId on one T2) is not handled: the configured macosUserId is the
 //     only identity this build ever asks the SEP about. Per design doc 4
 //     this is an accepted MVP limit (1 Windows account = 1 finger), not an
 //     oversight - but it means Enroll always confirms/denies against the
@@ -356,10 +357,15 @@ using t2::biometrickit::VerifyConfig;
 using t2::biometrickit::VerifyOutcome;
 using t2::biometrickit::IdentityRecordV1;
 
-// design doc 4: MVP is "1 Windows account = 1 macosUserId", not yet wired to
-// any per-account config store. Change this (and rebuild) to match whichever
-// macOS user id was actually enrolled, until a real settings UI exists.
-constexpr uint32_t kDefaultMacosUserId = 501;
+// design doc 4: MVP is "1 Windows account = 1 macosUserId". The id is NOT a
+// compile-time constant any more: it is derived from the special user bag the
+// user enters (bag -502 <-> uid 502) and persisted by T2SepBootstrap (from the
+// vault), the SepVault GUI and t2touchid.exe to
+//   HKLM\SOFTWARE\T2TouchIdBio\MacosUserId  (REG_DWORD, missing = 501)
+// (protocol/BiometricKit/MacosUserId.h). Read through the same TTL cache as the
+// other T2TouchIdBio DWORDs, so a changed bag reaches the NEXT capture without
+// a reboot or rebuild. Each CAPTURE_DATA handler snapshots it once.
+uint32_t CurrentMacosUserId();
 
 // Hybrid (Linux + WBF lock screen): each BiometricKit StartMatch session is
 // bounded to matchWindow (t2-fprintd --match-seconds default=20s) so the SEP
@@ -1789,6 +1795,15 @@ bool LoadShortVerify()
                                           1, kBioRegCacheTtlMs) != 0;
 }
 
+uint32_t CurrentMacosUserId()
+{
+    static t2::transport::CachedDword cache;
+    const DWORD v = t2::transport::ReadDwordCached(
+        cache, t2::biometrickit::kMacosUserIdRegKey, t2::biometrickit::kMacosUserIdRegValue,
+        t2::biometrickit::kDefaultMacosUserId, kBioRegCacheTtlMs);
+    return v != 0 ? static_cast<uint32_t>(v) : t2::biometrickit::kDefaultMacosUserId;
+}
+
 // HKLM\SOFTWARE\T2TouchIdBio\LockOnDisplayOff (REG_DWORD, GUI writes 0/1)
 // When nonzero: OnConsoleDisplayState(OFF) signals Global\\T2TouchIdBio_LockRequest
 // (T2SepBootstrap performs LockWorkStation in the interactive session).
@@ -1807,7 +1822,7 @@ bool LoadLockOnDisplayOff()
 // PURPOSE_ENROLL / _ENROLL_FOR_VERIFICATION / _ENROLL_FOR_IDENTIFICATION
 // (design doc 4): does NOT collect a new biometric sample. Runs the same
 // WarmUp() identity-list read the CLI's `warmup`/`identities` commands use
-// and requires a non-empty identity list for kDefaultMacosUserId - i.e. it
+// and requires a non-empty identity list for the configured macosUserId - i.e. it
 // confirms the SEP already has this macOS user enrolled (enrollment stays
 // on macOS, per README), it does not create a new enrollment on the SEP.
 // The vendor payload carries no matchedUuid (WarmUp doesn't match anything);
@@ -1815,7 +1830,8 @@ bool LoadLockOnDisplayOff()
 // actually persist {macosUserId} as this account's "template" record.
 void HandleCaptureEnroll(_In_ WDFREQUEST Request, const CaptureKey& key)
 {
-    T2BioLog("CAPTURE_DATA(enroll): begin, macosUserId=%u", static_cast<unsigned>(kDefaultMacosUserId));
+    const uint32_t macosUserId = CurrentMacosUserId();
+    T2BioLog("CAPTURE_DATA(enroll): begin, macosUserId=%u", static_cast<unsigned>(macosUserId));
     // Same cancel-aware connect retry as verify: cold-boot NCM lag must not
     // turn enroll into an immediate DEVICE_FAILURE (Settings → Fingerprint).
     // The shared event is reset only by ProcessCapture after acquiring the
@@ -1845,7 +1861,7 @@ void HandleCaptureEnroll(_In_ WDFREQUEST Request, const CaptureKey& key)
     }
 
     VerifyConfig cfg;
-    cfg.macosUserId = kDefaultMacosUserId;
+    cfg.macosUserId = macosUserId;
     VerificationEngine engine(cfg);
     std::vector<IdentityRecordV1> identities;
     const bool warmedUp = engine.WarmUp(&conn, &identities);
@@ -1856,24 +1872,24 @@ void HandleCaptureEnroll(_In_ WDFREQUEST Request, const CaptureKey& key)
         return;
     }
     const bool hasIdentity = std::any_of(identities.begin(), identities.end(),
-        [](const IdentityRecordV1& r) { return r.userId == kDefaultMacosUserId; });
+        [macosUserId](const IdentityRecordV1& r) { return r.userId == macosUserId; });
     if (!hasIdentity) {
         // Fail-closed per design doc 5's spirit: an empty/mismatched
         // identity list is not "enrolled", never silently accepted.
         T2BioLog("CAPTURE_DATA(enroll): SEP has no identity for macosUserId=%u (found %u total)",
-                 static_cast<unsigned>(kDefaultMacosUserId), static_cast<unsigned>(identities.size()));
+                 static_cast<unsigned>(macosUserId), static_cast<unsigned>(identities.size()));
         // WINBIO_E_UNKNOWN_ID (winbio_err.h): the requested identity is not
         // among the identities the SEP reports.
         CompleteCaptureData(Request, WINBIO_E_UNKNOWN_ID, WINBIO_SENSOR_READY, 0, {});
         return;
     }
 
-    T2BioLog("CAPTURE_DATA(enroll): confirmed identity for macosUserId=%u", kDefaultMacosUserId);
+    T2BioLog("CAPTURE_DATA(enroll): confirmed identity for macosUserId=%u", macosUserId);
     // Kind=EnrollConfirm: no touch happened, so the engine adapter accepts
     // this sample only in UpdateEnrollment and never for verify/identify.
     std::vector<uint8_t> payload = t2::biometrickit::SerializeVendorPayload(
         VerifyOutcome::Match /* "confirmed", not a fingerprint match - see comment above */,
-        kDefaultMacosUserId, std::nullopt, t2::biometrickit::kSampleKindEnrollConfirm);
+        macosUserId, std::nullopt, t2::biometrickit::kSampleKindEnrollConfirm);
     const std::vector<uint8_t> bir = t2::wbdi::BuildVendorBir(key.Purpose, key.Flags, payload, LoadBirOptions());
     T2BioLog("CAPTURE_DATA(enroll): BIR built, %llu bytes (vendor payload %llu)",
              static_cast<unsigned long long>(bir.size()), static_cast<unsigned long long>(payload.size()));
@@ -1889,8 +1905,9 @@ void HandleCaptureEnroll(_In_ WDFREQUEST Request, const CaptureKey& key)
 // VerifyOutcome straight onto the WinBioHresult this IOCTL completes with.
 void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
 {
+    const uint32_t macosUserId = CurrentMacosUserId();
     T2BioLog("CAPTURE_DATA(verify): begin, macosUserId=%u, window=%llds",
-             static_cast<unsigned>(kDefaultMacosUserId),
+             static_cast<unsigned>(macosUserId),
              static_cast<long long>(kCaptureMatchWindow.count()));
 
     if (SystemIsShuttingDown()) {
@@ -1908,7 +1925,7 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
             ConsumeMatchReplay(&replayUuid)) {
             T2BioLog("CAPTURE_DATA(verify): replaying Match (WBF 2nd CAPTURE of pair) - no sensor session");
             const std::vector<uint8_t> payload = t2::biometrickit::SerializeVendorPayload(
-                VerifyOutcome::Match, kDefaultMacosUserId, replayUuid,
+                VerifyOutcome::Match, macosUserId, replayUuid,
                 t2::biometrickit::kSampleKindVerify);
             const std::vector<uint8_t> bir =
                 t2::wbdi::BuildVendorBir(key.Purpose, key.Flags, payload, LoadBirOptions());
@@ -1948,7 +1965,7 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
     }
 
     VerifyConfig cfg;
-    cfg.macosUserId = kDefaultMacosUserId;
+    cfg.macosUserId = macosUserId;
     cfg.matchWindow = kCaptureMatchWindow;
     // Snapshot BEFORE the initial wait, not after it. WaitForSystemResume()
     // always writes the CURRENT (already post-resume) generation into its
@@ -2255,7 +2272,7 @@ void HandleCaptureVerify(_In_ WDFREQUEST Request, const CaptureKey& key)
     std::vector<uint8_t> bir;
     if (outcome == VerifyOutcome::Match) {
         const std::vector<uint8_t> payload = t2::biometrickit::SerializeVendorPayload(
-            outcome, kDefaultMacosUserId, matchedUuid, t2::biometrickit::kSampleKindVerify);
+            outcome, macosUserId, matchedUuid, t2::biometrickit::kSampleKindVerify);
         bir = t2::wbdi::BuildVendorBir(key.Purpose, key.Flags, payload, LoadBirOptions());
         T2BioLog("CAPTURE_DATA(verify): BIR built, %llu bytes (vendor payload %llu)",
                  static_cast<unsigned long long>(bir.size()), static_cast<unsigned long long>(payload.size()));

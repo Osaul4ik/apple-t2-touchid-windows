@@ -1176,6 +1176,23 @@ namespace T2TouchId.SepVaultGui
             }
         }
 
+        // HKLM\SOFTWARE\T2TouchIdBio\MacosUserId - read by the UMDF driver (Queue.cpp,
+        // CurrentMacosUserId) and t2touchid.exe; see protocol/BiometricKit/MacosUserId.h.
+        private static bool WriteMacosUserId(uint uid)
+        {
+            try
+            {
+                using var key = Microsoft.Win32.Registry.LocalMachine.CreateSubKey(BioRegPath, true);
+                if (key == null) return false;
+                key.SetValue("MacosUserId", unchecked((int)uid), Microsoft.Win32.RegistryValueKind.DWord);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
         private void OnSave(object sender, RoutedEventArgs e)
         {
             if (_keybagBytes == null)
@@ -1200,8 +1217,19 @@ namespace T2TouchId.SepVaultGui
             try
             {
                 SepVaultFormat.Write(VaultPath, _keybagBytes, PasswordBox.Password, specialBag);
+                // The special bag is the negated macOS uid (-502 <-> uid 502). Publish it
+                // for the UMDF driver / CLI (HKLM\SOFTWARE\T2TouchIdBio\MacosUserId); the
+                // T2SepBootstrap service re-derives it from the vault on every start too.
+                string uidNote = "";
+                if (specialBag < 0 && specialBag != int.MinValue)
+                {
+                    uint macosUid = (uint)(-(long)specialBag);
+                    uidNote = WriteMacosUserId(macosUid)
+                        ? $"\nmacOS user id: {macosUid}."
+                        : $"\nCould not write macOS user id {macosUid} to HKLM; the service will set it at next start.";
+                }
                 VaultStatusText.Foreground = DotOk;
-                VaultStatusText.Text = $"Saved: {VaultPath}\nYou can delete the original user.kb; the vault does not keep it in plaintext.\nRestart Windows to apply.";
+                VaultStatusText.Text = $"Saved: {VaultPath}\nYou can delete the original user.kb; the vault does not keep it in plaintext.{uidNote}\nRestart Windows to apply.";
                 _keybagBytes = null;
                 KeybagPathBox.Text = "";
                 LoadVaultState();
