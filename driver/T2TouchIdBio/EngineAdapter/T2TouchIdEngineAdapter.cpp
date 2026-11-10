@@ -570,8 +570,11 @@ HRESULT WINAPI EngineVerifyFeatureSet(
     SIZE_T count = 0;
     const HRESULT qhr = OpenRecordSet(Pipeline, Identity, SubFactor, &count);
     if (FAILED(qhr) || count == 0) {
-        EngLog("     no enrolled record for this identity/subfactor");
-        return TraceRet("VerifyFeatureSet", WINBIO_E_UNKNOWN_ID);
+        // Microsoft's engine-adapter sample maps "no record for this identity"
+        // (WINBIO_E_DATABASE_NO_RESULTS) to WINBIO_E_NO_MATCH; UNKNOWN_ID is
+        // the IdentifyFeatureSet code, not a documented Verify return.
+        EngLog("     no enrolled record for this identity/subfactor -> NO_MATCH");
+        return TraceRet("VerifyFeatureSet", WINBIO_E_NO_MATCH);
     }
     bool matched = false;
     ForEachRecord(Pipeline, count, [&](const WINBIO_STORAGE_RECORD& record) {
@@ -585,7 +588,10 @@ HRESULT WINAPI EngineVerifyFeatureSet(
     EngLog("     verify: sample macosUserId=%lu -> %s", static_cast<unsigned long>(sampleUser),
            matched ? "MATCH" : "no match");
     *Match = matched ? TRUE : FALSE;
-    return TraceRet("VerifyFeatureSet", S_OK);
+    // PIBIO_ENGINE_VERIFY_FEATURE_SET_FN: a feature set that does not match
+    // the template of Identity/SubFactor is reported as WINBIO_E_NO_MATCH with
+    // *Match = FALSE - S_OK is the success (match) code only.
+    return TraceRet("VerifyFeatureSet", matched ? S_OK : WINBIO_E_NO_MATCH);
 }
 
 HRESULT WINAPI EngineIdentifyFeatureSet(

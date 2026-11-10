@@ -148,6 +148,20 @@ AksResult Client::Exchange(uint8_t operation, const std::vector<uint8_t>& reques
         *outSepStatus = 0;
     }
     std::vector<uint8_t> in(sizeof(T2_AKS_EXCHANGE_IN) + request.size(), 0);
+    // `in` is a second copy of the request body - for load-keybag that is the
+    // decrypted keybag, for change-lock-state the plaintext password - and
+    // `out` can carry key material back. Callers zero their own buffers
+    // (Unlock, T2SepBootstrap's ZeroingBuffer), but these two heap copies were
+    // freed with the secret still in them. Wipe both on every return path.
+    std::vector<uint8_t> out;
+    struct WipeOnExit {
+        std::vector<uint8_t>& a;
+        std::vector<uint8_t>& b;
+        ~WipeOnExit() {
+            if (a.capacity()) SecureZeroMemory(a.data(), a.capacity());
+            if (b.capacity()) SecureZeroMemory(b.data(), b.capacity());
+        }
+    } wipe{in, out};
     auto* inHeader = reinterpret_cast<T2_AKS_EXCHANGE_IN*>(in.data());
     inHeader->Operation = operation;
     if (!request.empty()) {
@@ -155,7 +169,7 @@ AksResult Client::Exchange(uint8_t operation, const std::vector<uint8_t>& reques
     }
 
     constexpr size_t kResponseBodyCap = 4096; // local cap; response resized to actual length below
-    std::vector<uint8_t> out(sizeof(T2_AKS_EXCHANGE_OUT) + kResponseBodyCap, 0);
+    out.assign(sizeof(T2_AKS_EXCHANGE_OUT) + kResponseBodyCap, 0);
 
     DWORD returned = 0;
     BOOL ok = DeviceIoControl(handle_, IOCTL_T2_AKS_EXCHANGE,
@@ -212,6 +226,8 @@ AksResult Client::LoadKeybag(const std::vector<uint8_t>& bagBytes, int32_t* outH
 
     std::vector<uint8_t> response;
     AksResult r = Exchange(static_cast<uint8_t>(T2AksOpLoadKeybag), req, &response, outSepStatus);
+    // req holds a full copy of the decrypted keybag - never free it unwiped.
+    SecureZeroMemory(req.data(), req.capacity());
     if (r != AksResult::Ok) return r;
     if (outSepStatus && *outSepStatus != 0) return AksResult::Ok; // transport ok, SEP rejected — response body is empty
     if (response.size() < 8) return AksResult::IoError;

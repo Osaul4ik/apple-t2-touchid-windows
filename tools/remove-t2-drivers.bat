@@ -19,6 +19,11 @@ setlocal EnableDelayedExpansion
 ::   HKLM\SOFTWARE\T2TouchId      (Network, Session, Logging, Gui settings)
 ::   HKLM\SOFTWARE\T2TouchIdBio   (ShortVerify, BirVariant, LockOnDisplayOff, PostResumeSettleMs)
 ::
+:: Also removed: the T2SepBootstrap service, the root\T2TouchIdBio device
+:: node, the System32 files the INFs copy outside the Driver Store
+:: (T2SepCoInstaller.dll, T2SepBootstrap\, WinBioPlugIns engine adapter) and
+:: the sensor's WinBio database registration.
+::
 :: Not touched: %ProgramData%\T2TouchId\sep-vault.bin (your encrypted keybag,
 :: so a later reinstall does not need a new import) and installed certificates.
 ::
@@ -47,6 +52,31 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ^
   "$k='HKLM:\SYSTEM\CurrentControlSet\Services\WbioSrvc'; $v=(Get-Item -LiteralPath $k).GetValue('DependOnService',$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames); if($v -and ($v -contains 'T2SepBootstrap')){ $n=[string[]]@($v | Where-Object { $_ -ne 'T2SepBootstrap' }); if($n.Count -gt 0){ Set-ItemProperty -LiteralPath $k -Name DependOnService -Type MultiString -Value $n } else { Remove-ItemProperty -LiteralPath $k -Name DependOnService }; Write-Host 'Removed T2SepBootstrap from WbioSrvc dependencies.' } else { Write-Host 'WbioSrvc has no T2SepBootstrap dependency - nothing to undo.' }"
 echo.
 
+rem Windows Biometric Service holds T2TouchIdEngineAdapter.dll (WinBioPlugIns)
+rem loaded and has an open session on the Touch ID unit. Stop it before the
+rem Bio package and the engine DLL go away; it is started again at the end so
+rem any other biometric device keeps working.
+echo Stopping Windows Biometric Service...
+net stop WbioSrvc /y >nul 2>&1
+
+rem T2SepBootstrap is created by T2SepCoInstaller.dll (not by an INF
+rem AddService), so pnputil /delete-driver never removes it. Without this the
+rem service stayed AUTO_START after removal and waited 60 s for a transport
+rem device that no longer exists on every boot.
+echo Stopping and deleting the T2SepBootstrap service...
+sc.exe stop T2SepBootstrap >nul 2>&1
+call :WAIT_SERVICE_STOPPED T2SepBootstrap
+sc.exe delete T2SepBootstrap >nul 2>&1
+echo.
+
+rem The Touch ID sensor is a ROOT-enumerated node (Install-T2TouchIdBio.ps1).
+rem Deleting its driver package leaves the node behind as an "Unknown device"
+rem with no driver; remove the node itself first.
+echo Removing the root\T2TouchIdBio device node(s)...
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ^
+  "Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.HardwareID -contains 'root\T2TouchIdBio' } | ForEach-Object { Write-Host ('  ' + $_.InstanceId); & pnputil.exe /remove-device $_.InstanceId | Out-Null }"
+echo.
+
 call :REMOVE_INF "apple-t2-ncm-ctrl-stub.inf" "Apple T2 USB NCM Control Interface"
 call :REMOVE_INF "apple-t2-ncm.inf"           "Apple T2 USB NCM Network Adapter"
 call :REMOVE_INF "T2TouchIdBio.inf"           "Apple T2 Touch ID (Windows Hello sensor)"
@@ -54,8 +84,32 @@ call :REMOVE_INF "T2TouchIdTransport.inf"     "Apple T2 SEP Mailbox"
 call :REMOVE_INF "apple-t2-composite.inf"     "Apple T2 Controller (Composite)"
 
 echo.
+echo --- Files outside the Driver Store ---
+rem Copied by the INFs to fixed System32 locations (DIRID 11), which
+rem pnputil /delete-driver does not clean up.
+call :DEL_FILE "%SystemRoot%\System32\T2SepCoInstaller.dll"
+call :DEL_FILE "%SystemRoot%\System32\WinBioPlugIns\T2TouchIdEngineAdapter.dll"
+if exist "%SystemRoot%\System32\T2SepBootstrap\" (
+    rd /s /q "%SystemRoot%\System32\T2SepBootstrap" >nul 2>&1
+    if exist "%SystemRoot%\System32\T2SepBootstrap\" (
+        echo   FAILED to delete: %SystemRoot%\System32\T2SepBootstrap
+    ) else (
+        echo   Deleted: %SystemRoot%\System32\T2SepBootstrap
+    )
+)
+
+rem WBF database registered by T2TouchIdBio.inf ([T2TouchIdBio_DatabaseAddReg])
+rem and its auto-created file. The records in it only name a macOS user id for
+rem this sensor and are useless without it.
+reg delete "HKLM\SYSTEM\CurrentControlSet\Services\WbioSrvc\Databases\{B039A555-3EEC-475A-ABBD-3AA5C5F550DA}" /f >nul 2>&1
+call :DEL_FILE "%SystemRoot%\System32\WinBioDatabase\{B039A555-3EEC-475A-ABBD-3AA5C5F550DA}.DAT"
+
+echo.
 echo Rescanning devices...
 pnputil.exe /scan-devices >nul 2>&1
+
+echo Starting Windows Biometric Service again...
+net start WbioSrvc >nul 2>&1
 
 :: Registry is cleaned after the drivers are gone, so a driver that is still
 :: unloading cannot write its settings back.
@@ -186,3 +240,33 @@ if errorlevel 1 (
     echo   Deleted: %~1 [%~2-bit view]
 )
 goto :EOF
+
+:: ============================================================================
+:: :DEL_FILE <path>  - best-effort delete with a one-line report.
+:: ============================================================================
+:DEL_FILE
+if not exist "%~1" goto :EOF
+del /f /q "%~1" >nul 2>&1
+if exist "%~1" (
+    echo   FAILED to delete ^(in use? reboot and re-run^): %~1
+) else (
+    echo   Deleted: %~1
+)
+goto :EOF
+
+:: ============================================================================
+:: :WAIT_SERVICE_STOPPED <name> - waits up to ~15 s for a service to stop.
+:: sc query output is localized except for the numeric state, so match the
+:: "STATE : 1" (SERVICE_STOPPED) code, not the text.
+:: ============================================================================
+:WAIT_SERVICE_STOPPED
+set /a "_WAIT=0"
+:WAIT_SERVICE_LOOP
+sc.exe query "%~1" >nul 2>&1
+if errorlevel 1 goto :EOF
+sc.exe query "%~1" | findstr /r /c:"STATE *: *1 " >nul
+if not errorlevel 1 goto :EOF
+if %_WAIT% GEQ 15 goto :EOF
+set /a "_WAIT+=1"
+timeout /t 1 /nobreak >nul
+goto WAIT_SERVICE_LOOP

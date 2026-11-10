@@ -373,6 +373,34 @@ bool RunBootstrapSequence(HANDLE readyEvent) {
     }
     Log(L"bootstrap: T2TouchIdTransport device interface opened OK");
 
+    // Real idempotency guard. AlreadyPrepared() (Global\T2SepReady) only
+    // works while some process still holds that event open: a named event
+    // is destroyed with its last handle, and nothing but this service ever
+    // opens it - so after this service is stopped and started again in the
+    // same boot (installer upgrade, `sc stop/start`, SCM recovery) the event
+    // is gone and the whole unlock sequence used to run a second time
+    // against an already-unlocked SEP. The bootstrap status kept by the
+    // transport driver lives in its device context, i.e. exactly as long as
+    // the unlock it describes: it survives a service restart, and it is
+    // reset to Unknown when the transport device itself restarts (driver
+    // update, disable/enable) - the one case where the sequence MUST run
+    // again because OOL has to be re-registered. Require the OOL
+    // registration to still be live too, so a transport that failed closed
+    // on resume (HardwareReady) is re-armed instead of skipped.
+    {
+        T2_BOOTSTRAP_STATUS prior{};
+        bool pci = false, bar4 = false, oolRegistered = false, mailbox = false;
+        if (client.GetBootstrapStatus(&prior) == AksResult::Ok &&
+            prior.Reason == T2SepReasonOk && prior.Step == T2SepStepReady &&
+            client.GetStatus(&pci, &bar4, &oolRegistered, &mailbox) == AksResult::Ok &&
+            oolRegistered) {
+            Log(L"bootstrap: transport driver already reports SEP ready this boot - "
+                L"skipping the unlock sequence (service restart, not a cold boot)");
+            SetEvent(readyEvent);
+            return true;
+        }
+    }
+
     auto vault = t2::sepvault::ReadVaultFile(kVaultPath);
     if (!vault.ok) {
         Log(L"bootstrap: sep-vault.bin missing or malformed — run SepVaultGui first");
@@ -712,11 +740,16 @@ DWORD WINAPI ServiceCtrlHandler(DWORD ctrl, DWORD, LPVOID, LPVOID) {
     switch (ctrl) {
         case SERVICE_CONTROL_STOP:
         case SERVICE_CONTROL_SHUTDOWN:
+            // Only STOP_PENDING here. SERVICE_STOPPED is reported by
+            // ServiceMain once the lock-watcher thread has been joined and
+            // the handles are closed: reporting STOPPED from the handler
+            // let the SCM treat the process as finished (and, on upgrade,
+            // let an installer overwrite/delete the .exe) while ServiceMain
+            // was still running its cleanup.
             gStatus.dwCurrentState = SERVICE_STOP_PENDING;
+            gStatus.dwWaitHint = 10000;
             SetServiceStatus(gStatusHandle, &gStatus);
             if (gStopEvent) SetEvent(gStopEvent);
-            gStatus.dwCurrentState = SERVICE_STOPPED;
-            SetServiceStatus(gStatusHandle, &gStatus);
             return NO_ERROR;
         default:
             return NO_ERROR;
@@ -812,6 +845,11 @@ VOID WINAPI ServiceMain(DWORD, LPWSTR*) {
         gStopEvent = nullptr;
     }
     if (readyEvent) CloseHandle(readyEvent);
+
+    gStatus.dwCurrentState = SERVICE_STOPPED;
+    gStatus.dwCheckPoint = 0;
+    gStatus.dwWaitHint = 0;
+    SetServiceStatus(gStatusHandle, &gStatus);
 }
 
 } // namespace

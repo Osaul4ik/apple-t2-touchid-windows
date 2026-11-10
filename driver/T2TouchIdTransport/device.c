@@ -277,7 +277,17 @@ T2EvtDeviceAdd(
         return status;
     }
 
-    WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&queueConfig, WdfIoQueueDispatchSequential);
+    // Parallel, not Sequential. Every handler that touches the SEP or the
+    // transport state already serializes on ExchangeLock (and the bootstrap
+    // status on BootstrapStatusLock), so the queue itself does not need to
+    // serialize anything. With a Sequential queue, IOCTL_T2_GET_STATUS and
+    // IOCTL_T2_GET_BOOTSTRAP_STATUS were dispatched only after an in-flight
+    // IOCTL_T2_AKS_EXCHANGE / IOCTL_T2_REGISTER_OOL completed - up to
+    // T2_SEP_TRANSACTION_DEADLINE_US (15 s, 30 s for REGISTER_OOL) against a
+    // wedged SEP - which defeated the separate BootstrapStatusLock and made
+    // the UMDF driver's per-CAPTURE readiness check (CheckSepReady) stall
+    // behind a stuck exchange.
+    WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&queueConfig, WdfIoQueueDispatchParallel);
     queueConfig.EvtIoDeviceControl = T2EvtIoDeviceControl;
     // Milestone 2B §4: this is a power-managed default queue (the WDF
     // default), so the framework can call EvtIoStop for a request that is
@@ -715,16 +725,33 @@ T2EvtIoDeviceControlGetStatus(_In_ WDFREQUEST Request, _In_ PT2_DEVICE_CONTEXT C
     // race a concurrent D0Exit, RegisterOol, or ReleaseHardware transition
     // (previously read lock-free and could report "OOL registered" while
     // State was already demoted out of Ready).
-    WdfWaitLockAcquire(Ctx->ExchangeLock, NULL);
-    out->Bar4Mapped = Ctx->Bar4Mapped;
-    out->Bar4Size = Ctx->Bar4Length;
-    out->OolRegistered = Ctx->OolInRegistered && Ctx->OolOutRegistered;
-    if (Ctx->Bar4Mapped) {
-        ULONG inbox = READ_REGISTER_ULONG((PULONG)(Ctx->Bar4VirtualAddress + T2_SEP_INBOX_STATUS));
-        UNREFERENCED_PARAMETER(inbox);
-        out->MailboxAccessible = TRUE; // a successful MMIO read is our liveness signal
+    //
+    // Try-acquire only: an AKS exchange can legitimately hold ExchangeLock
+    // for up to T2_SEP_TRANSACTION_DEADLINE_US, and a status query must not
+    // wait that out (the queue is parallel for exactly this reason). While
+    // an exchange is in flight the transport is by definition Ready with
+    // the BAR mapped, so the snapshot below is answered from the fields
+    // without the MMIO read - the mailbox is being polled by the owner of
+    // the lock right now.
+    {
+        LONGLONG noWait = 0;
+        if (WdfWaitLockAcquire(Ctx->ExchangeLock, &noWait) == STATUS_SUCCESS) {
+            out->Bar4Mapped = Ctx->Bar4Mapped;
+            out->Bar4Size = Ctx->Bar4Length;
+            out->OolRegistered = Ctx->OolInRegistered && Ctx->OolOutRegistered;
+            if (Ctx->Bar4Mapped) {
+                ULONG inbox = READ_REGISTER_ULONG((PULONG)(Ctx->Bar4VirtualAddress + T2_SEP_INBOX_STATUS));
+                // all-ones = nothing answered on the bus (see T2_SEP_MAILBOX_DEAD_READ)
+                out->MailboxAccessible = (inbox != T2_SEP_MAILBOX_DEAD_READ);
+            }
+            WdfWaitLockRelease(Ctx->ExchangeLock);
+        } else {
+            out->Bar4Mapped = Ctx->Bar4Mapped;
+            out->Bar4Size = Ctx->Bar4Length;
+            out->OolRegistered = Ctx->OolInRegistered && Ctx->OolOutRegistered;
+            out->MailboxAccessible = Ctx->Bar4Mapped;
+        }
     }
-    WdfWaitLockRelease(Ctx->ExchangeLock);
 
     WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, sizeof(*out));
 }

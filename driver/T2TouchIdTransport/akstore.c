@@ -469,6 +469,8 @@ T2AksExchange(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
         if (bodyLen > ResponseCapacity) {
             // VERIFIED FROM SOURCE: the Linux ioctl handler returns -ENOSPC
             // in this situation rather than silently truncating.
+            RtlSecureZeroMemory(outBase, replyWireLength);
+            T2AksFlushForDevice(outBase, replyWireLength);
             return STATUS_BUFFER_TOO_SMALL;
         }
         if (bodyLen > 0 && ResponseBody != NULL) {
@@ -477,8 +479,16 @@ T2AksExchange(_In_ PT2_DEVICE_CONTEXT Ctx, _In_ UINT8 Operation,
         *ResponseLength = bodyLen;
     }
 
-    // Do NOT zero outBase here: SEP still considers it a live OOL buffer
-    // per the pinning contract (Milestone 1) and may reuse it on the next
-    // exchange without a fresh SET_OOL_OUT.
+    // The reply body has been handed to the caller; do not leave it (it can
+    // carry key material) sitting in the long-lived OOL_OUT buffer until the
+    // next exchange happens to overwrite it. SEP still owns this buffer per
+    // the pinning contract (Milestone 1) and reuses it without a fresh
+    // SET_OOL_OUT - wiping its contents does not change that. SEP is not
+    // writing now (its reply for this transaction already arrived), so the
+    // zeroed lines are written back immediately and leave the buffer clean,
+    // which is the invariant the "OUT starts each exchange clean" comment at
+    // the top of this function relies on.
+    RtlSecureZeroMemory(outBase, replyWireLength);
+    T2AksFlushForDevice(outBase, replyWireLength);
     return STATUS_SUCCESS;
 }

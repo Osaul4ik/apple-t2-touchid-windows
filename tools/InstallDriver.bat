@@ -26,30 +26,27 @@ rem ============================================================
 echo [0/7] Enabling Test Mode (bcdedit testsigning)...
 echo.
 
-rem Detect whether testsigning is already configured (localized Yes/No - don't parse value).
-set "TESTMODE_WAS_ON=0"
-bcdedit /enum | findstr /i "testsigning" >nul
-if not errorlevel 1 set "TESTMODE_WAS_ON=1"
-
-if "%TESTMODE_WAS_ON%"=="1" (
-    echo [OK] Test Mode is already enabled.
-) else (
-    bcdedit /set testsigning on
-    if errorlevel 1 (
-        echo.
-        echo [ERROR] Failed to enable Test Mode.
-        echo.
-        echo Possible reasons:
-        echo   - Secure Boot is enabled in firmware.
-        echo   - This script is not running as Administrator.
-        echo.
-        echo Disable Secure Boot or enable Test Mode manually, then re-run this installer.
-        echo.
-        pause
-        exit /b 1
-    )
-    echo [OK] Test Mode enabled. A reboot will be required after installation.
+rem Always (re)apply it. The previous check grepped "bcdedit /enum" for the
+rem word "testsigning", which ALSO matches "testsigning   No" - an entry that
+rem had been explicitly turned off was reported as "already enabled", the set
+rem was skipped and the drivers then failed to load (Code 52) after reboot.
+rem Setting it again when it is already on is a harmless no-op, and the value
+rem itself cannot be parsed reliably (Yes/No is localized).
+bcdedit /set testsigning on
+if errorlevel 1 (
+    echo.
+    echo [ERROR] Failed to enable Test Mode.
+    echo.
+    echo Possible reasons:
+    echo   - Secure Boot is enabled in firmware.
+    echo   - This script is not running as Administrator.
+    echo.
+    echo Disable Secure Boot or enable Test Mode manually, then re-run this installer.
+    echo.
+    pause
+    exit /b 1
 )
+echo [OK] Test Mode enabled. Restart Windows after installation if it was not on already.
 
 echo.
 
@@ -113,6 +110,7 @@ if not exist "%ROOT%SEP\T2TouchIdTransport.inf" (
 )
 
 pnputil /add-driver "%ROOT%SEP\T2TouchIdTransport.inf" /install
+call :PNPUTIL_RESULT
 
 if errorlevel 1 (
     echo.
@@ -142,6 +140,7 @@ if not exist "%ROOT%NCM\apple-t2-composite.inf" (
 )
 
 pnputil /add-driver "%ROOT%NCM\apple-t2-composite.inf" /install
+call :PNPUTIL_RESULT
 
 if errorlevel 1 (
     echo.
@@ -194,6 +193,7 @@ if not exist "%ROOT%NCM\apple-t2-ncm-ctrl-stub.inf" (
 
 echo Installing apple-t2-ncm.inf...
 pnputil /add-driver "%ROOT%NCM\apple-t2-ncm.inf" /install
+call :PNPUTIL_RESULT
 
 if errorlevel 1 (
     echo.
@@ -206,6 +206,7 @@ if errorlevel 1 (
 echo.
 echo Installing apple-t2-ncm-ctrl-stub.inf...
 pnputil /add-driver "%ROOT%NCM\apple-t2-ncm-ctrl-stub.inf" /install
+call :PNPUTIL_RESULT
 
 if errorlevel 1 (
     echo.
@@ -325,3 +326,25 @@ echo If Test Mode was just enabled, restart Windows before using the drivers.
 echo.
 pause
 exit /b 0
+
+rem ============================================================
+rem :PNPUTIL_RESULT - maps the pnputil exit code to 0/1.
+rem pnputil /add-driver /install returns 3010 (ERROR_SUCCESS_REBOOT_REQUIRED)
+rem when the package installed fine but a device needs a restart to switch to
+rem it - typical when upgrading over an already-installed version. That used
+rem to abort the whole install as "[ERROR] Failed to install".
+rem 259 (ERROR_NO_MORE_ITEMS) = package staged, no matching device present
+rem right now (e.g. NCM function not enumerated yet) - also not a failure.
+rem ============================================================
+:PNPUTIL_RESULT
+if "%ERRORLEVEL%"=="0" exit /b 0
+if "%ERRORLEVEL%"=="3010" (
+    echo [INFO] pnputil: installed, a restart is required to finish.
+    set "REBOOT_REQUIRED=1"
+    exit /b 0
+)
+if "%ERRORLEVEL%"=="259" (
+    echo [INFO] pnputil: package staged, no matching device present right now.
+    exit /b 0
+)
+exit /b 1

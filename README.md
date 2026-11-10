@@ -48,7 +48,9 @@
 
 ### 1. Install the drivers
 
-Download the appropriate release package from GitHub Releases and **extract it first**. From the extracted release package, run `InstallDriver.bat` as Administrator. Its expected layout includes `SEP/`, `NCM/`, `Bio/`, and `Inst/` directories.
+**Recommended: `T2TouchID-Setup-<version>.exe`.** Run it, choose *Drivers + T2 Touch ID control panel* (or *Drivers only*), and let it restart Windows when it finishes (tick the red checkbox if you want to restart yourself). It enables Test Mode, imports the certificate, replaces any previous version of the drivers (including ones installed with `InstallDriver.bat`), installs the SEP, NCM and Touch ID sensor drivers, configures the IPv4 fallback address and the Windows Biometric Service start order, and registers in *Apps & features*. Uninstalling from there removes the drivers, the `T2SepBootstrap` service, the sensor device node and the System32 leftovers, and asks before disabling Test Mode or deleting settings / `sep-vault.bin`. Every step is logged to `%ProgramData%\T2TouchId\install.log` (`uninstall.log`). Unattended: `T2TouchID-Setup-<version>.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART` installs the drivers and keeps `sep-vault.bin` on uninstall.
+
+**Manual alternative:** download the release package from GitHub Releases and **extract it first**. From the extracted release package, run `InstallDriver.bat` as Administrator. Its expected layout includes `SEP/`, `NCM/`, `Bio/`, and `Inst/` directories.
 
 The installer configures test signing (when needed), installs the certificate and T2 drivers, configures the IPv4 fallback address, and sets the Windows Biometric Service startup ordering. **Reboot Windows when installation is complete.**
 

@@ -35,23 +35,28 @@ name: CI Apple T2 TouchId (CodeQL + PREfast + Build + Package)
 
 on:
   push:
-    branches: [ main, Dev_lifecycle, Hello_Prepare ]
+    branches: [ main, RC, Dev_lifecycle, Hello_Prepare ]
+    # NOTE: path filters are case-sensitive. This used to list
+    # 'CiAppleT2TouchId.yml', which never matched this file
+    # (Ciapplet2touchid.yml), so edits to the workflow itself did not trigger it.
     paths:
       - 'T2NCM/**'
       - 'driver/**'
       - 'protocol/**'
       - 'tools/**'
+      - 'installer/**'
       - 'T2TouchId.sln'
-      - '.github/workflows/CiAppleT2TouchId.yml'
+      - '.github/workflows/Ciapplet2touchid.yml'
   pull_request:
-    branches: [ main, Dev_lifecycle ]
+    branches: [ main, RC, Dev_lifecycle ]
     paths:
       - 'T2NCM/**'
       - 'driver/**'
       - 'protocol/**'
       - 'tools/**'
+      - 'installer/**'
       - 'T2TouchId.sln'
-      - '.github/workflows/CiAppleT2TouchId.yml'
+      - '.github/workflows/Ciapplet2touchid.yml'
   workflow_dispatch:
 
 concurrency:
@@ -1092,4 +1097,50 @@ jobs:
       with:
         name: apple-t2-touchid-${{ env.DRIVER_VERSION }}
         path: dist
+        if-no-files-found: error
+
+    # =====================================================================
+    # Installer (installer/T2TouchId.iss) - built from the exact package
+    # folder uploaded above, so the zip and the setup.exe never diverge.
+    # =====================================================================
+    - name: "Installer: compile T2TouchID-Setup (Inno Setup 6)"
+      run: |
+        $ErrorActionPreference = "Stop"
+        $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+        if (-not (Test-Path $iscc)) {
+          Write-Host "Inno Setup not preinstalled on this runner - installing via Chocolatey"
+          choco install innosetup -y --no-progress | Out-Host
+          if ($LASTEXITCODE -ne 0) { Write-Error "choco install innosetup failed ($LASTEXITCODE)"; exit 1 }
+        }
+        if (-not (Test-Path $iscc)) { Write-Error "ISCC.exe not found at $iscc"; exit 1 }
+        $pkg = (Resolve-Path "dist\apple-t2-touchid").Path
+        & $iscc "installer\T2TouchId.iss" "/DMyAppVersion=$env:DRIVER_VERSION" "/DPackageDir=$pkg"
+        if ($LASTEXITCODE -ne 0) { Write-Error "ISCC failed ($LASTEXITCODE)"; exit 1 }
+        $exe = "installer\output\T2TouchID-Setup-$env:DRIVER_VERSION.exe"
+        if (-not (Test-Path $exe)) { Write-Error "Installer not produced: $exe"; exit 1 }
+        Write-Host "OK: $exe"
+      shell: pwsh
+
+    - name: "Installer: sign setup.exe"
+      if: ${{ env.SIGN_CERT_PFX != '' && env.SIGN_CERT_PASSWORD != '' }}
+      run: |
+        $ErrorActionPreference = "Stop"
+        $pfxPath = Join-Path $env:TEMP "apple-t2-signcert-setup.pfx"
+        try {
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:SIGN_CERT_PFX))
+          $exe = "installer\output\T2TouchID-Setup-$env:DRIVER_VERSION.exe"
+          & "$env:SIGNTOOL_PATH" sign /v /fd SHA256 /f "$pfxPath" /p "$env:SIGN_CERT_PASSWORD" `
+            /tr http://timestamp.digicert.com /td SHA256 "$exe"
+          if ($LASTEXITCODE -ne 0) { Write-Error "Signing $exe failed ($LASTEXITCODE)."; exit 1 }
+        }
+        finally {
+          if (Test-Path $pfxPath) { Remove-Item -Path $pfxPath -Force }
+        }
+      shell: pwsh
+
+    - name: "Installer: upload"
+      uses: actions/upload-artifact@v4
+      with:
+        name: T2TouchID-Setup-${{ env.DRIVER_VERSION }}
+        path: installer/output/*.exe
         if-no-files-found: error
