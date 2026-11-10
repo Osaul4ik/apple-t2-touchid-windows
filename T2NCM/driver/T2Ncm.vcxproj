@@ -94,6 +94,7 @@
     <ClCompile Include="NcmTx.c" />
     <ClCompile Include="Tunnel.c" />
     <ClCompile Include="NdisMiniport.c" />
+    <ClCompile Include="Control.c" />
     <ClCompile Include="Power.c" />
     <!-- CtrlStub.c is deliberately NOT here: it builds into a separate
          binary (T2NcmCtrl.sys, T2NcmCtrl.vcxproj) because it needs a
@@ -109,6 +110,7 @@
     <ClInclude Include="NcmRx.h" />
     <ClInclude Include="NcmTx.h" />
     <ClInclude Include="NdisMiniport.h" />
+    <ClInclude Include="Control.h" />
     <ClInclude Include="Power.h" />
     <ClInclude Include="Public.h" />
   </ItemGroup>
