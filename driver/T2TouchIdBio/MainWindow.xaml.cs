@@ -131,8 +131,8 @@ namespace T2TouchId.SepVaultGui
         // ---- Network transport (automatic only) ----
         // Auto-switch (persistent): HKLM\SOFTWARE\T2TouchId\Network\AutoSwitch, DWORD, missing == ON.
         // Native IPv6 first; if IPv6 is blocked the connection switches to the IPv4 tunnel and
-        // stays there until reboot or until the one native IPv6 re-check after a real unlock
-        // succeeds. That sticky flag lives in T2Ncm.sys memory (cleared on reboot) and is
+        // stays there until reboot or until a native IPv6 re-check succeeds (after a real
+        // unlock, after a host network change such as a VPN going away, or on Rescan). That sticky flag lives in T2Ncm.sys memory (cleared on reboot) and is
         // read here with IOCTL_T2NCM_GET_TUNNEL_STATE.
         // There is no manual "force IPv4".
         private const string NetworkRegPath = @"SOFTWARE\T2TouchId\Network";
@@ -220,8 +220,8 @@ namespace T2TouchId.SepVaultGui
                 TransportStatusText.Text = !auto
                     ? "Mode: Native IPv6 only (automatic switch is off)."
                     : sticky
-                        ? "Mode: IPv4 tunnel. IPv6 was not working, so the connection switched automatically; it stays on IPv4 until the next reboot."
-                        : "Mode: automatic. Native IPv6; if it does not work, the connection switches to the IPv4 tunnel until the next reboot.";
+                        ? "Mode: IPv4 tunnel. IPv6 was not working (VPN?), so the connection switched automatically. It returns to native IPv6 once IPv6 works again (checked after unlock, after a network change, or on Rescan)."
+                        : "Mode: automatic. Native IPv6; if it is blocked (e.g. by a VPN), the connection switches to the IPv4 tunnel on its own.";
                 TransportStatusText.Foreground = TextMuted;
             }
             finally
@@ -350,10 +350,15 @@ namespace T2TouchId.SepVaultGui
 
         private static async Task<CliResult> RunCliAsync(string exe, string args, TimeSpan timeout)
         {
+            // Cancel through a named event (t2touchid.exe --cancel-event), not by killing
+            // the process: a CLI killed in the middle of a transport phase used to leave
+            // T2Ncm.sys in the wrong transport mode. Kill stays only as a last resort.
+            string cancelName = @"Local\T2TouchIdCliCancel-" + Guid.NewGuid().ToString("N");
+            using var cancelEvent = new System.Threading.EventWaitHandle(false, System.Threading.EventResetMode.ManualReset, cancelName);
             var psi = new ProcessStartInfo
             {
                 FileName = exe,
-                Arguments = args,
+                Arguments = args + " --cancel-event " + cancelName,
                 WorkingDirectory = Path.GetDirectoryName(exe) ?? AppContext.BaseDirectory,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
@@ -370,7 +375,11 @@ namespace T2TouchId.SepVaultGui
             if (await Task.WhenAny(exitTask, Task.Delay(timeout)) != exitTask)
             {
                 timedOut = true;
-                try { p.Kill(true); } catch { }
+                cancelEvent.Set();
+                if (await Task.WhenAny(exitTask, Task.Delay(TimeSpan.FromSeconds(10))) != exitTask)
+                {
+                    try { p.Kill(true); } catch { }
+                }
                 await exitTask;
             }
 
@@ -388,7 +397,7 @@ namespace T2TouchId.SepVaultGui
             if (r.TimedOut) return "Timed out - the command was cancelled.";
             string[] markers =
             {
-                "no T2 NCM adapter", "no Preferred IPv6", "no peer to scan", "no TCP listeners",
+                "no T2 NCM adapter", "no T2 NCM endpoint", "no Preferred IPv6", "no peer to scan", "no TCP listeners",
                 "BiometricKit service not advertised", "BridgeXPC connect/HELO failed",
                 "getBridgeVersion failed", "note:", "verify-failed", "failed",
             };
@@ -442,7 +451,8 @@ namespace T2TouchId.SepVaultGui
             try
             {
                 // --rescan: skip the cached port, scan, verify with a live HELO, then cache it.
-                CliResult r = await RunCliAsync(cli, "network --rescan", TimeSpan.FromMinutes(5));
+                // The CLI gives up on its own after --timeout; the GUI timeout is only a backstop.
+                CliResult r = await RunCliAsync(cli, "network --rescan --timeout 90", TimeSpan.FromMinutes(3));
 
                 int port = 0;
                 foreach (string line in r.Lines)

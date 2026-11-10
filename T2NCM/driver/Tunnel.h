@@ -19,6 +19,25 @@ BOOLEAN T2NcmTunnelGetMode(VOID);
 VOID    T2NcmTunnelSetSticky(_In_ BOOLEAN Sticky);
 BOOLEAN T2NcmTunnelGetSticky(VOID);
 
+// Mode ownership. Userspace flips the live mode away from the committed
+// (sticky) decision only for the duration of one probe phase (TransportPhase,
+// TransportMode.h) and puts it back when the phase ends. A process that dies
+// in the middle of that phase (GUI timeout kill, crash, WUDFHost restart)
+// used to leave the driver in the probe's mode for every later user
+// ("sticky=0 mode=1"). The handle that moved the live mode away from the
+// committed one is now its owner; when that handle is cleaned up while still
+// the owner, the driver restores the committed mode by itself.
+//   ModeWrite   - under the mode lock: set the global live mode and record /
+//                 clear the owner (owner = FileObject when Enabled != sticky).
+//   StickyWrite - set the committed flag; a live mode that now equals it has
+//                 no owner any more.
+//   ReleaseModeOwner - IRP_MJ_CLEANUP: when FileObject still owns the live
+//                 mode, set it back to the committed value and return TRUE
+//                 with *RestoredTunnel = that value.
+VOID    T2NcmTunnelModeWrite(_In_opt_ PFILE_OBJECT FileObject, _In_ BOOLEAN Enabled);
+VOID    T2NcmTunnelStickyWrite(_In_ BOOLEAN Sticky);
+BOOLEAN T2NcmTunnelReleaseModeOwner(_In_opt_ PFILE_OBJECT FileObject, _Out_ PBOOLEAN RestoredTunnel);
+
 // Copy the driver-global mode into a (re)created DeviceContext.
 // Called from InitializeEx / Restart.
 VOID T2NcmTunnelRefreshMode(_In_ PT2NCM_DEVICE_CONTEXT DeviceContext);

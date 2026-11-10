@@ -114,6 +114,13 @@ VOID T2BioRegisterSessionLockNotification(VOID);
 VOID T2BioUnregisterSessionLockNotification(VOID);
 EXTERN_C_END
 
+// Host network-change watcher (VPN up/down, Queue.cpp OnHostNetworkChanged).
+// Called from DriverEntry / T2BioEvtDriverUnload (Driver.cpp).
+EXTERN_C_START
+VOID T2BioRegisterNetworkChangeNotification(VOID);
+VOID T2BioUnregisterNetworkChangeNotification(VOID);
+EXTERN_C_END
+
 // Debug-only trace; visible in DebugView (Capture Global Win32) because
 // WUDFHost.exe is a normal user-mode process.
 void T2BioLog(_In_z_ const char* fmt, ...);

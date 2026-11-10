@@ -168,6 +168,59 @@ BOOLEAN T2NcmTunnelGetSticky(VOID)
     return InterlockedCompareExchange(&g_T2NcmTunnelSticky, 0, 0) != 0;
 }
 
+/*
+ * Live-mode ownership (see Tunnel.h). A spin lock rather than a mutex so it
+ * needs no runtime initialization (a zeroed KSPIN_LOCK is a released lock)
+ * and works from any IRQL the dispatch routines run at; the critical
+ * sections are a handful of stores.
+ */
+static KSPIN_LOCK g_T2NcmModeLock = 0;
+static PFILE_OBJECT g_T2NcmModeOwner = NULL;
+
+VOID T2NcmTunnelModeWrite(_In_opt_ PFILE_OBJECT FileObject, _In_ BOOLEAN Enabled)
+{
+    KIRQL irql;
+    KeAcquireSpinLock(&g_T2NcmModeLock, &irql);
+    T2NcmTunnelSetMode(Enabled);
+    // Away from the committed decision -> this handle owns the live mode until
+    // it writes the committed value back (ModeScope::Restore) or closes.
+    g_T2NcmModeOwner = ((Enabled != FALSE) != (T2NcmTunnelGetSticky() != FALSE)) ? FileObject : NULL;
+    KeReleaseSpinLock(&g_T2NcmModeLock, irql);
+}
+
+VOID T2NcmTunnelStickyWrite(_In_ BOOLEAN Sticky)
+{
+    KIRQL irql;
+    KeAcquireSpinLock(&g_T2NcmModeLock, &irql);
+    T2NcmTunnelSetSticky(Sticky);
+    // A probe that just got committed (tunnel handshake -> sticky=1 while the
+    // live mode is already 1) is no longer an override: nothing to restore.
+    if ((T2NcmTunnelGetMode() != FALSE) == (Sticky != FALSE))
+        g_T2NcmModeOwner = NULL;
+    KeReleaseSpinLock(&g_T2NcmModeLock, irql);
+}
+
+BOOLEAN T2NcmTunnelReleaseModeOwner(_In_opt_ PFILE_OBJECT FileObject, _Out_ PBOOLEAN RestoredTunnel)
+{
+    KIRQL irql;
+    BOOLEAN released = FALSE;
+
+    *RestoredTunnel = FALSE;
+    if (FileObject == NULL)
+        return FALSE;
+    KeAcquireSpinLock(&g_T2NcmModeLock, &irql);
+    if (g_T2NcmModeOwner == FileObject)
+    {
+        const BOOLEAN committed = T2NcmTunnelGetSticky();
+        T2NcmTunnelSetMode(committed);
+        g_T2NcmModeOwner = NULL;
+        *RestoredTunnel = committed;
+        released = TRUE;
+    }
+    KeReleaseSpinLock(&g_T2NcmModeLock, irql);
+    return released;
+}
+
 VOID T2NcmTunnelRefreshMode(_In_ PT2NCM_DEVICE_CONTEXT DeviceContext)
 {
     /* Re-seed the freshly created device context from driver memory.

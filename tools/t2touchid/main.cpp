@@ -18,6 +18,7 @@
 #include "../../protocol/BiometricKit/VerificationEngine.h"
 #include "../../protocol/BiometricKit/MacosUserId.h"
 #include "../../protocol/Discovery/Adapter.h"
+#include "../../protocol/Discovery/BridgeDiscovery.h"
 #include "../../protocol/Discovery/PortCache.h"
 #include "../../protocol/Discovery/PortScan.h"
 #include "../../protocol/Discovery/RemoteXpc.h"
@@ -372,11 +373,6 @@ static int CmdDeviceState(Client& client, int64_t handle, uint32_t selector) {
 
 
 
-// BiometricKit discovery constants (shared by the cache fast path, `network`
-// and DiscoverBiometricKitBridge).
-static constexpr const char* kBiometricKitService = "com.apple.eos.BiometricKit";
-static constexpr std::chrono::milliseconds kRemoteXpcCheckTimeout{2000};
-
 // Narrow an ASCII-only wide string (IPv6 literal from argv). Non-ASCII input
 // yields an empty string, which the callers already report as "invalid
 // --host", instead of silently truncating each char to its low byte.
@@ -394,122 +390,206 @@ static bool IsDecimal(const std::wstring& a) {
     return !a.empty() && a.find_first_not_of(L"0123456789") == std::wstring::npos;
 }
 
-// Scan-then-verify in parallel (used by `network` and DiscoverBiometricKitBridge).
-// Every HTTP/2 hit is handed to a RemoteXPC checker thread the moment
-// PortScan.cpp finds it (onHit), running alongside the still-in-flight scan of
-// the remaining ports. The instant a checker confirms the BiometricKit
-// service, the scan's cancel flag stops the rest of the range. The caller
-// fills in the ScanOptions knobs (concurrency, timeout, scanFromEnd, ...);
-// onHit/cancel are owned by this function.
-struct ScanProbeResult {
-    uint16_t servicePort = 0;  // BridgeXPC port advertised by the verified candidate; 0 = none
-    uint16_t rsdPort = 0;      // RemoteXPC (HTTP/2) port that advertised it
-    std::vector<t2::discovery::PortCandidate> hits;
-};
+// ---- Discovery + connect: the shared TransportManager ----------------------------
+//
+// Every BridgeXPC-facing command (`network`, `identities`, `warmup`, `verify`)
+// connects through t2::discovery::ConnectToBiometricKitBridge - the SAME code the
+// UMDF driver runs on the lock screen. That gives the CLI (and the GUI, which runs
+// it for "Rescan" / "Test fingerprint") the cross-process TransportPhase lock, the
+// native IPv6 -> IPv4 tunnel switch and the full scan policy. The CLI used to carry
+// its own copy (cache fast path + ScanAndProbe): no phase lock, so it flipped the
+// global T2Ncm transport mode underneath a driver connect, and no tunnel fallback,
+// so a Rescan with a VPN on could never find the port.
+//
+// One call of ConnectToBiometricKitBridge is one STEP; like Queue.cpp, the CLI
+// repeats steps on a short backoff until it connects, discovery reports that a full
+// scan pass completed without BiometricKit, the deadline passes, or it is cancelled.
 
-static ScanProbeResult ScanAndProbe(const t2::discovery::NcmEndpoint& ep,
-                                    t2::discovery::ScanOptions opt) {
-    using namespace t2::discovery;
+// Cancel for discovery / verify: Ctrl+C, Ctrl+Break, closing the console, or a named
+// event the parent process signals (--cancel-event <name>, used by the GUI so a
+// timed-out Rescan ends cleanly - TransportPhase scopes restore the driver mode -
+// instead of being killed in the middle of a phase).
+static HANDLE g_cliCancel = nullptr;
 
-    std::atomic<bool> stop{false};
-    std::atomic<bool> serviceFound{false};
-    std::mutex checkersMu;
-    std::vector<std::thread> checkers;
-    ScanProbeResult res;
-
-    opt.cancel = &stop;
-    opt.onHit = [&](const PortCandidate& c) {
-        if (!c.http2PrefaceOk) return;      // TCP-only hits aren't real candidates
-        if (serviceFound.load(std::memory_order_relaxed)) return; // already answered
-        uint16_t port = c.port;
-        std::lock_guard<std::mutex> lock(checkersMu);
-        checkers.emplace_back([&, port]() {
-            if (serviceFound.load(std::memory_order_relaxed)) return;
-            uint16_t servicePort = 0;
-            if (!ProbeServiceOnPort(ep, port, kBiometricKitService, kRemoteXpcCheckTimeout,
-                                    &servicePort)) {
-                return; // decoy or unreachable - not a discovery failure
-            }
-            bool expected = false;
-            if (serviceFound.compare_exchange_strong(expected, true)) {
-                res.servicePort = servicePort;
-                res.rsdPort = port;
-                stop.store(true, std::memory_order_relaxed); // abort rest of the scan
-            }
-        });
-    };
-
-    res.hits = ScanHttp2Preface(ep, opt);
-    {
-        // ScanHttp2Preface has already joined every scan worker, so onHit can
-        // no longer fire and nothing else pushes into `checkers` concurrently.
-        std::lock_guard<std::mutex> lock(checkersMu);
-        for (auto& th : checkers) th.join();
+static BOOL WINAPI CliConsoleCtrl(DWORD type) {
+    switch (type) {
+    case CTRL_C_EVENT:
+    case CTRL_BREAK_EVENT:
+        if (g_cliCancel) SetEvent(g_cliCancel);
+        return TRUE; // the running command sees the cancel and unwinds
+    case CTRL_CLOSE_EVENT:
+    case CTRL_LOGOFF_EVENT:
+    case CTRL_SHUTDOWN_EVENT:
+        if (g_cliCancel) SetEvent(g_cliCancel);
+        Sleep(2000); // the process ends when this returns: give the scopes time
+        return TRUE;
+    default:
+        return FALSE;
     }
-    return res;
 }
 
-// Cache fast-path shared by `network` and DiscoverBiometricKitBridge.
-//
-// The cache holds the BridgeXPC service port (raw TCP) and, when known, the
-// RemoteXPC (HTTP/2) port whose peer record advertised it. Fast path, in
-// order of cost:
-//   A. direct BridgeXPC HELO on the cached service port (one TCP connect);
-//   B. replay of the scan's own sequence against the cached RemoteXPC port:
-//      RSD probe -> advertised port -> HELO (covers the case where the
-//      service port only accepts clients after an RSD handshake, or moved);
-// and only if both fail does the caller fall back to the 16384-port scan.
-// Every path ends in a live BridgeXPC HELO, so a stale entry can never
-// produce a false "found".
-//
-// NOTE: requires Winsock to be initialised. Previously WSAStartup was only
-// called from inside ScanHttp2Preface, so on a cache hit (no scan) every
-// socket() call failed and the cache always looked "stale". wmain now calls
-// WSAStartup up front.
-//
-// On success `conn` is connected (HELO done) and *outPort is the BridgeXPC port.
-static bool TryCachedBridgePort(const t2::discovery::NcmEndpoint& ep,
-                                t2::bridgexpc::Connection* conn,
-                                uint16_t* outPort) {
-    using namespace t2::discovery;
-    using namespace t2::bridgexpc;
-
-    uint16_t svcPort = 0, rsdPort = 0;
-    if (!LoadCachedPort(ep, &svcPort, &rsdPort)) return false; // same port on both transports
-
-    // A: direct.
-    ConnectResult crA = conn->Connect(ep.peerLinkLocal, ep.ifIndex, svcPort,
-                                       std::chrono::milliseconds(1500));
-    if (crA == ConnectResult::Ok) {
-        *outPort = svcPort;
-        return true;
-    }
-
-    // B: RSD replay on the cached RemoteXPC port.
-    if (rsdPort != 0) {
-        uint16_t advertised = 0;
-        if (ProbeServiceOnPort(ep, rsdPort, kBiometricKitService, kRemoteXpcCheckTimeout, &advertised)) {
-            ConnectResult crB = conn->Connect(ep.peerLinkLocal, ep.ifIndex, advertised, kRemoteXpcCheckTimeout);
-            if (crB == ConnectResult::Ok) {
-                if (advertised != svcPort) SaveCachedPort(ep, advertised, rsdPort);
-                *outPort = advertised;
-                return true;
-            }
-            std::wcout << L"cached ports (RemoteXPC " << rsdPort << L", BridgeXPC " << advertised
-                       << L"): HELO failed (direct result=" << static_cast<int>(crA)
-                       << L", via RSD result=" << static_cast<int>(crB)
-                       << L") - falling back to full scan.\n";
-            return false;
+// Pulls `--cancel-event <name>` out of argv (like --verbose) and sets up g_cliCancel.
+// The named event must already exist (created by the parent); otherwise, and when no
+// name is given, an anonymous manual-reset event is used (console Ctrl+C only).
+static void InitCliCancel(int* argc, wchar_t** argv) {
+    std::wstring name;
+    int w = 1;
+    for (int i = 1; i < *argc; ++i) {
+        if (std::wstring(argv[i]) == L"--cancel-event" && i + 1 < *argc) {
+            name = argv[++i];
+            continue;
         }
-        std::wcout << L"cached ports (RemoteXPC " << rsdPort << L", BridgeXPC " << svcPort
-                   << L"): direct HELO failed (result=" << static_cast<int>(crA)
-                   << L") and RemoteXPC probe did not answer (T2 rebooted?) - falling back to full scan.\n";
-        return false;
+        argv[w++] = argv[i];
     }
+    *argc = w;
+    if (!name.empty()) {
+        g_cliCancel = OpenEventW(SYNCHRONIZE | EVENT_MODIFY_STATE, FALSE, name.c_str());
+        if (!g_cliCancel) {
+            std::wcout << L"warning: --cancel-event " << name << L" not found (GetLastError="
+                       << GetLastError() << L") - Ctrl+C only\n";
+        }
+    }
+    if (!g_cliCancel) g_cliCancel = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+}
 
-    std::wcout << L"cached BridgeXPC port " << svcPort << L": direct HELO failed (result="
-               << static_cast<int>(crA) << L") - falling back to full scan.\n";
-    return false;
+// Ctrl+C -> cancel instead of process kill. Only for the BridgeXPC commands, which
+// check g_cliCancel; `unlock` & co. read a password with _getch and must stay
+// abortable with a plain Ctrl+C.
+static void EnableCtrlCCancel() {
+    SetConsoleCtrlHandler(CliConsoleCtrl, TRUE);
+}
+
+static bool CliCancelled() {
+    return g_cliCancel && WaitForSingleObject(g_cliCancel, 0) == WAIT_OBJECT_0;
+}
+
+// Endpoint selection shared by every command: [ifIndex] and/or --host fe80::...
+// starting at argv[firstArgIndex]. Flags owned by the individual commands are
+// skipped so e.g. "--match-flags 1" never reads as ifIndex 1.
+struct EndpointArgs {
+    unsigned long ifIndex = 0;
+    std::string host;      // peer IPv6 without zone
+    bool ok = true;
+};
+static EndpointArgs ParseEndpointArgs(int argc, wchar_t* argv[], int firstArgIndex) {
+    EndpointArgs r;
+    auto isValueFlag = [](const std::wstring& a) {
+        return a == L"--uid" || a == L"--seconds" || a == L"--match-layout" ||
+               a == L"--match-flags" || a == L"--ifindex" || a == L"--timeout";
+    };
+    for (int i = firstArgIndex; i < argc; ++i) {
+        const std::wstring a = argv[i];
+        if (a == L"--host" && i + 1 < argc) {
+            r.host = NarrowAscii(argv[++i]);
+            if (r.host.empty()) {
+                std::wcout << L"invalid --host IPv6\n";
+                r.ok = false;
+                return r;
+            }
+        } else if (a == L"--ifindex" && i + 1 < argc) {
+            r.ifIndex = static_cast<unsigned long>(_wtoi(argv[++i]));
+        } else if (isValueFlag(a) && i + 1 < argc) {
+            ++i; // the value belongs to the command
+        } else if (!a.empty() && a[0] == L'-') {
+            // boolean flag of the command (or unknown): not an endpoint argument
+        } else if (IsDecimal(a)) {
+            r.ifIndex = static_cast<unsigned long>(_wtoi(a.c_str()));
+        }
+    }
+    return r;
+}
+
+enum class CliConnect { Ok, NoAdapter, NoPeer, NotFound, TimedOut, Cancelled, BadArgs };
+
+// Resolves the endpoint (adapter + readiness gate + peer) and connects through the
+// shared TransportManager. *outPort / *outRsd: the BridgeXPC / RemoteXPC ports.
+static CliConnect ConnectBridgeCli(const EndpointArgs& args, t2::bridgexpc::Connection* conn,
+                                   bool forceRescan, ULONGLONG budgetMs,
+                                   uint16_t* outPort, uint16_t* outRsd,
+                                   t2::discovery::NcmEndpoint* outEndpoint = nullptr) {
+    using namespace t2::discovery;
+    if (!args.ok) return CliConnect::BadArgs;
+    const ULONGLONG deadline = GetTickCount64() + budgetMs;
+    ConnectOptions opt;
+    opt.forceRescan = forceRescan;
+    DWORD backoffMs = 250;
+    bool sawPeer = false;
+    for (unsigned step = 1;; ++step) {
+        if (CliCancelled()) return CliConnect::Cancelled;
+        NcmEndpoint ep;
+        if (args.ifIndex != 0) {
+            if (!GetEndpointByIfIndex(args.ifIndex, &ep)) {
+                std::wcout << L"no T2 NCM endpoint on ifIndex " << args.ifIndex << L"\n";
+                return CliConnect::NoAdapter;
+            }
+        } else if (!PickDefaultT2Endpoint(&ep, g_cliCancel)) {
+            if (CliCancelled()) return CliConnect::Cancelled;
+            std::wcout << L"no T2 NCM adapter found.\n";
+            return CliConnect::NoAdapter;
+        }
+        if (!args.host.empty()) {
+            in6_addr parsed{};
+            if (!ParseIpv6(args.host.c_str(), &parsed)) {
+                std::wcout << L"invalid --host IPv6\n";
+                return CliConnect::BadArgs;
+            }
+            ep.peerLinkLocal = parsed;
+            ep.peerSource = PeerSource::ManualOverride;
+        }
+        if (ep.peerSource != PeerSource::None) sawPeer = true;
+        if (outEndpoint) *outEndpoint = ep;
+
+        bool exhausted = false;
+        uint16_t port = 0, rsd = 0;
+        if (ConnectToBiometricKitBridge(ep, conn, &port, &rsd, g_cliCancel, &exhausted, opt)) {
+            if (outPort) *outPort = port;
+            if (outRsd) *outRsd = rsd;
+            T2_LOG("cli", L"connected after %u step(s): port=%u rsd=%u (%s)", step,
+                   static_cast<unsigned>(port), static_cast<unsigned>(rsd),
+                   t2::transport::IsTunnelModeActive() ? L"IPv4 tunnel" : L"native IPv6");
+            return CliConnect::Ok;
+        }
+        if (CliCancelled()) return CliConnect::Cancelled;
+        if (exhausted) {
+            T2_LOG("cli", L"step %u: a full scan pass completed without BiometricKit - giving up", step);
+            return CliConnect::NotFound;
+        }
+        const ULONGLONG now = GetTickCount64();
+        if (now + backoffMs >= deadline) {
+            T2_LOG("cli", L"no BridgeXPC connection after %u step(s) - deadline reached", step);
+            return sawPeer ? CliConnect::TimedOut : CliConnect::NoPeer;
+        }
+        T2_LOG("cli", L"step %u: not connected yet - retrying in %lu ms", step, backoffMs);
+        if (WaitForSingleObject(g_cliCancel, backoffMs) == WAIT_OBJECT_0) return CliConnect::Cancelled;
+        backoffMs = backoffMs * 2 > 2000 ? 2000 : backoffMs * 2;
+        opt.forceRescan = false; // only the first step of a Rescan skips the cache:
+                                 // a port it confirmed is in the registry by now
+    }
+}
+
+// One-line reason for a failed connect, phrased for the GUI's FailureReason markers.
+static void PrintConnectFailure(CliConnect r) {
+    switch (r) {
+    case CliConnect::NoAdapter: break; // already printed
+    case CliConnect::BadArgs:   break; // already printed
+    case CliConnect::NoPeer:
+        std::wcout << L"no peer to scan: the T2 did not answer neighbor discovery / ping "
+                      L"(try again, or pass --host fe80::...).\n";
+        break;
+    case CliConnect::NotFound:
+        std::wcout << L"BiometricKit service not advertised: a full port scan found no "
+                      L"BridgeXPC listener (T2 still booting?).\n";
+        break;
+    case CliConnect::TimedOut:
+        std::wcout << L"BridgeXPC connect/HELO failed: no answer before the deadline "
+                   << kSeeVerboseHint;
+        break;
+    case CliConnect::Cancelled:
+        std::wcout << L"cancelled.\n";
+        break;
+    case CliConnect::Ok:
+        break;
+    }
 }
 
 // Reads T2Ncm.sys's own RX/TX counters via IOCTL_T2NCM_GET_STATUS (0x900,
@@ -583,35 +663,29 @@ static int CmdNcmStatus() {
 static int CmdNetwork(int argc, wchar_t* argv[]) {
     using namespace t2::discovery;
 
-    unsigned long ifIndexOverride = 0;
     bool doScan = true;
-    bool forceRescan = false; // --rescan: ignore the cached port, always scan (GUI "Rescan")
-    std::string hostOverride; // peer IPv6 without zone
-
+    bool forceRescan = false; // --rescan: skip the cached port, always scan (GUI "Rescan")
+    ULONGLONG budgetMs = 120000;
     for (int i = 2; i < argc; ++i) {
-        std::wstring a = argv[i];
+        const std::wstring a = argv[i];
         if (a == L"--no-scan") {
             doScan = false;
         } else if (a == L"--rescan") {
             forceRescan = true;
-        } else if (a == L"--ifindex" && i + 1 < argc) {
-            ifIndexOverride = static_cast<unsigned long>(_wtoi(argv[++i]));
-        } else if (a == L"--host" && i + 1 < argc) {
-            hostOverride = NarrowAscii(argv[++i]);
-            if (hostOverride.empty()) {
-                std::wcout << L"invalid --host IPv6\n";
-                return 1;
-            }
-        } else if (IsDecimal(a)) {
-            ifIndexOverride = static_cast<unsigned long>(_wtoi(a.c_str()));
+        } else if (a == L"--timeout" && i + 1 < argc) {
+            const int sec = _wtoi(argv[++i]);
+            if (sec > 0) budgetMs = static_cast<ULONGLONG>(sec) * 1000;
         }
     }
+    const EndpointArgs args = ParseEndpointArgs(argc, argv, 2);
+    if (!args.ok) return 1;
 
+    // Adapter report (no network I/O beyond what enumeration itself does).
     std::vector<NcmEndpoint> endpoints;
-    if (ifIndexOverride != 0) {
+    if (args.ifIndex != 0) {
         NcmEndpoint ep;
-        if (!GetEndpointByIfIndex(ifIndexOverride, &ep)) {
-            std::wcout << L"no Preferred IPv6 link-local on ifIndex " << ifIndexOverride << L"\n";
+        if (!GetEndpointByIfIndex(args.ifIndex, &ep)) {
+            std::wcout << L"no T2 NCM endpoint on ifIndex " << args.ifIndex << L"\n";
             return 1;
         }
         endpoints.push_back(ep);
@@ -619,24 +693,12 @@ static int CmdNetwork(int argc, wchar_t* argv[]) {
         endpoints = FindT2NcmEndpoints();
         if (endpoints.empty()) {
             std::wcout << L"no T2 NCM adapter found.\n";
-            std::wcout << L"hint: t2touchid.exe network <ifIndex> [--host fe80::...] [--rescan]\n";
+            std::wcout << L"hint: t2touchid.exe network [ifIndex] [--host fe80::...] [--rescan]\n";
             return 1;
         }
     }
-
-    for (auto& ep : endpoints) {
-        if (!hostOverride.empty()) {
-            in6_addr parsed{};
-            if (!ParseIpv6(hostOverride.c_str(), &parsed)) {
-                std::wcout << L"invalid --host IPv6\n";
-                return 1;
-            }
-            ep.peerLinkLocal = parsed;
-            ep.peerSource = PeerSource::ManualOverride;
-        }
-
-        std::string local = FormatLinkLocal(ep.localLinkLocal, ep.ifIndex);
-        std::string peer = FormatLinkLocal(ep.peerLinkLocal, ep.ifIndex);
+    for (const auto& ep : endpoints) {
+        const std::string local = FormatLinkLocal(ep.localLinkLocal, ep.ifIndex);
         std::wcout << L"adapter:  " << ep.friendlyName << L"\n";
         std::wcout << L"desc:     " << ep.description << L"\n";
         std::wcout << L"ifIndex:  " << ep.ifIndex << L"\n";
@@ -649,156 +711,38 @@ static int CmdNetwork(int argc, wchar_t* argv[]) {
             }
             std::wcout << L"\n";
         }
-        std::wcout << L"local:    ";
-        std::wcout << std::wstring(local.begin(), local.end());
-        std::wcout << L"  (Windows - do NOT scan this)\n";
-        if (ep.peerSource == PeerSource::None) {
-            std::wcout << L"peer:     (none found)\n";
-            std::wcout << L"  no Reachable/Stale/Delay/Probe IPv6 neighbor "
-                          L"on ifIndex " << ep.ifIndex << L" yet, even after "
-                          L"an automatic ff02::1 prompt ping.\n";
-            std::wcout << L"  try running the command again (the T2 may just "
-                          L"need another moment), or pass --host fe80::...\n";
-        } else {
-            std::wcout << L"peer:     ";
-            std::wcout << std::wstring(peer.begin(), peer.end());
-            if (ep.peerSource == PeerSource::NeighborTable)
-                std::wcout << L"  (IPv6 neighbor table - scan target)\n";
-            else if (ep.peerSource == PeerSource::LastKnown)
-                std::wcout << L"  (last known peer - IPv6 ND blocked, IPv4 tunnel target)\n";
-            else
-                std::wcout << L"  (--host override - scan target)\n";
-        }
+        std::wcout << L"local:    " << std::wstring(local.begin(), local.end())
+                   << L"  (Windows - do NOT scan this)\n";
     }
-
     if (!doScan) {
         std::wcout << L"scan skipped (--no-scan).\n";
         return 0;
     }
 
-    const auto& ep = endpoints.front();
-    if (ep.peerSource == PeerSource::None) {
-        std::wcout << L"no peer to scan - see above.\n";
-        return 1;
+    std::wcout << (forceRescan ? L"rescanning" : L"connecting")
+               << L" (shared TransportManager: native IPv6 first, IPv4 tunnel if IPv6 is "
+                  L"blocked; up to " << (budgetMs / 1000) << L" s)...\n";
+    t2::bridgexpc::Connection bridge;
+    uint16_t port = 0, rsd = 0;
+    NcmEndpoint used;
+    const CliConnect cr = ConnectBridgeCli(args, &bridge, forceRescan, budgetMs, &port, &rsd, &used);
+    if (cr != CliConnect::Ok) {
+        PrintConnectFailure(cr);
+        return cr == CliConnect::NotFound ? 2 : 1;
     }
-
-    // Cache-first, same policy as DiscoverBiometricKitBridge (used by
-    // identities/verify/warmup): the BridgeXPC port doesn't move within a
-    // boot/session, so try the last known-good port for this adapter
-    // before paying for a 16384-port scan. Verified by a live BridgeXPC
-    // HELO (see TryCachedBridgePort) - a stale/wrong entry just falls
-    // through to the full scan below, never a false "found".
-    // --rescan skips this fast path on purpose; the old cache entry is kept
-    // until the new scan confirms a port (SaveCachedPort below), so a failed
-    // rescan never throws a possibly-good entry away.
-    if (!forceRescan) {
-        using namespace t2::bridgexpc;
-        Connection cachedBridge;
-        uint16_t cachedPort = 0;
-        if (TryCachedBridgePort(ep, &cachedBridge, &cachedPort)) {
-            int64_t bridgeVersion = 0;
-            if (cachedBridge.GetBridgeVersion(&bridgeVersion, std::chrono::milliseconds(2000))) {
-                std::wcout << L"BiometricKit BridgeXPC port: " << cachedPort
-                           << L"  (cached - skipped port scan)\n";
-                std::wcout << L"BridgeXPC verified: HELO OK, bridge version="
-                           << bridgeVersion << L"\n";
-                return 0;
-            }
-            std::wcout << L"cached port " << cachedPort
-                       << L" HELO OK but getBridgeVersion failed - falling back to full scan.\n";
-            cachedBridge.Close();
-        }
+    if (used.peerSource != PeerSource::None) {
+        const std::string peer = FormatLinkLocal(used.peerLinkLocal, used.ifIndex);
+        std::wcout << L"peer:     " << std::wstring(peer.begin(), peer.end()) << L"\n";
     }
-
-    // Same scan parameters as the driver (BridgeDiscovery.cpp) on both
-    // transports: 256 wide, 25 ms per connect, 49000-65535.
-    ScanOptions opt;
-    opt.concurrency = 256;
-    opt.connectTimeoutMs = 25;
-    opt.includeTcpOnly = true;
-    // priorityBands default: 59000-60000 → 49xxx → rest (see PortScan.h).
-    opt.onProgress = [](unsigned tried, unsigned total, unsigned tcp, unsigned http2) {
-        std::wcout << L"  scanned " << tried << L"/" << total
-                   << L"  tcp=" << tcp << L"  http2=" << http2 << L"\r" << std::flush;
-    };
-
-    std::wcout << L"scanning PEER ports " << opt.portBegin << L"-" << opt.portEnd
-               << L" (order: 59000-60000, 49xxx, rest; concurrency " << opt.concurrency
-               << L", timeout " << opt.connectTimeoutMs << L"ms)...\n";
-    ScanProbeResult scan = ScanAndProbe(ep, opt);
+    const bool tunnel = t2::transport::IsTunnelModeActive();
+    std::wcout << L"transport: " << (tunnel ? L"IPv4 tunnel" : L"Native IPv6") << L"\n";
+    std::wcout << L"BiometricKit BridgeXPC port: " << port;
+    if (rsd != 0) std::wcout << L"  (RemoteXPC " << rsd << L")";
     std::wcout << L"\n";
-    std::vector<PortCandidate> hits = std::move(scan.hits);
-    const uint16_t foundPort = scan.servicePort;
-    const uint16_t foundRsdPort = scan.rsdPort;
 
-    unsigned nTcp = 0, nHttp2 = 0;
-    for (const auto& h : hits) {
-        if (h.tcpOpen) ++nTcp;
-        if (h.http2PrefaceOk) ++nHttp2;
-    }
-
-    if (hits.empty()) {
-        std::wcout << L"no TCP listeners on peer in " << opt.portBegin << L"-"
-                   << opt.portEnd << L".\n";
-        std::wcout << L"try: --host fe80::... to override the discovered peer.\n";
-        return 2;
-    }
-
-    // Sort ascending purely for a readable diagnostic table — with
-    // scanFromEnd left at its default (ascending), hits already mostly
-    // arrive in this order, but onHit/cancel can still leave it uneven;
-    // this has no effect on scan or verification order above.
-    std::sort(hits.begin(), hits.end(),
-              [](const PortCandidate& a, const PortCandidate& b) { return a.port < b.port; });
-
-    std::wcout << L"candidates: tcp_open=" << nTcp << L"  http2_settings=" << nHttp2;
-    if (foundPort != 0) std::wcout << L"  (scan stopped early - BiometricKit already found)";
-    std::wcout << L"\n";
-    for (const auto& h : hits) {
-        std::wcout << L"  port " << h.port;
-        if (h.http2PrefaceOk) std::wcout << L"  [HTTP/2 SETTINGS]";
-        else std::wcout << L"  [TCP only]";
-        std::wcout << L"  recv=" << h.recvLen << L"B";
-        if (h.recvLen > 0) {
-            std::wcout << L"  hex=";
-            int show = h.recvLen < 12 ? h.recvLen : 12;
-            for (int i = 0; i < show; ++i) {
-                wchar_t tmp[4];
-                swprintf(tmp, 4, L"%02x", h.recvHead[i]);
-                std::wcout << tmp;
-            }
-        } else {
-            std::wcout << L"  (no data)";
-        }
-        std::wcout << L"\n";
-    }
-
-    if (foundPort == 0) {
-        if (nHttp2 == 0) {
-            std::wcout << L"note: no HTTP/2 SETTINGS yet. Confirm peer address matches Linux T2_TOUCHID_HOST.\n";
-            return 0;
-        }
-        std::wcout << L"BiometricKit service not advertised by any candidate "
-                      L"(all decoys, or T2 is not currently offering it).\n";
-        return 0;
-    }
-
-    std::wcout << L"BiometricKit BridgeXPC port: " << foundPort << L"\n";
-
-    // Gate 7 phase 1: prove the discovered port is a live BridgeXpc
-    // endpoint, not just a plausible-looking number — open a real
-    // connection (HELO handshake, Milestone 1 section 7) and read the
-    // bridge's own version, rather than declaring victory on the port
-    // number alone.
-    using namespace t2::bridgexpc;
-    Connection bridge;
-    ConnectResult cr = bridge.Connect(ep.peerLinkLocal, ep.ifIndex, foundPort,
-                                       std::chrono::milliseconds(2000));
-    if (cr != ConnectResult::Ok) {
-        std::wcout << L"BridgeXPC connect/HELO failed on port " << foundPort
-                   << L" - discovered port did not answer as BridgeXpc.\n";
-        return 1;
-    }
+    // Prove the port is a live BridgeXPC endpoint beyond the HELO: read the
+    // bridge's own version. (Discovery has already cached the port - it does so
+    // the moment a scan confirms it, and only after a live HELO otherwise.)
     int64_t bridgeVersion = 0;
     if (!bridge.GetBridgeVersion(&bridgeVersion, std::chrono::milliseconds(2000))) {
         std::wcout << L"BridgeXPC HELO OK, but getBridgeVersion failed "
@@ -806,160 +750,24 @@ static int CmdNetwork(int argc, wchar_t* argv[]) {
         return 1;
     }
     std::wcout << L"BridgeXPC verified: HELO OK, bridge version=" << bridgeVersion << L"\n";
-    // Only cache after a live BridgeXPC connect actually succeeds — never
-    // cache a port on RemoteXPC verification alone.
-    SaveCachedPort(ep, foundPort, foundRsdPort);
     return 0;
 }
 
-// Shared discovery+connect step for `identities`, `warmup` and `verify`
-// (cache fast path, then scan-and-probe; see TryCachedBridgePort and
-// ScanAndProbe). Accepts the same trailing args as `network` (an ifIndex and/or
-// --host fe80::...) starting at argv[firstArgIndex].
+// Shared discovery+connect step for `identities`, `warmup` and `verify`: the same
+// TransportManager path as `network` (cache first, scan on a miss, tunnel when IPv6
+// is blocked). Accepts the same trailing endpoint args as `network` (an ifIndex
+// and/or --host fe80::...) starting at argv[firstArgIndex].
 static bool DiscoverBiometricKitBridge(int argc, wchar_t* argv[], int firstArgIndex,
                                         t2::bridgexpc::Connection* outConn) {
-    using namespace t2::discovery;
-    using namespace t2::bridgexpc;
-
-    unsigned long ifIndexOverride = 0;
-    std::string hostOverride;
-    // Flags whose *following* argv token is a value owned by CmdVerify /
-    // CmdIdentities / etc. Must be skipped here or e.g. "--match-flags 1"
-    // makes "1" look like a positional ifIndex and discovery dies with
-    // "no Preferred IPv6 link-local on ifIndex 1".
-    auto isValueFlag = [](const std::wstring& a) {
-        return a == L"--uid" || a == L"--seconds" || a == L"--match-layout" ||
-               a == L"--match-flags" || a == L"--host";
-    };
-    auto isBoolFlag = [](const std::wstring& a) {
-        return a == L"--no-reset-sensor" || a == L"--no-load-calibration" ||
-               a == L"--reset-sensor" || a == L"--load-calibration" ||
-               a == L"--verbose" || a == L"-v";
-    };
-    for (int i = firstArgIndex; i < argc; ++i) {
-        std::wstring a = argv[i];
-        if (a == L"--host" && i + 1 < argc) {
-            hostOverride = NarrowAscii(argv[++i]);
-            if (hostOverride.empty()) {
-                std::wcout << L"invalid --host IPv6\n";
-                return false;
-            }
-        } else if (isValueFlag(a) && i + 1 < argc) {
-            ++i; // skip the value token
-        } else if (isBoolFlag(a) || (!a.empty() && a[0] == L'-')) {
-            // Boolean flag or unknown dashed option: ignore (do not treat as ifIndex).
-        } else if (IsDecimal(a)) {
-            // Pure decimal token only -> positional ifIndex override.
-            ifIndexOverride = static_cast<unsigned long>(_wtoi(a.c_str()));
-        }
-    }
-
-    NcmEndpoint ep;
-    if (ifIndexOverride != 0) {
-        if (!GetEndpointByIfIndex(ifIndexOverride, &ep)) {
-            std::wcout << L"no Preferred IPv6 link-local on ifIndex " << ifIndexOverride << L"\n";
-            return false;
-        }
-    } else {
-        auto endpoints = FindT2NcmEndpoints();
-        if (endpoints.empty()) {
-            std::wcout << L"no T2 NCM adapter found - try 'network' first.\n";
-            return false;
-        }
-        ep = endpoints.front();
-    }
-    if (!hostOverride.empty()) {
-        in6_addr parsed{};
-        if (!ParseIpv6(hostOverride.c_str(), &parsed)) {
-            std::wcout << L"invalid --host IPv6\n";
-            return false;
-        }
-        ep.peerLinkLocal = parsed;
-        ep.peerSource = PeerSource::ManualOverride;
-    }
-    if (ep.peerSource == PeerSource::None) {
-        std::wcout << L"no peer to scan (automatic ff02::1 prompt ping didn't "
-                      L"turn one up) - run 'network' first or pass --host fe80::...\n";
+    const EndpointArgs args = ParseEndpointArgs(argc, argv, firstArgIndex);
+    uint16_t port = 0;
+    const CliConnect cr = ConnectBridgeCli(args, outConn, /*forceRescan=*/false, 60000, &port, nullptr);
+    if (cr != CliConnect::Ok) {
+        PrintConnectFailure(cr);
         return false;
     }
-
-    // Discovery race: a single scan is flaky under USB NCM jitter, so the scan
-    // below is attempted twice (20ms, then 60ms per-port timeout). Hits are
-    // verified over RemoteXPC while the scan is still running, and the scan
-    // stops the moment BiometricKit is confirmed (see ScanAndProbe).
-    // Cache first: the BridgeXPC port is ephemeral per T2 boot but stable within
-    // a boot/session, so repeated identities/verify/warmup calls try the cached
-    // port pair (see TryCachedBridgePort) before paying for a 16384-port scan.
-    // A stale or wrong entry just fails the HELO and falls through to the scan.
-    {
-        uint16_t cachedPort = 0;
-        if (TryCachedBridgePort(ep, outConn, &cachedPort)) {
-            std::wcout << L"BiometricKit BridgeXPC port: " << cachedPort
-                       << L"  (cached - skipped port scan)\n";
-            return true;
-        }
-    }
-
-    uint16_t foundPort = 0;
-    uint16_t foundRsdPort = 0;
-    unsigned lastHttp2Count = 0;
-    // Same scan parameters as the driver (BridgeDiscovery.cpp) on both
-    // transports: 256 wide, 25 ms per connect, full chain 49000-65535. The
-    // second attempt is a plain re-pass (BiometricKit may come up meanwhile).
-    const unsigned timeoutsMs[] = {25, 25};
-    const unsigned kAttempts = static_cast<unsigned>(sizeof(timeoutsMs) / sizeof(timeoutsMs[0]));
-    for (unsigned attempt = 0; attempt < kAttempts; ++attempt) {
-        ScanOptions opt;
-        opt.concurrency = 256;
-        opt.includeTcpOnly = true;
-        opt.connectTimeoutMs = timeoutsMs[attempt];
-        // priorityBands default: 59000-60000 → 49xxx → rest (see PortScan.h).
-
-        ScanProbeResult scan = ScanAndProbe(ep, opt);
-        if (scan.servicePort != 0) {
-            foundPort = scan.servicePort;
-            foundRsdPort = scan.rsdPort;
-            if (attempt > 0) {
-                std::wcout << L"BiometricKit found on retry " << (attempt + 1)
-                           << L" (timeout " << opt.connectTimeoutMs << L"ms)\n";
-            }
-            break;
-        }
-        lastHttp2Count = 0;
-        for (const auto& h : scan.hits) {
-            if (h.http2PrefaceOk) ++lastHttp2Count;
-        }
-        const wchar_t* tail = (attempt + 1 < kAttempts) ? L" - retrying...\n" : L"\n";
-        if (lastHttp2Count == 0) {
-            std::wcout << L"no HTTP/2 candidates (attempt " << (attempt + 1)
-                       << L", timeout " << opt.connectTimeoutMs << L"ms)" << tail;
-        } else {
-            std::wcout << L"BiometricKit service not advertised by any of " << lastHttp2Count
-                       << L" HTTP/2 candidate(s) (attempt " << (attempt + 1) << L")" << tail;
-        }
-    }
-    if (foundPort == 0) {
-        if (lastHttp2Count == 0) {
-            std::wcout << L"no HTTP/2 candidates on peer after retries - run 'network' for full diagnostics.\n";
-        } else {
-            std::wcout << L"BiometricKit is not being advertised right now (T2 still booting?) - "
-                          L"run 'network' for full diagnostics.\n";
-        }
-        return false;
-    }
-    std::wcout << L"BiometricKit BridgeXPC port: " << foundPort << L"\n";
-
-    ConnectResult cr = outConn->Connect(ep.peerLinkLocal, ep.ifIndex, foundPort,
-                                         std::chrono::milliseconds(2000));
-    if (cr != ConnectResult::Ok) {
-        std::wcout << L"BridgeXPC connect/HELO failed on port " << foundPort << L"\n";
-        return false;
-    }
-    // Only cache after a live BridgeXPC connect actually succeeds — never
-    // cache a port on RemoteXPC verification alone, since that's exactly
-    // the "verified but BridgeXPC HELO failed" case the cache-hit path
-    // above already knows how to recover from.
-    SaveCachedPort(ep, foundPort, foundRsdPort);
+    std::wcout << L"BiometricKit BridgeXPC port: " << port << L"  ("
+               << (t2::transport::IsTunnelModeActive() ? L"IPv4 tunnel" : L"native IPv6") << L")\n";
     return true;
 }
 
@@ -1112,7 +920,7 @@ static int CmdVerify(int argc, wchar_t* argv[]) {
     std::wcout << L"place finger on sensor (lift and place again if prompted)...\n";
     VerificationEngine engine(cfg);
     std::optional<std::array<uint8_t, 16>> matchedUuid;
-    VerifyOutcome outcome = engine.Verify(&bridge, &matchedUuid);
+    VerifyOutcome outcome = engine.Verify(&bridge, &matchedUuid, g_cliCancel);
 
     switch (outcome) {
         case VerifyOutcome::Match:
@@ -1177,6 +985,8 @@ int wmain(int argc, wchar_t* argv[]) {
     }
     argv = filtered.data();
     argc = static_cast<int>(filtered.size());
+    // --cancel-event <name>: pulled out the same way (see InitCliCancel).
+    InitCliCancel(&argc, argv);
 
     t2::log::InitFromEnvironment(verbose);
 
@@ -1197,12 +1007,14 @@ int wmain(int argc, wchar_t* argv[]) {
 
     if (argc < 2) {
         std::wcout << L"usage: t2touchid.exe [--verbose|-v] <status|register-ool|capabilities|device-state|load-keybag|set-system-keybag|unlock|network|identities|warmup|verify>\n";
+        std::wcout << L"  network    [ifIndex] [--host fe80::...] [--rescan] [--no-scan] [--timeout SEC]\n";
         std::wcout << L"  identities [ifIndex] [--host fe80::...] [--uid N]\n";
         std::wcout << L"  warmup     [ifIndex] [--host fe80::...] [--uid N]\n";
         std::wcout << L"  verify     [ifIndex] [--host fe80::...] [--uid N] [--seconds N]\n"
                       L"             [--match-layout inline|padded|legacy]  (default: legacy)\n"
                       L"             [--match-flags N]  (0=default, 1=unlock match per Linux)\n"
                       L"             [--no-reset-sensor] [--no-load-calibration]  (both ON by default, Linux parity)\n";
+        std::wcout << L"  --cancel-event NAME: abort cleanly when the named event is signaled\n";
         std::wcout << L"  --verbose/-v (or env T2TOUCHID_VERBOSE=1): print step-by-step\n";
         std::wcout << L"    BridgeXPC diagnostics to the console. Always available in\n";
         std::wcout << L"    DebugView (run as Administrator, Capture Global Win32) even\n";
@@ -1216,6 +1028,9 @@ int wmain(int argc, wchar_t* argv[]) {
     // T2), they never touch the transport driver - so dispatch them before
     // opening the device (which needs the driver loaded and Administrator, and
     // is opened with exclusive share mode).
+    if (cmd == L"network" || cmd == L"identities" || cmd == L"warmup" || cmd == L"verify") {
+        EnableCtrlCCancel();
+    }
     if (cmd == L"network") return CmdNetwork(argc, argv);
     if (cmd == L"identities") return CmdIdentities(argc, argv);
     if (cmd == L"warmup") return CmdWarmup(argc, argv);

@@ -64,6 +64,8 @@
     <ClCompile Include="BridgeXpc\Frame.cpp" />
     <ClCompile Include="BridgeXpc\PlistPayload.cpp" />
     <ClCompile Include="Discovery\Adapter.cpp" />
+    <ClCompile Include="Discovery\BridgeDiscovery.cpp" />
+    <ClCompile Include="Discovery\NetworkWatch.cpp" />
     <ClCompile Include="Discovery\PortCache.cpp" />
     <ClCompile Include="Discovery\PortScan.cpp" />
     <ClCompile Include="Discovery\RemoteXpc.cpp" />
@@ -79,7 +81,9 @@
     <ClInclude Include="BridgeXpc\PlistPayload.h" />
     <ClInclude Include="BridgeXpc\Winsock.h" />
     <ClInclude Include="Discovery\Adapter.h" />
+    <ClInclude Include="Discovery\BridgeDiscovery.h" />
     <ClInclude Include="Discovery\NativeVerdict.h" />
+    <ClInclude Include="Discovery\NetworkWatch.h" />
     <ClInclude Include="Discovery\PortCache.h" />
     <ClInclude Include="Discovery\PortScan.h" />
     <ClInclude Include="Discovery\RemoteXpc.h" />

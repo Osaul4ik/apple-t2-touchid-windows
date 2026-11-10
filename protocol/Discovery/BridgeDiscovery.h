@@ -4,25 +4,15 @@
 // now that means the T2TouchIdBio UMDF WBDI driver (Windows-hello-design.MD
 // section 3, IOCTL_BIOMETRIC_CAPTURE_DATA).
 //
-// This intentionally duplicates the SHAPE of tools/t2touchid/main.cpp's
-// static ScanAndProbe/TryCachedBridgePort/DiscoverBiometricKitBridge (cache
-// fast path -> scan-from-end with a RemoteXPC checker racing each HTTP/2
-// hit -> live BridgeXPC HELO) rather than sharing code with them directly:
-// those three are `static` to main.cpp and wired to argv/std::wcout, which
-// a driver must never touch (no console, and DeviceIoControl callers should
-// not pay for argv-shaped parsing). The underlying primitives this calls
-// (ScanHttp2Preface, ProbeServiceOnPort, LoadCachedPort/SaveCachedPort,
-// Connection::Connect/GetBridgeVersion) are the SAME already-hardware-
-// verified library functions the CLI uses — no new wire-protocol code,
-// exactly the "нуль нового протокольного коду" rule design doc 2 states.
-//
-// TODO(follow-up, low risk / not yet done): refactor main.cpp's
-// DiscoverBiometricKitBridge to call ConnectToBiometricKitBridge for the
-// no-ifIndex/no-host-override case, so the two callers share one
-// implementation instead of two copies of the same shape. Left as a
-// follow-up rather than done here to avoid touching a CLI path that is
-// already confirmed working on real hardware, in the same change that
-// introduces new, not-yet-hardware-tested driver code.
+// This is the ONE implementation of discovery + connect. The UMDF driver
+// (Queue.cpp, per CAPTURE_DATA retry ladder) and the t2touchid.exe CLI
+// (`network`, `network --rescan` - the GUI "Rescan" button - `identities`,
+// `warmup`, `verify`) all go through it, so every caller gets the same
+// cross-process TransportPhase lock, the same native-IPv6 -> IPv4-tunnel
+// policy and the same scan. (Until RC the CLI had its own static copy in
+// main.cpp: no phase lock, no tunnel fallback, unbounded RemoteXPC checker
+// threads - it flipped the global T2Ncm mode under the driver's feet and a
+// Rescan with a VPN on could never find the port.)
 #pragma once
 #include "Adapter.h"
 #include "../BridgeXpc/Connection.h"
@@ -78,6 +68,29 @@ bool PickDefaultT2Endpoint(NcmEndpoint* outEndpoint, void* cancelEvent = nullptr
 // (the tunnel when IPv6 was blocked or the tunnel is sticky, otherwise native
 // IPv6). Everything else - cancel, a silent path, a cool-down, no peer/MAC yet -
 // leaves it false: "not yet", and the caller keeps retrying.
+// Per-call knobs. The defaults are the driver's lock-screen behaviour.
+struct ConnectOptions {
+    // User-requested rescan (GUI "Rescan", `t2touchid.exe network --rescan`):
+    //  * the registry port is NOT tried first - a full-chain scan always runs
+    //    (the old entry is kept until the scan confirms a port, so a failed
+    //    rescan never throws a good entry away);
+    //  * the empty-pass cool-down and the scan resume cursor are ignored;
+    //  * native IPv6 is tried even when the sticky tunnel is committed: a
+    //    rescan is a fresh verdict, and a native success clears the sticky
+    //    tunnel exactly like the post-unlock re-check (a VPN that forced the
+    //    tunnel may be gone). If native is blocked it falls through to the
+    //    tunnel as usual.
+    bool forceRescan = false;
+};
+
+bool ConnectToBiometricKitBridge(const NcmEndpoint& endpoint,
+                                  t2::bridgexpc::Connection* outConn,
+                                  uint16_t* outServicePort,
+                                  uint16_t* outRsdPort,
+                                  void* cancelEvent,
+                                  bool* outScansExhausted,
+                                  const ConnectOptions& options);
+
 bool ConnectToBiometricKitBridge(const NcmEndpoint& endpoint,
                                   t2::bridgexpc::Connection* outConn,
                                   uint16_t* outServicePort = nullptr,

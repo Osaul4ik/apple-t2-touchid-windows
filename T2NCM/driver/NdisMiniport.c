@@ -226,6 +226,52 @@ T2NcmDispatchCreateClose(
     return STATUS_SUCCESS;
 }
 
+// IRP_MJ_CLEANUP: the last user handle of a file object is gone. If that
+// handle still owns a live transport mode that differs from the committed
+// (sticky) one - i.e. its process died inside a probe phase - put the
+// committed mode back, globally and on the running adapter (Tunnel.h).
+_Dispatch_type_(IRP_MJ_CLEANUP)
+DRIVER_DISPATCH T2NcmDispatchCleanup;
+
+NTSTATUS
+T2NcmDispatchCleanup(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _Inout_ PIRP Irp
+    )
+{
+    PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(Irp);
+    BOOLEAN restoredTunnel = FALSE;
+
+    UNREFERENCED_PARAMETER(DeviceObject);
+
+    if (T2NcmTunnelReleaseModeOwner(stack->FileObject, &restoredTunnel))
+    {
+        PT2NCM_DEVICE_CONTEXT context;
+
+        KeEnterCriticalRegion();
+        ExAcquireResourceSharedLite(&g_T2NcmDiagnosticLock, TRUE);
+        context = g_T2NcmDiagnosticAdapter;
+        if (context != NULL)
+        {
+            // Re-read the global instead of using restoredTunnel: a SET_TRANSPORT_MODE
+            // from another handle may have landed between the restore and here, and
+            // the adapter must end up on whatever the driver-global mode is now.
+            InterlockedExchange(&context->TunnelModeEnabled, T2NcmTunnelGetMode() ? 1 : 0);
+        }
+        ExReleaseResourceLite(&g_T2NcmDiagnosticLock);
+        KeLeaveCriticalRegion();
+
+        T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_WARNING_LEVEL,
+            "T2Ncm: control handle closed while owning a probe transport mode - "
+            "restored committed mode %u\n", restoredTunnel ? 1u : 0u));
+    }
+
+    Irp->IoStatus.Status = STATUS_SUCCESS;
+    Irp->IoStatus.Information = 0;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return STATUS_SUCCESS;
+}
+
 _Dispatch_type_(IRP_MJ_DEVICE_CONTROL)
 DRIVER_DISPATCH T2NcmDispatchDeviceControl;
 
@@ -272,7 +318,7 @@ T2NcmDispatchDeviceControl(
             status = STATUS_INVALID_PARAMETER;
             goto Complete;
         }
-        T2NcmTunnelSetSticky(sticky == 1ul);
+        T2NcmTunnelStickyWrite(sticky == 1ul);
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
             "T2Ncm: sticky tunnel set via IOCTL -> %u (driver memory, cleared on reboot)\n",
             (sticky == 1ul) ? 1u : 0u));
@@ -427,7 +473,10 @@ T2NcmDispatchDeviceControl(
         // survives adapter reset and sleep), then the running adapter's
         // cached copy. Plain assignment on the context field: the TX/RX
         // rewrite paths only ever read it.
-        T2NcmTunnelSetMode(mode == 1ul);
+        // Records this handle as the owner when the mode now differs from the
+        // committed (sticky) decision, so IRP_MJ_CLEANUP can undo it if the
+        // process dies before putting the committed mode back.
+        T2NcmTunnelModeWrite(stack->FileObject, mode == 1ul);
         InterlockedExchange(&context->TunnelModeEnabled, mode == 1ul ? 1 : 0);
 
         T2NCM_LOG((T2NCM_DPFLTR_ID, DPFLTR_INFO_LEVEL,
@@ -531,6 +580,7 @@ T2NcmRegisterDiagnosticDevice(
     RtlZeroMemory(dispatchTable, sizeof(dispatchTable));
     dispatchTable[IRP_MJ_CREATE]         = T2NcmDispatchCreateClose;
     dispatchTable[IRP_MJ_CLOSE]          = T2NcmDispatchCreateClose;
+    dispatchTable[IRP_MJ_CLEANUP]        = T2NcmDispatchCleanup;
     dispatchTable[IRP_MJ_DEVICE_CONTROL] = T2NcmDispatchDeviceControl;
 
     RtlInitUnicodeString(&deviceName, T2NCM_NT_DEVICE_NAME);

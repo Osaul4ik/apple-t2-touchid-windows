@@ -135,6 +135,7 @@
     <ClCompile Include="..\..\..\protocol\BridgeXpc\PlistPayload.cpp" />
     <ClCompile Include="..\..\..\protocol\Discovery\Adapter.cpp" />
     <ClCompile Include="..\..\..\protocol\Discovery\BridgeDiscovery.cpp" />
+    <ClCompile Include="..\..\..\protocol\Discovery\NetworkWatch.cpp" />
     <ClCompile Include="..\..\..\protocol\Discovery\PortCache.cpp" />
     <ClCompile Include="..\..\..\protocol\Discovery\PortScan.cpp" />
     <ClCompile Include="..\..\..\protocol\Discovery\RemoteXpc.cpp" />

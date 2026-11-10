@@ -4,8 +4,11 @@
 #include "../WbdiBir.h"
 // Transport policy (Native IPv6 <-> IPv4 tunnel auto-switch): see the header
 // comment in TransportMode.h. This file only feeds it events
-// (RequestNativeReprobe on unlock).
+// (RequestNativeReprobe on unlock, and the host network-change watcher at the end
+// of this file).
 #include "BridgeXpc/TransportMode.h"
+#include "Discovery/NetworkWatch.h"
+#include "Discovery/PortCache.h"
 // FindT2NcmEndpoints() - peer IPv6 link-local + interface index for the probe.
 #include "Discovery/Adapter.h"
 #include "BiometricKit/MacosUserId.h"
@@ -850,8 +853,8 @@ ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_
         // persistent VPN causes a failed native probe + TunnelMode flip and can
         // leave the next CAPTURE in MatchingCancelled. Unlock (WTS_SESSION_UNLOCK)
         // asks for ONE native re-check of a committed tunnel; the next connect runs
-        // it. (There is no NotifyIpInterfaceChange registration: VPN up/down is not
-        // observed directly, only through a failed/successful connect.)
+        // it. VPN up/down between unlocks is handled by the host network-change
+        // watcher (OnHostNetworkChanged, end of this file).
         std::lock_guard<std::mutex> commitLock(g_captureRequestCommitMu);
         BeginCaptureSuspend("OnSuspendResume(PBT_APMSUSPEND)");
     } else if (Type == PBT_APMRESUMESUSPEND || Type == PBT_APMRESUMEAUTOMATIC) {
@@ -3089,4 +3092,94 @@ extern "C" VOID T2BioUnregisterSessionLockNotification(VOID)
         CloseHandle(g_sessionLockReadyEvent);
         g_sessionLockReadyEvent = nullptr;
     }
+}
+
+// ---- Host network changes (VPN up/down) -------------------------------------
+// Until RC the transport was re-decided only by a connect (and one native re-check
+// per real unlock). Two cases slipped through:
+//  * a VPN came up while a capture was armed over native IPv6: its WFP filters drop
+//    the T2's events, so the touch was ignored until that capture's match window
+//    ended and the retry ladder reconnected (over the tunnel);
+//  * the VPN that forced the sticky tunnel went away: the tunnel stayed until the
+//    next unlock.
+// The watcher (protocol/Discovery/NetworkWatch) calls this after a debounced burst
+// of interface/route changes, on its own thread:
+//  * sticky tunnel committed -> RequestNativeReprobe(): the next connect re-checks
+//    native once (exactly what an unlock does). The armed tunnel session is left
+//    alone - the tunnel keeps working without a VPN too;
+//  * native committed and a capture armed -> one 250 ms SYN to the cached port. If
+//    the native path no longer answers (WFP block / silence), the active match is
+//    invalidated exactly like a screen lock does (the WBF CAPTURE_DATA stays pending,
+//    the worker reconnects at once and the connect flow switches to the tunnel).
+//    An alive path, or a probe that could not run, changes nothing.
+namespace {
+
+t2::discovery::NetworkChangeWatcher g_netWatch;
+
+void OnHostNetworkChanged()
+{
+    if (t2::transport::IsTransportIoSuspended() ||
+        g_systemShuttingDown.load(std::memory_order_acquire)) {
+        T2BioLog("NetworkChange: ignored (system suspending / shutting down)");
+        return;
+    }
+    t2::transport::DiagTransportSnapshot(L"host network change");
+    if (!t2::transport::IsAutoSwitchEnabled()) {
+        return; // native only: nothing to switch
+    }
+    t2::transport::RefreshStickyFromDriver();
+    if (t2::transport::IsAutoTunnelCommitted()) {
+        t2::transport::RequestNativeReprobe();
+        T2BioLog("NetworkChange: IPv4 tunnel committed - the next connect re-checks native IPv6 once");
+        return;
+    }
+    if (!g_captureBusy.load(std::memory_order_acquire)) {
+        return; // nothing armed: the next connect decides on its own
+    }
+    if (t2::transport::TransportOverride().load(std::memory_order_relaxed) >= 0) {
+        // A connect phase of this process is probing right now; the driver mode is
+        // the probe's, so a native SYN would say nothing. That connect decides.
+        T2BioLog("NetworkChange: a connect phase is running - leaving the decision to it");
+        return;
+    }
+    t2::discovery::NcmEndpoint ep;
+    {
+        std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
+        if (!g_stickyNcm.valid || g_stickyNcm.ep.peerSource == t2::discovery::PeerSource::None) {
+            return;
+        }
+        ep = g_stickyNcm.ep;
+    }
+    uint16_t port = 0;
+    uint16_t rsd = 0;
+    if (!t2::discovery::LoadCachedPort(ep, &port, &rsd) || port == 0) {
+        return;
+    }
+    const t2::discovery::NativePathProbe probe =
+        t2::discovery::ProbeNativePath(ep.peerLinkLocal, ep.ifIndex, port, 250);
+    T2_LOG("netwatch", L"armed capture over native IPv6: probe of port %u -> %s",
+           static_cast<unsigned>(port), t2::discovery::NativePathProbeName(probe));
+    if (probe == t2::discovery::NativePathProbe::Alive ||
+        probe == t2::discovery::NativePathProbe::LocalError) {
+        return;
+    }
+    std::lock_guard<std::mutex> commitLock(g_captureRequestCommitMu);
+    InvalidateActiveCapture("NetworkChange(native IPv6 path lost)",
+                            /*resetResumeEvent=*/false, /*clearStickyEndpoint=*/false);
+}
+
+}  // namespace
+
+extern "C" VOID T2BioRegisterNetworkChangeNotification(VOID)
+{
+    if (!g_netWatch.Start(&OnHostNetworkChanged)) {
+        T2BioLog("NetworkChange registration failed - VPN changes are picked up only by the "
+                 "next connect / unlock");
+    }
+}
+
+// Before unload: joins the watcher thread (it runs code from this DLL).
+extern "C" VOID T2BioUnregisterNetworkChangeNotification(VOID)
+{
+    g_netWatch.Stop();
 }

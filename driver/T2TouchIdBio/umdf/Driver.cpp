@@ -106,6 +106,9 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject,
     // no suspend. See BeginCaptureSessionLock's header comment (Queue.cpp)
     // for why the suspend/resume hook above alone is not enough.
     T2BioRegisterSessionLockNotification();
+    // Third: host network changes (a VPN coming up / going down) re-decide the
+    // transport between touches instead of at the next failed connect.
+    T2BioRegisterNetworkChangeNotification();
     T2BioLog("DriverEntry ok");
     return status;
 }
@@ -118,6 +121,7 @@ extern "C" VOID T2BioEvtDriverUnload(_In_ WDFDRIVER Driver)
     // when the host is free to unload us. Then reverse of DriverEntry's
     // registration order.
     T2BioDrainCaptureWorkers();
+    T2BioUnregisterNetworkChangeNotification();
     T2BioUnregisterSessionLockNotification();
     T2BioUnregisterSuspendResumeNotification();
     T2BioLog("EvtDriverUnload ok");

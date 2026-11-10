@@ -970,6 +970,31 @@ inline void EnsureStickySeededFromDriver() {
     StickySeedState().store(2, std::memory_order_release);
 }
 
+// Re-reads the sticky flag from T2Ncm memory and brings this process's copy in line
+// with it, in BOTH directions. EnsureStickySeededFromDriver alone seeds once per
+// process, which was enough while only WUDFHost decided the transport; now that the
+// CLI (GUI Rescan / Test) runs the same connect flow in its own process, either side
+// can commit or clear the tunnel, and a copy seeded hours ago would make the other
+// process start on the wrong transport. Called at the start of every connect (one
+// IOCTL, no I/O on the wire). No-op without the IOCTL (older T2Ncm.sys) or while the
+// system is suspending.
+inline void RefreshStickyFromDriver() {
+    EnsureStickySeededFromDriver();
+    if (StickySeedState().load(std::memory_order_acquire) != 1) return;
+    if (IsTransportIoSuspended()) return;
+    T2NcmTunnelStateWire st{};
+    DWORD err = 0;
+    if (!ReadTunnelStateFromDriver(&st, &err)) return; // keep the in-process copy
+    const bool driverSticky = st.Sticky != 0;
+    if (g_autoTunnel.exchange(driverSticky, std::memory_order_relaxed) != driverSticky) {
+        if (driverSticky) g_autoTunnelGen.store(CurrentGeneration(), std::memory_order_relaxed);
+        T2_LOG("transport", L"sticky tunnel re-synced from T2Ncm memory: sticky=%lu (another "
+               L"process changed it)", st.Sticky);
+        T2_DIAG("state", L"sticky tunnel re-synced from T2Ncm memory: sticky=%lu mode=%lu",
+                st.Sticky, st.Mode);
+    }
+}
+
 inline bool PushTunnelStickyToDriver(bool on) {
     if (StickySeedState().load(std::memory_order_acquire) == 2) return false; // no IOCTL
     if (IsTransportIoSuspended()) {
@@ -1362,11 +1387,12 @@ private:
 //     driver mode == committed mode when a phase ends          (invariant 8)
 //
 // Both ends push only when the driver does NOT already hold that mode, judged by
-// LastPushedModeFlag. That is exact, not a guess: this process is the only writer of
-// the driver's mode (nothing else sends IOCTL_T2NCM_SET_TRANSPORT_MODE; the CLI only
-// reads status), and the hint is reset to "unknown" on every event that can change what
-// the driver holds - IOCTL failure, resume from Dx (Queue.cpp), InvalidateTunnelPrepCache
-// after a failed connect. An unknown hint always writes.
+// LastPushedModeFlag. Within one phase that is exact: the cross-process mutex keeps
+// every other writer out, and the hint is reset to "unknown" at the start of every
+// phase (TransportPhase) and on every event that can change what the driver holds -
+// IOCTL failure, resume from Dx (Queue.cpp), InvalidateTunnelPrepCache after a failed
+// connect. An unknown hint always writes. If the process dies inside a phase, T2Ncm.sys
+// restores the committed mode when the phase's control handle is cleaned up.
 // These calls used to be force=true, a leftover from when a GUI checkbox also wrote the
 // mode. Blind forcing re-sent the value the driver already had: once on Enter and again
 // on Restore of every phase, and between the native and the tunnel step of one connect
@@ -1397,7 +1423,14 @@ private:
 // Lock + mode scope in one object. Members are destroyed in reverse order, so
 // the mode is restored while the mutex is still held.
 struct TransportPhase {
-    explicit TransportPhase(HANDLE cancelEvent = nullptr) : lock(cancelEvent) {}
+    explicit TransportPhase(HANDLE cancelEvent = nullptr) : lock(cancelEvent) {
+        // This process is NOT the only writer of the driver mode: the CLI (GUI
+        // Rescan / Test) runs the same phases from its own process, and T2Ncm.sys
+        // itself restores the committed mode when a phase owner dies (IRP_MJ_CLEANUP).
+        // So the "what did I last push" record cannot be trusted across phases:
+        // forget it once the mutex is held, and the phase's first push always writes.
+        LastPushedModeFlag().store(-1, std::memory_order_relaxed);
+    }
     // Declared FIRST so it is destroyed LAST: the Enter()/Restore() pushes (and every
     // push made by the phase body) share one control handle, and Restore() still has it
     // while the mutex is held. Opened lazily by the first IOCTL, closed when the phase ends.

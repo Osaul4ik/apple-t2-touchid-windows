@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
-// BridgeDiscovery.cpp — the TransportManager: one silent (no stdout, no argv)
-// implementation of "find the BiometricKit BridgeXPC port and connect", see
-// BridgeDiscovery.h and CONNECT_ARCHITECTURE_v2.md.
+// BridgeDiscovery.cpp — the TransportManager: the one silent (no stdout, no argv)
+// implementation of "find the BiometricKit BridgeXPC port and connect", shared by
+// the UMDF driver and the t2touchid.exe CLI; see BridgeDiscovery.h and
+// CONNECT_ARCHITECTURE_v2.md.
 //
 // One call of ConnectToBiometricKitBridge is ONE step of the caller's retry
 // ladder (Queue.cpp ConnectForCaptureWithRetry). What survives between steps -
@@ -269,9 +270,18 @@ bool RecheckCandidates(const NcmEndpoint& ep, ScanState* st, bool tunnel, ULONGL
 // One full-chain scan pass on `tunnel` (the caller is inside the matching
 // TransportPhase), resumed from the stored cursor. Returns when the service is
 // confirmed, the pass ended (empty or silent), the budget ran out, or cancel fired.
-ScanOutcome RunScanAttempt(const NcmEndpoint& ep, bool tunnel, void* cancelEvent) {
+ScanOutcome RunScanAttempt(const NcmEndpoint& ep, bool tunnel, void* cancelEvent,
+                           bool forceRescan) {
     ScanOutcome out;
     ScanState st = LoadScanState(ep, tunnel);
+    if (forceRescan) {
+        // A user-requested rescan is a complete, fresh pass: no cool-down, no
+        // resume from a cursor an earlier (cancelled) pass left behind. Known
+        // HTTP/2 candidates are kept - re-checking them first is still cheapest.
+        st.cursor = 0;
+        st.emptyPasses = 0;
+        st.lastPassEnd = 0;
+    }
 
     const ULONGLONG start = GetTickCount64();
     if (st.cursor == 0 && st.emptyPasses > 0 && st.lastPassEnd != 0 &&
@@ -460,8 +470,8 @@ struct StepResult {
 
 // Scan on the current transport and connect what it confirms. Shared by both steps.
 void ScanAndConnect(const NcmEndpoint& ep, Connection* conn, bool tunnel, void* cancelEvent,
-                    StepResult* sr, ScanOutcome* outScan) {
-    ScanOutcome so = RunScanAttempt(ep, tunnel, cancelEvent);
+                    bool forceRescan, StepResult* sr, ScanOutcome* outScan) {
+    ScanOutcome so = RunScanAttempt(ep, tunnel, cancelEvent, forceRescan);
     *outScan = so;
     if (so.servicePort != 0) {
         // Save at the moment of confirmation, before the final connect and
@@ -521,13 +531,16 @@ DWORD LoadSilenceGraceMs() {
 }
 
 // ---- Step B: native IPv6 -----------------------------------------------------
-StepResult NativeStep(const NcmEndpoint& ep, Connection* conn, void* cancelEvent, bool autoSwitch) {
+StepResult NativeStep(const NcmEndpoint& ep, Connection* conn, void* cancelEvent, bool autoSwitch,
+                      bool forceRescan) {
     StepResult sr;
     tp::TransportPhase phase(static_cast<HANDLE>(cancelEvent));
     phase.mode.Enter(tp::TransportMode::NativeIpv6);
 
-    // B.1: registry port, live HELO on native.
-    CacheTry ct = TryCachedBridgePort(ep, conn, false);
+    // B.1: registry port, live HELO on native (skipped by a forced rescan: the
+    // scan below decides, and also detects a WFP block from its own errors).
+    CacheTry ct;
+    if (!forceRescan) ct = TryCachedBridgePort(ep, conn, false);
     if (ct.ok) {
         tp::RecordNativeSuccess(ct.tcpMs); // native works
         ClearNativeSilent();
@@ -551,7 +564,7 @@ StepResult NativeStep(const NcmEndpoint& ep, Connection* conn, void* cancelEvent
 
     // B.3: no cache or no HELO => full-chain native rescan right away.
     ScanOutcome so;
-    ScanAndConnect(ep, conn, false, cancelEvent, &sr, &so);
+    ScanAndConnect(ep, conn, false, cancelEvent, forceRescan, &sr, &so);
     if (sr.ok) {
         ClearNativeSilent();
         return sr;
@@ -626,7 +639,7 @@ StepResult NativeRevalidateStep(const NcmEndpoint& ep, Connection* conn, void* c
 }
 
 // ---- Step C: IPv4 tunnel -----------------------------------------------------
-StepResult TunnelStep(NcmEndpoint* ep, Connection* conn, void* cancelEvent) {
+StepResult TunnelStep(NcmEndpoint* ep, Connection* conn, void* cancelEvent, bool forceRescan) {
     StepResult sr;
     tp::TransportPhase phase(static_cast<HANDLE>(cancelEvent));
     phase.mode.Enter(tp::TransportMode::Ipv4Tunnel);
@@ -655,7 +668,8 @@ StepResult TunnelStep(NcmEndpoint* ep, Connection* conn, void* cancelEvent) {
     }
 
     // Same registry port as native (one port for both transports).
-    CacheTry ct = TryCachedBridgePort(*ep, conn, true);
+    CacheTry ct;
+    if (!forceRescan) ct = TryCachedBridgePort(*ep, conn, true);
     if (ct.ok) {
         tp::CommitAutoTunnel(true);
         T2_LOG("discovery", L"CommitTunnel (cached port %u) - sticky until reboot",
@@ -669,7 +683,7 @@ StepResult TunnelStep(NcmEndpoint* ep, Connection* conn, void* cancelEvent) {
     if (Cancelled(cancelEvent)) return sr;
 
     ScanOutcome so;
-    ScanAndConnect(*ep, conn, true, cancelEvent, &sr, &so);
+    ScanAndConnect(*ep, conn, true, cancelEvent, forceRescan, &sr, &so);
     if (sr.ok) {
         tp::CommitAutoTunnel(true);
         T2_LOG("discovery", L"CommitTunnel (scanned port %u) - sticky until reboot",
@@ -723,7 +737,9 @@ bool PickDefaultT2Endpoint(NcmEndpoint* outEndpoint, void* cancelEvent) {
 // cold-boot diagnostics (start / end / duration / state snapshot) - see Log.h T2_DIAG.
 static bool ConnectToBiometricKitBridgeImpl(const NcmEndpoint& endpoint, t2::bridgexpc::Connection* outConn,
                                             uint16_t* outServicePort, uint16_t* outRsdPort,
-                                            void* cancelEvent, bool* outScansExhausted) {
+                                            void* cancelEvent, bool* outScansExhausted,
+                                            const ConnectOptions& options) {
+    const bool forceRescan = options.forceRescan;
     if (outScansExhausted) *outScansExhausted = false;
     if (outConn == nullptr) return false;
     if (Cancelled(cancelEvent)) return false;
@@ -758,8 +774,11 @@ static bool ConnectToBiometricKitBridgeImpl(const NcmEndpoint& endpoint, t2::bri
     const bool v6Unavailable = autoSwitch && tp::IsV6Unavailable();
 
     // Return from the sticky tunnel: at most one native re-check per unlock (step B').
-    // Skipped while IPv6 is unusable on the adapter (the flag then stays for later).
-    if (sticky && !v6Unavailable && !Cancelled(cancelEvent) && tp::ConsumeNativeRevalidate()) {
+    // Skipped while IPv6 is unusable on the adapter (the flag then stays for later),
+    // and by a forced rescan, which runs the full native step below anyway (the
+    // pending post-unlock re-check is left for the driver's next connect).
+    if (sticky && !v6Unavailable && !forceRescan && !Cancelled(cancelEvent) &&
+        tp::ConsumeNativeRevalidate()) {
         const StepResult rv = NativeRevalidateStep(ep, outConn, cancelEvent);
         if (rv.ok) {
             tp::NotePathAlive();
@@ -768,7 +787,8 @@ static bool ConnectToBiometricKitBridgeImpl(const NcmEndpoint& endpoint, t2::bri
             return true;
         }
     }
-    const bool tryNative = !sticky && !v6Unavailable;
+    // A forced rescan re-checks native even on a committed sticky tunnel.
+    const bool tryNative = (!sticky || forceRescan) && !v6Unavailable;
     T2_DIAG("connect", L"decision: autoSwitch=%d sticky=%d v6Unavailable=%d -> tryNative=%d "
             L"(sticky/v6Unavailable skip native and go straight to the IPv4 tunnel)",
             autoSwitch ? 1 : 0, sticky ? 1 : 0, v6Unavailable ? 1 : 0, tryNative ? 1 : 0);
@@ -776,7 +796,7 @@ static bool ConnectToBiometricKitBridgeImpl(const NcmEndpoint& endpoint, t2::bri
     StepResult native;
     bool sawSilent = false;
     if (tryNative) {
-        native = NativeStep(ep, outConn, cancelEvent, autoSwitch);
+        native = NativeStep(ep, outConn, cancelEvent, autoSwitch, forceRescan);
         sawSilent = native.sawSilent;
         T2_DIAG("connect", L"native step: ok=%d blocked=%d wfpBlocked=%d silent=%d pathAlive=%d fullPassEmpty=%d",
                 native.ok ? 1 : 0, native.blocked ? 1 : 0, native.wfpBlocked ? 1 : 0,
@@ -795,7 +815,7 @@ static bool ConnectToBiometricKitBridgeImpl(const NcmEndpoint& endpoint, t2::bri
         if (autoSwitch && native.blocked && !native.wfpBlocked && !Cancelled(cancelEvent)) {
             T2_LOG("discovery", L"native IPv6 silent - recovery ff02::1 ping before switching to IPv4");
             if (RecoverPeerViaMulticastPing(&ep)) {
-                native = NativeStep(ep, outConn, cancelEvent, autoSwitch);
+                native = NativeStep(ep, outConn, cancelEvent, autoSwitch, forceRescan);
                 sawSilent = sawSilent || native.sawSilent;
                 if (native.ok) {
                     tp::NotePathAlive();
@@ -808,7 +828,11 @@ static bool ConnectToBiometricKitBridgeImpl(const NcmEndpoint& endpoint, t2::bri
     }
 
     // Step C - IPv4 tunnel: sticky, IPv6 unusable, or native judged blocked.
-    const bool goTunnel = autoSwitch && (sticky || v6Unavailable || (tryNative && native.blocked));
+    // On a forced rescan the sticky flag alone no longer sends us to the tunnel:
+    // native was just re-checked, so only its own verdict (blocked) or an
+    // unusable IPv6 stack does.
+    const bool goTunnel = autoSwitch && ((sticky && !forceRescan) || v6Unavailable ||
+                                         (tryNative && native.blocked));
     StepResult tunnel;
     bool tunnelTried = false;
     if (goTunnel && !Cancelled(cancelEvent)) {
@@ -816,7 +840,7 @@ static bool ConnectToBiometricKitBridgeImpl(const NcmEndpoint& endpoint, t2::bri
         T2_LOG("discovery", L"tunnel step: sticky=%d v6unavail=%d nativeBlocked=%d%s",
                sticky ? 1 : 0, v6Unavailable ? 1 : 0, native.blocked ? 1 : 0,
                native.wfpBlocked ? L" (WFP)" : L"");
-        tunnel = TunnelStep(&ep, outConn, cancelEvent);
+        tunnel = TunnelStep(&ep, outConn, cancelEvent, forceRescan);
         sawSilent = sawSilent || tunnel.sawSilent;
         T2_DIAG("connect", L"tunnel step: ok=%d localError=%d silent=%d pathAlive=%d fullPassEmpty=%d",
                 tunnel.ok ? 1 : 0, tunnel.localError ? 1 : 0, tunnel.sawSilent ? 1 : 0,
@@ -856,14 +880,30 @@ static bool ConnectToBiometricKitBridgeImpl(const NcmEndpoint& endpoint, t2::bri
 bool ConnectToBiometricKitBridge(const NcmEndpoint& endpoint, t2::bridgexpc::Connection* outConn,
                                   uint16_t* outServicePort, uint16_t* outRsdPort,
                                   void* cancelEvent, bool* outScansExhausted) {
+    return ConnectToBiometricKitBridge(endpoint, outConn, outServicePort, outRsdPort, cancelEvent,
+                                       outScansExhausted, ConnectOptions{});
+}
+
+bool ConnectToBiometricKitBridge(const NcmEndpoint& endpoint, t2::bridgexpc::Connection* outConn,
+                                  uint16_t* outServicePort, uint16_t* outRsdPort,
+                                  void* cancelEvent, bool* outScansExhausted,
+                                  const ConnectOptions& options) {
     const ULONGLONG t0 = GetTickCount64();
-    T2_DIAG("connect", L"connect START ifIndex=%lu peerSource=%d", static_cast<unsigned long>(endpoint.ifIndex),
-            static_cast<int>(endpoint.peerSource));
+    T2_DIAG("connect", L"connect START ifIndex=%lu peerSource=%d forceRescan=%d",
+            static_cast<unsigned long>(endpoint.ifIndex), static_cast<int>(endpoint.peerSource),
+            options.forceRescan ? 1 : 0);
+    // Another process (CLI vs. WUDFHost) may have committed or cleared the sticky
+    // tunnel since this one last looked: start every connect from the driver's view.
+    tp::RefreshStickyFromDriver();
+    if (options.forceRescan) {
+        T2_LOG("discovery", L"forced rescan requested - registry port skipped, full-chain scan, "
+               L"native IPv6 re-checked even on a sticky tunnel");
+    }
     tp::DiagTransportSnapshot(L"connect START");
     // The caller's out-pointers go straight through: the wrapper must not change what a failed
     // connect leaves in them. Values are only read back for the log, and only when ok.
     const bool ok = ConnectToBiometricKitBridgeImpl(endpoint, outConn, outServicePort, outRsdPort,
-                                                    cancelEvent, outScansExhausted);
+                                                    cancelEvent, outScansExhausted, options);
     T2_DIAG("connect", L"connect END ok=%d port=%u rsd=%u scansExhausted=%d cancelled=%d mode=%s in %llu ms",
             ok ? 1 : 0, (ok && outServicePort) ? static_cast<unsigned>(*outServicePort) : 0u,
             (ok && outRsdPort) ? static_cast<unsigned>(*outRsdPort) : 0u,

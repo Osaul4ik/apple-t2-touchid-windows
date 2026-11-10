@@ -298,9 +298,34 @@ inline void WriteDiagEventLog(const wchar_t* line) {
     }
 }
 
+// Short name of the executable hosting this code ("WUDFHost", "t2touchid",
+// "T2SepBootstrap"), computed once. The same protocol/ code runs in several
+// processes; without it a DebugView capture only shows PIDs and leaves the reader
+// guessing which line came from the lock-screen driver and which from a GUI Rescan.
+inline const wchar_t* ProcessTag() {
+    static wchar_t tag[48] = {};
+    static std::once_flag once;
+    std::call_once(once, [] {
+        wchar_t path[MAX_PATH] = {};
+        const DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
+        const wchar_t* base = path;
+        for (DWORD i = 0; i < n; ++i) {
+            if (path[i] == L'\\' || path[i] == L'/') base = path + i + 1;
+        }
+        size_t len = 0;
+        while (base[len] != L'\0' && base[len] != L'.' && len < (sizeof(tag) / sizeof(tag[0])) - 1) {
+            tag[len] = base[len];
+            ++len;
+        }
+        tag[len] = L'\0';
+        if (len == 0) wcscpy_s(tag, L"?");
+    });
+    return tag;
+}
+
 // Diagnostic line (cold-boot investigation). Only when the master Diag switch is on.
 // DebugView + (if DiagEventLog is on) the ETW provider above. Prefix:
-//   "T2TouchIdDiag: [pid:tid up=<s since boot>][tag] msg"
+//   "T2TouchIdDiag: [process pid:tid up=<s since boot>][tag] msg"
 inline void Diagf(const wchar_t* tag, const wchar_t* fmt, ...) {
     if (!DiagEnabled()) {
         return;
@@ -312,8 +337,8 @@ inline void Diagf(const wchar_t* tag, const wchar_t* fmt, ...) {
     va_end(args);
 
     wchar_t line[1200];
-    _snwprintf_s(line, _TRUNCATE, L"T2TouchIdDiag: [%lu:%lu up=%.3fs][%s] %s\n",
-                 GetCurrentProcessId(), GetCurrentThreadId(), UptimeSec(), tag, msg);
+    _snwprintf_s(line, _TRUNCATE, L"T2TouchIdDiag: [%s %lu:%lu up=%.3fs][%s] %s\n",
+                 ProcessTag(), GetCurrentProcessId(), GetCurrentThreadId(), UptimeSec(), tag, msg);
     EmitLine(line);
     if (DiagEventLogEnabled()) {
         WriteDiagEventLog(line);
@@ -336,8 +361,8 @@ inline void Logf(const wchar_t* tag, const wchar_t* fmt, ...) {
     // filter - T2TouchId* - catches all user-mode output.
     // +<ms>.<us>: sub-millisecond stamp, taken BEFORE the line is emitted.
     const int64_t us = ElapsedUs();
-    _snwprintf_s(line, _TRUNCATE, L"T2TouchIdBridge: [%lu:%lu +%lld.%03lldms][%s] %s\n",
-                 GetCurrentProcessId(), GetCurrentThreadId(),
+    _snwprintf_s(line, _TRUNCATE, L"T2TouchIdBridge: [%s %lu:%lu +%lld.%03lldms][%s] %s\n",
+                 ProcessTag(), GetCurrentProcessId(), GetCurrentThreadId(),
                  static_cast<long long>(us / 1000), static_cast<long long>(us % 1000), tag, msg);
     EmitLine(line);
 }
