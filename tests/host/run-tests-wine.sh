@@ -87,6 +87,11 @@ if [[ -f "$ROOT/tests/ScenarioTests.cpp" ]]; then
     TESTS+=(T2TouchIdScenarioTests)
 fi
 
+# The UMDF driver's WDF-free transport glue (driver/T2TouchIdBio/umdf/TransportGlue.cpp)
+# compiles against the same headers; the capture engine is WDK-only.
+$CXX "${CXXFLAGS[@]}" -I"$ROOT/driver/T2TouchIdBio/umdf" -fsyntax-only \
+    "$ROOT/driver/T2TouchIdBio/umdf/TransportGlue.cpp"
+
 # Link check of the CLI (it runs only against real hardware, but a missing symbol
 # in the shared code shows up here).
 CLI_FLAGS=()

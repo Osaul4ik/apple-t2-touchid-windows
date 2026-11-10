@@ -117,6 +117,7 @@
   <ItemGroup>
     <ClCompile Include="Driver.cpp" />
     <ClCompile Include="Queue.cpp" />
+    <ClCompile Include="TransportGlue.cpp" />
     <!-- Protocol sources this driver now depends on (CAPTURE_DATA ->
          VerificationEngine -> BridgeXpc -> Discovery). Compiled directly
          into this project rather than referenced as a .lib - see the
@@ -149,6 +150,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Internal.h" />
+    <ClInclude Include="CaptureState.h" />
   </ItemGroup>
   <ItemGroup>
     <!-- No <Inf> item, same reason as T2TouchIdTransport.vcxproj (automatic
