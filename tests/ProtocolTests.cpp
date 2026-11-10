@@ -29,7 +29,7 @@ using namespace t2;
 static int g_failures = 0;
 #define CHECK(cond) do { \
     if (!(cond)) { \
-        std::wcerr << L"FAIL: " << __FILE__ << L":" << __LINE__ << L" " << L#cond << L"\n"; \
+        std::wcerr << L"FAIL: " << __FILE__ << L":" << __LINE__ << L" " << #cond << L"\n"; \
         g_failures++; \
     } \
 } while (0)
