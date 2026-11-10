@@ -15,7 +15,10 @@
 ;       T2SepBootstrap.exe (both copied by the INFs into System32) can be
 ;       replaced on an upgrade instead of being queued for a reboot.
 ;    2. bcdedit /set testsigning on (always - see InstallDriver.bat for why
-;       detecting the current value is unreliable).
+;       parsing bcdedit's Yes/No is unreliable). A failed set is NOT fatal
+;       when Test Mode is already on (SystemStartOptions of the running boot,
+;       or element 16000049 of the default BCD entry); otherwise setup stops
+;       and shows bcdedit's own message.
 ;    3. Import every .cer of the package (Inst\) into LocalMachine Root and
 ;       TrustedPublisher.
 ;    4. Check every INF / script is present BEFORE anything is removed.
@@ -221,6 +224,113 @@ var
   ResultCode: Integer;
 begin
   RunLogged(Exe, Args, ResultCode);
+end;
+
+// Runs a command, appends its output to the install log AND returns it, so a
+// failure can be shown to the user instead of a guess.
+function RunCaptured(const Exe, Args: String; var ResultCode: Integer;
+  var Output: String): Boolean;
+var
+  OutFile: String;
+  Raw: AnsiString;
+begin
+  Output := '';
+  OutFile := ExpandConstant('{tmp}\cmd-output.txt');
+  DeleteFile(OutFile);
+  LogLine('> "' + Exe + '" ' + Args);
+  Result := Exec(ExpandConstant('{cmd}'),
+    '/S /C ""' + Exe + '" ' + Args + ' > "' + OutFile + '" 2>&1"', '', SW_HIDE,
+    ewWaitUntilTerminated, ResultCode);
+  if not Result then
+  begin
+    LogLine('  could not launch (' + SysErrorMessage(ResultCode) + ')');
+    Exit;
+  end;
+  if LoadStringFromFile(OutFile, Raw) then
+    Output := Trim(String(Raw));
+  DeleteFile(OutFile);
+  if Output <> '' then
+    LogLine('  ' + Output);
+  LogLine('  exit code ' + IntToStr(ResultCode));
+end;
+
+// Test Mode of the RUNNING boot: the loader writes the effective options to
+// SystemStartOptions (" ... TESTSIGNING ..."). Locale-independent, unlike the
+// Yes/No that bcdedit prints.
+function TestSigningActiveNow(): Boolean;
+var
+  Opts: String;
+begin
+  Result := RegQueryStringValue(HKLM, 'SYSTEM\CurrentControlSet\Control',
+              'SystemStartOptions', Opts) and
+            (Pos('TESTSIGNING', Uppercase(Opts)) > 0);
+end;
+
+// Test Mode STORED in the BCD for the next boot, read from the mounted BCD hive:
+// boot manager {9dea862c-...} -> default entry (23000003) -> element 16000049
+// (BcdLibraryBoolean_AllowPrereleaseSignatures = "testsigning") == 1.
+// False when anything along the way cannot be read.
+function TestSigningStoredInBcd(): Boolean;
+var
+  Def: String;
+  Data: AnsiString;
+begin
+  Result := False;
+  if not RegQueryStringValue(HKLM,
+       'BCD00000000\Objects\{9dea862c-5cdd-4e70-acc1-f32b344d4795}\Elements\23000003',
+       'Element', Def) then
+    Exit;
+  if not RegQueryBinaryValue(HKLM,
+       'BCD00000000\Objects\' + Def + '\Elements\16000049', 'Element', Data) then
+    Exit;
+  Result := (Length(Data) > 0) and (Ord(Data[1]) <> 0);
+end;
+
+// Turns Test Mode on. Not an error when it is already on: "bcdedit /set" can
+// fail on a machine that is already in Test Mode (BitLocker / firmware policy /
+// a BCD store bcdedit cannot open), and the old code then aborted the install
+// although nothing needed to change.
+function EnsureTestSigning(var Details: String): Boolean;
+var
+  ResultCode: Integer;
+  Output: String;
+  ActiveNow, Stored: Boolean;
+begin
+  Details := '';
+  ActiveNow := TestSigningActiveNow();
+  Stored := TestSigningStoredInBcd();
+  LogLine('testsigning: running boot=' + IntToStr(Ord(ActiveNow)) +
+          ', stored for next boot=' + IntToStr(Ord(Stored)));
+
+  // Still (re)apply it: an explicit "testsigning No" must be overwritten.
+  if RunCaptured(ExpandConstant('{sys}\bcdedit.exe'), '/set testsigning on',
+       ResultCode, Output) and (ResultCode = 0) then
+  begin
+    Result := True;
+    Exit;
+  end;
+  Details := Output;
+
+  // Second form: some BCD layouts only accept an explicit {current}.
+  if RunCaptured(ExpandConstant('{sys}\bcdedit.exe'), '/set {current} testsigning on',
+       ResultCode, Output) and (ResultCode = 0) then
+  begin
+    Result := True;
+    Exit;
+  end;
+  if Output <> '' then
+    Details := Output;
+
+  Stored := TestSigningStoredInBcd();
+  if Stored or ActiveNow then
+  begin
+    LogLine('WARNING: bcdedit could not set testsigning, but Test Mode is already on ' +
+            '(running boot=' + IntToStr(Ord(ActiveNow)) + ', stored=' + IntToStr(Ord(Stored)) +
+            ') - continuing.');
+    Result := True;
+    Exit;
+  end;
+  Result := False;
 end;
 
 function ServiceExists(const Name: String): Boolean;
@@ -548,7 +658,7 @@ end;
 function InstallDriversNow(): Boolean;
 var
   ResultCode, I, CertCount: Integer;
-  Pkg: String;
+  Pkg, Details: String;
   Certs, Required: TArrayOfString;
 begin
   Result := False;
@@ -574,12 +684,13 @@ begin
 
   // 2. Test Mode.
   SetStatus('Enabling Windows Test Mode...');
-  if (not RunLogged(ExpandConstant('{sys}\bcdedit.exe'), '/set testsigning on', ResultCode)) or
-     (ResultCode <> 0) then
+  if not EnsureTestSigning(Details) then
   begin
-    SuppressibleMsgBox('Could not enable Test Mode (bcdedit).' + #13#10 +
+    SuppressibleMsgBox('Could not enable Test Mode (bcdedit /set testsigning on).' + #13#10 + #13#10 +
+      'bcdedit said:' + #13#10 + Details + #13#10 + #13#10 +
       'If Secure Boot is on in the firmware, it must be disabled first.' + #13#10 +
-      'Driver installation was NOT completed - nothing was removed.', mbError, MB_OK, IDOK);
+      'Driver installation was NOT completed - nothing was removed.' + #13#10 +
+      'Log: ' + LogFile, mbError, MB_OK, IDOK);
     StartBiometricService;
     Exit;
   end;

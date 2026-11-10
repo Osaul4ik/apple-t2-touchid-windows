@@ -33,7 +33,18 @@ rem was skipped and the drivers then failed to load (Code 52) after reboot.
 rem Setting it again when it is already on is a harmless no-op, and the value
 rem itself cannot be parsed reliably (Yes/No is localized).
 bcdedit /set testsigning on
-if errorlevel 1 (
+if not errorlevel 1 goto TESTSIGN_OK
+
+rem The set can fail on a machine that is ALREADY in Test Mode (firmware or
+rem BitLocker policy, a BCD store bcdedit cannot open). The running boot's
+rem options are locale-independent: TESTSIGNING in SystemStartOptions.
+reg query "HKLM\SYSTEM\CurrentControlSet\Control" /v SystemStartOptions 2>nul | findstr /i "TESTSIGNING" >nul
+if not errorlevel 1 (
+    echo [WARN] bcdedit could not set testsigning, but Test Mode is already active - continuing.
+    goto TESTSIGN_DONE
+)
+
+(
     echo.
     echo [ERROR] Failed to enable Test Mode.
     echo.
@@ -46,7 +57,9 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
+:TESTSIGN_OK
 echo [OK] Test Mode enabled. Restart Windows after installation if it was not on already.
+:TESTSIGN_DONE
 
 echo.
 
