@@ -96,17 +96,22 @@ DWORD WINAPI NetworkChangeWatcher::ThreadProc(LPVOID self) {
 }
 
 void NetworkChangeWatcher::Run() {
+    // WaitForMultipleObjects indices, spelled numerically: WAIT_OBJECT_0 expands to
+    // (STATUS_WAIT_0 + 0), and STATUS_WAIT_0 is undeclared in the UMDF build
+    // (UMDF_USING_NTSTATUS) - same convention as Connection.h / Log.h.
+    constexpr DWORD kWaitStop = 0;   // == WAIT_OBJECT_0 + 0
+    constexpr DWORD kWaitChange = 1; // == WAIT_OBJECT_0 + 1
     const HANDLE waitFirst[2] = {stopEvent_, changeEvent_};
     for (;;) {
-        if (WaitForMultipleObjects(2, waitFirst, FALSE, INFINITE) != WAIT_OBJECT_0 + 1) return;
+        if (WaitForMultipleObjects(2, waitFirst, FALSE, INFINITE) != kWaitChange) return;
         // Debounce: keep waiting while changes keep coming; fire after a quiet
         // debounceMs_. Bounded so a flapping adapter still gets evaluated.
         const ULONGLONG firstChange = GetTickCount64();
         for (;;) {
             const DWORD w = WaitForMultipleObjects(2, waitFirst, FALSE, debounceMs_);
-            if (w == WAIT_OBJECT_0) return;                      // stop
+            if (w == kWaitStop) return;                           // stop
             if (w == WAIT_TIMEOUT) break;                         // quiet: evaluate
-            if (w != WAIT_OBJECT_0 + 1) return;                   // wait failed
+            if (w != kWaitChange) return;                         // wait failed
             if (GetTickCount64() - firstChange > 10ull * debounceMs_) break;
         }
         T2_LOG("netwatch", L"host network configuration changed");
