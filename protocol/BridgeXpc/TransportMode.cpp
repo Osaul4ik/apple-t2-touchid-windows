@@ -94,6 +94,15 @@ struct TransportState {
 
     T2NcmControlState control;
 
+    // Counters (TransportStats).
+    std::atomic<uint64_t> connectsOk{0}, connectsFailed{0}, tunnelCommits{0}, nativeReturns{0},
+        nativeRechecks{0};
+    std::mutex lastMu;
+    ULONGLONG lastConnectTick = 0;
+    bool lastConnectOk = false;
+    bool lastConnectTunnel = false;
+    uint16_t lastPort = 0;
+
     void Reset() {
         generation = 1;
         realSuspendGeneration = 0;
@@ -112,6 +121,13 @@ struct TransportState {
         lastPushedPeer.Clear();
         lastPushedLocal.Clear();
         arpPrepared.Clear();
+        connectsOk = connectsFailed = tunnelCommits = nativeReturns = nativeRechecks = 0;
+        {
+            std::lock_guard<std::mutex> lastLock(lastMu);
+            lastConnectTick = 0;
+            lastConnectOk = lastConnectTunnel = false;
+            lastPort = 0;
+        }
         std::lock_guard<std::mutex> lock(control.mu);
         if (control.h != INVALID_HANDLE_VALUE) CloseHandle(control.h);
         control.h = INVALID_HANDLE_VALUE;
@@ -259,7 +275,10 @@ void RequestNativeRevalidate() {
 }
 bool ConsumeNativeRevalidate() {
     const bool had = S().nativeRevalidate.exchange(false, std::memory_order_relaxed);
-    if (had) T2_DIAG("state", L"native re-check consumed by this connect");
+    if (had) {
+        ++S().nativeRechecks;
+        T2_DIAG("state", L"native re-check consumed by this connect");
+    }
     return had;
 }
 void RequestNativeReprobe() {
@@ -311,6 +330,7 @@ void RecordNativeSuccess(ULONGLONG tcpMs) {
     s.nativeEmaMs.store(next, std::memory_order_relaxed);
     EnsureStickySeededFromDriver();
     if (s.autoTunnel.exchange(false, std::memory_order_relaxed)) {
+        ++s.nativeReturns;
         T2_DIAG("state", L"sticky tunnel CLEARED: native handshake worked (tcp %llu ms)",
                 static_cast<unsigned long long>(tcpMs));
         PushTunnelStickyToDriver(false);
@@ -344,6 +364,7 @@ void CommitAutoTunnel(bool on) {
                 on ? L"COMMITTED" : L"DROPPED (auto-switch off)",
                 static_cast<unsigned long long>(CurrentGeneration()), IsV6Unavailable() ? 1 : 0);
     }
+    if (on && !was) ++s.tunnelCommits;
     if (on) {
         s.autoTunnelGen.store(CurrentGeneration(), std::memory_order_relaxed);
         // Native was just found dead: an older unlock's re-check request is stale.
@@ -1133,6 +1154,32 @@ void DiagTransportSnapshot(const wchar_t* why) {
             static_cast<unsigned long>(s.nativeEmaMs.load(std::memory_order_relaxed)),
             static_cast<unsigned long>(s.tunnelEmaMs.load(std::memory_order_relaxed)),
             s.lastPushedMode.load(std::memory_order_relaxed));
+}
+
+TransportStats GetTransportStats() {
+    auto& s = S();
+    TransportStats t;
+    t.connectsOk = s.connectsOk.load();
+    t.connectsFailed = s.connectsFailed.load();
+    t.tunnelCommits = s.tunnelCommits.load();
+    t.nativeReturns = s.nativeReturns.load();
+    t.nativeRechecks = s.nativeRechecks.load();
+    std::lock_guard<std::mutex> lock(s.lastMu);
+    t.lastConnectTick = s.lastConnectTick;
+    t.lastConnectOk = s.lastConnectOk;
+    t.lastConnectTunnel = s.lastConnectTunnel;
+    t.lastPort = s.lastPort;
+    return t;
+}
+
+void NoteConnectResult(bool ok, bool tunnel, uint16_t port) {
+    auto& s = S();
+    ++(ok ? s.connectsOk : s.connectsFailed);
+    std::lock_guard<std::mutex> lock(s.lastMu);
+    s.lastConnectTick = GetTickCount64();
+    s.lastConnectOk = ok;
+    s.lastConnectTunnel = tunnel;
+    if (ok) s.lastPort = port;
 }
 
 // ============================================================================

@@ -914,8 +914,12 @@ bool ConnectToBiometricKitBridge(const NcmEndpoint& endpoint, t2::bridgexpc::Con
     tp::DiagTransportSnapshot(L"connect START");
     // The caller's out-pointers go straight through: the wrapper must not change what a failed
     // connect leaves in them. Values are only read back for the log, and only when ok.
-    const bool ok = ConnectToBiometricKitBridgeImpl(endpoint, outConn, outServicePort, outRsdPort,
-                                                    cancelEvent, outScansExhausted, options);
+    uint16_t servicePort = 0;
+    const bool ok = ConnectToBiometricKitBridgeImpl(endpoint, outConn,
+                                                    outServicePort ? outServicePort : &servicePort,
+                                                    outRsdPort, cancelEvent, outScansExhausted, options);
+    tp::NoteConnectResult(ok, tp::IsTunnelModeActive(),
+                          ok ? (outServicePort ? *outServicePort : servicePort) : 0);
     T2_DIAG("connect", L"connect END ok=%d port=%u rsd=%u scansExhausted=%d cancelled=%d mode=%s in %llu ms",
             ok ? 1 : 0, (ok && outServicePort) ? static_cast<unsigned>(*outServicePort) : 0u,
             (ok && outRsdPort) ? static_cast<unsigned>(*outRsdPort) : 0u,

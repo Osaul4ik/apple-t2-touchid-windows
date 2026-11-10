@@ -87,7 +87,15 @@ if [[ -f "$ROOT/tests/ScenarioTests.cpp" ]]; then
     TESTS+=(T2TouchIdScenarioTests)
 fi
 
-[[ $RUN == 1 ]] || { echo "built: ${TESTS[*]} in $OUT"; exit 0; }
+# Link check of the CLI (it runs only against real hardware, but a missing symbol
+# in the shared code shows up here).
+CLI_FLAGS=()
+for f in "${CXXFLAGS[@]}"; do [[ "$f" == -DNOMINMAX ]] || CLI_FLAGS+=("$f"); done # main.cpp defines it
+$CXX "${CLI_FLAGS[@]}" -Wno-pragmas -c "$ROOT/tools/t2touchid/main.cpp" -o "$OUT/obj/cli_main.o"
+$CXX -municode -static -o "$OUT/t2touchid.exe" "$OUT/obj/cli_main.o" "$OUT/libt2protocol.a" \
+    "$PLIST_LIB" "${LIBS[@]}"
+
+[[ $RUN == 1 ]] || { echo "built: ${TESTS[*]} t2touchid in $OUT"; exit 0; }
 
 # --- run -------------------------------------------------------------------------
 export WINEDEBUG="${WINEDEBUG:--all}"

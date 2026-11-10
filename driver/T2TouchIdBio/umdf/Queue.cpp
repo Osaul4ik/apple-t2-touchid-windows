@@ -9,6 +9,8 @@
 #include "BridgeXpc/TransportMode.h"
 #include "Discovery/NetworkWatch.h"
 #include "Discovery/PortCache.h"
+#include "Discovery/TransportService.h"
+#include "Ipc/TransportPipe.h"
 // FindT2NcmEndpoints() - peer IPv6 link-local + interface index for the probe.
 #include "Discovery/Adapter.h"
 #include "BiometricKit/MacosUserId.h"
@@ -3185,4 +3187,86 @@ extern "C" VOID T2BioRegisterNetworkChangeNotification(VOID)
 extern "C" VOID T2BioUnregisterNetworkChangeNotification(VOID)
 {
     g_netWatch.Stop();
+}
+
+// ---- Transport owner: \\.\pipe\T2TouchIdTransport (protocol/Ipc/TransportPipe.h) ----
+// This driver owns the T2 transport. The CLI (and through it the GUI's Rescan) asks
+// here instead of scanning and flipping T2Ncm.sys from a second process. A rescan
+// never runs under an armed capture (reply "busy"), and a capture that arrives while
+// one runs cancels it: the relay below turns "capture armed" into the request's
+// cancel event within 50 ms, so the capture's own connect gets the phase lock long
+// before its 2 s wait runs out.
+namespace {
+
+t2::ipc::PipeServer g_transportPipe;
+
+t2::discovery::TransportServiceContext OwnerContext()
+{
+    t2::discovery::TransportServiceContext ctx;
+    ctx.ownerName = "T2TouchIdBio";
+    ctx.captureBusy = [] { return g_captureBusy.load(std::memory_order_acquire); };
+    ctx.statusEndpoint = [](t2::discovery::NcmEndpoint* ep) {
+        {
+            std::lock_guard<std::mutex> lock(g_stickyNcm.mu);
+            if (g_stickyNcm.valid) {
+                *ep = g_stickyNcm.ep;
+                return true;
+            }
+        }
+        auto eps = t2::discovery::FindT2NcmEndpoints(/*resolvePeer=*/false);
+        if (eps.empty()) return false;
+        *ep = eps.front();
+        return true;
+    };
+    return ctx;
+}
+
+std::string OnTransportPipeRequest(const std::string& request, HANDLE clientGone)
+{
+    HANDLE cancel = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!cancel) return "result=error\nerror=no event\n";
+    std::atomic<bool> finished{false};
+    std::thread relay;
+    try {
+        relay = std::thread([&] {
+            while (!finished.load(std::memory_order_acquire)) {
+                if (WaitForSingleObject(clientGone, 50) == 0 ||
+                    g_captureBusy.load(std::memory_order_acquire)) {
+                    SetEvent(cancel);
+                    return;
+                }
+            }
+        });
+    } catch (...) {
+        CloseHandle(cancel);
+        return "result=error\nerror=no thread\n";
+    }
+    std::string reply;
+    try {
+        reply = t2::discovery::HandleTransportRequest(request, cancel, OwnerContext());
+    } catch (...) {
+        reply = "result=error\nerror=exception\n";
+    }
+    finished.store(true, std::memory_order_release);
+    relay.join();
+    CloseHandle(cancel);
+    return reply;
+}
+
+}  // namespace
+
+extern "C" VOID T2BioStartTransportOwner(VOID)
+{
+    if (!g_transportPipe.Start(t2::ipc::kTransportPipeName, &OnTransportPipeRequest)) {
+        T2BioLog("transport owner pipe not started (GetLastError=%lu) - the CLI / GUI fall back to "
+                 "running discovery themselves", GetLastError());
+        return;
+    }
+    T2BioLog("transport owner: serving \\\\.\\pipe\\T2TouchIdTransport");
+}
+
+// Before unload: joins the pipe threads (they run code from this DLL).
+extern "C" VOID T2BioStopTransportOwner(VOID)
+{
+    g_transportPipe.Stop();
 }

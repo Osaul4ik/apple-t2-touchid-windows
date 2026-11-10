@@ -121,6 +121,13 @@ VOID T2BioRegisterNetworkChangeNotification(VOID);
 VOID T2BioUnregisterNetworkChangeNotification(VOID);
 EXTERN_C_END
 
+// Transport owner IPC (\\.\pipe\T2TouchIdTransport, Queue.cpp): the CLI / GUI ask
+// this driver to connect / report instead of running discovery themselves.
+EXTERN_C_START
+VOID T2BioStartTransportOwner(VOID);
+VOID T2BioStopTransportOwner(VOID);
+EXTERN_C_END
+
 // Debug-only trace; visible in DebugView (Capture Global Win32) because
 // WUDFHost.exe is a normal user-mode process.
 void T2BioLog(_In_z_ const char* fmt, ...);

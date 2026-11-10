@@ -22,6 +22,8 @@
 #include "../../protocol/Discovery/PortCache.h"
 #include "../../protocol/Discovery/PortScan.h"
 #include "../../protocol/Discovery/RemoteXpc.h"
+#include "../../protocol/Discovery/TransportService.h"
+#include "../../protocol/Ipc/TransportPipe.h"
 #include "../../protocol/BridgeXpc/Log.h"
 #include "../../protocol/BridgeXpc/TransportMode.h"
 #include "../../T2NCM/driver/Public.h"
@@ -499,72 +501,65 @@ static EndpointArgs ParseEndpointArgs(int argc, wchar_t* argv[], int firstArgInd
     return r;
 }
 
-enum class CliConnect { Ok, NoAdapter, NoPeer, NotFound, TimedOut, Cancelled, BadArgs };
+enum class CliConnect { Ok, NoAdapter, NoPeer, NotFound, TimedOut, Cancelled, BadArgs, Busy };
+
+static CliConnect FromLadder(t2::discovery::LadderResult r) {
+    using t2::discovery::LadderResult;
+    switch (r) {
+    case LadderResult::Ok:        return CliConnect::Ok;
+    case LadderResult::NoAdapter: return CliConnect::NoAdapter;
+    case LadderResult::NoPeer:    return CliConnect::NoPeer;
+    case LadderResult::NotFound:  return CliConnect::NotFound;
+    case LadderResult::TimedOut:  return CliConnect::TimedOut;
+    case LadderResult::Cancelled: return CliConnect::Cancelled;
+    }
+    return CliConnect::TimedOut;
+}
 
 // Resolves the endpoint (adapter + readiness gate + peer) and connects through the
-// shared TransportManager. *outPort / *outRsd: the BridgeXPC / RemoteXPC ports.
+// shared ladder (TransportService.h ConnectWithLadder - the same one the transport
+// owner runs for a pipe "connect"). *outPort / *outRsd: the BridgeXPC / RemoteXPC ports.
 static CliConnect ConnectBridgeCli(const EndpointArgs& args, t2::bridgexpc::Connection* conn,
                                    bool forceRescan, ULONGLONG budgetMs,
                                    uint16_t* outPort, uint16_t* outRsd,
                                    t2::discovery::NcmEndpoint* outEndpoint = nullptr) {
     using namespace t2::discovery;
     if (!args.ok) return CliConnect::BadArgs;
-    const ULONGLONG deadline = GetTickCount64() + budgetMs;
-    ConnectOptions opt;
-    opt.forceRescan = forceRescan;
-    DWORD backoffMs = 250;
-    bool sawPeer = false;
-    for (unsigned step = 1;; ++step) {
-        if (CliCancelled()) return CliConnect::Cancelled;
-        NcmEndpoint ep;
+    in6_addr manualPeer{};
+    if (!args.host.empty() && !ParseIpv6(args.host.c_str(), &manualPeer)) {
+        std::wcout << L"invalid --host IPv6\n";
+        return CliConnect::BadArgs;
+    }
+    bool printedNoAdapter = false;
+    LadderOptions lo;
+    lo.forceRescan = forceRescan;
+    lo.budgetMs = budgetMs;
+    lo.cancelEvent = g_cliCancel;
+    lo.resolveEndpoint = [&](NcmEndpoint* ep, void* cancel) {
         if (args.ifIndex != 0) {
-            if (!GetEndpointByIfIndex(args.ifIndex, &ep)) {
-                std::wcout << L"no T2 NCM endpoint on ifIndex " << args.ifIndex << L"\n";
-                return CliConnect::NoAdapter;
+            if (!GetEndpointByIfIndex(args.ifIndex, ep)) {
+                if (!printedNoAdapter) std::wcout << L"no T2 NCM endpoint on ifIndex " << args.ifIndex << L"\n";
+                printedNoAdapter = true;
+                return false;
             }
-        } else if (!PickDefaultT2Endpoint(&ep, g_cliCancel)) {
-            if (CliCancelled()) return CliConnect::Cancelled;
-            std::wcout << L"no T2 NCM adapter found.\n";
-            return CliConnect::NoAdapter;
+        } else if (!PickDefaultT2Endpoint(ep, cancel)) {
+            if (!CliCancelled() && !printedNoAdapter) std::wcout << L"no T2 NCM adapter found.\n";
+            printedNoAdapter = true;
+            return false;
         }
         if (!args.host.empty()) {
-            in6_addr parsed{};
-            if (!ParseIpv6(args.host.c_str(), &parsed)) {
-                std::wcout << L"invalid --host IPv6\n";
-                return CliConnect::BadArgs;
-            }
-            ep.peerLinkLocal = parsed;
-            ep.peerSource = PeerSource::ManualOverride;
+            ep->peerLinkLocal = manualPeer;
+            ep->peerSource = PeerSource::ManualOverride;
         }
-        if (ep.peerSource != PeerSource::None) sawPeer = true;
-        if (outEndpoint) *outEndpoint = ep;
-
-        bool exhausted = false;
-        uint16_t port = 0, rsd = 0;
-        if (ConnectToBiometricKitBridge(ep, conn, &port, &rsd, g_cliCancel, &exhausted, opt)) {
-            if (outPort) *outPort = port;
-            if (outRsd) *outRsd = rsd;
-            T2_LOG("cli", L"connected after %u step(s): port=%u rsd=%u (%s)", step,
-                   static_cast<unsigned>(port), static_cast<unsigned>(rsd),
-                   t2::transport::IsTunnelModeActive() ? L"IPv4 tunnel" : L"native IPv6");
-            return CliConnect::Ok;
-        }
-        if (CliCancelled()) return CliConnect::Cancelled;
-        if (exhausted) {
-            T2_LOG("cli", L"step %u: a full scan pass completed without BiometricKit - giving up", step);
-            return CliConnect::NotFound;
-        }
-        const ULONGLONG now = GetTickCount64();
-        if (now + backoffMs >= deadline) {
-            T2_LOG("cli", L"no BridgeXPC connection after %u step(s) - deadline reached", step);
-            return sawPeer ? CliConnect::TimedOut : CliConnect::NoPeer;
-        }
-        T2_LOG("cli", L"step %u: not connected yet - retrying in %lu ms", step, backoffMs);
-        if (WaitForSingleObject(g_cliCancel, backoffMs) == WAIT_OBJECT_0) return CliConnect::Cancelled;
-        backoffMs = backoffMs * 2 > 2000 ? 2000 : backoffMs * 2;
-        opt.forceRescan = false; // only the first step of a Rescan skips the cache:
-                                 // a port it confirmed is in the registry by now
+        return true;
+    };
+    const LadderOutcome o = ConnectWithLadder(lo, conn);
+    if (outEndpoint) *outEndpoint = o.endpoint;
+    if (o.result == LadderResult::Ok) {
+        if (outPort) *outPort = o.port;
+        if (outRsd) *outRsd = o.rsd;
     }
+    return FromLadder(o.result);
 }
 
 // One-line reason for a failed connect, phrased for the GUI's FailureReason markers.
@@ -587,9 +582,95 @@ static void PrintConnectFailure(CliConnect r) {
     case CliConnect::Cancelled:
         std::wcout << L"cancelled.\n";
         break;
+    case CliConnect::Busy:
+        std::wcout << L"sensor busy: a fingerprint capture is armed (lock screen / Windows Hello "
+                      L"prompt) - the transport is not moved under it; try again when it is idle.\n";
+        break;
     case CliConnect::Ok:
         break;
     }
+}
+
+// ---- the transport owner (T2TouchIdBio driver) over \\.\pipe\T2TouchIdTransport ----
+// The UMDF driver owns the transport. When it is running, `network` / `--rescan`
+// ask it to connect (it runs the scan in its own process, under its own phase
+// lock, with its own sticky state) instead of doing all of that from here. When it
+// is not (pipe missing), the CLI does the work locally as before.
+enum class OwnerCall { Done, Fallback };
+
+static std::wstring Widen(const std::string& s) { return std::wstring(s.begin(), s.end()); }
+
+static OwnerCall ConnectViaOwner(bool forceRescan, ULONGLONG budgetMs, int* exitCode) {
+    t2::ipc::KvMessage req;
+    req.Set("op", "connect");
+    req.Set("force", forceRescan ? 1 : 0);
+    req.Set("timeout", static_cast<long long>(budgetMs));
+    std::string reply;
+    const t2::ipc::PipeCallResult pr =
+        t2::ipc::CallPipe(t2::ipc::kTransportPipeName, req.Serialize(),
+                          static_cast<DWORD>(budgetMs + 15000), &reply, g_cliCancel);
+    if (pr == t2::ipc::PipeCallResult::NoServer || pr == t2::ipc::PipeCallResult::Untrusted) {
+        T2_LOG("cli", L"transport owner pipe: %s - running discovery in this process",
+               t2::ipc::PipeCallResultName(pr));
+        return OwnerCall::Fallback;
+    }
+    if (pr == t2::ipc::PipeCallResult::Cancelled) {
+        PrintConnectFailure(CliConnect::Cancelled);
+        *exitCode = 1;
+        return OwnerCall::Done;
+    }
+    if (pr != t2::ipc::PipeCallResult::Ok) {
+        std::wcout << L"transport owner (T2TouchIdBio driver) did not answer: "
+                   << t2::ipc::PipeCallResultName(pr) << L"\n";
+        *exitCode = 1;
+        return OwnerCall::Done;
+    }
+    const t2::ipc::KvMessage r = t2::ipc::KvMessage::Parse(reply);
+    const std::string result = r.Get("result");
+    std::wcout << L"owner:    T2TouchIdBio driver (WUDFHost pid " << r.GetInt("pid", 0)
+               << L") - discovery ran in the driver\n";
+    if (result != "ok") {
+        CliConnect c = CliConnect::TimedOut;
+        if (result == "busy") c = CliConnect::Busy;
+        else if (result == "no_adapter") { std::wcout << L"no T2 NCM adapter found.\n"; c = CliConnect::NoAdapter; }
+        else if (result == "no_peer") c = CliConnect::NoPeer;
+        else if (result == "not_found") c = CliConnect::NotFound;
+        else if (result == "cancelled") c = CliConnect::Cancelled;
+        else if (result != "timed_out") std::wcout << L"owner error: " << Widen(r.Get("error", result)) << L"\n";
+        PrintConnectFailure(c);
+        *exitCode = c == CliConnect::NotFound ? 2 : 1;
+        return OwnerCall::Done;
+    }
+    if (r.Has("peer")) std::wcout << L"peer:     " << Widen(r.Get("peer")) << L"\n";
+    std::wcout << L"transport: " << (r.Get("transport") == "tunnel" ? L"IPv4 tunnel" : L"Native IPv6") << L"\n";
+    std::wcout << L"BiometricKit BridgeXPC port: " << r.GetInt("port");
+    if (r.GetInt("rsd") != 0) std::wcout << L"  (RemoteXPC " << r.GetInt("rsd") << L")";
+    std::wcout << L"\n";
+    if (!r.Has("bridge_version")) {
+        std::wcout << L"BridgeXPC HELO OK, but getBridgeVersion failed (unexpected reply shape).\n";
+        *exitCode = 1;
+        return OwnerCall::Done;
+    }
+    std::wcout << L"BridgeXPC verified: HELO OK, bridge version=" << r.GetInt("bridge_version") << L"\n";
+    *exitCode = 0;
+    return OwnerCall::Done;
+}
+
+// `t2touchid transport-status`: what the owner knows - no network I/O at all.
+static int CmdTransportStatus() {
+    std::string reply;
+    const t2::ipc::PipeCallResult pr =
+        t2::ipc::CallPipe(t2::ipc::kTransportPipeName, "op=status\n", 5000, &reply, g_cliCancel);
+    if (pr != t2::ipc::PipeCallResult::Ok) {
+        std::wcout << L"transport owner not reachable (" << t2::ipc::PipeCallResultName(pr)
+                   << L"): the T2TouchIdBio driver is not running.\n";
+        return 1;
+    }
+    const t2::ipc::KvMessage r = t2::ipc::KvMessage::Parse(reply);
+    for (const auto& kv : r.Items()) {
+        std::wcout << Widen(kv.first) << L": " << Widen(kv.second) << L"\n";
+    }
+    return r.Get("result") == "ok" ? 0 : 1;
 }
 
 // Reads T2Ncm.sys's own RX/TX counters via IOCTL_T2NCM_GET_STATUS (0x900,
@@ -722,6 +803,12 @@ static int CmdNetwork(int argc, wchar_t* argv[]) {
     std::wcout << (forceRescan ? L"rescanning" : L"connecting")
                << L" (shared TransportManager: native IPv6 first, IPv4 tunnel if IPv6 is "
                   L"blocked; up to " << (budgetMs / 1000) << L" s)...\n";
+    // An explicit endpoint (ifIndex / --host) is a diagnostic request for THIS
+    // process; otherwise the transport owner does it.
+    if (args.ifIndex == 0 && args.host.empty()) {
+        int code = 1;
+        if (ConnectViaOwner(forceRescan, budgetMs, &code) == OwnerCall::Done) return code;
+    }
     t2::bridgexpc::Connection bridge;
     uint16_t port = 0, rsd = 0;
     NcmEndpoint used;
@@ -1006,8 +1093,10 @@ int wmain(int argc, wchar_t* argv[]) {
     }
 
     if (argc < 2) {
-        std::wcout << L"usage: t2touchid.exe [--verbose|-v] <status|register-ool|capabilities|device-state|load-keybag|set-system-keybag|unlock|network|identities|warmup|verify>\n";
-        std::wcout << L"  network    [ifIndex] [--host fe80::...] [--rescan] [--no-scan] [--timeout SEC]\n";
+        std::wcout << L"usage: t2touchid.exe [--verbose|-v] <status|register-ool|capabilities|device-state|load-keybag|set-system-keybag|unlock|network|transport-status|identities|warmup|verify>\n";
+        std::wcout << L"  network    [ifIndex] [--host fe80::...] [--rescan] [--no-scan] [--timeout SEC]\n"
+                      L"             (without ifIndex/--host the T2TouchIdBio driver does it, when running)\n";
+        std::wcout << L"  transport-status  what the transport owner (driver) knows: transport, port, counters\n";
         std::wcout << L"  identities [ifIndex] [--host fe80::...] [--uid N]\n";
         std::wcout << L"  warmup     [ifIndex] [--host fe80::...] [--uid N]\n";
         std::wcout << L"  verify     [ifIndex] [--host fe80::...] [--uid N] [--seconds N]\n"
@@ -1036,6 +1125,7 @@ int wmain(int argc, wchar_t* argv[]) {
     if (cmd == L"warmup") return CmdWarmup(argc, argv);
     if (cmd == L"verify") return CmdVerify(argc, argv);
     if (cmd == L"ncmstatus") return CmdNcmStatus();
+    if (cmd == L"transport-status") return CmdTransportStatus();
 
     Client client;
     AksResult openResult = client.Open();

@@ -109,6 +109,8 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject,
     // Third: host network changes (a VPN coming up / going down) re-decide the
     // transport between touches instead of at the next failed connect.
     T2BioRegisterNetworkChangeNotification();
+    // Fourth: serve the transport to the CLI / GUI (one owner, see Queue.cpp).
+    T2BioStartTransportOwner();
     T2BioLog("DriverEntry ok");
     return status;
 }
@@ -120,6 +122,7 @@ extern "C" VOID T2BioEvtDriverUnload(_In_ WDFDRIVER Driver)
     // Queue.cpp) execute code from this DLL, so none may still be unwinding
     // when the host is free to unload us. Then reverse of DriverEntry's
     // registration order.
+    T2BioStopTransportOwner();
     T2BioDrainCaptureWorkers();
     T2BioUnregisterNetworkChangeNotification();
     T2BioUnregisterSessionLockNotification();

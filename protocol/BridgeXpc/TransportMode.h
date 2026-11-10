@@ -258,6 +258,23 @@ TunnelPrep PrepareTunnelPeer(unsigned long ifIndex, const in6_addr& peer6,
 // One line with every piece of transport state (Log.h T2_DIAG). Never does an IOCTL.
 void DiagTransportSnapshot(const wchar_t* why);
 
+// ---- Counters (since process start) ---------------------------------------------
+// What the transport owner did, for `t2touchid status` / the GUI - no logs needed.
+struct TransportStats {
+    uint64_t connectsOk = 0;
+    uint64_t connectsFailed = 0;
+    uint64_t tunnelCommits = 0;   // native -> IPv4 tunnel (sticky set)
+    uint64_t nativeReturns = 0;   // IPv4 tunnel -> native (sticky cleared)
+    uint64_t nativeRechecks = 0;  // one-shot re-checks consumed (unlock / network change)
+    ULONGLONG lastConnectTick = 0; // GetTickCount64 of the last connect END, 0 = none
+    bool lastConnectOk = false;
+    bool lastConnectTunnel = false;
+    uint16_t lastPort = 0;
+};
+TransportStats GetTransportStats();
+// Called once per connect step by BridgeDiscovery.
+void NoteConnectResult(bool ok, bool tunnel, uint16_t port);
+
 // ---- Shared \\.\T2Ncm control handle (lease-counted) ---------------------
 // A lease keeps ONE handle alive for as long as at least one lease exists in the
 // process; the last lease closes it. Deliberately not a process-lifetime handle:

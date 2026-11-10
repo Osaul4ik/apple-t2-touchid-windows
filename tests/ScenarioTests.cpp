@@ -13,6 +13,9 @@
 #include "FakeT2.h"
 #include "../protocol/Discovery/BridgeDiscovery.h"
 #include "../protocol/Discovery/PortCache.h"
+#include "../protocol/Discovery/TransportService.h"
+#include "../protocol/Ipc/TransportPipe.h"
+#include <atomic>
 #include "../protocol/BridgeXpc/TransportMode.h"
 #include <chrono>
 #include <cstdio>
@@ -93,6 +96,34 @@ Result Connect(FakeT2& fake, bool forceRescan = false, HANDLE cancelEvent = null
     // ...and the process's copy of the sticky flag is the driver's.
     CHECK(fake.driverSticky.load() == (tp::IsAutoTunnelCommitted() ? 1 : 0));
     return r;
+}
+
+// The transport owner as the UMDF driver runs it: HandleTransportRequest behind
+// the pipe, endpoint = the simulated T2's.
+const wchar_t kTestPipe[] = L"\\\\.\\pipe\\T2TouchIdTransport-scenario-test";
+std::atomic<bool> g_captureBusy{false};
+
+td::TransportServiceContext ServiceContext() {
+    td::TransportServiceContext ctx;
+    ctx.ownerName = "scenario-test";
+    ctx.captureBusy = [] { return g_captureBusy.load(); };
+    ctx.resolveEndpoint = [](td::NcmEndpoint* ep, void*) { *ep = Endpoint(); return true; };
+    ctx.statusEndpoint = [](td::NcmEndpoint* ep) { *ep = Endpoint(); return true; };
+    return ctx;
+}
+
+ipc::KvMessage Call(const std::string& request, DWORD timeoutMs, ipc::PipeCallResult* res = nullptr,
+                    HANDLE cancel = nullptr) {
+    std::string reply;
+    const ipc::PipeCallResult r = ipc::CallPipe(kTestPipe, request, timeoutMs, &reply, cancel,
+                                                /*requireServiceServer=*/false);
+    if (res) *res = r;
+    return ipc::KvMessage::Parse(reply);
+}
+
+bool RunningUnderWine() {
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    return ntdll && GetProcAddress(ntdll, "wine_get_version") != nullptr;
 }
 
 uint16_t CachedPort() {
@@ -341,6 +372,118 @@ const Scenario kScenarios[] = {
          CHECK(f.driverMode == 0);
          CHECK(!tp::IsAutoTunnelCommitted());
          CHECK(CachedPort() == cached); // a failure never throws the saved port away
+     }},
+
+    {"pipe: owner rescans for the client, reply carries port / transport / bridge version",
+     [](FakeT2& f) {
+         FreshProcess(f);
+         ipc::PipeServer server;
+         const td::TransportServiceContext ctx = ServiceContext();
+         CHECK(server.Start(kTestPipe, [&ctx](const std::string& req, HANDLE cancel) {
+             return td::HandleTransportRequest(req, cancel, ctx);
+         }));
+         ipc::PipeCallResult pr;
+         ipc::KvMessage r = Call("op=connect\nforce=1\ntimeout=20000\n", 30000, &pr);
+         CHECK(pr == ipc::PipeCallResult::Ok);
+         CHECK(r.Get("result") == "ok");
+         CHECK(r.GetInt("port") == f.BridgePort());
+         CHECK(r.GetInt("rsd") == f.RsdPort());
+         CHECK(r.Get("transport") == "native");
+         // FakeT2 answers HELO but not getBridgeVersion: the reply must then say nothing
+         // about the version rather than invent one.
+         CHECK(!r.Has("bridge_version"));
+         CHECK(r.Get("peer") == "fe80::aede:48ff:fe00:1122");
+         r = Call("op=status\n", 5000, &pr);
+         CHECK(pr == ipc::PipeCallResult::Ok);
+         CHECK(r.Get("owner") == "scenario-test");
+         CHECK(r.GetInt("port") == f.BridgePort());
+         CHECK(r.Get("transport") == "native" && r.GetInt("sticky") == 0);
+         CHECK(r.GetInt("connects_ok") >= 1);
+         CHECK(r.GetInt("last_connect_ok") == 1 && r.GetInt("last_port") == f.BridgePort());
+         r = Call("op=bogus\n", 5000);
+         CHECK(r.Get("result") == "error");
+         server.Stop();
+         CHECK(ipc::CallPipe(kTestPipe, "op=status\n", 500, nullptr, nullptr, false) ==
+               ipc::PipeCallResult::NoServer);
+     }},
+
+    {"pipe: VPN blocks IPv6 -> the owner commits the tunnel, status shows it + counters",
+     [](FakeT2& f) {
+         FreshProcess(f);
+         f.nativePath = NativePath::Blocked;
+         ipc::PipeServer server;
+         const td::TransportServiceContext ctx = ServiceContext();
+         CHECK(server.Start(kTestPipe, [&ctx](const std::string& req, HANDLE cancel) {
+             return td::HandleTransportRequest(req, cancel, ctx);
+         }));
+         ipc::KvMessage r = Call("op=connect\nforce=1\ntimeout=20000\n", 30000);
+         CHECK(r.Get("result") == "ok" && r.Get("transport") == "tunnel");
+         r = Call("op=status\n", 5000);
+         CHECK(r.Get("transport") == "tunnel" && r.GetInt("sticky") == 1);
+         CHECK(r.GetInt("tunnel_commits") == 1);
+         f.nativePath = NativePath::Open;
+         r = Call("op=connect\nforce=1\ntimeout=20000\n", 30000);
+         CHECK(r.Get("result") == "ok" && r.Get("transport") == "native");
+         r = Call("op=status\n", 5000);
+         CHECK(r.GetInt("sticky") == 0 && r.GetInt("native_returns") == 1);
+         server.Stop();
+     }},
+
+    {"pipe: a capture is armed -> rescan refused (busy), transport untouched",
+     [](FakeT2& f) {
+         FreshProcess(f);
+         ipc::PipeServer server;
+         const td::TransportServiceContext ctx = ServiceContext();
+         CHECK(server.Start(kTestPipe, [&ctx](const std::string& req, HANDLE cancel) {
+             return td::HandleTransportRequest(req, cancel, ctx);
+         }));
+         g_captureBusy = true;
+         const ipc::KvMessage r = Call("op=connect\nforce=1\ntimeout=20000\n", 30000);
+         g_captureBusy = false;
+         CHECK(r.Get("result") == "busy");
+         CHECK(f.rsdNative == 0 && f.rsdTunnel == 0 && f.modeWrites == 0);
+         server.Stop();
+     }},
+
+    {"pipe: client gives up mid-rescan -> the owner's scan is cancelled, mode rolled back",
+     [](FakeT2& f) {
+         FreshProcess(f);
+         f.nativePath = NativePath::Silent;   // slow path: silent native, then tunnel...
+         f.SetBiometricKitAdvertised(false); // ...that never finds the service
+         ipc::PipeServer server;
+         const td::TransportServiceContext ctx = ServiceContext();
+         std::atomic<bool> handlerSawCancel{false};
+         CHECK(server.Start(kTestPipe, [&](const std::string& req, HANDLE cancel) {
+             std::string out = td::HandleTransportRequest(req, cancel, ctx);
+             if (WaitForSingleObject(cancel, 0) == 0) handlerSawCancel = true;
+             return out;
+         }));
+         ipc::PipeCallResult pr;
+         const auto t0 = std::chrono::steady_clock::now();
+         Call("op=connect\nforce=1\ntimeout=120000\n", 400, &pr); // the client times out
+         CHECK(pr == ipc::PipeCallResult::TimedOut);
+         server.Stop(); // joins the handler: it must end promptly once cancelled
+         const long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  std::chrono::steady_clock::now() - t0).count();
+         CHECK(handlerSawCancel.load());
+         CHECK(ms < 10000);
+         CHECK(f.driverMode == 0 && f.driverSticky == 0);
+     }},
+
+    {"pipe: name already taken (squatter) -> the owner refuses to serve on it",
+     [](FakeT2&) {
+         ipc::PipeServer squatter, owner;
+         CHECK(squatter.Start(kTestPipe, [](const std::string&, HANDLE) { return std::string("result=ok\n"); }));
+         // FILE_FLAG_FIRST_PIPE_INSTANCE: Windows refuses a second "first" instance.
+         // wine does not implement the flag, so only the client-side check runs there.
+         if (!RunningUnderWine()) {
+             CHECK(!owner.Start(kTestPipe, [](const std::string&, HANDLE) { return std::string(); }));
+         }
+         // A real client (requireServiceServer=true) does not trust a non-service server.
+         std::string reply;
+         CHECK(ipc::CallPipe(kTestPipe, "op=status\n", 2000, &reply, nullptr, true) ==
+               ipc::PipeCallResult::Untrusted);
+         squatter.Stop();
      }},
 
     {"AutoSwitch off + IPv6 blocked: no tunnel, nothing committed",
