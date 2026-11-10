@@ -392,6 +392,72 @@ namespace T2TouchId.SepVaultGui
             return new CliResult(timedOut ? -1 : p.ExitCode, timedOut, lines);
         }
 
+        // "Collect diagnostics…": runs Tools\Collect-T2Diagnostics.ps1 (read-only) and shows
+        // the zip it wrote in Explorer.
+        private async void OnCollectDiagnostics(object sender, RoutedEventArgs e)
+        {
+            string script = Path.Combine(AppContext.BaseDirectory, "Tools", "Collect-T2Diagnostics.ps1");
+            if (!File.Exists(script))
+            {
+                DiagnosticsStatusText.Text = "Tools\\Collect-T2Diagnostics.ps1 is missing next to the app - reinstall.";
+                DiagnosticsStatusText.Foreground = DotError;
+                return;
+            }
+            string desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+            CollectDiagnosticsButton.IsEnabled = false;
+            DiagnosticsStatusText.Text = "Collecting (up to a few minutes)...";
+            DiagnosticsStatusText.Foreground = TextMuted;
+            try
+            {
+                string powershell = Path.Combine(Environment.SystemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe");
+                var psi = new ProcessStartInfo
+                {
+                    FileName = powershell,
+                    Arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"" + script +
+                                "\" -OutputDirectory \"" + desktop + "\"",
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                };
+                using var p = new Process { StartInfo = psi };
+                p.Start();
+                Task<string> outTask = p.StandardOutput.ReadToEndAsync();
+                Task<string> errTask = p.StandardError.ReadToEndAsync();
+                Task exitTask = p.WaitForExitAsync();
+                if (await Task.WhenAny(exitTask, Task.Delay(TimeSpan.FromMinutes(5))) != exitTask)
+                {
+                    try { p.Kill(true); } catch { }
+                    DiagnosticsStatusText.Text = "Collecting diagnostics timed out.";
+                    DiagnosticsStatusText.Foreground = DotError;
+                    return;
+                }
+                string output = await outTask;
+                await errTask;
+                string? zip = output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+                                    .Select(l => l.Trim())
+                                    .LastOrDefault(l => l.EndsWith(".zip", StringComparison.OrdinalIgnoreCase) && File.Exists(l));
+                if (zip == null)
+                {
+                    DiagnosticsStatusText.Text = "Collecting diagnostics failed (exit code " + p.ExitCode + ").";
+                    DiagnosticsStatusText.Foreground = DotError;
+                    return;
+                }
+                DiagnosticsStatusText.Text = "Saved " + zip;
+                DiagnosticsStatusText.Foreground = DotOk;
+                try { Process.Start("explorer.exe", "/select,\"" + zip + "\""); } catch { }
+            }
+            catch (Exception ex)
+            {
+                DiagnosticsStatusText.Text = "Collecting diagnostics failed: " + ex.Message;
+                DiagnosticsStatusText.Foreground = DotError;
+            }
+            finally
+            {
+                CollectDiagnosticsButton.IsEnabled = true;
+            }
+        }
+
         private static string FailureReason(CliResult r, string fallback)
         {
             if (r.TimedOut) return "Timed out - the command was cancelled.";

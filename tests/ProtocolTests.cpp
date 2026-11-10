@@ -567,7 +567,66 @@ static void TestPeerMac_DerivedFromEui64LinkLocal() {
     notLinkLocal.s6_addr[11] = 0xFF;
     CHECK(!transport::MacFromEui64(notLinkLocal, mac));
 }
+// Log file sink: lines land in %ProgramData%\T2TouchId\Logs\<process>.log with a
+// wall-clock prefix, the file rotates to .1.log at 4 MiB, and a closed sink stays closed.
+static void TestLogFileSink() {
+    wchar_t tmp[MAX_PATH] = {};
+    GetTempPathW(MAX_PATH, tmp);
+    std::wstring root = std::wstring(tmp) + L"t2log-test-" + std::to_wstring(GetCurrentProcessId());
+    wchar_t saved[MAX_PATH] = {};
+    const DWORD hadSaved = GetEnvironmentVariableW(L"ProgramData", saved, MAX_PATH);
+    SetEnvironmentVariableW(L"ProgramData", root.c_str());
+    CreateDirectoryW(root.c_str(), nullptr);
+    CreateDirectoryW((root + L"\\T2TouchId").c_str(), nullptr);
+    const std::wstring dir = root + L"\\T2TouchId\\Logs";
+    const std::wstring file = dir + L"\\" + t2::log::ProcessTag() + L".log";
+    const std::wstring rotated = dir + L"\\" + t2::log::ProcessTag() + L".1.log";
+
+    t2::log::FileSinkResetForTests();
+    t2::log::FileSinkWrite(L"T2TouchIdBridge: hello file sink\n");
+    t2::log::FileSinkWriteA("ascii line without newline");
+    std::string text;
+    {
+        HANDLE h = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                               OPEN_EXISTING, 0, nullptr);
+        CHECK(h != INVALID_HANDLE_VALUE);
+        if (h != INVALID_HANDLE_VALUE) {
+            char buf[4096];
+            DWORD got = 0;
+            while (ReadFile(h, buf, sizeof(buf), &got, nullptr) && got > 0) text.append(buf, got);
+            CloseHandle(h);
+        }
+    }
+    CHECK(text.find("hello file sink\n") != std::string::npos);
+    CHECK(text.find("ascii line without newline\n") != std::string::npos);
+    // "YYYY-MM-DD hh:mm:ss.mmm " in front of the line
+    CHECK(text.size() > 24 && text[4] == '-' && text[10] == ' ' && text[13] == ':' && text[19] == '.');
+
+    // Rotation at 4 MiB.
+    const std::wstring big(1000, L'x');
+    for (int i = 0; i < 4300; ++i) t2::log::FileSinkWrite((big + L"\n").c_str());
+    WIN32_FILE_ATTRIBUTE_DATA a{}, b{};
+    CHECK(GetFileAttributesExW(rotated.c_str(), GetFileExInfoStandard, &a));
+    CHECK(GetFileAttributesExW(file.c_str(), GetFileExInfoStandard, &b));
+    CHECK(a.nFileSizeLow >= 4u * 1024 * 1024 && a.nFileSizeHigh == 0);
+    CHECK(b.nFileSizeLow < 1024u * 1024);
+
+    // After Close (DLL unload) nothing reopens the file.
+    t2::log::FileSinkClose();
+    DeleteFileW(file.c_str());
+    t2::log::FileSinkWrite(L"after close\n");
+    CHECK(GetFileAttributesW(file.c_str()) == INVALID_FILE_ATTRIBUTES);
+
+    t2::log::FileSinkResetForTests();
+    DeleteFileW(rotated.c_str());
+    RemoveDirectoryW(dir.c_str());
+    RemoveDirectoryW((root + L"\\T2TouchId").c_str());
+    RemoveDirectoryW(root.c_str());
+    SetEnvironmentVariableW(L"ProgramData", hadSaved ? saved : nullptr);
+}
+
 int wmain() {
+    TestLogFileSink();
     TestFrameHeader_Valid();
     TestMacosUserId_DerivedFromSpecialBag();
     TestFrameHeader_Truncated();

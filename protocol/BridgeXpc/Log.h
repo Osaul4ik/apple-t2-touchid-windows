@@ -98,13 +98,13 @@ struct CachedFlag {
     std::atomic<bool> value{false};      // same default as RegistryFlag()
 };
 
-inline bool CachedRegistryFlag(CachedFlag& cache, const wchar_t* valueName) {
+inline bool CachedRegistryFlag(CachedFlag& cache, const wchar_t* valueName, bool defaultValue = false) {
     const ULONGLONG now = GetTickCount64();
     const ULONGLONG last = cache.stampMs.load(std::memory_order_relaxed);
     if (last != 0 && now - last < kFlagTtlMs) {
         return cache.value.load(std::memory_order_relaxed);
     }
-    const bool v = RegistryFlag(valueName);
+    const bool v = RegistryFlag(valueName, defaultValue);
     cache.value.store(v, std::memory_order_relaxed);
     cache.stampMs.store(now != 0 ? now : 1, std::memory_order_relaxed);
     return v;
@@ -120,6 +120,9 @@ inline bool PowerEnabled() { static CachedFlag c; return DiagEnabled() || Cached
 inline bool TransportEnabled() { static CachedFlag c; return DiagEnabled() || CachedRegistryFlag(c, L"Transport"); }
 inline bool NcmEnabled() { static CachedFlag c; return DiagEnabled() || CachedRegistryFlag(c, L"Ncm"); }
 inline bool SyncEmitForced() { static CachedFlag c; return CachedRegistryFlag(c, L"SyncEmit"); }
+// FileLog (default ON): every line that is emitted at all also goes to a file - see
+// the file sink below. 0 = DebugView / ETW only, like before.
+inline bool FileLogEnabled() { static CachedFlag c; return CachedRegistryFlag(c, L"FileLog", true); }
 
 inline int64_t ElapsedUs() {
     static const auto start = std::chrono::steady_clock::now();
@@ -141,6 +144,10 @@ inline int64_t ElapsedMs() { return ElapsedUs() / 1000; }
 // The writer holds a reference on its own module until Shutdown(), so a DLL cannot be
 // unloaded under it; the host must call Shutdown() from its unload callback.
 inline constexpr size_t kAsyncMaxLines = 8192;
+
+// The file sink (defined below, after ProcessTag's declaration).
+inline void FileSinkWrite(const wchar_t* line);
+inline void FileSinkClose();
 
 struct AsyncSink {
     std::mutex mu;
@@ -168,12 +175,14 @@ inline DWORD WINAPI AsyncWriterMain(LPVOID) {
         }
         for (const std::wstring& l : batch) {
             OutputDebugStringW(l.c_str());
+            FileSinkWrite(l.c_str());
         }
         batch.clear();
         if (dropped != 0) {
             wchar_t msg[96];
             _snwprintf_s(msg, _TRUNCATE, L"T2TouchIdLog: dropped %zu line(s), async queue full\n", dropped);
             OutputDebugStringW(msg);
+            FileSinkWrite(msg);
         }
         if (s.stop.load(std::memory_order_acquire)) {
             std::lock_guard<std::mutex> lock(s.mu);
@@ -222,6 +231,7 @@ inline void Shutdown() {
         CloseHandle(s.wake);
         s.wake = nullptr;
     }   // else: writer stuck in OutputDebugString - leak the handles rather than race it
+    FileSinkClose(); // the module may be unloaded next: no handle left behind
 }
 
 inline bool AsyncActive() {
@@ -243,12 +253,128 @@ inline void AsyncEnqueue(const wchar_t* line) {
     if (wasEmpty) SetEvent(s.wake);
 }
 
+// ---- file sink ---------------------------------------------------------------
+// DebugView is not something most users have running when the problem happens.
+// Every emitted line is therefore also appended to
+//   %ProgramData%\T2TouchId\Logs\<process>.log   (WUDFHost.log, t2touchid.log, ...)
+// prefixed with the local wall-clock time, rotated to <process>.1.log at 4 MiB (so at
+// most ~8 MiB per process). Lines only exist while a logging switch is on, so this
+// costs nothing with logging off. The Logs folder is created by the installer with
+// write access for LocalService (the UMDF host); where the process cannot write
+// (folder missing / no access) the sink retries at most once a minute and otherwise
+// stays out of the way. tools\Collect-T2Diagnostics.ps1 zips the folder.
+inline const wchar_t* ProcessTag();
+
+inline constexpr ULONGLONG kFileLogMaxBytes = 4ull * 1024 * 1024;
+inline constexpr ULONGLONG kFileLogRetryMs = 60000;
+
+struct FileSink {
+    std::mutex mu;
+    HANDLE h = INVALID_HANDLE_VALUE;
+    ULONGLONG size = 0;
+    ULONGLONG nextTryMs = 0;
+    std::wstring path;
+    bool closed = false; // FileSinkClose(): the host is unloading us, never reopen
+};
+inline FileSink& Files() { static FileSink f; return f; }
+
+inline std::wstring FileLogDirectory() {
+    wchar_t dir[MAX_PATH] = {};
+    const DWORD n = ExpandEnvironmentStringsW(L"%ProgramData%\\T2TouchId\\Logs", dir, MAX_PATH);
+    if (n == 0 || n > MAX_PATH || dir[0] == L'%') return std::wstring();
+    return dir;
+}
+
+// mu held. Opens (or re-opens after a rotation) the process's log file.
+inline bool FileSinkOpenLocked(FileSink& f) {
+    if (f.h != INVALID_HANDLE_VALUE) return true;
+    if (f.closed) return false;
+    const ULONGLONG now = GetTickCount64();
+    if (now < f.nextTryMs) return false;
+    f.nextTryMs = now + kFileLogRetryMs;
+    const std::wstring dir = FileLogDirectory();
+    if (dir.empty()) return false;
+    CreateDirectoryW(dir.c_str(), nullptr); // usually made by the installer (with the ACL)
+    f.path = dir + L"\\" + ProcessTag() + L".log";
+    f.h = CreateFileW(f.path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                      nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f.h == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER sz{};
+    f.size = GetFileSizeEx(f.h, &sz) ? static_cast<ULONGLONG>(sz.QuadPart) : 0;
+    return true;
+}
+
+inline void FileSinkWrite(const wchar_t* line) {
+    if (!line || !FileLogEnabled()) return;
+    SYSTEMTIME t{};
+    GetLocalTime(&t);
+    char stamp[32];
+    const int sl = _snprintf_s(stamp, _TRUNCATE, "%04u-%02u-%02u %02u:%02u:%02u.%03u ", t.wYear, t.wMonth,
+                               t.wDay, t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
+    char utf8[2048];
+    int ul = WideCharToMultiByte(CP_UTF8, 0, line, -1, utf8, static_cast<int>(sizeof(utf8)) - 2, nullptr, nullptr);
+    if (ul <= 0) return;
+    ul -= 1; // without the terminator
+    if (ul == 0 || utf8[ul - 1] != '\n') utf8[ul++] = '\n';
+    FileSink& f = Files();
+    std::lock_guard<std::mutex> lock(f.mu);
+    if (!FileSinkOpenLocked(f)) return;
+    if (f.size >= kFileLogMaxBytes) {
+        CloseHandle(f.h);
+        f.h = INVALID_HANDLE_VALUE;
+        const std::wstring old = f.path.substr(0, f.path.size() - 4) + L".1.log";
+        MoveFileExW(f.path.c_str(), old.c_str(), MOVEFILE_REPLACE_EXISTING);
+        f.nextTryMs = 0;
+        if (!FileSinkOpenLocked(f)) return;
+        f.size = 0;
+    }
+    DWORD put = 0;
+    if (sl > 0) WriteFile(f.h, stamp, static_cast<DWORD>(sl), &put, nullptr);
+    f.size += put;
+    put = 0;
+    if (!WriteFile(f.h, utf8, static_cast<DWORD>(ul), &put, nullptr)) {
+        CloseHandle(f.h); // e.g. the folder was deleted: reopen on the next retry
+        f.h = INVALID_HANDLE_VALUE;
+        return;
+    }
+    f.size += put;
+}
+
+inline void FileSinkWriteA(const char* line) {
+    if (!line) return;
+    wchar_t w[1024];
+    size_t n = 0;
+    for (; line[n] != '\0' && n < ARRAYSIZE(w) - 1; ++n) w[n] = static_cast<unsigned char>(line[n]);
+    w[n] = L'\0';
+    FileSinkWrite(w);
+}
+
+inline void FileSinkClose() {
+    FileSink& f = Files();
+    std::lock_guard<std::mutex> lock(f.mu);
+    if (f.h != INVALID_HANDLE_VALUE) CloseHandle(f.h);
+    f.h = INVALID_HANDLE_VALUE;
+    f.closed = true;
+}
+
+// Tests only: forget the open file (and a previous close) so the next line opens anew.
+inline void FileSinkResetForTests() {
+    FileSink& f = Files();
+    std::lock_guard<std::mutex> lock(f.mu);
+    if (f.h != INVALID_HANDLE_VALUE) CloseHandle(f.h);
+    f.h = INVALID_HANDLE_VALUE;
+    f.closed = false;
+    f.nextTryMs = 0;
+    f.size = 0;
+}
+
 inline void EmitLine(const wchar_t* line) {
     if (AsyncActive()) {
         AsyncEnqueue(line);
         return;
     }
     OutputDebugStringW(line);
+    FileSinkWrite(line);
     if (ConsoleEnabled()) {
         std::wcerr << line;
     }
@@ -267,6 +393,7 @@ inline void EmitLineA(const char* line) {
         return;
     }
     OutputDebugStringA(line);
+    FileSinkWriteA(line);
 }
 
 // Seconds since Windows booted. Deliberately NOT process-relative: the kernel DebugView

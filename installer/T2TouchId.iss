@@ -115,6 +115,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Source: "{#PackageDir}\T2TouchID_GUI\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "*.pdb"; Check: InstallGui
 ; Diagnostics helpers, kept after install (support / first-boot evidence).
 Source: "{#PackageDir}\Inst\Collect-T2TouchIdFirstBootEvidence.ps1"; DestDir: "{app}\Tools"; Flags: ignoreversion; Check: InstallGui
+Source: "{#PackageDir}\Inst\Collect-T2Diagnostics.ps1"; DestDir: "{app}\Tools"; Flags: ignoreversion; Check: InstallGui
 
 ; Driver packages + install scripts: extracted to Setup's own {tmp} only for
 ; the duration of the install (Inno deletes {tmp} when Setup exits), never
@@ -492,6 +493,12 @@ begin
   RunIgnore(ExpandConstant('{sys}\icacls.exe'),
     '"' + DataDir() + '" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F ' +
     '*S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX /T /C /Q');
+  // Logs\: the components' own log files (protocol/BridgeXpc/Log.h file sink).
+  // The UMDF driver runs as LocalService, which gets modify here and only here -
+  // never on the vault next to it.
+  ForceDirectories(DataDir() + '\Logs');
+  RunIgnore(ExpandConstant('{sys}\icacls.exe'),
+    '"' + DataDir() + '\Logs" /grant *S-1-5-19:(OI)(CI)M /C /Q');
 end;
 
 function FindPackageCertificates(var Certs: TArrayOfString): Integer;

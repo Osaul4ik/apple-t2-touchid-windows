@@ -594,9 +594,9 @@
                         </Grid>
 
                         <!-- Logging -->
-                        <TextBlock Style="{StaticResource FieldLabel}" Text="Logging (DebugView)"/>
+                        <TextBlock Style="{StaticResource FieldLabel}" Text="Logging"/>
                         <TextBlock Style="{StaticResource CardHint}" Margin="0,0,0,12"
-                                   Text="Flags are written to HKLM\SOFTWARE\T2TouchId\Logging. In DebugView enable Capture Global Win32 and Capture Kernel. Administrator rights are required to save."/>
+                                   Text="Flags are written to HKLM\SOFTWARE\T2TouchId\Logging. The driver, the CLI and T2SepBootstrap also write their lines to %ProgramData%\T2TouchId\Logs - no DebugView needed (kernel drivers still log to DebugView: Capture Kernel). Administrator rights are required to save."/>
                         <CheckBox x:Name="LogDiagCheck" Style="{StaticResource ToggleSwitch}" Margin="0,0,0,10"
                                   Checked="OnLogFlagChanged" Unchecked="OnLogFlagChanged">
                             <TextBlock Text="Cold-boot diagnostics (everything below + lock/unlock, SEP readiness, transport state, uptime-stamped)" TextWrapping="Wrap"/>
@@ -626,6 +626,14 @@
                             <TextBlock Text="T2NCM (kernel, MiniportPause/Restart)" TextWrapping="Wrap"/>
                         </CheckBox>
                         <TextBlock x:Name="LogStatusText" Style="{StaticResource StatusLine}" Margin="52,10,0,0"/>
+
+                        <StackPanel Orientation="Horizontal" Margin="0,16,0,0">
+                            <Button x:Name="CollectDiagnosticsButton" Content="Collect diagnostics…"
+                                    Style="{StaticResource SecondaryButton}" Click="OnCollectDiagnostics"/>
+                        </StackPanel>
+                        <TextBlock Style="{StaticResource CardHint}" Margin="0,6,0,0" TextWrapping="Wrap"
+                                   Text="One zip on the Desktop with the logs, driver / service / network state and event logs. No vault file and no password goes in."/>
+                        <TextBlock x:Name="DiagnosticsStatusText" Style="{StaticResource StatusLine}" Margin="0,6,0,0" TextWrapping="Wrap"/>
 
                         <Border Height="1" Background="{StaticResource BrushLine}" Margin="0,18,0,18"/>
 
