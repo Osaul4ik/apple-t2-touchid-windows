@@ -122,17 +122,19 @@ jobs:
     - uses: actions/checkout@v4
     - name: Install mingw-w64 + wine
       run: |
+        # The same set the tests are developed with: the `wine` wrapper plus the
+        # 64- and 32-bit loaders. wine64 alone has no usable `wine` command
+        # (symlinking its raw loader fails with "could not exec the wine loader").
+        sudo dpkg --add-architecture i386
         sudo apt-get update -q
-        sudo apt-get install -y -q --no-install-recommends mingw-w64 wine64 xvfb
-        # Ubuntu ships the 64-bit loader as wine64; give it the plain name the script uses.
-        command -v wine >/dev/null || sudo ln -sf "$(command -v wine64 || echo /usr/lib/wine/wine64)" /usr/local/bin/wine
+        sudo apt-get install -y -q --no-install-recommends mingw-w64 wine wine64 wine32:i386
         wine --version
     - name: Build and run
       env:
         WINEDEBUG: -all
         WINEPREFIX: ${{ runner.temp }}/wineprefix
       run: |
-        wineboot --init >/dev/null 2>&1 || wine wineboot --init >/dev/null 2>&1 || true
+        wineboot --init
         tests/host/run-tests-wine.sh
 
   ci:
