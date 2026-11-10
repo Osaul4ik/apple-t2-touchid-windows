@@ -110,6 +110,23 @@ typedef struct _T2_TRANSPORT_STATUS
     BOOLEAN OolRegistered;      // both SET_OOL_IN and SET_OOL_OUT succeeded
 } T2_TRANSPORT_STATUS, *PT2_TRANSPORT_STATUS;
 
+// Extended status: the v1 struct first (same offsets), then AKS exchange
+// counters since the device started. IOCTL_T2_GET_STATUS fills the tail only
+// when the caller's output buffer is at least this large, so v1 callers (an
+// older GUI / CLI passing sizeof(T2_TRANSPORT_STATUS)) are unaffected.
+#define T2_TRANSPORT_STATUS_VERSION_2 2u
+typedef struct _T2_TRANSPORT_STATUS_V2
+{
+    T2_TRANSPORT_STATUS Base;
+    UINT32  Version;              // T2_TRANSPORT_STATUS_VERSION_2
+    UINT32  ExchangesOk;          // IOCTL_T2_AKS_EXCHANGE completed with success
+    UINT32  ExchangesFailed;      // ... with a failure (timeouts included)
+    UINT32  ExchangeTimeouts;     // ... with STATUS_IO_TIMEOUT (SEP did not answer)
+    INT32   LastFailureStatus;    // NTSTATUS of the most recent failure, 0 = none
+    UINT32  Reserved;
+    LARGE_INTEGER LastFailureTimeUtc; // KeQuerySystemTimePrecise, 0 = none
+} T2_TRANSPORT_STATUS_V2, *PT2_TRANSPORT_STATUS_V2;
+
 #define IOCTL_T2_GET_STATUS \
     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x900, METHOD_BUFFERED, FILE_READ_ACCESS)
 

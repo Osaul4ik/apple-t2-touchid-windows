@@ -101,6 +101,28 @@ AksResult Client::GetStatus(bool* pciPresent, bool* bar4Mapped, bool* oolRegiste
     return AksResult::Ok;
 }
 
+AksResult Client::GetStatusEx(bool* pciPresent, bool* bar4Mapped, bool* oolRegistered,
+                              bool* mailboxAccessible, ExchangeCounters* counters, bool* haveCounters) {
+    T2_TRANSPORT_STATUS_V2 status{};
+    DWORD returned = 0;
+    if (!DeviceIoControl(handle_, IOCTL_T2_GET_STATUS, nullptr, 0, &status, sizeof(status), &returned, nullptr)) {
+        return AksResult::IoError;
+    }
+    *pciPresent = status.Base.PciPresent;
+    *bar4Mapped = status.Base.Bar4Mapped;
+    *oolRegistered = status.Base.OolRegistered;
+    *mailboxAccessible = status.Base.MailboxAccessible;
+    *haveCounters = returned >= sizeof(status) && status.Version == T2_TRANSPORT_STATUS_VERSION_2;
+    if (*haveCounters && counters) {
+        counters->ok = status.ExchangesOk;
+        counters->failed = status.ExchangesFailed;
+        counters->timeouts = status.ExchangeTimeouts;
+        counters->lastFailureStatus = status.LastFailureStatus;
+        counters->lastFailureTimeUtc = status.LastFailureTimeUtc.QuadPart;
+    }
+    return AksResult::Ok;
+}
+
 AksResult Client::RegisterOol() {
     DWORD returned = 0;
     if (!DeviceIoControl(handle_, IOCTL_T2_REGISTER_OOL, nullptr, 0, nullptr, 0, &returned, nullptr)) {

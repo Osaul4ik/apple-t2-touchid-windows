@@ -708,6 +708,8 @@ T2EvtIoDeviceControlGetStatus(_In_ WDFREQUEST Request, _In_ PT2_DEVICE_CONTEXT C
         WdfRequestComplete(Request, status);
         return;
     }
+    // v2 tail (exchange counters) only for callers that sized the buffer for it.
+    const BOOLEAN wantV2 = (outLen >= sizeof(T2_TRANSPORT_STATUS_V2));
 
     // WdfRequestRetrieveOutputBuffer's contract guarantees outLen is at
     // least the MinimumRequiredSize (sizeof(*out)) we passed in whenever it
@@ -753,6 +755,19 @@ T2EvtIoDeviceControlGetStatus(_In_ WDFREQUEST Request, _In_ PT2_DEVICE_CONTEXT C
         }
     }
 
+    if (wantV2) {
+        PT2_TRANSPORT_STATUS_V2 v2 = (PT2_TRANSPORT_STATUS_V2)out;
+        _Analysis_assume_(outLen >= sizeof(*v2));
+        v2->Version = T2_TRANSPORT_STATUS_VERSION_2;
+        v2->ExchangesOk = (UINT32)InterlockedCompareExchange(&Ctx->ExchangesOk, 0, 0);
+        v2->ExchangesFailed = (UINT32)InterlockedCompareExchange(&Ctx->ExchangesFailed, 0, 0);
+        v2->ExchangeTimeouts = (UINT32)InterlockedCompareExchange(&Ctx->ExchangeTimeouts, 0, 0);
+        v2->LastFailureStatus = (INT32)InterlockedCompareExchange(&Ctx->LastFailureStatus, 0, 0);
+        v2->Reserved = 0;
+        v2->LastFailureTimeUtc.QuadPart = InterlockedCompareExchange64(&Ctx->LastFailureTimeUtc, 0, 0);
+        WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, sizeof(*v2));
+        return;
+    }
     WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, sizeof(*out));
 }
 
@@ -1107,6 +1122,19 @@ T2EvtIoDeviceControlAksExchange(_In_ WDFREQUEST Request, _In_ PT2_DEVICE_CONTEXT
             responseBody, responseCapacity, &responseLength, &sepStatus);
     }
     WdfWaitLockRelease(Ctx->ExchangeLock);
+
+    // Counters for IOCTL_T2_GET_STATUS (v2). STATUS_DEVICE_NOT_READY above is a
+    // state check, not an exchange, and is not counted.
+    if (NT_SUCCESS(status)) {
+        InterlockedIncrement(&Ctx->ExchangesOk);
+    } else if (status != STATUS_DEVICE_NOT_READY) {
+        LARGE_INTEGER now;
+        KeQuerySystemTimePrecise(&now);
+        InterlockedIncrement(&Ctx->ExchangesFailed);
+        if (status == STATUS_IO_TIMEOUT) InterlockedIncrement(&Ctx->ExchangeTimeouts);
+        InterlockedExchange(&Ctx->LastFailureStatus, (LONG)status);
+        InterlockedExchange64(&Ctx->LastFailureTimeUtc, now.QuadPart);
+    }
 
     if (requestBody) {
         RtlSecureZeroMemory(requestBody, requestLength);

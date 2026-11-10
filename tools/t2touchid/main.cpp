@@ -135,8 +135,9 @@ static std::vector<uint8_t> ReadPasswordInteractive() {
 }
 
 static int CmdStatus(Client& client) {
-    bool pci, bar4, ool, mailbox;
-    AksResult r = client.GetStatus(&pci, &bar4, &ool, &mailbox);
+    bool pci = false, bar4 = false, ool = false, mailbox = false, haveCounters = false;
+    Client::ExchangeCounters counters;
+    AksResult r = client.GetStatusEx(&pci, &bar4, &ool, &mailbox, &counters, &haveCounters);
     if (r != AksResult::Ok) {
         std::wcout << L"T2 PCI                  FAILED TO QUERY\n";
         return 1;
@@ -145,6 +146,26 @@ static int CmdStatus(Client& client) {
     std::wcout << L"BAR4                    " << (bar4 ? L"mapped" : L"not mapped") << L"\n";
     std::wcout << L"SEP mailbox             " << (mailbox ? L"accessible" : L"unavailable") << L"\n";
     std::wcout << L"DMA / OOL               " << (ool ? L"registered" : L"not registered") << L"\n";
+    if (haveCounters) {
+        std::wcout << L"AKS exchanges           " << counters.ok << L" ok, " << counters.failed
+                   << L" failed (" << counters.timeouts << L" SEP timeouts)\n";
+        if (counters.lastFailureStatus != 0) {
+            wchar_t st[16];
+            swprintf_s(st, L"0x%08X", static_cast<unsigned>(counters.lastFailureStatus));
+            FILETIME ft{static_cast<DWORD>(counters.lastFailureTimeUtc),
+                        static_cast<DWORD>(counters.lastFailureTimeUtc >> 32)};
+            FILETIME local{};
+            SYSTEMTIME t{};
+            FileTimeToLocalFileTime(&ft, &local);
+            FileTimeToSystemTime(&local, &t);
+            wchar_t when[32];
+            swprintf_s(when, L"%04u-%02u-%02u %02u:%02u:%02u", t.wYear, t.wMonth, t.wDay, t.wHour,
+                       t.wMinute, t.wSecond);
+            std::wcout << L"last AKS failure        " << st << L" at " << when << L"\n";
+        }
+    } else {
+        std::wcout << L"AKS exchanges           (counters need the updated T2TouchIdTransport.sys)\n";
+    }
     // NOTE: network / RemoteXPC / BridgeXPC / BiometricKit / sensor /
     // identities rows from the ТЗ §27 example require the protocol layer
     // (network discovery + a live BridgeXpc connection), not just the

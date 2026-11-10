@@ -305,6 +305,14 @@ typedef struct _T2_DEVICE_CONTEXT
     // wedged SEP - the exact moment a status query is most useful.
     WDFSPINLOCK          BootstrapStatusLock;
     T2_BOOTSTRAP_STATUS  BootstrapStatus;  // guarded by BootstrapStatusLock
+
+    // AKS exchange counters for IOCTL_T2_GET_STATUS (T2_TRANSPORT_STATUS_V2).
+    // Interlocked, no lock: a status query never waits for an exchange.
+    volatile LONG        ExchangesOk;
+    volatile LONG        ExchangesFailed;
+    volatile LONG        ExchangeTimeouts;
+    volatile LONG        LastFailureStatus;
+    volatile LONG64      LastFailureTimeUtc;
 } T2_DEVICE_CONTEXT, *PT2_DEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(T2_DEVICE_CONTEXT, GetDeviceContext);

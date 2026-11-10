@@ -68,6 +68,17 @@ public:
     void Close();
 
     AksResult GetStatus(bool* pciPresent, bool* bar4Mapped, bool* oolRegistered, bool* mailboxAccessible);
+    // The same plus the driver's AKS exchange counters (T2_TRANSPORT_STATUS_V2).
+    // *haveCounters is false with an older driver that only knows v1.
+    struct ExchangeCounters {
+        uint32_t ok = 0;
+        uint32_t failed = 0;
+        uint32_t timeouts = 0;
+        int32_t lastFailureStatus = 0;     // NTSTATUS, 0 = none
+        int64_t lastFailureTimeUtc = 0;    // FILETIME units, 0 = none
+    };
+    AksResult GetStatusEx(bool* pciPresent, bool* bar4Mapped, bool* oolRegistered,
+                          bool* mailboxAccessible, ExchangeCounters* counters, bool* haveCounters);
     AksResult RegisterOol();
 
     // Bootstrap status mailbox the driver holds in memory (public.h
