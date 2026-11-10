@@ -130,8 +130,8 @@ static bool SetSocketTimeout(SOCKET s, int optname, std::chrono::milliseconds ti
 // This puts the socket in non-blocking mode for the handshake only, then
 // restores blocking mode before returning - callers get an ordinary
 // blocking socket either way, just with a real, enforced connect deadline.
-static bool ConnectWithTimeout(SOCKET s, const sockaddr* addr, int addrlen,
-                                std::chrono::milliseconds timeout,
+static bool ConnectWithTimeout(SOCKET s, const t2::transport::PeerAddress& addr, bool tunnel,
+                                uint16_t port, std::chrono::milliseconds timeout,
                                 int* outWsaError = nullptr,
                                 const std::atomic<bool>* closing = nullptr) {
     // outWsaError (optional): 0 on success, WSAETIMEDOUT when nothing came
@@ -151,7 +151,7 @@ static bool ConnectWithTimeout(SOCKET s, const sockaddr* addr, int addrlen,
         return false;
     }
     bool ok = false;
-    const int rc = connect(s, addr, addrlen);
+    const int rc = t2::transport::ConnectToPeer(s, addr, tunnel, port);
     if (rc == 0) {
         ok = true;
     } else if (WSAGetLastError() != WSAEWOULDBLOCK) {
@@ -385,27 +385,27 @@ ConnectResult Connection::ConnectOnce(bool tunnel, const in6_addr& linkLocalAddr
             return ConnectResult::ConnectFailed;
         }
         const in_addr peer4 = t2::transport::MapPeerToIpv4(linkLocalAddress);
-        socket_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        const t2::transport::PeerAddress addr4 =
+            t2::transport::MakePeerAddress(true, linkLocalAddress, interfaceIndex, port);
+        socket_ = socket(addr4.family, SOCK_STREAM, IPPROTO_TCP);
         if (socket_ == INVALID_SOCKET) {
             T2_LOG("connect", L"socket(AF_INET) failed, WSAGetLastError=%d", WSAGetLastError());
             evidence = t2::transport::PathEvidence::LocalError;
             return ConnectResult::ConnectFailed;
         }
-        DWORD ifIndexNet = htonl(static_cast<DWORD>(interfaceIndex));
-        if (setsockopt(socket_, IPPROTO_IP, IP_UNICAST_IF,
-                       reinterpret_cast<const char*>(&ifIndexNet), sizeof(ifIndexNet)) != 0) {
-            T2_LOG("connect", L"IP_UNICAST_IF ifIndex=%lu failed WSA=%d (continuing)",
-                   interfaceIndex, WSAGetLastError());
+        if (t2::transport::hooks::Active() == nullptr) {
+            DWORD ifIndexNet = htonl(static_cast<DWORD>(interfaceIndex));
+            if (setsockopt(socket_, IPPROTO_IP, IP_UNICAST_IF,
+                           reinterpret_cast<const char*>(&ifIndexNet), sizeof(ifIndexNet)) != 0) {
+                T2_LOG("connect", L"IP_UNICAST_IF ifIndex=%lu failed WSA=%d (continuing)",
+                       interfaceIndex, WSAGetLastError());
+            }
         }
-        sockaddr_in addr4{};
-        addr4.sin_family = AF_INET;
-        addr4.sin_port = htons(port);
-        addr4.sin_addr = peer4;
         T2_LOG("connect", L"Ipv4Tunnel peer %u.%u.%u.%u:%u ifIndex=%lu",
                peer4.S_un.S_un_b.s_b1, peer4.S_un.S_un_b.s_b2,
                peer4.S_un.S_un_b.s_b3, peer4.S_un.S_un_b.s_b4,
                static_cast<unsigned>(port), interfaceIndex);
-        if (!ConnectWithTimeout(socket_, reinterpret_cast<sockaddr*>(&addr4), sizeof(addr4),
+        if (!ConnectWithTimeout(socket_, addr4, true, port,
                                 RemainingBudget(tcpDeadline), &wsa, &closing_)) {
             T2_LOG("connect", L"connect(AF_INET) failed WSA=%d (%llu ms)", wsa,
                    static_cast<unsigned long long>(GetTickCount64() - tcpStart));
@@ -423,21 +423,18 @@ ConnectResult Connection::ConnectOnce(bool tunnel, const in6_addr& linkLocalAddr
             return ConnectResult::ConnectFailed;
         }
     } else {
-        socket_ = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+        const t2::transport::PeerAddress addr =
+            t2::transport::MakePeerAddress(false, linkLocalAddress, interfaceIndex, port);
+        socket_ = socket(addr.family, SOCK_STREAM, IPPROTO_TCP);
         if (socket_ == INVALID_SOCKET) {
             T2_LOG("connect", L"socket(AF_INET6) failed, WSAGetLastError=%d", WSAGetLastError());
             evidence = t2::transport::PathEvidence::LocalError;
             return ConnectResult::ConnectFailed;
         }
-        sockaddr_in6 addr{};
-        addr.sin6_family = AF_INET6;
-        addr.sin6_port = htons(port);
-        addr.sin6_addr = linkLocalAddress;
-        addr.sin6_scope_id = interfaceIndex;
         T2_LOG("connect", L"NativeIpv6 ifIndex=%lu port=%u (tcp budget %lld ms)",
                interfaceIndex, static_cast<unsigned>(port),
                static_cast<long long>(tcpTimeout.count()));
-        if (!ConnectWithTimeout(socket_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr),
+        if (!ConnectWithTimeout(socket_, addr, false, port,
                                 RemainingBudget(tcpDeadline), &wsa, &closing_)) {
             T2_LOG("connect", L"connect(AF_INET6) failed WSA=%d (%llu ms)", wsa,
                    static_cast<unsigned long long>(GetTickCount64() - tcpStart));

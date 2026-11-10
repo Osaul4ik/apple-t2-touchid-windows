@@ -61,6 +61,7 @@
     <ClCompile Include="BiometricKit\MatchResult.cpp" />
     <ClCompile Include="BiometricKit\VerificationEngine.cpp" />
     <ClCompile Include="BridgeXpc\Connection.cpp" />
+    <ClCompile Include="BridgeXpc\TransportMode.cpp" />
     <ClCompile Include="BridgeXpc\Frame.cpp" />
     <ClCompile Include="BridgeXpc\PlistPayload.cpp" />
     <ClCompile Include="Discovery\Adapter.cpp" />
@@ -79,6 +80,7 @@
     <ClInclude Include="BridgeXpc\Frame.h" />
     <ClInclude Include="BridgeXpc\Log.h" />
     <ClInclude Include="BridgeXpc\PlistPayload.h" />
+    <ClInclude Include="BridgeXpc\TransportHooks.h" />
     <ClInclude Include="BridgeXpc\Winsock.h" />
     <ClInclude Include="Discovery\Adapter.h" />
     <ClInclude Include="Discovery\BridgeDiscovery.h" />

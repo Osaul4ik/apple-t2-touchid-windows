@@ -526,7 +526,7 @@ void ClearNativeSilent() {
 // (silent native is "blocked" at once, the behavior before this change).
 DWORD LoadSilenceGraceMs() {
     static tp::CachedDword c;
-    const DWORD v = tp::ReadDwordCached(c, tp::kNetworkRegPath, L"NativeSilenceGraceMs", 15000, 1000);
+    const DWORD v = tp::ReadNetworkDwordCached(c, L"NativeSilenceGraceMs", 15000, 1000);
     return v > 120000 ? 120000 : v;
 }
 

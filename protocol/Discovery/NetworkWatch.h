@@ -64,18 +64,4 @@ private:
     HANDLE routeNotify_ = nullptr;
 };
 
-// Is the native IPv6 path to the T2 usable right now? One TCP SYN to
-// [peer%ifIndex]:port with a `timeoutMs` budget. Requires T2Ncm.sys to be in
-// native mode (the caller only asks while the committed transport is native).
-enum class NativePathProbe {
-    Alive,      // SYN-ACK or RST came back: packets reach the T2 and back
-    Blocked,    // WSAEACCES: a local WFP block filter (VPN kill-switch)
-    Silent,     // nothing within the budget (filtered, or the T2 is gone)
-    LocalError, // could not even try (no socket, no route) - says nothing
-};
-NativePathProbe ProbeNativePath(const in6_addr& peer, unsigned long ifIndex, uint16_t port,
-                                DWORD timeoutMs);
-
-const wchar_t* NativePathProbeName(NativePathProbe p);
-
 } // namespace t2::discovery

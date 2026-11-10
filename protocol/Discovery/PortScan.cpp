@@ -46,10 +46,14 @@ ProbeResult ProbePort(const NcmEndpoint& ep, uint16_t port,
                       unsigned connectTimeoutMs, unsigned recvTimeoutMs) {
     ProbeResult r;
     const bool tunnel = t2::transport::IsTunnelModeActive();
-    SOCKET s = socket(tunnel ? AF_INET : AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+    const t2::transport::PeerAddress pa =
+        t2::transport::MakePeerAddress(tunnel, ep.peerLinkLocal, ep.ifIndex, port);
+    SOCKET s = socket(pa.family, SOCK_STREAM, IPPROTO_TCP);
     if (s == INVALID_SOCKET) return r;
 
-    if (tunnel) {
+    if (t2::transport::hooks::Active() != nullptr) {
+        // Simulated T2 (tests): no interface pinning on the redirected address.
+    } else if (tunnel) {
         DWORD ifIndexNet = htonl(static_cast<DWORD>(ep.ifIndex));
         setsockopt(s, IPPROTO_IP, IP_UNICAST_IF,
                    reinterpret_cast<const char*>(&ifIndexNet), sizeof(ifIndexNet));
@@ -67,21 +71,7 @@ ProbeResult ProbePort(const NcmEndpoint& ep, uint16_t port,
     u_long nonblock = 1;
     ioctlsocket(s, FIONBIO, &nonblock);
 
-    int cr;
-    if (tunnel) {
-        sockaddr_in addr4{};
-        addr4.sin_family = AF_INET;
-        addr4.sin_port = htons(port);
-        addr4.sin_addr = t2::transport::MapPeerToIpv4(ep.peerLinkLocal);
-        cr = connect(s, reinterpret_cast<sockaddr*>(&addr4), sizeof(addr4));
-    } else {
-        sockaddr_in6 addr{};
-        addr.sin6_family = AF_INET6;
-        addr.sin6_port = htons(port);
-        addr.sin6_addr = ep.peerLinkLocal;
-        addr.sin6_scope_id = ep.ifIndex;
-        cr = connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
-    }
+    const int cr = t2::transport::ConnectToPeer(s, pa, tunnel, port);
     if (cr != 0) {
         int err = WSAGetLastError();
         if (err != WSAEWOULDBLOCK && err != WSAEINPROGRESS) {

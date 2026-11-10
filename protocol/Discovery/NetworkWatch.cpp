@@ -2,10 +2,8 @@
 // NetworkWatch.cpp - see NetworkWatch.h.
 #include "NetworkWatch.h"
 #include "../BridgeXpc/Log.h"
-#include "../BridgeXpc/Winsock.h"
 
 #pragma comment(lib, "Iphlpapi.lib")
-#pragma comment(lib, "Ws2_32.lib")
 
 namespace t2::discovery {
 
@@ -123,79 +121,6 @@ void NetworkChangeWatcher::Run() {
             }
         }
     }
-}
-
-const wchar_t* NativePathProbeName(NativePathProbe p) {
-    switch (p) {
-    case NativePathProbe::Alive:      return L"alive";
-    case NativePathProbe::Blocked:    return L"blocked (WFP)";
-    case NativePathProbe::Silent:     return L"silent";
-    case NativePathProbe::LocalError: return L"local error";
-    }
-    return L"?";
-}
-
-NativePathProbe ProbeNativePath(const in6_addr& peer, unsigned long ifIndex, uint16_t port,
-                                DWORD timeoutMs) {
-    if (!t2::EnsureWinsock() || port == 0 || ifIndex == 0) return NativePathProbe::LocalError;
-    SOCKET s = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
-    if (s == INVALID_SOCKET) return NativePathProbe::LocalError;
-    u_long nonBlocking = 1;
-    if (ioctlsocket(s, FIONBIO, &nonBlocking) != 0) {
-        closesocket(s);
-        return NativePathProbe::LocalError;
-    }
-    sockaddr_in6 addr{};
-    addr.sin6_family = AF_INET6;
-    addr.sin6_port = htons(port);
-    addr.sin6_addr = peer;
-    addr.sin6_scope_id = ifIndex;
-
-    NativePathProbe result = NativePathProbe::Silent;
-    if (connect(s, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) == 0) {
-        result = NativePathProbe::Alive;
-    } else {
-        const int e = WSAGetLastError();
-        if (e == WSAEACCES) {
-            result = NativePathProbe::Blocked;
-        } else if (e == WSAECONNREFUSED) {
-            result = NativePathProbe::Alive;
-        } else if (e != WSAEWOULDBLOCK) {
-            result = (e == WSAENETUNREACH || e == WSAEADDRNOTAVAIL || e == WSAENETDOWN)
-                         ? NativePathProbe::LocalError
-                         : NativePathProbe::Silent;
-        } else {
-            fd_set wr, ex;
-            FD_ZERO(&wr);
-            FD_ZERO(&ex);
-            FD_SET(s, &wr);
-            FD_SET(s, &ex);
-            timeval tv{};
-            tv.tv_sec = static_cast<long>(timeoutMs / 1000);
-            tv.tv_usec = static_cast<long>((timeoutMs % 1000) * 1000);
-            const int n = select(0, nullptr, &wr, &ex, &tv);
-            if (n > 0) {
-                int soErr = 0;
-                int len = sizeof(soErr);
-                getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&soErr), &len);
-                if (FD_ISSET(s, &wr) && soErr == 0) {
-                    result = NativePathProbe::Alive;          // SYN-ACK
-                } else if (soErr == WSAECONNREFUSED) {
-                    result = NativePathProbe::Alive;          // RST: the path works
-                } else if (soErr == WSAEACCES) {
-                    result = NativePathProbe::Blocked;
-                } else {
-                    result = NativePathProbe::Silent;
-                }
-            }
-            // n == 0: timeout -> Silent; n < 0: select failed -> Silent (no verdict wanted)
-        }
-    }
-    // RST instead of a FIN dance: this was only a reachability probe.
-    linger lg{1, 0};
-    setsockopt(s, SOL_SOCKET, SO_LINGER, reinterpret_cast<const char*>(&lg), sizeof(lg));
-    closesocket(s);
-    return result;
 }
 
 } // namespace t2::discovery

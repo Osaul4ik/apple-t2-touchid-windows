@@ -479,6 +479,9 @@ void NotePeerIdentity(const NcmEndpoint& ep) {
 } // namespace
 
 GateResult RunReadinessGate(NcmEndpoint* ep, void* cancelEvent, unsigned maxMs) {
+    if (const auto* h = t2::transport::hooks::Active(); h && h->gateReady && ep) {
+        return GateResult::Ready; // simulated T2 (tests): adapter + link-local are up
+    }
     if (!ep || ep->ifIndex == 0) {
         T2_DIAG("gate", L"readiness gate: no T2 NCM adapter (ifIndex=0) -> TimedOut");
         return GateResult::TimedOut;

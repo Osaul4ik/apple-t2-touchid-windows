@@ -865,7 +865,7 @@ ULONG CALLBACK OnSuspendResume(_In_opt_ PVOID Context, _In_ ULONG Type, _In_opt_
         t2::transport::SetTransportIoSuspended(false);
         // Force next PushTransportMode to actually hit the driver (post-Dx
         // cache in miniport may not match our LastPushedMode).
-        t2::transport::LastPushedModeFlag().store(-1, std::memory_order_relaxed);
+        t2::transport::ResetLastPushedMode();
         t2::transport::ClearLastPushedPeer();
         // Resume hygiene: drop sticky/replay; pending CAPTURE restarts via resume event.
         ClearMatchReplay();
@@ -3136,7 +3136,7 @@ void OnHostNetworkChanged()
     if (!g_captureBusy.load(std::memory_order_acquire)) {
         return; // nothing armed: the next connect decides on its own
     }
-    if (t2::transport::TransportOverride().load(std::memory_order_relaxed) >= 0) {
+    if (t2::transport::HasTransportOverride()) {
         // A connect phase of this process is probing right now; the driver mode is
         // the probe's, so a native SYN would say nothing. That connect decides.
         T2BioLog("NetworkChange: a connect phase is running - leaving the decision to it");
@@ -3155,12 +3155,15 @@ void OnHostNetworkChanged()
     if (!t2::discovery::LoadCachedPort(ep, &port, &rsd) || port == 0) {
         return;
     }
-    const t2::discovery::NativePathProbe probe =
-        t2::discovery::ProbeNativePath(ep.peerLinkLocal, ep.ifIndex, port, 250);
-    T2_LOG("netwatch", L"armed capture over native IPv6: probe of port %u -> %s",
-           static_cast<unsigned>(port), t2::discovery::NativePathProbeName(probe));
-    if (probe == t2::discovery::NativePathProbe::Alive ||
-        probe == t2::discovery::NativePathProbe::LocalError) {
+    using t2::transport::PathEvidence;
+    const PathEvidence probe = t2::transport::ProbeNativePath(
+        ep.peerLinkLocal, ep.ifIndex, port, std::chrono::milliseconds(250));
+    T2_LOG("netwatch", L"armed capture over native IPv6: probe of port %u -> evidence %d "
+           L"(0 positive, 1 silent, 2 local error, 3 refused, 4 blocked)",
+           static_cast<unsigned>(port), static_cast<int>(probe));
+    // SYN-ACK or RST: the path still reaches the T2. LocalError says nothing.
+    if (probe == PathEvidence::Positive || probe == PathEvidence::Refused ||
+        probe == PathEvidence::LocalError) {
         return;
     }
     std::lock_guard<std::mutex> commitLock(g_captureRequestCommitMu);

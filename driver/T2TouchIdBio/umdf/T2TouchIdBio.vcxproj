@@ -133,6 +133,7 @@
     <ClCompile Include="..\..\..\protocol\BridgeXpc\Connection.cpp" />
     <ClCompile Include="..\..\..\protocol\BridgeXpc\Frame.cpp" />
     <ClCompile Include="..\..\..\protocol\BridgeXpc\PlistPayload.cpp" />
+    <ClCompile Include="..\..\..\protocol\BridgeXpc\TransportMode.cpp" />
     <ClCompile Include="..\..\..\protocol\Discovery\Adapter.cpp" />
     <ClCompile Include="..\..\..\protocol\Discovery\BridgeDiscovery.cpp" />
     <ClCompile Include="..\..\..\protocol\Discovery\NetworkWatch.cpp" />

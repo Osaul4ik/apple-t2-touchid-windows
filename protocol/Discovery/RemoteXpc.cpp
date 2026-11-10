@@ -578,14 +578,21 @@ RemoteXpcResult RemoteXpcConnection::Connect(const NcmEndpoint& endpoint, uint16
     if (connectTimeout.count() <= 0) return RemoteXpcResult::ConnectFailed;
     if (!t2::EnsureWinsock()) return RemoteXpcResult::ConnectFailed;
     const bool tunnel = t2::transport::IsTunnelModeActive();
-    socket_ = socket(tunnel ? AF_INET : AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+    const t2::transport::PeerAddress pa =
+        t2::transport::MakePeerAddress(tunnel, endpoint.peerLinkLocal, endpoint.ifIndex, port);
+    socket_ = socket(pa.family, SOCK_STREAM, IPPROTO_TCP);
     if (socket_ == INVALID_SOCKET) return RemoteXpcResult::ConnectFailed;
 
+    const bool pinInterface = t2::transport::hooks::Active() == nullptr;
     if (tunnel) {
         // Same seed PortScan.cpp / Connection.cpp do before their own
         // AF_INET connect(): without it this targets an unresolved
         // 169.254.x.y and dies on an ARP request T2Ncm.sys never answers.
         t2::transport::PrepareTunnelPeer(endpoint.ifIndex, endpoint.peerLinkLocal);
+    }
+    if (!pinInterface) {
+        // Simulated T2 (tests): no interface pinning on the redirected address.
+    } else if (tunnel) {
         DWORD ifIndexNet = htonl(static_cast<DWORD>(endpoint.ifIndex));
         setsockopt(socket_, IPPROTO_IP, IP_UNICAST_IF,
                    reinterpret_cast<const char*>(&ifIndexNet), sizeof(ifIndexNet));
@@ -600,21 +607,7 @@ RemoteXpcResult RemoteXpcConnection::Connect(const NcmEndpoint& endpoint, uint16
     u_long nonblock = 1;
     ioctlsocket(socket_, FIONBIO, &nonblock);
 
-    int cr;
-    if (tunnel) {
-        sockaddr_in addr4{};
-        addr4.sin_family = AF_INET;
-        addr4.sin_port = htons(port);
-        addr4.sin_addr = t2::transport::MapPeerToIpv4(endpoint.peerLinkLocal);
-        cr = connect(socket_, reinterpret_cast<sockaddr*>(&addr4), sizeof(addr4));
-    } else {
-        sockaddr_in6 addr{};
-        addr.sin6_family = AF_INET6;
-        addr.sin6_port = htons(port);
-        addr.sin6_addr = endpoint.peerLinkLocal;
-        addr.sin6_scope_id = endpoint.ifIndex;
-        cr = connect(socket_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
-    }
+    const int cr = t2::transport::ConnectToPeer(socket_, pa, tunnel, port);
     if (cr != 0) {
         int err = WSAGetLastError();
         if (err != WSAEWOULDBLOCK && err != WSAEINPROGRESS) {

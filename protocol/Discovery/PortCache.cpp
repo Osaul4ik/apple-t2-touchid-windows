@@ -62,7 +62,7 @@ std::string Narrow(const wchar_t* w) {
 }
 
 std::wstring PortCacheRegPath() {
-    return std::wstring(t2::transport::kNetworkRegPath) + L"\\PortCache";
+    return std::wstring(t2::transport::NetworkRegPath()) + L"\\PortCache";
 }
 
 // Strict decimal parse of a whole token: digits only, 1..65535.
@@ -85,7 +85,7 @@ bool ReadRegValue(const std::string& macKey, std::string* out) {
     DWORD cb = sizeof(buf) - sizeof(wchar_t); // keep room for a terminator
     const std::wstring path = PortCacheRegPath();
     const std::wstring name = Widen(macKey);
-    if (RegGetValueW(HKEY_LOCAL_MACHINE, path.c_str(), name.c_str(), RRF_RT_REG_SZ,
+    if (RegGetValueW(t2::transport::NetworkRegRoot(), path.c_str(), name.c_str(), RRF_RT_REG_SZ,
                      nullptr, buf, &cb) != ERROR_SUCCESS) {
         return false;
     }
@@ -148,7 +148,7 @@ void SaveCachedPort(const NcmEndpoint& endpoint, uint16_t port, uint16_t rsdPort
     const std::wstring name = Widen(FormatMacKey(endpoint.mac));
 
     HKEY hKey = nullptr;
-    LSTATUS rc = RegCreateKeyExW(HKEY_LOCAL_MACHINE, path.c_str(), 0, nullptr,
+    LSTATUS rc = RegCreateKeyExW(t2::transport::NetworkRegRoot(), path.c_str(), 0, nullptr,
                                  REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, nullptr,
                                  &hKey, nullptr);
     if (rc != ERROR_SUCCESS) {
@@ -173,7 +173,7 @@ bool DeleteCachedPort(const NcmEndpoint& endpoint) {
     if (!endpoint.hasMac) return false;
     const std::wstring path = PortCacheRegPath();
     const std::wstring name = Widen(FormatMacKey(endpoint.mac));
-    const LSTATUS rc = RegDeleteKeyValueW(HKEY_LOCAL_MACHINE, path.c_str(), name.c_str());
+    const LSTATUS rc = RegDeleteKeyValueW(t2::transport::NetworkRegRoot(), path.c_str(), name.c_str());
     return rc == ERROR_SUCCESS || rc == ERROR_FILE_NOT_FOUND || rc == ERROR_PATH_NOT_FOUND;
 }
 
