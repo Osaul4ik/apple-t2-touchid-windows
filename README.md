@@ -145,7 +145,16 @@ If this project is useful, you can support the development here:
 
 Thanks to **jmurth1234** and the research behind [t2-touchid-linux](https://github.com/jmurth1234/t2-touchid-linux), which provided valuable reference material for the Apple T2 biometric communication flow.
 
+## Development
+
+* Architecture: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+* Tests: `tests/host/run-tests-wine.sh` runs the protocol unit tests and the transport
+  scenario tests against a simulated T2 on any Linux box (mingw-w64 + wine); the
+  hardware checklist is in [docs/TESTING.md](docs/TESTING.md).
+* Problems: GUI developer card > *Collect diagnostics…* (or
+  `Tools\Collect-T2Diagnostics.ps1`) writes one zip with everything needed - no
+  DebugView required.
+
 ## License
 
 GPL-2.0-only. See [`LICENSE`](LICENSE) and [`NOTICE.md`](NOTICE.md).
-
