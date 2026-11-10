@@ -11,6 +11,9 @@
 ;  prompt, no self-relaunch.
 ;
 ;  Install (CurStepChanged / ssPostInstall), in this order:
+;    0. Refuse early (nothing changed) when Secure Boot is on; offer to keep the
+;       drivers as they are when this exact build is installed and working
+;       (Test-T2DriversCurrent.ps1) - an app-only update then needs no restart.
 ;    1. Stop WbioSrvc and T2SepBootstrap so the engine adapter DLL and
 ;       T2SepBootstrap.exe (both copied by the INFs into System32) can be
 ;       replaced on an upgrade instead of being queued for a reboot.
@@ -285,6 +288,23 @@ begin
        'BCD00000000\Objects\' + Def + '\Elements\16000049', 'Element', Data) then
     Exit;
   Result := (Length(Data) > 0) and (Ord(Data[1]) <> 0);
+end;
+
+// UEFI Secure Boot as Windows sees it. With it on, Windows ignores testsigning and
+// the test-signed drivers cannot load (Code 52), whatever bcdedit says.
+function SecureBootEnabled(): Boolean;
+var
+  V: Cardinal;
+begin
+  Result := RegQueryDWordValue(HKLM, 'SYSTEM\CurrentControlSet\Control\SecureBoot\State',
+              'UEFISecureBootEnabled', V) and (V <> 0);
+end;
+
+function SecureBootHelpText(): String;
+begin
+  Result := 'On a Mac with the T2 chip: restart holding Command-R (macOS Recovery), open ' +
+    'Utilities > Startup Security Utility and set Secure Boot to "No Security". ' +
+    'Then start Windows and run this setup again.';
 end;
 
 // Turns Test Mode on. Not an error when it is already on: "bcdedit /set" can
@@ -684,6 +704,42 @@ begin
     if not RequireFile(Pkg + Required[I]) then
       Exit;
 
+  // 0a. Secure Boot: Test Mode cannot work under it. Checked before anything is
+  //     touched, so the user gets the real reason instead of a bcdedit error.
+  if SecureBootEnabled() and (not TestSigningActiveNow()) then
+  begin
+    LogLine('Secure Boot is enabled and Test Mode is not active - driver install not started');
+    SuppressibleMsgBox('Secure Boot is turned on.' + #13#10 + #13#10 +
+      'With Secure Boot, Windows does not allow Test Mode, so the T2 Touch ID drivers ' +
+      '(test-signed) cannot load.' + #13#10 + #13#10 + SecureBootHelpText() + #13#10 + #13#10 +
+      'Nothing was changed.', mbError, MB_OK, IDOK);
+    Exit;
+  end;
+
+  // 0b. This exact build already installed and working? Then the drivers stay as
+  //     they are: an update that only changes the control panel needs no restart.
+  //     (CI gives every build its own DriverVer; see Test-T2DriversCurrent.ps1.)
+  if FileExists(Pkg + 'Inst\Test-T2DriversCurrent.ps1') then
+  begin
+    SetStatus('Checking the installed drivers...');
+    if RunPowerShellFile(Pkg + 'Inst\Test-T2DriversCurrent.ps1',
+         '-PackageDir "' + RemoveBackslash(Pkg) + '"', ResultCode) and (ResultCode = 0) then
+    begin
+      if SuppressibleMsgBox('The drivers in this setup are already installed and working (same build).' + #13#10 + #13#10 +
+           'Keep them as they are? No restart is needed then.' + #13#10 +
+           'Choose No to reinstall them anyway.', mbConfirmation, MB_YESNO, IDYES) = IDYES then
+      begin
+        LogLine('drivers unchanged (same build, devices OK) - driver reinstall skipped');
+        SecureDataDir; // folders / ACLs of this version (Logs\)
+        SetStatus('The drivers are up to date.');
+        RebootNeeded := False;
+        Result := True;
+        Exit;
+      end;
+      LogLine('drivers unchanged, reinstall requested anyway');
+    end;
+  end;
+
   // 1. Release files the INFs are about to replace in System32.
   StopBiometricService;
   SetStatus('Stopping T2SepBootstrap...');
@@ -695,7 +751,7 @@ begin
   begin
     SuppressibleMsgBox('Could not enable Test Mode (bcdedit /set testsigning on).' + #13#10 + #13#10 +
       'bcdedit said:' + #13#10 + Details + #13#10 + #13#10 +
-      'If Secure Boot is on in the firmware, it must be disabled first.' + #13#10 +
+      'If Secure Boot is on, it must be turned off first. ' + SecureBootHelpText() + #13#10 + #13#10 +
       'Driver installation was NOT completed - nothing was removed.' + #13#10 +
       'Log: ' + LogFile, mbError, MB_OK, IDOK);
     StartBiometricService;
