@@ -98,4 +98,11 @@ bool ConnectToBiometricKitBridge(const NcmEndpoint& endpoint,
                                   void* cancelEvent = nullptr,
                                   bool* outScansExhausted = nullptr);
 
+namespace testing {
+// Forgets the in-process discovery state (scan cursors and candidates, the
+// "alive but silent" streak, the passed readiness gate). Tests only; nothing may
+// be running. The transport state has its own: t2::transport::testing::ResetState.
+void ResetState();
+} // namespace testing
+
 } // namespace t2::discovery

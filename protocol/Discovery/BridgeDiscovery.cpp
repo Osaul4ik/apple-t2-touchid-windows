@@ -877,6 +877,18 @@ static bool ConnectToBiometricKitBridgeImpl(const NcmEndpoint& endpoint, t2::bri
     return false;
 }
 
+namespace testing {
+void ResetState() {
+    {
+        std::lock_guard<std::mutex> lock(g_scanMu);
+        ScanStates().clear();
+    }
+    ClearNativeSilent();
+    g_gateGeneration.store(0, std::memory_order_release);
+    g_gateIfIndex.store(0, std::memory_order_relaxed);
+}
+} // namespace testing
+
 bool ConnectToBiometricKitBridge(const NcmEndpoint& endpoint, t2::bridgexpc::Connection* outConn,
                                   uint16_t* outServicePort, uint16_t* outRsdPort,
                                   void* cancelEvent, bool* outScansExhausted) {

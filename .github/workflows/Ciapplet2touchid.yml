@@ -35,7 +35,7 @@ name: CI Apple T2 TouchId (CodeQL + PREfast + Build + Package)
 
 on:
   push:
-    branches: [ main, RC, Dev_lifecycle, Hello_Prepare ]
+    branches: [ main, RC, rc1, Dev_lifecycle, Hello_Prepare ]
     # NOTE: path filters are case-sensitive. This used to list
     # 'CiAppleT2TouchId.yml', which never matched this file
     # (Ciapplet2touchid.yml), so edits to the workflow itself did not trigger it.
@@ -45,16 +45,18 @@ on:
       - 'protocol/**'
       - 'tools/**'
       - 'installer/**'
+      - 'tests/**'
       - 'T2TouchId.sln'
       - '.github/workflows/Ciapplet2touchid.yml'
   pull_request:
-    branches: [ main, RC, Dev_lifecycle ]
+    branches: [ main, RC, rc1, Dev_lifecycle ]
     paths:
       - 'T2NCM/**'
       - 'driver/**'
       - 'protocol/**'
       - 'tools/**'
       - 'installer/**'
+      - 'tests/**'
       - 'T2TouchId.sln'
       - '.github/workflows/Ciapplet2touchid.yml'
   workflow_dispatch:
@@ -108,6 +110,31 @@ env:
   DOTNET_VERSION: '8.0.x'
 
 jobs:
+  # Fast, independent of the WDK: the shared user-mode code (protocol/) built with a
+  # second compiler (mingw-w64) and run under wine - the protocol unit tests plus the
+  # transport scenario tests against a simulated T2 (tests/FakeT2.*). Catches
+  # discovery / VPN / sticky-tunnel regressions in a couple of minutes.
+  host-tests:
+    name: Protocol + transport scenario tests (mingw + wine)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install mingw-w64 + wine
+      run: |
+        sudo apt-get update -q
+        sudo apt-get install -y -q --no-install-recommends mingw-w64 wine64 xvfb
+        # Ubuntu ships the 64-bit loader as wine64; give it the plain name the script uses.
+        command -v wine >/dev/null || sudo ln -sf "$(command -v wine64 || echo /usr/lib/wine/wine64)" /usr/local/bin/wine
+        wine --version
+    - name: Build and run
+      env:
+        WINEDEBUG: -all
+        WINEPREFIX: ${{ runner.temp }}/wineprefix
+      run: |
+        wineboot --init >/dev/null 2>&1 || wine wineboot --init >/dev/null 2>&1 || true
+        tests/host/run-tests-wine.sh
+
   ci:
     name: CodeQL + PREfast + Build + Package (SEP, NCM, Bio, T2TouchID_GUI)
     runs-on: windows-2022
