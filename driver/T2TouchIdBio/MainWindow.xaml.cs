@@ -1202,7 +1202,7 @@ namespace T2TouchId.SepVaultGui
             {
                 if (File.Exists(VaultPath))
                     File.Delete(VaultPath);
-                _keybagBytes = null;
+                WipeKeybag();
                 KeybagPathBox.Text = "";
                 PasswordBox.Clear();
                 VaultStatusText.Text = "";
@@ -1241,6 +1241,7 @@ namespace T2TouchId.SepVaultGui
                     VaultStatusText.Text = $"user.kb must be 1..16000 bytes; the selected file is {bytes.Length}.";
                     return;
                 }
+                WipeKeybag(); // a previously selected file
                 _keybagBytes = bytes;
                 KeybagPathBox.Text = dialog.FileName;
                 VaultStatusText.Text = "";
@@ -1283,7 +1284,11 @@ namespace T2TouchId.SepVaultGui
                 VaultStatusText.Text = "Special bag ID must be an integer (e.g. -501).";
                 return;
             }
-            if (string.IsNullOrEmpty(PasswordBox.Password))
+            // SecurePassword, not Password: the latter makes a managed string of the
+            // password (immutable, never wiped) just to test it for emptiness.
+            bool passwordEmpty;
+            using (var probe = PasswordBox.SecurePassword) passwordEmpty = probe.Length == 0;
+            if (passwordEmpty)
             {
                 VaultStatusText.Foreground = DotError;
                 VaultStatusText.Text = "Enter the password.";
@@ -1292,7 +1297,10 @@ namespace T2TouchId.SepVaultGui
 
             try
             {
-                SepVaultFormat.Write(VaultPath, _keybagBytes, PasswordBox.Password, specialBag);
+                using (var password = PasswordBox.SecurePassword)
+                {
+                    SepVaultFormat.Write(VaultPath, _keybagBytes, password, specialBag);
+                }
                 // The special bag is the negated macOS uid (-502 <-> uid 502). Publish it
                 // for the UMDF driver / CLI (HKLM\SOFTWARE\T2TouchIdBio\MacosUserId); the
                 // T2SepBootstrap service re-derives it from the vault on every start too.
@@ -1306,7 +1314,7 @@ namespace T2TouchId.SepVaultGui
                 }
                 VaultStatusText.Foreground = DotOk;
                 VaultStatusText.Text = $"Saved: {VaultPath}\nYou can delete the original user.kb; the vault does not keep it in plaintext.{uidNote}\nRestart Windows to apply.";
-                _keybagBytes = null;
+                WipeKeybag();
                 KeybagPathBox.Text = "";
                 LoadVaultState();
             }
@@ -1317,13 +1325,25 @@ namespace T2TouchId.SepVaultGui
             }
             finally
             {
-                // Password lives in a WPF PasswordBox's internal SecureString
-                // machinery either way, and .NET string immutability means
-                // the plaintext string handed to Write() can't be scrubbed
-                // from the managed heap from here — clearing the control's
-                // own buffer is the one thing this method can actually do.
+                // The password went SecureString -> pinned buffers -> DPAPI
+                // (SepVaultFormat.ProtectPassword) and never became a string;
+                // clearing the control drops its own SecureString too.
                 PasswordBox.Clear();
             }
+        }
+
+        // The plaintext keybag (user.kb) must not wait for the GC: zero it the moment
+        // it is no longer needed - saved, replaced, cleared or the window closes.
+        private void WipeKeybag()
+        {
+            if (_keybagBytes != null) Array.Clear(_keybagBytes, 0, _keybagBytes.Length);
+            _keybagBytes = null;
+        }
+
+        protected override void OnClosed(EventArgs e)
+        {
+            WipeKeybag();
+            base.OnClosed(e);
         }
     }
 }

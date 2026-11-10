@@ -10,6 +10,8 @@
 
 using System;
 using System.IO;
+using System.Runtime.InteropServices;
+using System.Security;
 using System.Security.Cryptography;
 using System.Security.AccessControl;
 using System.Security.Principal;
@@ -29,19 +31,10 @@ namespace T2TouchId.SepVaultGui
         // a LocalSystem service that starts before any user profile is
         // loaded — user-scope DPAPI would have nothing to unprotect with at
         // that point.
-        public static void Write(string path, byte[] keybagBytes, string password, int specialUserBag)
+        public static void Write(string path, byte[] keybagBytes, SecureString password, int specialUserBag)
         {
             byte[] protectedKeybag = ProtectedData.Protect(keybagBytes, null, DataProtectionScope.LocalMachine);
-            byte[] passwordBytes = Encoding.UTF8.GetBytes(password);
-            byte[] protectedPassword;
-            try
-            {
-                protectedPassword = ProtectedData.Protect(passwordBytes, null, DataProtectionScope.LocalMachine);
-            }
-            finally
-            {
-                Array.Clear(passwordBytes, 0, passwordBytes.Length);
-            }
+            byte[] protectedPassword = ProtectPassword(password);
 
             // Never expose a partially written or inheritably-readable final vault.
             // Stage the new file in the same directory, restrict its ACL while
@@ -87,6 +80,37 @@ namespace T2TouchId.SepVaultGui
                 if (File.Exists(temporaryPath)) File.Delete(temporaryPath);
                 Array.Clear(protectedKeybag, 0, protectedKeybag.Length);
                 Array.Clear(protectedPassword, 0, protectedPassword.Length);
+            }
+        }
+
+        // The password never becomes a managed string (immutable, cannot be wiped, may
+        // be copied around by the GC): SecureString -> unmanaged UTF-16 -> a pinned
+        // char[] -> a pinned UTF-8 byte[] -> DPAPI, every plaintext copy zeroed in
+        // `finally`. Same UTF-8 bytes as Encoding.UTF8.GetBytes(string) produced before,
+        // so T2SepBootstrap reads vaults of either version the same way.
+        private static byte[] ProtectPassword(SecureString password)
+        {
+            IntPtr unmanaged = IntPtr.Zero;
+            char[] chars = new char[password.Length];
+            GCHandle charsPin = GCHandle.Alloc(chars, GCHandleType.Pinned);
+            byte[]? utf8 = null;
+            GCHandle utf8Pin = default;
+            try
+            {
+                unmanaged = Marshal.SecureStringToGlobalAllocUnicode(password);
+                Marshal.Copy(unmanaged, chars, 0, chars.Length);
+                utf8 = new byte[Encoding.UTF8.GetByteCount(chars)];
+                utf8Pin = GCHandle.Alloc(utf8, GCHandleType.Pinned);
+                Encoding.UTF8.GetBytes(chars, 0, chars.Length, utf8, 0);
+                return ProtectedData.Protect(utf8, null, DataProtectionScope.LocalMachine);
+            }
+            finally
+            {
+                Array.Clear(chars, 0, chars.Length);
+                charsPin.Free();
+                if (utf8 != null) Array.Clear(utf8, 0, utf8.Length);
+                if (utf8Pin.IsAllocated) utf8Pin.Free();
+                if (unmanaged != IntPtr.Zero) Marshal.ZeroFreeGlobalAllocUnicode(unmanaged);
             }
         }
     }
