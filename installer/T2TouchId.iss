@@ -22,8 +22,10 @@
 ;       when Test Mode is already on (SystemStartOptions of the running boot,
 ;       or element 16000049 of the default BCD entry); otherwise setup stops
 ;       and shows bcdedit's own message.
-;    3. Import every .cer of the package (Inst\) into LocalMachine Root and
-;       TrustedPublisher.
+;    3. Import every .cer of the package (Inst\, else SEP/NCM/Bio) into LocalMachine
+;       Root and TrustedPublisher (certutil, Import-Certificate as fallback), checked
+;       by thumbprint - BEFORE services or Test Mode are touched; no .cer = clear
+;       error, nothing changed.
 ;    4. Check every INF / script is present BEFORE anything is removed.
 ;    5. Remove previously published packages of our five INFs (matched by
 ;       OriginalFileName through Get-WindowsDriver, so it is locale-proof).
@@ -521,26 +523,103 @@ begin
     '"' + DataDir() + '\Logs" /grant *S-1-5-19:(OI)(CI)M /C /Q');
 end;
 
-function FindPackageCertificates(var Certs: TArrayOfString): Integer;
+procedure AddCertificatesIn(const Dir: String; var Certs: TArrayOfString; var Count: Integer);
 var
   FindRec: TFindRec;
-  Dir: String;
 begin
-  Result := 0;
-  SetArrayLength(Certs, 0);
-  Dir := ExpandConstant('{tmp}\pkg\Inst\');
   if FindFirst(Dir + '*.cer', FindRec) then
   begin
     try
       repeat
-        SetArrayLength(Certs, Result + 1);
-        Certs[Result] := Dir + FindRec.Name;
-        Result := Result + 1;
+        if (FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY) = 0 then
+        begin
+          SetArrayLength(Certs, Count + 1);
+          Certs[Count] := Dir + FindRec.Name;
+          Count := Count + 1;
+          LogLine('certificate found: ' + Dir + FindRec.Name);
+        end;
       until not FindNext(FindRec);
     finally
       FindClose(FindRec);
     end;
   end;
+end;
+
+// The package's driver certificate(s): Inst\ (where CI puts the one .cer), else
+// next to the drivers (a hand-made package may keep the WDK's exported .cer there).
+function FindPackageCertificates(var Certs: TArrayOfString): Integer;
+var
+  Pkg: String;
+begin
+  Result := 0;
+  SetArrayLength(Certs, 0);
+  Pkg := ExpandConstant('{tmp}\pkg\');
+  AddCertificatesIn(Pkg + 'Inst\', Certs, Result);
+  if Result = 0 then
+  begin
+    AddCertificatesIn(Pkg + 'SEP\', Certs, Result);
+    AddCertificatesIn(Pkg + 'NCM\', Certs, Result);
+    AddCertificatesIn(Pkg + 'Bio\', Certs, Result);
+  end;
+end;
+
+// "a.ps1, b.cer, ..." - what IS in a folder, for an error message.
+function ListFolder(const Dir: String): String;
+var
+  FindRec: TFindRec;
+begin
+  Result := '';
+  if FindFirst(Dir + '*', FindRec) then
+  begin
+    try
+      repeat
+        if (FindRec.Name <> '.') and (FindRec.Name <> '..') then
+        begin
+          if Result <> '' then Result := Result + ', ';
+          Result := Result + FindRec.Name;
+        end;
+      until not FindNext(FindRec);
+    finally
+      FindClose(FindRec);
+    end;
+  end;
+  if Result = '' then Result := '(empty or missing)';
+end;
+
+// Puts one certificate into LocalMachine\<Store> and checks it is there.
+// certutil first: built into Windows, no PowerShell module involved. Then
+// PowerShell's Import-Certificate (what InstallCert.bat uses). The output of both
+// goes into Details for the error message.
+function ImportCertificateInto(const CertPath, Store: String; var Details: String): Boolean;
+var
+  ResultCode: Integer;
+  Output, Thumb: String;
+begin
+  Result := False;
+  if RunCaptured(ExpandConstant('{sys}\certutil.exe'), '-f -addstore ' + Store + ' "' + CertPath + '"',
+       ResultCode, Output) and (ResultCode = 0) then
+    Result := True
+  else
+  begin
+    Details := 'certutil -addstore ' + Store + ' (exit ' + IntToStr(ResultCode) + '): ' + Output;
+    if RunCaptured(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+         '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "Import-Certificate -FilePath ''' +
+         PsQuote(CertPath) + ''' -CertStoreLocation Cert:\LocalMachine\' + Store + ' | Out-Null"',
+         ResultCode, Output) and (ResultCode = 0) then
+      Result := True
+    else
+      Details := Details + #13#10 + 'Import-Certificate (exit ' + IntToStr(ResultCode) + '): ' + Output;
+  end;
+  if not Result then Exit;
+  // A DER .cer's SHA-1 is the certificate's thumbprint: look it up in the store.
+  // (A base64 .cer hashes differently - then the import result has to do.)
+  Thumb := GetSHA1OfFile(CertPath);
+  if RunCaptured(ExpandConstant('{sys}\certutil.exe'), '-store ' + Store + ' ' + Thumb,
+       ResultCode, Output) and (ResultCode = 0) then
+    LogLine('certificate ' + Thumb + ' present in LocalMachine\' + Store)
+  else
+    LogLine('note: thumbprint ' + Thumb + ' not confirmed in LocalMachine\' + Store +
+            ' (base64 .cer, or certutil unavailable) - import reported success');
 end;
 
 function IsDotNet8DesktopRuntimeInstalled(): Boolean;
@@ -740,6 +819,33 @@ begin
     end;
   end;
 
+  // 3. Certificate(s) - before anything on the machine is changed (services,
+  //    Test Mode): without the certificate the drivers cannot be installed at all.
+  CertCount := FindPackageCertificates(Certs);
+  if CertCount = 0 then
+  begin
+    LogLine('no .cer in the package; Inst\ holds: ' + ListFolder(Pkg + 'Inst\'));
+    SuppressibleMsgBox('The driver certificate (.cer) is missing from this installer.' + #13#10 + #13#10 +
+      'The drivers are signed with it; without it Windows refuses to install them. ' +
+      'This happens with a package built without the signing secrets (CERT / CERT_PWD).' + #13#10 + #13#10 +
+      'Looked in: ' + Pkg + 'Inst\ (and SEP\, NCM\, Bio\)' + #13#10 +
+      'Inst\ contains: ' + ListFolder(Pkg + 'Inst\') + #13#10 + #13#10 +
+      'Nothing was changed. Log: ' + LogFile, mbError, MB_OK, IDOK);
+    Exit;
+  end;
+  for I := 0 to CertCount - 1 do
+  begin
+    SetStatus('Importing certificate ' + ExtractFileName(Certs[I]) + '...');
+    if (not ImportCertificateInto(Certs[I], 'Root', Details)) or
+       (not ImportCertificateInto(Certs[I], 'TrustedPublisher', Details)) then
+    begin
+      SuppressibleMsgBox('Failed to import the driver certificate ' + ExtractFileName(Certs[I]) + '.' + #13#10 + #13#10 +
+        Details + #13#10 + #13#10 +
+        'Driver installation was NOT started - nothing was removed. Log: ' + LogFile, mbError, MB_OK, IDOK);
+      Exit;
+    end;
+  end;
+
   // 1. Release files the INFs are about to replace in System32.
   StopBiometricService;
   SetStatus('Stopping T2SepBootstrap...');
@@ -756,25 +862,6 @@ begin
       'Log: ' + LogFile, mbError, MB_OK, IDOK);
     StartBiometricService;
     Exit;
-  end;
-
-  // 3. Certificate(s).
-  CertCount := FindPackageCertificates(Certs);
-  if CertCount = 0 then
-    LogLine('WARNING: no .cer in the package - the drivers are unsigned and will not load (Code 52).');
-  for I := 0 to CertCount - 1 do
-  begin
-    SetStatus('Importing certificate ' + ExtractFileName(Certs[I]) + '...');
-    if (not RunPowerShell('Import-Certificate -FilePath ''' + PsQuote(Certs[I]) +
-          ''' -CertStoreLocation Cert:\LocalMachine\Root | Out-Null', ResultCode)) or (ResultCode <> 0) or
-       (not RunPowerShell('Import-Certificate -FilePath ''' + PsQuote(Certs[I]) +
-          ''' -CertStoreLocation Cert:\LocalMachine\TrustedPublisher | Out-Null', ResultCode)) or (ResultCode <> 0) then
-    begin
-      SuppressibleMsgBox('Failed to import the driver certificate ' + ExtractFileName(Certs[I]) + '.' + #13#10 +
-        'Driver installation was NOT completed - nothing was removed.', mbError, MB_OK, IDOK);
-      StartBiometricService;
-      Exit;
-    end;
   end;
 
   // 5. Old packages (only now that the new ones are known to be installable).
