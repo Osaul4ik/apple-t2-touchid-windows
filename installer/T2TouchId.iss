@@ -204,8 +204,10 @@ begin
   OutFile := ExpandConstant('{tmp}\cmd-output.txt');
   DeleteFile(OutFile);
   LogLine('> "' + Exe + '" ' + Args);
+  // chcp 65001: console programs write UTF-8, decoded below - otherwise their
+  // localized (e.g. Cyrillic) OEM-codepage text ended up as "?????" in the log.
   Result := Exec(ExpandConstant('{cmd}'),
-    '/S /C ""' + Exe + '" ' + Args + ' > "' + OutFile + '" 2>&1"', '', SW_HIDE,
+    '/S /C "chcp 65001 >nul & "' + Exe + '" ' + Args + ' > "' + OutFile + '" 2>&1"', '', SW_HIDE,
     ewWaitUntilTerminated, ResultCode);
   if not Result then
   begin
@@ -213,7 +215,11 @@ begin
     Exit;
   end;
   if LoadStringFromFile(OutFile, Raw) then
-    Output := Trim(String(Raw));
+  begin
+    Output := Trim(UTF8Decode(Raw));
+    if (Output = '') and (Trim(String(Raw)) <> '') then
+      Output := Trim(String(Raw)); // not UTF-8 after all: keep it as it is
+  end;
   DeleteFile(OutFile);
   if Output <> '' then
     LogLine('  ' + Output);
@@ -481,6 +487,10 @@ begin
     'ForEach-Object { & pnputil.exe /remove-device $_.InstanceId }', ResultCode);
 end;
 
+// Through the Service Control Manager (sc config), not only the registry: the SCM
+// reads DependOnService at boot, so a registry-only edit left WbioSrvc depending
+// on the just-deleted T2SepBootstrap until the next restart - "net start WbioSrvc"
+// then failed with 1075 and Windows Hello stayed down. sc config updates both.
 procedure UndoWbioDependency;
 var
   ResultCode: Integer;
@@ -492,8 +502,11 @@ begin
     '[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames); ' +
     'if($v -and ($v -contains ''T2SepBootstrap'')){ ' +
     '$n=[string[]]@($v | Where-Object { $_ -ne ''T2SepBootstrap'' }); ' +
-    'if($n.Count -gt 0){ Set-ItemProperty -LiteralPath $k -Name DependOnService -Type MultiString -Value $n } ' +
-    'else { Remove-ItemProperty -LiteralPath $k -Name DependOnService } }', ResultCode);
+    '$d=if($n.Count -gt 0){ $n -join ''/'' } else { ''/'' }; ' +
+    '& sc.exe config WbioSrvc depend= $d; exit $LASTEXITCODE }', ResultCode);
+  if ResultCode <> 0 then
+    LogLine('WARNING: sc config WbioSrvc depend= failed (' + IntToStr(ResultCode) +
+            ') - Windows Hello may only start again after a restart');
 end;
 
 // sep-vault.bin is read by T2SepBootstrap (LocalSystem). The default
@@ -534,6 +547,8 @@ begin
     '"' + Dir + '\Logs" /grant *S-1-5-19:(OI)(CI)M /C /Q');
   RunIgnore(ExpandConstant('{sys}\icacls.exe'),
     '"' + Dir + '\Logs\*" /reset /T /C /Q');
+  // portcache.ini: written by old versions only (the port cache is in the registry).
+  DeleteFile(Dir + '\portcache.ini');
   // Every file of the folder: the vault gets its own protected ACL directly (never
   // an inherited "Users read" first), everything else goes back to inheriting.
   if FindFirst(Dir + '\*', FindRec) then
