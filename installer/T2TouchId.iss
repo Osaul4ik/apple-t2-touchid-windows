@@ -191,46 +191,6 @@ begin
     UninstallProgressForm.StatusLabel.Caption := S;
 end;
 
-// Runs Exe with Args through cmd so stdout/stderr land in the log file.
-// Returns False only when the process could not be launched; the exit code is
-// handed back in ResultCode.
-function RunLogged(const Exe, Args: String; var ResultCode: Integer): Boolean;
-var
-  CmdArgs: String;
-begin
-  LogLine('> "' + Exe + '" ' + Args);
-  if LogFile <> '' then
-    CmdArgs := '/S /C ""' + Exe + '" ' + Args + ' >> "' + LogFile + '" 2>&1"'
-  else
-    CmdArgs := '/S /C ""' + Exe + '" ' + Args + '"';
-  Result := Exec(ExpandConstant('{cmd}'), CmdArgs, '', SW_HIDE,
-    ewWaitUntilTerminated, ResultCode);
-  if Result then
-    LogLine('  exit code ' + IntToStr(ResultCode))
-  else
-    LogLine('  could not launch (' + SysErrorMessage(ResultCode) + ')');
-end;
-
-function RunPowerShell(const Command: String; var ResultCode: Integer): Boolean;
-begin
-  Result := RunLogged(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
-    '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "' + Command + '"',
-    ResultCode);
-end;
-
-function RunPowerShellFile(const ScriptPath, ScriptArgs: String; var ResultCode: Integer): Boolean;
-begin
-  Result := RunLogged(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
-    '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ScriptPath + '" ' + ScriptArgs,
-    ResultCode);
-end;
-
-procedure RunIgnore(const Exe, Args: String);
-var
-  ResultCode: Integer;
-begin
-  RunLogged(Exe, Args, ResultCode);
-end;
 
 // Runs a command, appends its output to the install log AND returns it, so a
 // failure can be shown to the user instead of a guess.
@@ -259,6 +219,41 @@ begin
     LogLine('  ' + Output);
   LogLine('  exit code ' + IntToStr(ResultCode));
 end;
+
+// Runs Exe with Args; its output goes to the install log. Returns False only when
+// the process could not be launched; the exit code is handed back in ResultCode.
+// The output is captured into {tmp} first and appended to the log afterwards -
+// never redirected into the log file by cmd: a log that cannot be written (locked,
+// broken ACL) must not stop cmd from running the command itself (it would refuse
+// with exit code 1, which looked like the command failing).
+function RunLogged(const Exe, Args: String; var ResultCode: Integer): Boolean;
+var
+  Output: String;
+begin
+  Result := RunCaptured(Exe, Args, ResultCode, Output);
+end;
+
+function RunPowerShell(const Command: String; var ResultCode: Integer): Boolean;
+begin
+  Result := RunLogged(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+    '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "' + Command + '"',
+    ResultCode);
+end;
+
+function RunPowerShellFile(const ScriptPath, ScriptArgs: String; var ResultCode: Integer): Boolean;
+begin
+  Result := RunLogged(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+    '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ScriptPath + '" ' + ScriptArgs,
+    ResultCode);
+end;
+
+procedure RunIgnore(const Exe, Args: String);
+var
+  ResultCode: Integer;
+begin
+  RunLogged(Exe, Args, ResultCode);
+end;
+
 
 // Test Mode of the RUNNING boot: the loader writes the effective options to
 // SystemStartOptions (" ... TESTSIGNING ..."). Locale-independent, unlike the
@@ -504,23 +499,87 @@ end;
 // sep-vault.bin is read by T2SepBootstrap (LocalSystem). The default
 // ProgramData ACL lets any user create a subfolder and own it, so a folder
 // created by a standard user BEFORE install would let that user replace the
-// vault the SYSTEM service parses. Reset it: SYSTEM + Administrators full,
-// Users read. Nothing that runs unelevated writes here (the GUI requires
-// admin; the UMDF host keeps its state in the registry).
+// vault the SYSTEM service parses. So the folder is reset on every install:
+//
+// %ProgramData%\T2TouchId: SYSTEM + Administrators full, Users read - so the logs
+// (install.log, uninstall.log, coinstaller.log, Logs\*.log) open in Notepad without
+// elevation; the vault file alone is SYSTEM + Administrators only (it is DPAPI
+// LocalMachine, i.e. readable = decryptable by any local process).
+//
+// The ACL is set on the FOLDER only and reaches the files by inheritance. Setup
+// 1.2026.1110.x applied "(OI)(CI)" grants recursively (/T) after /inheritance:r:
+// inheritance flags do not apply to files, so every file was left with an EMPTY
+// DACL - nobody could read or write install.log any more (and the next Setup's
+// commands, whose output is appended to it, failed). This routine repairs that:
+// it is safe to run on any state of the folder and runs at the start and at the
+// end of every install.
 procedure SecureDataDir;
+var
+  FindRec: TFindRec;
+  Dir, Name, Path: String;
 begin
-  ForceDirectories(DataDir());
+  Dir := DataDir();
+  ForceDirectories(Dir);
+  ForceDirectories(Dir + '\Logs');
+  // Administrators own everything, so the ACLs below can always be rewritten.
+  RunIgnore(ExpandConstant('{sys}\icacls.exe'), '"' + Dir + '" /setowner *S-1-5-32-544 /T /C /Q');
+  // The folder: explicit, protected, inheritable to files and subfolders. No /T.
   RunIgnore(ExpandConstant('{sys}\icacls.exe'),
-    '"' + DataDir() + '" /setowner *S-1-5-32-544 /T /C /Q');
+    '"' + Dir + '" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F ' +
+    '*S-1-5-32-545:(OI)(CI)RX /C /Q');
+  // Logs\: plus modify for LocalService (the UMDF driver writes its log there).
   RunIgnore(ExpandConstant('{sys}\icacls.exe'),
-    '"' + DataDir() + '" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F ' +
-    '*S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX /T /C /Q');
-  // Logs\: the components' own log files (protocol/BridgeXpc/Log.h file sink).
-  // The UMDF driver runs as LocalService, which gets modify here and only here -
-  // never on the vault next to it.
-  ForceDirectories(DataDir() + '\Logs');
+    '"' + Dir + '\Logs" /reset /C /Q');
   RunIgnore(ExpandConstant('{sys}\icacls.exe'),
-    '"' + DataDir() + '\Logs" /grant *S-1-5-19:(OI)(CI)M /C /Q');
+    '"' + Dir + '\Logs" /grant *S-1-5-19:(OI)(CI)M /C /Q');
+  RunIgnore(ExpandConstant('{sys}\icacls.exe'),
+    '"' + Dir + '\Logs\*" /reset /T /C /Q');
+  // Every file of the folder: the vault gets its own protected ACL directly (never
+  // an inherited "Users read" first), everything else goes back to inheriting.
+  if FindFirst(Dir + '\*', FindRec) then
+  begin
+    try
+      repeat
+        Name := FindRec.Name;
+        Path := Dir + '\' + Name;
+        if (FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY) <> 0 then
+          Continue;
+        if Pos('sep-vault', Lowercase(Name)) = 1 then
+          RunIgnore(ExpandConstant('{sys}\icacls.exe'),
+            '"' + Path + '" /inheritance:r /grant:r *S-1-5-18:F *S-1-5-32-544:F /C /Q')
+        else
+          RunIgnore(ExpandConstant('{sys}\icacls.exe'), '"' + Path + '" /reset /C /Q');
+      until not FindNext(FindRec);
+    finally
+      FindClose(FindRec);
+    end;
+  end;
+end;
+
+// Uninstall: make the logs readable / writable again before logging (see
+// SecureDataDir), without touching anything else.
+procedure RepairLogAccess;
+var
+  FindRec: TFindRec;
+  Dir: String;
+begin
+  Dir := DataDir();
+  RunIgnore(ExpandConstant('{sys}\icacls.exe'), '"' + Dir + '" /setowner *S-1-5-32-544 /T /C /Q');
+  RunIgnore(ExpandConstant('{sys}\icacls.exe'),
+    '"' + Dir + '" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F ' +
+    '*S-1-5-32-545:(OI)(CI)RX /C /Q');
+  if FindFirst(Dir + '\*.log', FindRec) then
+  begin
+    try
+      repeat
+        RunIgnore(ExpandConstant('{sys}\icacls.exe'), '"' + Dir + '\' + FindRec.Name + '" /reset /C /Q');
+      until not FindNext(FindRec);
+    finally
+      FindClose(FindRec);
+    end;
+  end;
+  if DirExists(Dir + '\Logs') then
+    RunIgnore(ExpandConstant('{sys}\icacls.exe'), '"' + Dir + '\Logs\*" /reset /T /C /Q');
 end;
 
 procedure AddCertificatesIn(const Dir: String; var Certs: TArrayOfString; var Count: Integer);
@@ -956,6 +1015,9 @@ begin
   begin
     ForceDirectories(DataDir());
     LogFile := DataDir() + '\install.log';
+    // Repair the folder / log ACLs first (an older Setup could leave the logs
+    // unreadable and unwritable, see SecureDataDir), then log.
+    SecureDataDir;
     LogLine('==== T2 Touch ID setup {#MyAppVersion} ====');
 
     if SuppressibleMsgBox(
@@ -1115,6 +1177,7 @@ begin
   begin
     ForceDirectories(DataDir());
     LogFile := DataDir() + '\uninstall.log';
+    RepairLogAccess; // see SecureDataDir
     LogLine('==== T2 Touch ID uninstall ====');
     RemoveDriversNow;
   end;
